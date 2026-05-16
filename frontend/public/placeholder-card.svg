@@ -1,0 +1,13 @@
+<svg width="488" height="680" viewBox="0 0 488 680" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="488" height="680" rx="28" fill="#20242d"/>
+  <rect x="28" y="28" width="432" height="624" rx="22" fill="#2b303b" stroke="#596174" stroke-width="4"/>
+  <rect x="52" y="58" width="384" height="56" rx="10" fill="#3a4150"/>
+  <rect x="52" y="142" width="384" height="300" rx="14" fill="#171a21"/>
+  <rect x="52" y="468" width="384" height="132" rx="14" fill="#3a4150"/>
+  <text x="244" y="310" text-anchor="middle" fill="#cbd5e1" font-family="Arial, sans-serif" font-size="28" font-weight="700">
+    No Image
+  </text>
+  <text x="244" y="348" text-anchor="middle" fill="#94a3b8" font-family="Arial, sans-serif" font-size="18">
+    Commander card image unavailable
+  </text>
+</svg>

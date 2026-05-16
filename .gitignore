@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Node / Vite
+frontend/node_modules/
+frontend/dist/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Raw scrape data can become large.
+# The workflow can upload raw data as artifacts instead of committing it.
+data/raw/
+
+# Keep processed snapshots tracked for trend history.
+# Do not ignore data/processed/.
+# Generated data outputs - too large for GitHub source control
+data/raw/
+data/processed/
+frontend/public/data/latest/

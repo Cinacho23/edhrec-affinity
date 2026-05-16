@@ -1,0 +1,65 @@
+# pyproject.toml
+#
+# This file defines the Python project configuration.
+#
+# It tell sPython packaging tools:
+# - how to build the project
+# - what the project is called
+# - which Python version it requires
+# - which dependencies it needs
+# -  where the source code lives
+# - where pytest should look for tests
+
+# The build-system table tells packaging tools what backend to use.
+#
+# setuptools is the build backend.
+# wheel allows the project to be built as a wheel package.
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# The project table contains the basic project metadata.
+[project]
+name = "edhrec-affinity"
+version = "0.1.0"
+
+# This project currently assumes Python 3.12 or newer.
+requires-python = ">=3.12"
+
+# Runtime dependencies.
+#
+# These are needed for the scraper to run normally.
+dependencies = [
+    "httpx",
+    "pydantic"
+]
+
+# Optional dependency groups
+#
+# The "dev" group contains tools needed for development and testing,
+# but not necessarily needed when running the scraper itself.
+#
+# Install with
+# pip isntall -e ".[dev]"
+[project.optional-dependencies]
+dev = [
+    "pytest"
+]
+
+# Tell setuptools to look for packages inside the src/ folder.
+#
+# This supports the common "src layout":
+#
+# src/
+#   edhrec_affinity/
+#       __init__.py
+#       single_commander.py
+#       models.py
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Pytest configuration.
+#
+# This tells pytest to look for test files inside the tests/ folder.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
