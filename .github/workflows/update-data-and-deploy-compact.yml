@@ -1,0 +1,162 @@
+name: Update data and deploy compact site
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every Monday at 6:00 AM America/Montreal.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: read
+
+concurrency:
+  group: update-data-and-deploy-compact
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+  RAW_ROOT: "data/raw"
+  PROCESSED_ROOT: "data/processed"
+  FRONTEND_DATA_DIR: "frontend/public/data/latest"
+
+jobs:
+  build:
+    name: Build data and frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Compute snapshot date
+        shell: bash
+        run: |
+          SNAPSHOT_DATE="$(TZ=America/Montreal date +%F)"
+          echo "SNAPSHOT_DATE=${SNAPSHOT_DATE}" >> "$GITHUB_ENV"
+          echo "RAW_DIR=${RAW_ROOT}/${SNAPSHOT_DATE}" >> "$GITHUB_ENV"
+          echo "PROCESSED_DIR=${PROCESSED_ROOT}/${SNAPSHOT_DATE}" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run Python tests
+        run: pytest
+
+      - name: Create data directories
+        run: |
+          mkdir -p "${RAW_DIR}"
+          mkdir -p "${PROCESSED_DIR}"
+          mkdir -p "${FRONTEND_DATA_DIR}"
+
+      - name: Run commander discovery
+        run: |
+          python3 src/edhrec_affinity/discovery.py \
+            --output-dir "${RAW_DIR}"
+
+      - name: Run normal tag scraper
+        run: |
+          python3 src/edhrec_affinity/tag_scraper.py \
+            --commander-index "${RAW_DIR}/commander_index.json" \
+            --output-dir "${RAW_DIR}"
+
+      - name: Run cEDH special-route scraper
+        run: |
+          python3 src/edhrec_affinity/cedh_scraper.py \
+            --commander-index "${RAW_DIR}/commander_index.json" \
+            --normal-tags "${RAW_DIR}/commander_tags_raw.jsonl" \
+            --output-dir "${RAW_DIR}"
+
+      - name: Run cleaning and validation
+        run: |
+          python3 src/edhrec_affinity/cleaning.py \
+            --raw-dir "${RAW_DIR}" \
+            --output-dir "${PROCESSED_DIR}"
+
+      - name: Run statistical analysis
+        run: |
+          python3 src/edhrec_affinity/analysis.py \
+            --input-path "${PROCESSED_DIR}/commander_tags_clean.json" \
+            --output-dir "${PROCESSED_DIR}"
+
+      - name: Run historical trends
+        run: |
+          python3 src/edhrec_affinity/trends.py \
+            --current-dir "${PROCESSED_DIR}" \
+            --processed-root "${PROCESSED_ROOT}"
+
+      - name: Run Scryfall enrichment
+        run: |
+          python3 src/edhrec_affinity/scryfall_enrichment.py \
+            --processed-dir "${PROCESSED_DIR}"
+
+      - name: Export compact frontend data
+        run: |
+          python3 scripts/export_compact_site_data.py \
+            --processed-dir "${PROCESSED_DIR}" \
+            --output-dir "${FRONTEND_DATA_DIR}" \
+            --top-global-rows 5000 \
+            --top-rows-per-tag 100 \
+            --top-tags-per-commander 30
+
+      - name: Upload full raw data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-data-${{ env.SNAPSHOT_DATE }}
+          path: ${{ env.RAW_DIR }}
+          retention-days: 30
+
+      - name: Upload full processed data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-data-${{ env.SNAPSHOT_DATE }}
+          path: ${{ env.PROCESSED_DIR }}
+          retention-days: 30
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: "frontend/package-lock.json"
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: frontend/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy GitHub Pages site
+        id: deployment
+        uses: actions/deploy-pages@v4
