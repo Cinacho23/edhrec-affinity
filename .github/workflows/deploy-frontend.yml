@@ -35,6 +35,43 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Create placeholder frontend data
+        shell: bash
+        run: |
+          mkdir -p frontend/public/data/latest
+
+          cat > frontend/public/data/latest/analysis_summary.json <<'EOF'
+          {
+            "input_row_count": 0,
+            "affinity_row_count": 0,
+            "global_leaderboard_row_count": 0,
+            "tag_summary_row_count": 0,
+            "unique_commander_count": 0,
+            "unique_tag_count": 0,
+            "analysis_eligible_row_count": 0,
+            "rows_with_missing_z": 0,
+            "min_total_decks_default": 200,
+            "min_tag_decks_default": 5
+          }
+          EOF
+
+          cat > frontend/public/data/latest/trend_summary.json <<'EOF'
+          {
+            "current_snapshot": null,
+            "previous_snapshot": null,
+            "previous_snapshot_found": false,
+            "current_row_count": 0,
+            "previous_row_count": 0,
+            "trend_row_count": 0,
+            "no_previous_snapshot_count": 0
+          }
+          EOF
+
+          echo "[]" > frontend/public/data/latest/tag_summary.json
+          echo "[]" > frontend/public/data/latest/global_leaderboard.json
+          echo "[]" > frontend/public/data/latest/tag_rankings.json
+          echo "[]" > frontend/public/data/latest/affinity_rows_with_trends.json
+
       - name: Build frontend
         working-directory: frontend
         run: npm run build
