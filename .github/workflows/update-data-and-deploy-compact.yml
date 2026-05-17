@@ -78,10 +78,20 @@ jobs:
             --normal-tags "${RAW_DIR}/commander_tags_raw.jsonl" \
             --output-dir "${RAW_DIR}"
 
+      - name: Show raw output files before cleaning
+        shell: bash
+          run: |
+            echo "Raw directory contents:"
+            ls -lah "${RAW_DIR}"
+
       - name: Run cleaning and validation
+        shell: bash
         run: |
           python3 src/edhrec_affinity/cleaning.py \
-            --raw-dir "${RAW_DIR}" \
+            --commander-index "${RAW_DIR}/commander_index.json" \
+            --normal-tags "${RAW_DIR}/commander_tags_raw.jsonl" \
+            --cedh-tags "${RAW_DIR}/commander_tags_cedh_raw.jsonl" \
+            --cedh-status "${RAW_DIR}/commander_cedh_status.jsonl" \
             --output-dir "${PROCESSED_DIR}"
 
       - name: Run statistical analysis
