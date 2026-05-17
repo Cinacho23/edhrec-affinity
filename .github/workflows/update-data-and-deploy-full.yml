@@ -104,7 +104,7 @@ jobs:
         shell: bash
         run: |
           python3 src/edhrec_affinity/analysis.py \
-            --input-path "${PROCESSED_DIR}/commander_tags_clean.json" \
+            --input "${PROCESSED_DIR}/commander_tags_clean.json" \
             --output-dir "${PROCESSED_DIR}"
 
       - name: Run historical trends
@@ -118,7 +118,9 @@ jobs:
         shell: bash
         run: |
           python3 src/edhrec_affinity/scryfall_enrichment.py \
-            --processed-dir "${PROCESSED_DIR}"
+            --processed-dir "${PROCESSED_DIR}" \
+            --merge-website-files \
+            --website-files affinity_rows_with_trends.json
 
       - name: Export full sharded frontend data
         shell: bash
