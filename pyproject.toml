@@ -31,7 +31,8 @@ requires-python = ">=3.12"
 # These are needed for the scraper to run normally.
 dependencies = [
     "httpx",
-    "pydantic"
+    "pydantic",
+    "pandas",
 ]
 
 # Optional dependency groups
@@ -43,7 +44,7 @@ dependencies = [
 # pip isntall -e ".[dev]"
 [project.optional-dependencies]
 dev = [
-    "pytest"
+    "pytest",
 ]
 
 # Tell setuptools to look for packages inside the src/ folder.
