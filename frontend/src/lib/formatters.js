@@ -1,57 +1,57 @@
-/*
-  Small formatting helpers keep page components cleaner.
-*/
-
 export function formatNumber(value) {
-  if (value == null || Number.isNaN(Number(value))) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
     return "—";
   }
 
-  return Number(value).toLocaleString();
+  return new Intl.NumberFormat("en-US").format(Number(value));
 }
 
-export function formatPercent(value) {
-  if (value == null || Number.isNaN(Number(value))) {
+export function formatDecimal(value, digits = 2) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
     return "—";
   }
 
-  /*
-    The analysis pipeline stores tag_affinity_pct as a decimal.
-    Example:
-      0.037 = 3.7%
-
-    Some rows may also contain display versions elsewhere, but this function
-    assumes the formula field is decimal.
-  */
-  return `${(Number(value) * 100).toFixed(2)}%`;
+  return Number(value).toFixed(digits);
 }
 
-export function formatZScore(value) {
-  if (value == null || Number.isNaN(Number(value))) {
+export function formatPercent(value, digits = 2) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
     return "—";
   }
 
-  return Number(value).toFixed(2);
+  const number = Number(value);
+
+  // Backend may provide either decimal 0.037 or display value 3.7.
+  const displayValue = Math.abs(number) <= 1 ? number * 100 : number;
+
+  return `${displayValue.toFixed(digits)}%`;
 }
 
-export function formatSignedNumber(value) {
-  if (value == null || Number.isNaN(Number(value))) {
+export function formatSigned(value, digits = 2) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
     return "—";
   }
 
-  const numeric = Number(value);
+  const number = Number(value);
+  const sign = number > 0 ? "+" : "";
 
-  if (numeric > 0) {
-    return `+${numeric.toLocaleString()}`;
-  }
-
-  return numeric.toLocaleString();
+  return `${sign}${number.toFixed(digits)}`;
 }
 
-export function formatDateLike(value) {
-  if (!value) {
-    return "Unavailable";
+export function formatColorIdentity(value) {
+  if (!value) return "Colorless";
+
+  if (Array.isArray(value)) {
+    return value.length > 0 ? value.join("") : "Colorless";
   }
 
   return String(value);
+}
+
+export function formatRank(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return "—";
+  }
+
+  return `#${Number(value).toLocaleString("en-US")}`;
 }

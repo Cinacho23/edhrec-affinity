@@ -1,127 +1,143 @@
 import { useEffect, useMemo, useState } from "react";
-import { loadAffinityRowsWithTrends } from "../lib/api.js";
-import {
-  filterCommanders,
-  groupRowsByCommander,
-} from "../lib/commanderUtils.js";
-import { formatNumber } from "../lib/formatters.js";
-import CommanderCard from "../components/CommanderCard.jsx";
-import LoadingState from "../components/LoadingState.jsx";
-import ErrorState from "../components/ErrorState.jsx";
+import { Link } from "react-router-dom";
 
-/*
-  CommanderSearchPage is the first real data-browser prototype.
-
-  It loads the full affinity_rows_with_trends.json file, groups rows by
-  commander, and then lets the user search by commander name or slug.
-
-  This is intentionally simpler than the final Chat 10 table work.
-*/
-
-const DEFAULT_VISIBLE_COUNT = 24;
+import CommanderImageGallery from "../components/CommanderImageGallery";
+import { loadCommanderIndex } from "../lib/api";
+import { formatColorIdentity, formatNumber } from "../lib/formatters";
 
 export default function CommanderSearchPage() {
-  const [rows, setRows] = useState([]);
+  const [commanders, setCommanders] = useState([]);
   const [query, setQuery] = useState("");
-  const [visibleCount, setVisibleCount] = useState(DEFAULT_VISIBLE_COUNT);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+  const [visibleCount, setVisibleCount] = useState(100);
+  const [state, setState] = useState({ loading: true, error: null });
 
   useEffect(() => {
-    async function loadRows() {
+    async function loadData() {
       try {
-        const loadedRows = await loadAffinityRowsWithTrends();
-        setRows(loadedRows);
-      } catch (caughtError) {
-        setError(caughtError);
-      } finally {
-        setLoading(false);
+        const data = await loadCommanderIndex();
+
+        const sortedByPopularity = (Array.isArray(data) ? data : []).sort(
+          (a, b) => Number(b.total_decks || 0) - Number(a.total_decks || 0)
+        );
+
+        setCommanders(sortedByPopularity);
+        setState({ loading: false, error: null });
+      } catch (error) {
+        setState({ loading: false, error: error.message });
       }
     }
 
-    loadRows();
+    loadData();
   }, []);
 
-  const commanders = useMemo(() => {
-    return groupRowsByCommander(rows);
-  }, [rows]);
-
   const filteredCommanders = useMemo(() => {
-    return filterCommanders(commanders, query);
+    const normalizedQuery = query.trim().toLowerCase();
+
+    if (!normalizedQuery) {
+      return commanders;
+    }
+
+    return commanders.filter((commander) =>
+      String(commander.commander_name || "")
+        .toLowerCase()
+        .includes(normalizedQuery)
+    );
   }, [commanders, query]);
 
   const visibleCommanders = filteredCommanders.slice(0, visibleCount);
 
-  function handleQueryChange(event) {
-    setQuery(event.target.value);
-    setVisibleCount(DEFAULT_VISIBLE_COUNT);
+  if (state.loading) {
+    return <p className="muted">Loading commander index…</p>;
   }
 
-  if (loading) {
-    return <LoadingState message="Loading commander affinity rows..." />;
-  }
-
-  if (error) {
-    return <ErrorState title="Could not load commander data" error={error} />;
+  if (state.error) {
+    return <p className="error-message">Could not load commanders: {state.error}</p>;
   }
 
   return (
-    <div className="page">
-      <section className="page-header">
-        <p className="eyebrow">Commander Search Prototype</p>
-        <h1>Search commanders</h1>
-
+    <section className="page">
+      <div className="page-header">
+        <h1>Commander Search</h1>
         <p>
-          This prototype groups the analyzed commander-tag rows into commander
-          cards. It shows each commander’s strongest tag affinities by z-score.
+          Commanders are shown by popularity by default. Search all commanders in
+          the exported dataset and click a commander to load its complete tag table.
         </p>
-      </section>
+      </div>
 
-      <section className="search-panel">
-        <label htmlFor="commander-search">Commander name or slug</label>
-
+      <div className="search-panel">
+        <label htmlFor="commander-search">Search commander name</label>
         <input
           id="commander-search"
           type="search"
+          placeholder="Search commander name…"
           value={query}
-          onChange={handleQueryChange}
-          placeholder="Try Jasmine, Tenth Doctor, Atraxa..."
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setVisibleCount(100);
+          }}
         />
+      </div>
 
-        <p className="muted">
-          Showing {formatNumber(visibleCommanders.length)} of{" "}
-          {formatNumber(filteredCommanders.length)} matching commanders. Total
-          grouped commanders: {formatNumber(commanders.length)}.
-        </p>
-      </section>
+      <p className="muted">
+        Showing {formatNumber(visibleCommanders.length)} of{" "}
+        {formatNumber(filteredCommanders.length)} matching commanders.
+      </p>
 
-      {filteredCommanders.length === 0 ? (
-        <section className="status-box">
-          <h2>No commanders found</h2>
-          <p>Try a different spelling or search by commander slug.</p>
-        </section>
-      ) : (
-        <section className="commander-grid">
-          {visibleCommanders.map((commander) => (
-            <CommanderCard
-              key={commander.commander_slug}
-              commander={commander}
-            />
-          ))}
-        </section>
-      )}
+      <div className="commander-grid">
+        {visibleCommanders.map((commander) => (
+          <article className="commander-card" key={commander.commander_slug}>
+            <div className="commander-card__image-wrap">
+              <CommanderImageGallery
+                commanderName={commander.commander_name}
+                cardImageUrl={commander.card_image_url}
+                partnerCardImageUrls={commander.partner_card_image_urls}
+                scryfallUri={commander.scryfall_uri}
+                partnerScryfallUris={commander.partner_scryfall_uris}
+                variant="card"
+              />
+            </div>
+
+            <div className="commander-card__content">
+              <div className="commander-card__header">
+                <div>
+                  <h2>
+                    <Link
+                      className="commander-card__title-link"
+                      to={`/commanders/${commander.commander_slug}`}
+                    >
+                      {commander.commander_name}
+                    </Link>
+                  </h2>
+                  <p>{formatColorIdentity(commander.color_identity)}</p>
+                </div>
+
+                <span className="pill">
+                  {formatNumber(commander.total_decks)} decks
+                </span>
+              </div>
+
+              <Link
+                className="commander-card__link"
+                to={`/commanders/${commander.commander_slug}`}
+              >
+                View complete tag table →
+              </Link>
+            </div>
+          </article>
+        ))}
+      </div>
 
       {visibleCount < filteredCommanders.length ? (
         <div className="load-more-wrap">
           <button
             className="button"
             type="button"
-            onClick={() => setVisibleCount((count) => count + 24)}
+            onClick={() => setVisibleCount((current) => current + 100)}
           >
             Load more commanders
           </button>
         </div>
       ) : null}
-    </div>
+    </section>
   );
 }

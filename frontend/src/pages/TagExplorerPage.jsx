@@ -1,274 +1,321 @@
-/*
-  TagExplorerPage.jsx
-
-  The tag explorer answers:
-
-    "Within one selected tag, which commanders are most unusually associated
-     with that tag?"
-
-  It loads:
-  - tag_rankings.json for commander rows
-  - tag_summary.json for summary stats and the tag dropdown
-*/
-
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 
-import DataTable from "../components/DataTable";
-import SmallBarChart from "../components/SmallBarChart";
-import TableFilters from "../components/TableFilters";
-import TagSummaryCard from "../components/TagSummaryCard";
-
-import { createTagExplorerColumns } from "../lib/tableColumns";
-
+import SimpleTable from "../components/SimpleTable";
+import { loadTagDetail, loadTagIndex } from "../lib/api";
 import {
-  buildTagOptionsFromRows,
-  buildTagOptionsFromSummary,
-  findTagSummary,
+  formatDecimal,
   formatNumber,
-  getSelectedTagName,
-  makeTopTagDeckChartData,
-  makeTopZChartData,
-  rowMatchesTagExplorerFilters,
-} from "../lib/filterUtils";
+  formatPercent,
+  formatRank,
+} from "../lib/formatters";
+import {
+  passesMax,
+  passesMin,
+  rowMatchesText,
+  sortRows,
+  toggleSortDirection,
+} from "../lib/tableUtils";
 
-const TAG_RANKINGS_PATH = "/data/latest/tag_rankings.json";
-const TAG_SUMMARY_PATH = "/data/latest/tag_summary.json";
-
-async function loadJson(path) {
-  const response = await fetch(path);
-
-  if (!response.ok) {
-    throw new Error(`Could not load ${path}. HTTP status: ${response.status}`);
-  }
-
-  return response.json();
-}
+const DEFAULT_FILTERS = {
+  query: "",
+  minTotalDecks: "",
+  minTagDecks: "",
+  minZ: "",
+  maxZ: "",
+};
 
 export default function TagExplorerPage() {
+  const [tags, setTags] = useState([]);
+  const [selectedTag, setSelectedTag] = useState("");
   const [rows, setRows] = useState([]);
-  const [tagSummaryRows, setTagSummaryRows] = useState([]);
-  const [selectedTagSlug, setSelectedTagSlug] = useState("");
-
-  const [loadState, setLoadState] = useState({
-    loading: true,
-    error: "",
-  });
-
-  const [filters, setFilters] = useState({
-    commanderText: "",
-    colorIdentity: "",
-    minTotalDecks: "200",
-    minTagDecks: "5",
-    minZ: "",
-    minAffinityPct: "",
-    trendStatus: "",
+  const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  const [sortKey, setSortKey] = useState("rank_within_tag_by_z");
+  const [sortDirection, setSortDirection] = useState("asc");
+  const [state, setState] = useState({
+    loadingTags: true,
+    loadingRows: false,
+    error: null,
   });
 
   useEffect(() => {
-    let isMounted = true;
-
-    async function loadTagData() {
+    async function loadTags() {
       try {
-        const [loadedRows, loadedTagSummaryRows] = await Promise.all([
-          loadJson(TAG_RANKINGS_PATH),
-          loadJson(TAG_SUMMARY_PATH),
-        ]);
+        const data = await loadTagIndex();
+        const tagList = Array.isArray(data) ? data : [];
 
-        if (!Array.isArray(loadedRows)) {
-          throw new Error("tag_rankings.json did not contain an array.");
-        }
-
-        if (!Array.isArray(loadedTagSummaryRows)) {
-          throw new Error("tag_summary.json did not contain an array.");
-        }
-
-        if (isMounted) {
-          setRows(loadedRows);
-          setTagSummaryRows(loadedTagSummaryRows);
-          setLoadState({
-            loading: false,
-            error: "",
-          });
-        }
+        setTags(tagList);
+        setSelectedTag(tagList[0]?.tag_slug || "");
+        setState({ loadingTags: false, loadingRows: false, error: null });
       } catch (error) {
-        if (isMounted) {
-          setLoadState({
-            loading: false,
-            error: error.message,
-          });
-        }
+        setState({ loadingTags: false, loadingRows: false, error: error.message });
       }
     }
 
-    loadTagData();
-
-    return () => {
-      isMounted = false;
-    };
+    loadTags();
   }, []);
 
-  const columns = useMemo(() => createTagExplorerColumns(), []);
-
-  const tagOptions = useMemo(() => {
-    const summaryOptions = buildTagOptionsFromSummary(tagSummaryRows);
-
-    if (summaryOptions.length > 0) {
-      return summaryOptions;
-    }
-
-    return buildTagOptionsFromRows(rows);
-  }, [tagSummaryRows, rows]);
-
-  /*
-    Once data loads, automatically select the first tag alphabetically.
-    This gives the page useful content before the user manually chooses a tag.
-  */
   useEffect(() => {
-    if (!selectedTagSlug && tagOptions.length > 0) {
-      setSelectedTagSlug(tagOptions[0].slug);
+    if (!selectedTag) return;
+
+    async function loadRows() {
+      setState((previous) => ({
+        ...previous,
+        loadingRows: true,
+        error: null,
+      }));
+
+      try {
+        const data = await loadTagDetail(selectedTag);
+        setRows(Array.isArray(data) ? data : []);
+        setFilters(DEFAULT_FILTERS);
+        setSortKey("rank_within_tag_by_z");
+        setSortDirection("asc");
+        setState({ loadingTags: false, loadingRows: false, error: null });
+      } catch (error) {
+        setState({ loadingTags: false, loadingRows: false, error: error.message });
+      }
     }
-  }, [selectedTagSlug, tagOptions]);
 
-  const selectedTagName = useMemo(() => {
-    return getSelectedTagName(tagOptions, selectedTagSlug);
-  }, [tagOptions, selectedTagSlug]);
+    loadRows();
+  }, [selectedTag]);
 
-  const selectedTagSummary = useMemo(() => {
-    return findTagSummary(tagSummaryRows, selectedTagSlug);
-  }, [tagSummaryRows, selectedTagSlug]);
-
-  const selectedTagRows = useMemo(() => {
-    if (!selectedTagSlug) {
-      return [];
-    }
-
-    return rows.filter((row) => {
-      return (
-        row.tag_slug === selectedTagSlug ||
-        row.slug === selectedTagSlug ||
-        row.tag_name === selectedTagSlug
-      );
-    });
-  }, [rows, selectedTagSlug]);
+  const selectedTagInfo = useMemo(() => {
+    return tags.find((tag) => tag.tag_slug === selectedTag);
+  }, [tags, selectedTag]);
 
   const filteredRows = useMemo(() => {
-    return selectedTagRows.filter((row) =>
-      rowMatchesTagExplorerFilters(row, filters)
+    const filtered = rows.filter((row) => {
+      return (
+        rowMatchesText(row, filters.query, [
+          "commander_name",
+          "commander_slug",
+          "tag_name",
+          "tag_slug",
+        ]) &&
+        passesMin(row, "total_decks", filters.minTotalDecks) &&
+        passesMin(row, "tag_decks", filters.minTagDecks) &&
+        passesMin(row, "z", filters.minZ) &&
+        passesMax(row, "z", filters.maxZ)
+      );
+    });
+
+    return sortRows(filtered, sortKey, sortDirection);
+  }, [rows, filters, sortKey, sortDirection]);
+
+  function updateFilter(key, value) {
+    setFilters((current) => ({
+      ...current,
+      [key]: value,
+    }));
+  }
+
+  function resetFilters() {
+    setFilters(DEFAULT_FILTERS);
+  }
+
+  function handleSort(nextKey) {
+    setSortDirection((currentDirection) =>
+      toggleSortDirection(sortKey, nextKey, currentDirection)
     );
-  }, [selectedTagRows, filters]);
+    setSortKey(nextKey);
+  }
 
-  const zChartData = useMemo(() => {
-    return makeTopZChartData(filteredRows, 10);
-  }, [filteredRows]);
+  const columns = [
+    {
+      key: "commander_name",
+      header: "Commander",
+      sortable: true,
+      render: (row) => (
+        <Link className="table-commander-link" to={`/commanders/${row.commander_slug}`}>
+          {row.commander_name}
+        </Link>
+      ),
+    },
+    {
+      key: "total_decks",
+      header: "Total Decks",
+      sortable: true,
+      render: (row) => formatNumber(row.total_decks),
+    },
+    {
+      key: "tag_decks",
+      header: "Tag Decks",
+      sortable: true,
+      render: (row) => formatNumber(row.tag_decks),
+    },
+    {
+      key: "tag_affinity_pct",
+      header: "Affinity",
+      sortable: true,
+      render: (row) => formatPercent(row.tag_affinity_pct),
+    },
+    {
+      key: "z",
+      header: "Z-Score",
+      sortable: true,
+      render: (row) => formatDecimal(row.z),
+    },
+    {
+      key: "rank_within_tag_by_z",
+      header: "Rank",
+      sortable: true,
+      render: (row) => formatRank(row.rank_within_tag_by_z),
+    },
+  ];
 
-  const tagDeckChartData = useMemo(() => {
-    return makeTopTagDeckChartData(filteredRows, 10);
-  }, [filteredRows]);
-
-  if (loadState.loading) {
+  if (state.loadingTags) {
     return (
-      <main className="page">
-        <p>Loading tag explorer...</p>
-      </main>
+      <section className="page">
+        <p className="muted">Loading tag index…</p>
+      </section>
     );
   }
 
-  if (loadState.error) {
+  if (state.error) {
     return (
-      <main className="page">
+      <section className="page">
         <h1>Tag Explorer</h1>
-        <p className="error-message">{loadState.error}</p>
-        <p>
-          Check that <code>{TAG_RANKINGS_PATH}</code> and{" "}
-          <code>{TAG_SUMMARY_PATH}</code> exist inside{" "}
-          <code>frontend/public/data/latest/</code>.
-        </p>
-      </main>
+        <p className="error-message">Could not load tag data: {state.error}</p>
+      </section>
     );
   }
 
   return (
-    <main className="page">
-      <section className="page-header">
-        <p className="eyebrow">Chat 10</p>
+    <section className="page">
+      <div className="page-header">
         <h1>Tag Explorer</h1>
         <p>
-          Select one tag and inspect which commanders rank highest within that
-          tag by z-score, affinity percentage, tag deck count, percentile, and
-          rank.
+          Select a tag to load the complete commander ranking file for that tag.
+          Filters and sorting apply to all loaded rows for the selected tag.
         </p>
-      </section>
+      </div>
 
       <section className="tag-selector-panel">
-        <label>
-          <span>Selected tag</span>
+        <label htmlFor="tag-select">
+          Tag
           <select
-            value={selectedTagSlug}
-            onChange={(event) => setSelectedTagSlug(event.target.value)}
+            id="tag-select"
+            value={selectedTag}
+            onChange={(event) => setSelectedTag(event.target.value)}
           >
-            {tagOptions.map((tag) => (
-              <option key={tag.slug} value={tag.slug}>
-                {tag.name}
+            {tags.map((tag) => (
+              <option key={tag.tag_slug} value={tag.tag_slug}>
+                {tag.tag_name || tag.tag_slug}
               </option>
             ))}
           </select>
         </label>
       </section>
 
-      <TagSummaryCard
-        tagSummary={selectedTagSummary}
-        selectedTagName={selectedTagName}
-      />
-
-      <section className="stat-row">
-        <article className="stat-card">
-          <span>Rows for selected tag</span>
-          <strong>{formatNumber(selectedTagRows.length)}</strong>
-        </article>
-
-        <article className="stat-card">
-          <span>Rows after filters</span>
-          <strong>{formatNumber(filteredRows.length)}</strong>
-        </article>
-
-        <article className="stat-card">
-          <span>Total tags loaded</span>
-          <strong>{formatNumber(tagOptions.length)}</strong>
-        </article>
+      <section className="summary-card">
+        <h2>{selectedTagInfo?.tag_name || selectedTag}</h2>
+        <div className="summary-grid">
+          <div>
+            <span>Rows loaded</span>
+            <strong>{formatNumber(rows.length)}</strong>
+          </div>
+          <div>
+            <span>Rows after filters</span>
+            <strong>{formatNumber(filteredRows.length)}</strong>
+          </div>
+          <div>
+            <span>Tag slug</span>
+            <strong>{selectedTag}</strong>
+          </div>
+        </div>
       </section>
 
-      <TableFilters
-        mode="tag"
-        filters={filters}
-        setFilters={setFilters}
-        tagOptions={tagOptions}
-      />
+      <section className="filter-panel">
+        <div className="filter-panel-header">
+          <div>
+            <h2>Filters</h2>
+            <p className="muted">Filters apply to the selected tag.</p>
+          </div>
 
-      <div className="chart-grid">
-        <SmallBarChart
-          title={`Top z-scores for ${selectedTagName}`}
-          description="Shows the strongest statistical affinities within the selected tag."
-          data={zChartData}
-          xKey="name"
-          yKey="value"
-        />
+          <button type="button" onClick={resetFilters}>
+            Reset filters
+          </button>
+        </div>
 
-        <SmallBarChart
-          title={`Top tag deck counts for ${selectedTagName}`}
-          description="Shows commanders with the largest raw number of decks in this tag."
-          data={tagDeckChartData}
-          xKey="name"
-          yKey="value"
-        />
-      </div>
+        <div className="filter-grid">
+          <label>
+            Search commander
+            <input
+              type="search"
+              value={filters.query}
+              onChange={(event) => updateFilter("query", event.target.value)}
+              placeholder="Jasmine, Aang, Brims…"
+            />
+          </label>
 
-      <DataTable
-        data={filteredRows}
-        columns={columns}
-        tableLabel={`Tag explorer table for ${selectedTagName}`}
-        initialSorting={[{ id: "z", desc: true }]}
-        pageSize={25}
-      />
-    </main>
+          <label>
+            Minimum total decks
+            <input
+              type="number"
+              value={filters.minTotalDecks}
+              onChange={(event) => updateFilter("minTotalDecks", event.target.value)}
+              placeholder="200"
+            />
+          </label>
+
+          <label>
+            Minimum tag decks
+            <input
+              type="number"
+              value={filters.minTagDecks}
+              onChange={(event) => updateFilter("minTagDecks", event.target.value)}
+              placeholder="5"
+            />
+          </label>
+
+          <label>
+            Minimum z-score
+            <input
+              type="number"
+              step="0.1"
+              value={filters.minZ}
+              onChange={(event) => updateFilter("minZ", event.target.value)}
+              placeholder="0"
+            />
+          </label>
+
+          <label>
+            Maximum z-score
+            <input
+              type="number"
+              step="0.1"
+              value={filters.maxZ}
+              onChange={(event) => updateFilter("maxZ", event.target.value)}
+              placeholder="Optional"
+            />
+          </label>
+        </div>
+      </section>
+
+      <section className="data-table-section">
+        <div className="table-toolbar">
+          <div>
+            <p className="eyebrow">Tag rankings</p>
+            <h2>{selectedTagInfo?.tag_name || selectedTag}</h2>
+          </div>
+          <p className="table-count">
+            Showing {formatNumber(filteredRows.length)} of {formatNumber(rows.length)} rows
+          </p>
+        </div>
+
+        {state.loadingRows ? (
+          <p className="muted">Loading selected tag…</p>
+        ) : (
+          <SimpleTable
+            columns={columns}
+            rows={filteredRows}
+            sortKey={sortKey}
+            sortDirection={sortDirection}
+            onSort={handleSort}
+          />
+        )}
+      </section>
+    </section>
   );
 }
