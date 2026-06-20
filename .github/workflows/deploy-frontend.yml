@@ -10,10 +10,17 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  actions: read
 
 concurrency:
   group: github-pages
   cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+  FRONTEND_DATA_DIR: "frontend/public/data/latest"
+  RESTORED_PROCESSED_DIR: "data/processed/restored"
 
 jobs:
   build:
@@ -24,53 +31,94 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "."
+
+      - name: Restore latest processed data artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${RESTORED_PROCESSED_DIR}"
+
+          mapfile -t run_ids < <(
+            gh run list \
+              --workflow "update-data-and-deploy-full.yml" \
+              --status success \
+              --limit 20 \
+              --json databaseId \
+              --jq '.[].databaseId'
+          )
+
+          restored="false"
+
+          for run_id in "${run_ids[@]}"; do
+            artifact_name="$(
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" \
+                --jq '.artifacts[] | select(.expired == false) | select(.name | startswith("processed-data-")) | .name' \
+                | head -n 1
+            )"
+
+            if [[ -z "${artifact_name}" ]]; then
+              continue
+            fi
+
+            gh run download "${run_id}" \
+              --name "${artifact_name}" \
+              --dir "${RESTORED_PROCESSED_DIR}"
+
+            if [[ ! -f "${RESTORED_PROCESSED_DIR}/affinity_rows_with_trends.json" ]]; then
+              affinity_path="$(
+                find "${RESTORED_PROCESSED_DIR}" -name affinity_rows_with_trends.json -print -quit
+              )"
+
+              if [[ -n "${affinity_path}" ]]; then
+                affinity_dir="$(dirname "${affinity_path}")"
+                cp -a "${affinity_dir}/." "${RESTORED_PROCESSED_DIR}/"
+              fi
+            fi
+
+            if [[ -f "${RESTORED_PROCESSED_DIR}/affinity_rows_with_trends.json" ]]; then
+              echo "Restored ${artifact_name} from workflow run ${run_id}."
+              restored="true"
+              break
+            fi
+          done
+
+          if [[ "${restored}" != "true" ]]; then
+            echo "Could not find a usable processed-data artifact from update-data-and-deploy-full.yml." >&2
+            exit 1
+          fi
+
+      - name: Export sharded frontend data
+        shell: bash
+        run: |
+          python scripts/export_full_site_data.py \
+            --processed-dir "${RESTORED_PROCESSED_DIR}" \
+            --output-dir "${FRONTEND_DATA_DIR}" \
+            --page-size 500
+
       - name: Set up Node
         uses: actions/setup-node@v6
         with:
-          node-version: "22"
+          node-version: ${{ env.NODE_VERSION }}
           cache: "npm"
           cache-dependency-path: "frontend/package-lock.json"
 
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
-
-      - name: Create placeholder frontend data
-        shell: bash
-        run: |
-          mkdir -p frontend/public/data/latest
-
-          cat > frontend/public/data/latest/analysis_summary.json <<'EOF'
-          {
-            "input_row_count": 0,
-            "affinity_row_count": 0,
-            "global_leaderboard_row_count": 0,
-            "tag_summary_row_count": 0,
-            "unique_commander_count": 0,
-            "unique_tag_count": 0,
-            "analysis_eligible_row_count": 0,
-            "rows_with_missing_z": 0,
-            "min_total_decks_default": 200,
-            "min_tag_decks_default": 5
-          }
-          EOF
-
-          cat > frontend/public/data/latest/trend_summary.json <<'EOF'
-          {
-            "current_snapshot": null,
-            "previous_snapshot": null,
-            "previous_snapshot_found": false,
-            "current_row_count": 0,
-            "previous_row_count": 0,
-            "trend_row_count": 0,
-            "no_previous_snapshot_count": 0
-          }
-          EOF
-
-          echo "[]" > frontend/public/data/latest/tag_summary.json
-          echo "[]" > frontend/public/data/latest/global_leaderboard.json
-          echo "[]" > frontend/public/data/latest/tag_rankings.json
-          echo "[]" > frontend/public/data/latest/affinity_rows_with_trends.json
 
       - name: Build frontend
         working-directory: frontend
