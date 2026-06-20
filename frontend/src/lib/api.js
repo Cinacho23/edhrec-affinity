@@ -25,8 +25,23 @@ async function fetchJson(relativePath) {
   if (!response.ok) {
     throw new Error(`Failed to load ${url}. HTTP ${response.status}`);
   }
-  
-  return response.json();
+
+  const text = await response.text();
+  const cleanText = text.trimStart();
+
+  if (cleanText.startsWith("<")) {
+    throw new Error(
+      `Expected JSON at ${url}, but received HTML. Local data is probably missing. Run npm run data:download from the frontend folder.`
+    );
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Failed to parse JSON from ${url}: ${error.message}`, {
+      cause: error,
+    });
+  }
 }
 
 export function getDataUrl(relativePath) {
