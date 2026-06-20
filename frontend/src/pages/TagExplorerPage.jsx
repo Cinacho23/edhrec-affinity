@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import SimpleTable from "../components/SimpleTable";
+import TrendBadge from "../components/TrendBadge";
 import { loadTagDetail, loadTagIndex } from "../lib/api";
 import {
   formatDecimal,
@@ -10,26 +11,46 @@ import {
   formatRank,
 } from "../lib/formatters";
 import {
+  readSessionObject,
+  readSessionValue,
+  writeSessionValue,
+} from "../lib/persistentState";
+import {
   passesMax,
   passesMin,
   rowMatchesText,
   sortRows,
   toggleSortDirection,
 } from "../lib/tableUtils";
+import {
+  formatSignedDecimal,
+  formatSignedInteger,
+  normalizeTrendFields,
+} from "../lib/trendUtils";
 
 const DEFAULT_FILTERS = {
   query: "",
-  minTotalDecks: "",
-  minTagDecks: "",
+  minTotalDecks: "200",
+  minTagDecks: "5",
   minZ: "",
   maxZ: "",
+  trendStatus: "",
 };
+
+const FILTER_STORAGE_KEY = "edhrec-affinity:tag-explorer:filters";
+const SELECTED_TAG_STORAGE_KEY = "edhrec-affinity:tag-explorer:selected-tag";
+
+function isAvailableTag(tagList, tagSlug) {
+  return tagList.some((tag) => tag.tag_slug === tagSlug);
+}
 
 export default function TagExplorerPage() {
   const [tags, setTags] = useState([]);
   const [selectedTag, setSelectedTag] = useState("");
   const [rows, setRows] = useState([]);
-  const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  const [filters, setFilters] = useState(() =>
+    readSessionObject(FILTER_STORAGE_KEY, DEFAULT_FILTERS)
+  );
   const [sortKey, setSortKey] = useState("rank_within_tag_by_z");
   const [sortDirection, setSortDirection] = useState("asc");
   const [state, setState] = useState({
@@ -45,7 +66,19 @@ export default function TagExplorerPage() {
         const tagList = Array.isArray(data) ? data : [];
 
         setTags(tagList);
-        setSelectedTag(tagList[0]?.tag_slug || "");
+        setSelectedTag((currentTag) => {
+          if (currentTag && isAvailableTag(tagList, currentTag)) {
+            return currentTag;
+          }
+
+          const storedTag = readSessionValue(SELECTED_TAG_STORAGE_KEY, "");
+
+          if (storedTag && isAvailableTag(tagList, storedTag)) {
+            return storedTag;
+          }
+
+          return tagList[0]?.tag_slug || "";
+        });
         setState({ loadingTags: false, loadingRows: false, error: null });
       } catch (error) {
         setState({ loadingTags: false, loadingRows: false, error: error.message });
@@ -54,6 +87,16 @@ export default function TagExplorerPage() {
 
     loadTags();
   }, []);
+
+  useEffect(() => {
+    writeSessionValue(FILTER_STORAGE_KEY, filters);
+  }, [filters]);
+
+  useEffect(() => {
+    if (selectedTag) {
+      writeSessionValue(SELECTED_TAG_STORAGE_KEY, selectedTag);
+    }
+  }, [selectedTag]);
 
   useEffect(() => {
     if (!selectedTag) return;
@@ -67,10 +110,10 @@ export default function TagExplorerPage() {
 
       try {
         const data = await loadTagDetail(selectedTag);
-        setRows(Array.isArray(data) ? data : []);
-        setFilters(DEFAULT_FILTERS);
-        setSortKey("rank_within_tag_by_z");
-        setSortDirection("asc");
+        const normalizedRows = (Array.isArray(data) ? data : []).map(
+          normalizeTrendFields
+        );
+        setRows(normalizedRows);
         setState({ loadingTags: false, loadingRows: false, error: null });
       } catch (error) {
         setState({ loadingTags: false, loadingRows: false, error: error.message });
@@ -96,7 +139,8 @@ export default function TagExplorerPage() {
         passesMin(row, "total_decks", filters.minTotalDecks) &&
         passesMin(row, "tag_decks", filters.minTagDecks) &&
         passesMin(row, "z", filters.minZ) &&
-        passesMax(row, "z", filters.maxZ)
+        passesMax(row, "z", filters.maxZ) &&
+        (!filters.trendStatus || row.trend_status === filters.trendStatus)
       );
     });
 
@@ -111,7 +155,7 @@ export default function TagExplorerPage() {
   }
 
   function resetFilters() {
-    setFilters(DEFAULT_FILTERS);
+    setFilters({ ...DEFAULT_FILTERS });
   }
 
   function handleSort(nextKey) {
@@ -161,6 +205,30 @@ export default function TagExplorerPage() {
       header: "Rank",
       sortable: true,
       render: (row) => formatRank(row.rank_within_tag_by_z),
+    },
+    {
+      key: "rank_delta",
+      header: "Rank Move",
+      sortable: true,
+      render: (row) => formatSignedInteger(row.rank_delta),
+    },
+    {
+      key: "z_delta",
+      header: "Z \u0394",
+      sortable: true,
+      render: (row) => formatSignedDecimal(row.z_delta),
+    },
+    {
+      key: "tag_decks_delta",
+      header: "Tag Deck \u0394",
+      sortable: true,
+      render: (row) => formatSignedInteger(row.tag_decks_delta),
+    },
+    {
+      key: "trend_status",
+      header: "Trend",
+      sortable: true,
+      render: (row) => <TrendBadge row={row} compact />,
     },
   ];
 
@@ -240,12 +308,12 @@ export default function TagExplorerPage() {
 
         <div className="filter-grid">
           <label>
-            Search commander
+            Search commander or tag
             <input
               type="search"
               value={filters.query}
               onChange={(event) => updateFilter("query", event.target.value)}
-              placeholder="Jasmine, Aang, Brims…"
+              placeholder="Jasmine, Amass, Brims..."
             />
           </label>
 
@@ -289,6 +357,20 @@ export default function TagExplorerPage() {
               onChange={(event) => updateFilter("maxZ", event.target.value)}
               placeholder="Optional"
             />
+          </label>
+
+          <label>
+            Trend status
+            <select
+              value={filters.trendStatus}
+              onChange={(event) => updateFilter("trendStatus", event.target.value)}
+            >
+              <option value="">Any trend status</option>
+              <option value="existing">Existing pair</option>
+              <option value="new_pair">New pair</option>
+              <option value="removed_pair">Removed pair</option>
+              <option value="no_previous_snapshot">No previous snapshot</option>
+            </select>
           </label>
         </div>
       </section>

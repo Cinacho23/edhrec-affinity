@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import SimpleTable from "../components/SimpleTable";
+import TrendBadge from "../components/TrendBadge";
 import { loadLeaderboardIndex, loadLeaderboardPage } from "../lib/api";
 import {
   formatDecimal,
@@ -10,26 +11,45 @@ import {
   formatRank,
 } from "../lib/formatters";
 import {
+  readSessionObject,
+  readSessionValue,
+  writeSessionValue,
+} from "../lib/persistentState";
+import {
   passesMax,
   passesMin,
   rowMatchesText,
   sortRows,
   toggleSortDirection,
 } from "../lib/tableUtils";
+import {
+  formatSignedDecimal,
+  formatSignedInteger,
+  normalizeTrendFields,
+} from "../lib/trendUtils";
 
 const DEFAULT_FILTERS = {
   query: "",
-  minTotalDecks: "",
-  minTagDecks: "",
+  minTotalDecks: "200",
+  minTagDecks: "5",
   minZ: "",
   maxZ: "",
+  trendStatus: "",
 };
+
+const FILTER_STORAGE_KEY = "edhrec-affinity:leaderboard:filters";
+const PAGE_STORAGE_KEY = "edhrec-affinity:leaderboard:page";
 
 export default function GlobalLeaderboardPage() {
   const [index, setIndex] = useState(null);
   const [rows, setRows] = useState([]);
-  const [pageNumber, setPageNumber] = useState(1);
-  const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  const [pageNumber, setPageNumber] = useState(() => {
+    const storedPage = Number(readSessionValue(PAGE_STORAGE_KEY, 1));
+    return Number.isFinite(storedPage) && storedPage > 0 ? storedPage : 1;
+  });
+  const [filters, setFilters] = useState(() =>
+    readSessionObject(FILTER_STORAGE_KEY, DEFAULT_FILTERS)
+  );
   const [sortKey, setSortKey] = useState("z");
   const [sortDirection, setSortDirection] = useState("desc");
   const [state, setState] = useState({
@@ -37,6 +57,8 @@ export default function GlobalLeaderboardPage() {
     loadingRows: false,
     error: null,
   });
+  const pageCount = index?.page_count || 1;
+  const currentPageNumber = Math.min(Math.max(1, pageNumber), pageCount);
 
   useEffect(() => {
     async function loadIndex() {
@@ -53,6 +75,14 @@ export default function GlobalLeaderboardPage() {
   }, []);
 
   useEffect(() => {
+    writeSessionValue(FILTER_STORAGE_KEY, filters);
+  }, [filters]);
+
+  useEffect(() => {
+    writeSessionValue(PAGE_STORAGE_KEY, pageNumber);
+  }, [pageNumber]);
+
+  useEffect(() => {
     if (!index) return;
 
     async function loadRows() {
@@ -63,8 +93,11 @@ export default function GlobalLeaderboardPage() {
       }));
 
       try {
-        const data = await loadLeaderboardPage(pageNumber);
-        setRows(Array.isArray(data) ? data : []);
+        const data = await loadLeaderboardPage(currentPageNumber);
+        const normalizedRows = (Array.isArray(data) ? data : []).map(
+          normalizeTrendFields
+        );
+        setRows(normalizedRows);
         setState({ loadingIndex: false, loadingRows: false, error: null });
       } catch (error) {
         setState({ loadingIndex: false, loadingRows: false, error: error.message });
@@ -72,7 +105,7 @@ export default function GlobalLeaderboardPage() {
     }
 
     loadRows();
-  }, [index, pageNumber]);
+  }, [index, currentPageNumber]);
 
   const filteredRows = useMemo(() => {
     const filtered = rows.filter((row) => {
@@ -86,7 +119,8 @@ export default function GlobalLeaderboardPage() {
         passesMin(row, "total_decks", filters.minTotalDecks) &&
         passesMin(row, "tag_decks", filters.minTagDecks) &&
         passesMin(row, "z", filters.minZ) &&
-        passesMax(row, "z", filters.maxZ)
+        passesMax(row, "z", filters.maxZ) &&
+        (!filters.trendStatus || row.trend_status === filters.trendStatus)
       );
     });
 
@@ -101,7 +135,7 @@ export default function GlobalLeaderboardPage() {
   }
 
   function resetFilters() {
-    setFilters(DEFAULT_FILTERS);
+    setFilters({ ...DEFAULT_FILTERS });
   }
 
   function handleSort(nextKey) {
@@ -158,6 +192,30 @@ export default function GlobalLeaderboardPage() {
       sortable: true,
       render: (row) => formatRank(row.rank_within_tag_by_z),
     },
+    {
+      key: "rank_delta",
+      header: "Rank Move",
+      sortable: true,
+      render: (row) => formatSignedInteger(row.rank_delta),
+    },
+    {
+      key: "z_delta",
+      header: "Z \u0394",
+      sortable: true,
+      render: (row) => formatSignedDecimal(row.z_delta),
+    },
+    {
+      key: "tag_decks_delta",
+      header: "Tag Deck \u0394",
+      sortable: true,
+      render: (row) => formatSignedInteger(row.tag_decks_delta),
+    },
+    {
+      key: "trend_status",
+      header: "Trend",
+      sortable: true,
+      render: (row) => <TrendBadge row={row} compact />,
+    },
   ];
 
   if (state.loadingIndex) {
@@ -176,8 +234,6 @@ export default function GlobalLeaderboardPage() {
       </section>
     );
   }
-
-  const pageCount = index?.page_count || 1;
 
   return (
     <section className="page">
@@ -204,7 +260,7 @@ export default function GlobalLeaderboardPage() {
           <div>
             <dt>Current page</dt>
             <dd>
-              {formatNumber(pageNumber)} of {formatNumber(pageCount)}
+              {formatNumber(currentPageNumber)} of {formatNumber(pageCount)}
             </dd>
           </div>
         </dl>
@@ -212,16 +268,24 @@ export default function GlobalLeaderboardPage() {
         <div className="pagination-bar">
           <button
             type="button"
-            disabled={pageNumber <= 1}
-            onClick={() => setPageNumber((current) => Math.max(1, current - 1))}
+            disabled={currentPageNumber <= 1}
+            onClick={() =>
+              setPageNumber((current) =>
+                Math.max(1, Math.min(current, pageCount) - 1)
+              )
+            }
           >
             Previous
           </button>
 
           <button
             type="button"
-            disabled={pageNumber >= pageCount}
-            onClick={() => setPageNumber((current) => Math.min(pageCount, current + 1))}
+            disabled={currentPageNumber >= pageCount}
+            onClick={() =>
+              setPageNumber((current) =>
+                Math.min(pageCount, Math.min(current, pageCount) + 1)
+              )
+            }
           >
             Next
           </button>
@@ -292,6 +356,20 @@ export default function GlobalLeaderboardPage() {
               placeholder="Optional"
             />
           </label>
+
+          <label>
+            Trend status
+            <select
+              value={filters.trendStatus}
+              onChange={(event) => updateFilter("trendStatus", event.target.value)}
+            >
+              <option value="">Any trend status</option>
+              <option value="existing">Existing pair</option>
+              <option value="new_pair">New pair</option>
+              <option value="removed_pair">Removed pair</option>
+              <option value="no_previous_snapshot">No previous snapshot</option>
+            </select>
+          </label>
         </div>
       </section>
 
@@ -299,7 +377,7 @@ export default function GlobalLeaderboardPage() {
         <div className="table-toolbar">
           <div>
             <p className="eyebrow">Leaderboard</p>
-            <h2>Page {formatNumber(pageNumber)}</h2>
+            <h2>Page {formatNumber(currentPageNumber)}</h2>
           </div>
           <p className="table-count">
             Showing {formatNumber(filteredRows.length)} of {formatNumber(rows.length)} rows

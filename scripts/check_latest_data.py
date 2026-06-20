@@ -14,21 +14,37 @@ from pathlib import Path
 
 
 REQUIRED_FILES = [
-    "analysis_summary.json",
-    "trend_summary.json",
-    "tag_summary.json",
-    "global_leaderboard.json",
-    "tag_rankings.json",
-    "affinity_rows_with_trends.json",
+    "site_manifest.json",
+    "summaries/analysis_summary.json",
+    "summaries/trend_summary.json",
+    "summaries/tag_summary.json",
+    "leaderboard/index.json",
+    "leaderboard/page_0001.json",
+    "tags/index.json",
+    "commanders/index.json",
 ]
 
 
-def validate_json_file(path: Path) -> None:
+def read_json_file(path: Path):
     if not path.exists():
         raise FileNotFoundError(f"Missing required file: {path}")
 
     with path.open("r", encoding="utf-8") as file:
-        json.load(file)
+        return json.load(file)
+
+
+def validate_json_file(path: Path) -> None:
+    read_json_file(path)
+
+
+def safe_json_filename(value: str) -> str:
+    import re
+
+    value = str(value or "").strip().lower()
+    value = re.sub(r"[^a-z0-9_-]+", "-", value)
+    value = re.sub(r"-+", "-", value)
+    value = value.strip("-")
+    return value or "unknown"
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,7 +68,24 @@ def main() -> None:
     for filename in REQUIRED_FILES:
         validate_json_file(args.frontend_data_dir / filename)
 
-    print(f"Validated {len(REQUIRED_FILES)} required frontend data files.")
+    tag_index = read_json_file(args.frontend_data_dir / "tags/index.json")
+    commander_index = read_json_file(args.frontend_data_dir / "commanders/index.json")
+
+    if tag_index:
+        first_tag_slug = tag_index[0].get("tag_slug") or tag_index[0].get("slug")
+        validate_json_file(
+            args.frontend_data_dir / "tags" / f"{safe_json_filename(first_tag_slug)}.json"
+        )
+
+    if commander_index:
+        first_commander_slug = commander_index[0].get("commander_slug")
+        validate_json_file(
+            args.frontend_data_dir
+            / "commanders"
+            / f"{safe_json_filename(first_commander_slug)}.json"
+        )
+
+    print(f"Validated sharded frontend data in {args.frontend_data_dir}.")
 
 
 if __name__ == "__main__":
