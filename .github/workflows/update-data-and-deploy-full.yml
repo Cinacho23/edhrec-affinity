@@ -63,6 +63,66 @@ jobs:
           mkdir -p "${PROCESSED_DIR}"
           mkdir -p "${FRONTEND_DATA_DIR}"
 
+      - name: Restore previous processed snapshot artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          echo "Looking for processed-data artifacts before ${SNAPSHOT_DATE}."
+          restored="false"
+
+          mapfile -t run_ids < <(
+            gh run list \
+              --workflow "update-data-and-deploy-full.yml" \
+              --status success \
+              --limit 20 \
+              --json databaseId \
+              --jq '.[].databaseId'
+          )
+
+          for run_id in "${run_ids[@]}"; do
+            mapfile -t artifact_names < <(
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" \
+                --jq '.artifacts[] | select(.expired == false) | select(.name | startswith("processed-data-")) | .name'
+            )
+
+            for artifact_name in "${artifact_names[@]}"; do
+              artifact_date="${artifact_name#processed-data-}"
+
+              if [[ ! "${artifact_date}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+                continue
+              fi
+
+              if [[ "${artifact_date}" < "${SNAPSHOT_DATE}" ]]; then
+                destination="${PROCESSED_ROOT}/${artifact_date}"
+                mkdir -p "${destination}"
+
+                gh run download "${run_id}" \
+                  --name "${artifact_name}" \
+                  --dir "${destination}"
+
+                if [[ ! -f "${destination}/affinity_rows.json" ]]; then
+                  affinity_path="$(find "${destination}" -name affinity_rows.json -print -quit)"
+
+                  if [[ -n "${affinity_path}" ]]; then
+                    affinity_dir="$(dirname "${affinity_path}")"
+                    cp -a "${affinity_dir}/." "${destination}/"
+                  fi
+                fi
+
+                echo "Restored ${artifact_name} from workflow run ${run_id}."
+                restored="true"
+                break 2
+              fi
+            done
+          done
+
+          if [[ "${restored}" != "true" ]]; then
+            echo "No previous processed snapshot artifact found. Trends will use first-run mode."
+          fi
+
       - name: Run commander discovery
         shell: bash
         run: |

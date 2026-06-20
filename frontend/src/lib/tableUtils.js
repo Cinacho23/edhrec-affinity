@@ -22,7 +22,7 @@ export function compareValues(a, b, direction = "desc") {
   const aNumber = asNumber(a);
   const bNumber = asNumber(b);
 
-  let result = 0;
+  let result;
 
   if (aNumber !== null || bNumber !== null) {
     if (aNumber === null) result = 1;
@@ -53,18 +53,32 @@ export function toggleSortDirection(currentKey, nextKey, currentDirection) {
   return currentDirection === "desc" ? "asc" : "desc";
 }
 
+function normalizeSearchText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
 export function rowMatchesText(row, query, fields) {
-  const cleanQuery = query.trim().toLowerCase();
+  const cleanQuery = normalizeSearchText(query);
 
   if (!cleanQuery) {
     return true;
   }
 
-  return fields.some((field) =>
-    String(row?.[field] ?? "")
-      .toLowerCase()
-      .includes(cleanQuery)
-  );
+  const compactQuery = cleanQuery.replace(/\s+/g, "");
+
+  return fields.some((field) => {
+    const normalizedValue = normalizeSearchText(row?.[field]);
+    const compactValue = normalizedValue.replace(/\s+/g, "");
+
+    return (
+      normalizedValue.includes(cleanQuery) ||
+      compactValue.includes(compactQuery)
+    );
+  });
 }
 
 export function passesMin(row, key, minValue) {
