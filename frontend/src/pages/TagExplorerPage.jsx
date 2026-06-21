@@ -5,6 +5,7 @@ import SimpleTable from "../components/SimpleTable";
 import TrendBadge from "../components/TrendBadge";
 import { loadTagDetail, loadTagIndex } from "../lib/api";
 import {
+  formatColorIdentity,
   formatDecimal,
   formatNumber,
   formatPercent,
@@ -175,6 +176,12 @@ export default function TagExplorerPage() {
           {row.commander_name}
         </Link>
       ),
+    },
+    {
+      key: "color_identity",
+      header: "Colors",
+      sortable: true,
+      render: (row) => formatColorIdentity(row.color_identity),
     },
     {
       key: "total_decks",

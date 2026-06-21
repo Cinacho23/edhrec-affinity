@@ -9,7 +9,7 @@ function joinDataPath(relativePath) {
   return `${getBasePath()}data/latest/${cleanRelativePath}`;
 }
 
-function safeJsonFilename(value) {
+export function safeJsonFilename(value) {
   return String(value ?? "")
     .trim()
     .toLowerCase()
@@ -80,6 +80,15 @@ export async function loadTagIndex() {
 export async function loadTagDetail(tagSlug) {
   const filename = safeJsonFilename(tagSlug);
   return fetchJson(`tags/${filename}.json`);
+}
+
+export async function loadSetIndex() {
+  return fetchJson("sets/index.json");
+}
+
+export async function loadSetDetail(setCode) {
+  const filename = safeJsonFilename(setCode);
+  return fetchJson(`sets/${filename}.json`);
 }
 
 export async function loadLeaderboardIndex() {

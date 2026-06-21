@@ -277,6 +277,7 @@ h3 {
 .commander-card,
 .filter-panel,
 .tag-selector-panel,
+.set-list-panel,
 .summary-card,
 .chart-card,
 .data-table-section {
@@ -294,6 +295,7 @@ h3 {
 .method-section,
 .filter-panel,
 .tag-selector-panel,
+.set-list-panel,
 .summary-card,
 .chart-card,
 .data-table-section {
@@ -918,6 +920,73 @@ button:disabled {
   color: var(--muted-strong);
 }
 
+/* Set explorer */
+
+.set-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.set-list-panel {
+  max-height: 74vh;
+  overflow: hidden;
+}
+
+.set-list-header {
+  margin-bottom: 1rem;
+}
+
+.set-list-header h2 {
+  margin-bottom: 0;
+}
+
+.set-list {
+  display: grid;
+  gap: 0.5rem;
+  max-height: calc(74vh - 5rem);
+  overflow-y: auto;
+  padding-right: 0.25rem;
+}
+
+.set-list-button {
+  display: grid;
+  gap: 0.25rem;
+  width: 100%;
+  border-radius: var(--radius-sm);
+  padding: 0.75rem 0.85rem;
+  text-align: left;
+}
+
+.set-list-button span,
+.set-list-button small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.set-list-button span {
+  font-weight: 800;
+}
+
+.set-list-button small {
+  color: var(--muted);
+}
+
+.set-list-button.active {
+  border-color: rgb(125 211 252 / 0.45);
+  color: var(--text);
+  background: var(--accent-bg);
+}
+
+.set-results-panel {
+  margin-top: 0;
+}
+
+.set-table-message {
+  margin: 1rem;
+}
+
 /* Trend badges */
 
 .trend-badge {
@@ -993,6 +1062,10 @@ button:disabled {
 
 @media (max-width: 1050px) {
   .chart-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .set-layout {
     grid-template-columns: 1fr;
   }
 

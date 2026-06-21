@@ -3,6 +3,7 @@ import { Link } from "react-router";
 import CommanderImageGallery from "./CommanderImageGallery.jsx";
 
 import {
+  formatColorIdentity,
   formatNumber,
   formatPercent,
   formatSignedNumber,
@@ -20,66 +21,8 @@ import {
       /commanders/:commanderSlug
 */
 
-const COLOR_LABELS = {
-  W: "White",
-  U: "Blue",
-  B: "Black",
-  R: "Red",
-  G: "Green",
-};
-
-function normalizeColorArray(colorIdentity) {
-  if (Array.isArray(colorIdentity)) {
-    return colorIdentity;
-  }
-
-  if (typeof colorIdentity === "string") {
-    const trimmed = colorIdentity.trim();
-
-    if (!trimmed) {
-      return [];
-    }
-
-    if (trimmed.includes(",")) {
-      return trimmed
-        .split(",")
-        .map((part) => part.trim())
-        .filter(Boolean);
-    }
-
-    if (/^[WUBRG]+$/.test(trimmed)) {
-      return trimmed.split("");
-    }
-
-    return [trimmed];
-  }
-
-  return [];
-}
-
-function getColorDisplay(colorIdentity) {
-  const colors = normalizeColorArray(colorIdentity);
-
-  if (colors.length === 0) {
-    return "Colorless / unknown";
-  }
-
-  return colors.join("");
-}
-
-function getColorTitle(colorIdentity) {
-  const colors = normalizeColorArray(colorIdentity);
-
-  if (colors.length === 0) {
-    return "Colorless or unknown color identity";
-  }
-
-  return colors.map((color) => COLOR_LABELS[color] ?? color).join(", ");
-}
-
 export default function CommanderCard({ commander }) {
-  const colorDisplay = getColorDisplay(commander.color_identity);
-  const colorTitle = getColorTitle(commander.color_identity);
+  const colorDisplay = formatColorIdentity(commander.color_identity);
   const detailPath = `/commanders/${commander.commander_slug}`;
 
   return (
@@ -118,7 +61,7 @@ export default function CommanderCard({ commander }) {
             ) : null}
           </div>
 
-          <span className="pill" title={colorTitle}>
+          <span className="pill" title={colorDisplay}>
             {colorDisplay}
           </span>
         </div>

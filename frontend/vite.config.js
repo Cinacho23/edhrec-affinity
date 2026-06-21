@@ -36,4 +36,11 @@ function getBasePath() {
 export default defineConfig({
   plugins: [react()],
   base: getBasePath(),
+  build: {
+    rollupOptions: {
+      checks: {
+        pluginTimings: false,
+      },
+    },
+  },
 });

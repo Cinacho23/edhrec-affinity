@@ -62,6 +62,10 @@ def fetch_json(base_url: str, relative_path: str) -> object:
     return json.loads(text)
 
 
+def is_not_found_error(error: Exception) -> bool:
+    return "HTTP 404" in str(error)
+
+
 def has_valid_local_json(output_dir: Path, relative_path: str) -> bool:
     destination = output_dir / relative_path
 
@@ -126,6 +130,30 @@ def build_download_list(base_url: str, output_dir: Path) -> list[str]:
 
         if tag_slug:
             paths.add(f"tags/{safe_json_filename(tag_slug)}.json")
+
+    try:
+        set_index = fetch_json(base_url, "sets/index.json")
+    except RuntimeError as error:
+        if not is_not_found_error(error):
+            raise
+        set_index = []
+    else:
+        write_json(output_dir, "sets/index.json", set_index)
+
+    if not isinstance(set_index, list):
+        set_index = []
+
+    for set_info in set_index:
+        if not isinstance(set_info, dict):
+            continue
+
+        set_file = set_info.get("file")
+        set_code = set_info.get("set_code") or set_info.get("code")
+
+        if set_file:
+            paths.add(set_file)
+        elif set_code:
+            paths.add(f"sets/{safe_json_filename(set_code)}.json")
 
     return sorted(paths)
 
