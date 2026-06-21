@@ -70,6 +70,7 @@ def main() -> None:
 
     tag_index = read_json_file(args.frontend_data_dir / "tags/index.json")
     commander_index = read_json_file(args.frontend_data_dir / "commanders/index.json")
+    sets_index_path = args.frontend_data_dir / "sets/index.json"
 
     if tag_index:
         first_tag_slug = tag_index[0].get("tag_slug") or tag_index[0].get("slug")
@@ -84,6 +85,22 @@ def main() -> None:
             / "commanders"
             / f"{safe_json_filename(first_commander_slug)}.json"
         )
+
+    if sets_index_path.exists():
+        set_index = read_json_file(sets_index_path)
+
+        if isinstance(set_index, list) and set_index and isinstance(set_index[0], dict):
+            first_set_file = set_index[0].get("file")
+            first_set_code = set_index[0].get("set_code") or set_index[0].get("code")
+
+            if first_set_file:
+                validate_json_file(args.frontend_data_dir / first_set_file)
+            elif first_set_code:
+                validate_json_file(
+                    args.frontend_data_dir
+                    / "sets"
+                    / f"{safe_json_filename(first_set_code)}.json"
+                )
 
     print(f"Validated sharded frontend data in {args.frontend_data_dir}.")
 

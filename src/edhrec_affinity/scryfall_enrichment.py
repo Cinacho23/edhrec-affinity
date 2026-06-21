@@ -219,6 +219,132 @@ def fetch_scryfall_named(
     return card
 
 
+def make_uri_cache_key(uri: str) -> str:
+    """Build a stable cache key for Scryfall API URI fetches."""
+    return f"uri:{uri}"
+
+
+def fetch_scryfall_uri(
+    client: httpx.Client,
+    uri: str,
+    *,
+    delay_seconds: float,
+    cache: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Fetch and cache an arbitrary Scryfall API URI."""
+    cache_key = make_uri_cache_key(uri)
+
+    if cache_key in cache:
+        return cache[cache_key]
+
+    try:
+        response = client.get(uri)
+    except httpx.HTTPError:
+        cache[cache_key] = None
+        return None
+
+    time.sleep(delay_seconds)
+
+    if response.status_code == 404:
+        cache[cache_key] = None
+        return None
+
+    if response.status_code == 429:
+        time.sleep(max(delay_seconds * 4, 2.0))
+
+        try:
+            response = client.get(uri)
+        except httpx.HTTPError:
+            cache[cache_key] = None
+            return None
+
+        time.sleep(delay_seconds)
+
+        if response.status_code == 404:
+            cache[cache_key] = None
+            return None
+
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError:
+        cache[cache_key] = None
+        return None
+
+    data = response.json()
+    cache[cache_key] = data
+    return data
+
+
+def fetch_card_prints(
+    client: httpx.Client,
+    prints_search_uri: str,
+    *,
+    delay_seconds: float,
+    cache: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Fetch all Scryfall print objects from a card's prints_search_uri."""
+    prints: list[dict[str, Any]] = []
+    next_uri: str | None = prints_search_uri
+
+    while next_uri:
+        page = fetch_scryfall_uri(
+            client,
+            next_uri,
+            delay_seconds=delay_seconds,
+            cache=cache,
+        )
+
+        if not isinstance(page, dict):
+            break
+
+        page_cards = page.get("data", [])
+
+        if isinstance(page_cards, list):
+            prints.extend(card for card in page_cards if isinstance(card, dict))
+
+        next_uri = page.get("next_page") if page.get("has_more") else None
+
+    return prints
+
+
+def release_sort_key(card: dict[str, Any]) -> tuple[str, str]:
+    """Sort cards by earliest release date, then set code for stability."""
+    return (
+        str(card.get("released_at") or "9999-99-99"),
+        str(card.get("set") or ""),
+    )
+
+
+def find_origin_card(
+    client: httpx.Client,
+    card: dict[str, Any],
+    *,
+    delay_seconds: float,
+    cache: dict[str, Any],
+    use_print_history: bool,
+) -> dict[str, Any]:
+    """Return the earliest known print for a Scryfall card when available."""
+    if not use_print_history:
+        return card
+
+    prints_search_uri = card.get("prints_search_uri")
+
+    if not prints_search_uri:
+        return card
+
+    prints = fetch_card_prints(
+        client,
+        str(prints_search_uri),
+        delay_seconds=delay_seconds,
+        cache=cache,
+    )
+
+    if not prints:
+        return card
+
+    return sorted(prints, key=release_sort_key)[0]
+
+
 def find_cards_for_commander(
     client: httpx.Client,
     commander_name: str,
@@ -356,11 +482,50 @@ def get_card_image_url(card: dict[str, Any]) -> str | None:
     return None
 
 
+def get_origin_set_info(card: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract set metadata from a Scryfall card object."""
+    set_code = card.get("set")
+
+    if not set_code:
+        return None
+
+    return {
+        "set_code": str(set_code).lower(),
+        "set_name": card.get("set_name") or str(set_code).upper(),
+        "released_at": card.get("released_at"),
+        "scryfall_set_uri": card.get("scryfall_set_uri"),
+        "set_uri": card.get("set_uri"),
+    }
+
+
+def unique_origin_sets(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build a stable unique origin-set list from Scryfall card objects."""
+    origin_sets: list[dict[str, Any]] = []
+    seen_codes: set[str] = set()
+
+    for card in cards:
+        origin_set = get_origin_set_info(card)
+
+        if not origin_set:
+            continue
+
+        set_code = origin_set["set_code"]
+
+        if set_code in seen_codes:
+            continue
+
+        seen_codes.add(set_code)
+        origin_sets.append(origin_set)
+
+    return origin_sets
+
+
 def build_metadata_row(
     commander: CommanderIdentity,
     cards: list[dict[str, Any]],
     *,
     match_strategy: str,
+    origin_cards: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Convert one or more Scryfall card objects into one commander metadata row.
@@ -375,6 +540,8 @@ def build_metadata_row(
     scryfall_uris: list[str] = []
     matched_names: list[str] = []
     scryfall_ids: list[str] = []
+    origin_sets = unique_origin_sets(origin_cards or cards)
+    primary_origin_set = origin_sets[0] if origin_sets else None
 
     for card in cards:
         card_colors = card.get("color_identity", [])
@@ -414,6 +581,20 @@ def build_metadata_row(
         "partner_card_image_urls": image_urls,
         "scryfall_uri": scryfall_uris[0] if scryfall_uris else None,
         "partner_scryfall_uris": scryfall_uris,
+        "origin_set_code": primary_origin_set.get("set_code")
+        if primary_origin_set
+        else None,
+        "origin_set_name": primary_origin_set.get("set_name")
+        if primary_origin_set
+        else None,
+        "origin_released_at": primary_origin_set.get("released_at")
+        if primary_origin_set
+        else None,
+        "scryfall_set_uri": primary_origin_set.get("scryfall_set_uri")
+        if primary_origin_set
+        else None,
+        "set_uri": primary_origin_set.get("set_uri") if primary_origin_set else None,
+        "origin_sets": origin_sets,
     }
 
 
@@ -496,6 +677,7 @@ def enrich_commanders_with_scryfall(
     user_agent: str,
     delay_seconds: float,
     cache_path: Path,
+    use_print_history_for_origin: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """
     Enrich all commanders with Scryfall metadata.
@@ -526,10 +708,22 @@ def enrich_commanders_with_scryfall(
                 cache=cache,
             )
 
+            origin_cards = [
+                find_origin_card(
+                    client,
+                    card,
+                    delay_seconds=delay_seconds,
+                    cache=cache,
+                    use_print_history=use_print_history_for_origin,
+                )
+                for card in cards
+            ]
+
             metadata_row = build_metadata_row(
                 commander,
                 cards,
                 match_strategy=match_strategy,
+                origin_cards=origin_cards,
             )
 
             metadata_rows.append(metadata_row)
@@ -590,6 +784,12 @@ def merge_metadata_into_rows(
                 "partner_scryfall_uris": metadata.get("partner_scryfall_uris"),
                 "scryfall_card_names": metadata.get("scryfall_card_names"),
                 "scryfall_match_strategy": metadata.get("scryfall_match_strategy"),
+                "origin_set_code": metadata.get("origin_set_code"),
+                "origin_set_name": metadata.get("origin_set_name"),
+                "origin_released_at": metadata.get("origin_released_at"),
+                "scryfall_set_uri": metadata.get("scryfall_set_uri"),
+                "set_uri": metadata.get("set_uri"),
+                "origin_sets": metadata.get("origin_sets"),
             }
         )
 
@@ -649,6 +849,10 @@ def build_summary(
         1 for row in metadata_rows if row.get("color_identity")
     )
 
+    origin_set_count = sum(
+        1 for row in metadata_rows if row.get("origin_set_code")
+    )
+
     return {
         "commander_count": len(commanders),
         "metadata_row_count": len(metadata_rows),
@@ -656,6 +860,7 @@ def build_summary(
         "unmatched_count": len(failure_rows),
         "rows_with_card_image_url": image_count,
         "rows_with_color_identity": color_count,
+        "rows_with_origin_set": origin_set_count,
         "merged_file_counts": merged_file_counts,
         "output_files": output_files,
     }
@@ -707,6 +912,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--skip-origin-print-history",
+        action="store_true",
+        help=(
+            "Use the matched Scryfall card's set as the origin set instead of "
+            "fetching prints_search_uri to find the earliest print."
+        ),
+    )
+
+    parser.add_argument(
         "--website-files",
         nargs="*",
         default=DEFAULT_WEBSITE_FILES,
@@ -736,6 +950,7 @@ def main() -> None:
         user_agent=args.user_agent,
         delay_seconds=args.delay_seconds,
         cache_path=cache_path,
+        use_print_history_for_origin=not args.skip_origin_print_history,
     )
 
     metadata_path = processed_dir / "commander_scryfall_metadata.json"

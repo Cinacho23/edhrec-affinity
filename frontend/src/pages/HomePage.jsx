@@ -89,6 +89,9 @@ export default function HomePage() {
           <Link className="button" to="/tags">
             Tag Explorer
           </Link>
+          <Link className="button" to="/sets">
+            Set Explorer
+          </Link>
           <Link className="button" to="/leaderboard">
             Global Leaderboard
           </Link>
