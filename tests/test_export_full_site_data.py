@@ -1,9 +1,22 @@
 import json
+import importlib.util
 from pathlib import Path
 
-from scripts.export_full_site_data import (
-    export_full_site_data,
-    extract_set_code_from_scryfall_uri,
+EXPORT_SCRIPT_PATH = (
+    Path(__file__).resolve().parents[1] / "scripts" / "export_full_site_data.py"
+)
+
+spec = importlib.util.spec_from_file_location(
+    "export_full_site_data",
+    EXPORT_SCRIPT_PATH,
+)
+export_full_site_data_module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(export_full_site_data_module)
+
+export_full_site_data = export_full_site_data_module.export_full_site_data
+extract_set_code_from_scryfall_uri = (
+    export_full_site_data_module.extract_set_code_from_scryfall_uri
 )
 
 
