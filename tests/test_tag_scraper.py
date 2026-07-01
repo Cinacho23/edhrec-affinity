@@ -353,6 +353,34 @@ class DummyClient:
         return None
 
 
+def test_scrape_all_commander_tags_creates_empty_jsonl_outputs(tmp_path: Path) -> None:
+    """
+    Even when discovery produces zero commanders, later workflow steps expect
+    the normal tag JSONL paths to exist.
+    """
+    commander_index_path = tmp_path / "commander_index.json"
+    output_dir = tmp_path / "output"
+
+    commander_index_path.write_text("[]", encoding="utf-8")
+
+    summary = tag_scraper.scrape_all_commander_tags(
+        commander_index_path=commander_index_path,
+        output_dir=output_dir,
+        request_delay_seconds=0,
+        resume=True,
+        client_factory=DummyClient,
+    )
+
+    tags_jsonl_path = output_dir / tag_scraper.TAGS_JSONL_FILENAME
+    failures_jsonl_path = output_dir / tag_scraper.FAILURES_JSONL_FILENAME
+
+    assert summary["total_commander_records_in_index"] == 0
+    assert tags_jsonl_path.exists()
+    assert failures_jsonl_path.exists()
+    assert tags_jsonl_path.read_text(encoding="utf-8") == ""
+    assert failures_jsonl_path.read_text(encoding="utf-8") == ""
+
+
 def test_scrape_all_commander_tags_writes_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

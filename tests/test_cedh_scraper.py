@@ -171,6 +171,38 @@ def test_load_normal_commander_metadata_from_jsonl(tmp_path: Path) -> None:
     }
 
 
+def test_load_normal_commander_metadata_falls_back_to_json(tmp_path: Path) -> None:
+    """
+    GitHub Actions may have commander_tags_raw.json but no JSONL when the
+    normal scrape produced zero appended JSONL rows. The cEDH step should still
+    read the JSON sibling instead of crashing during setup.
+    """
+    missing_jsonl_path = tmp_path / "commander_tags_raw.jsonl"
+    json_path = tmp_path / "commander_tags_raw.json"
+
+    json_path.write_text(
+        json.dumps(
+            [
+                {
+                    "commander_name": "Jasmine Boreal of the Seven",
+                    "commander_slug": "jasmine-boreal-of-the-seven",
+                    "total_decks": 5736,
+                    "tag_name": "Vanilla",
+                    "tag_slug": "vanilla",
+                    "tag_decks": 214,
+                    "source_type": "commander_json",
+                    "scrape_timestamp": "2026-05-07T00:00:00+00:00",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    metadata = cedh_scraper.load_normal_commander_metadata(missing_jsonl_path)
+
+    assert metadata["jasmine-boreal-of-the-seven"]["total_decks"] == 5736
+
+
 def test_run_cedh_scrape_writes_row_and_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

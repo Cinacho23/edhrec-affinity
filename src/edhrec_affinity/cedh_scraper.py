@@ -154,6 +154,12 @@ def read_json_records(path: Path) -> list[JsonDict]:
     The extra dict shapes make this function tolerant if a previous scraper
     saved wrapped JSON instead of a raw list.
     """
+    if not path.exists() and path.suffix == ".jsonl":
+        json_fallback_path = path.with_suffix(".json")
+
+        if json_fallback_path.exists():
+            path = json_fallback_path
+
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
