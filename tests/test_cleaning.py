@@ -50,6 +50,27 @@ def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def test_read_json_records_falls_back_to_json_for_missing_jsonl(tmp_path: Path) -> None:
+    missing_jsonl_path = tmp_path / "commander_tags_raw.jsonl"
+    json_path = tmp_path / "commander_tags_raw.json"
+    records = [
+        {
+            "commander_name": "Jasmine Boreal of the Seven",
+            "commander_slug": "jasmine-boreal-of-the-seven",
+            "total_decks": 5736,
+            "tag_name": "Vanilla",
+            "tag_slug": "vanilla",
+            "tag_decks": 214,
+            "source_type": "commander_json",
+            "scrape_timestamp": "2026-05-07T00:00:00+00:00",
+        }
+    ]
+
+    write_json(json_path, records)
+
+    assert cleaning.read_json_records(missing_jsonl_path) == records
+
+
 def make_commander_index() -> list[dict]:
     """
     Fake commander index records.

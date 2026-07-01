@@ -443,6 +443,8 @@ def scrape_all_commander_tags(
     tags_json_path = output_dir / TAGS_JSON_FILENAME
     failures_json_path = output_dir / FAILURES_JSON_FILENAME
     summary_json_path = output_dir / SUMMARY_JSON_FILENAME
+    tags_jsonl_path.touch(exist_ok=True)
+    failures_jsonl_path.touch(exist_ok=True)
 
     started_at = utc_now_iso()
     scrape_timestamp = started_at

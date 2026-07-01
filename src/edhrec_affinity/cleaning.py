@@ -237,6 +237,12 @@ def read_json_records(path: Path, *, required: bool = True) -> list[JsonDict]:
     Returns:
         A list of dictionaries.
     """
+    if not path.exists() and path.suffix == ".jsonl":
+        json_fallback_path = path.with_suffix(".json")
+
+        if json_fallback_path.exists():
+            path = json_fallback_path
+
     if not path.exists():
         if required:
             raise FileNotFoundError(f"Input file does not exist: {path}")
