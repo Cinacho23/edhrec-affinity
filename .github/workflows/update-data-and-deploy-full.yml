@@ -160,6 +160,13 @@ jobs:
             --cedh-status "${RAW_DIR}/commander_cedh_status.jsonl" \
             --output-dir "${PROCESSED_DIR}"
 
+      - name: Use previous processed snapshot if current scrape is empty
+        shell: bash
+        run: |
+          python3 scripts/use_previous_processed_if_empty.py \
+            --current-dir "${PROCESSED_DIR}" \
+            --processed-root "${PROCESSED_ROOT}"
+
       - name: Run statistical analysis
         shell: bash
         run: |
