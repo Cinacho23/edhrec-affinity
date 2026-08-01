@@ -7,6 +7,7 @@ import CommanderDetailPage from "./pages/CommanderDetailPage";
 import GlobalLeaderboardPage from "./pages/GlobalLeaderboardPage";
 import TagExplorerPage from "./pages/TagExplorerPage";
 import SetExplorerPage from "./pages/SetExplorerPage";
+import SetBracketsPage from "./pages/SetBracketsPage";
 import MethodologyPage from "./pages/MethodologyPage";
 import NotFoundPage from "./pages/NotFoundPage";
 
@@ -20,6 +21,8 @@ export default function App() {
         <Route path="/leaderboard" element={<GlobalLeaderboardPage />} />
         <Route path="/tags" element={<TagExplorerPage />} />
         <Route path="/sets" element={<SetExplorerPage />} />
+        <Route path="/brackets" element={<SetBracketsPage />} />
+        <Route path="/brackets/:setCode" element={<SetBracketsPage />} />
         <Route path="/methodology" element={<MethodologyPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>
