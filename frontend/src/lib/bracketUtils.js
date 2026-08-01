@@ -70,6 +70,7 @@ function createClassification(key, scoredRow, reason) {
     decision_tag_name: scoredRow?.row?.tag_name || null,
     decision_tag_slug: scoredRow ? normalizeTagSlug(scoredRow.row) : null,
     decision_z: scoredRow?.score ?? null,
+    decision_tag_decks: scoredRow?.row?.tag_decks ?? null,
     bracket_reason: reason,
   };
 }
@@ -174,4 +175,3 @@ export function buildCommanderBracketRows(rows) {
     };
   });
 }
-

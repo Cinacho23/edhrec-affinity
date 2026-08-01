@@ -19,13 +19,14 @@ test("classifies exact cEDH boundaries and the 4/5 flux band", () => {
 
 test("gives a qualifying cEDH score precedence over a stronger archetype", () => {
   const classification = classifyCommanderRows([
-    tag("cedh", 0.65, "cEDH"),
+    { ...tag("cedh", 0.65, "cEDH"), tag_decks: 8 },
     tag("midrange", 1.12, "Midrange"),
   ]);
 
   assert.equal(classification.bracket_key, "4");
   assert.equal(classification.decision_tag_name, "cEDH");
   assert.equal(classification.decision_z, 0.65);
+  assert.equal(classification.decision_tag_decks, 8);
 });
 
 test("classifies archetype boundaries and both requested flux examples", () => {
@@ -51,13 +52,13 @@ test("uses the strongest qualifying archetype and otherwise falls back to Bracke
 
 test("groups tag rows into one result per commander", () => {
   const rows = buildCommanderBracketRows([
-    { commander_slug: "alpha", commander_name: "Alpha", ...tag("aggro", 0.4, "Aggro") },
-    { commander_slug: "alpha", commander_name: "Alpha", ...tag("combo", 1.1, "Combo") },
+    { commander_slug: "alpha", commander_name: "Alpha", ...tag("aggro", 0.4, "Aggro"), tag_decks: 20 },
+    { commander_slug: "alpha", commander_name: "Alpha", ...tag("combo", 1.1, "Combo"), tag_decks: 12 },
     { commander_slug: "beta", commander_name: "Beta", ...tag("tempo", -0.4, "Tempo") },
   ]);
 
   assert.equal(rows.length, 2);
   assert.equal(rows.find((row) => row.commander_slug === "alpha").bracket_key, "3");
+  assert.equal(rows.find((row) => row.commander_slug === "alpha").decision_tag_decks, 12);
   assert.equal(rows.find((row) => row.commander_slug === "beta").bracket_key, "1");
 });
-
