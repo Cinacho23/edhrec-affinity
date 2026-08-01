@@ -30,6 +30,7 @@ import {
   rowHasTagMetrics,
 } from "../lib/setUtils";
 import {
+  passesMin,
   rowMatchesText,
   sortRows,
   toggleSortDirection,
@@ -39,6 +40,8 @@ const DEFAULT_FILTERS = {
   setQuery: "",
   commanderQuery: "",
   bracket: "",
+  minTotalDecks: "200",
+  minTagDecks: "5",
 };
 
 const FILTER_STORAGE_KEY = "edhrec-affinity:set-brackets:filters";
@@ -244,17 +247,37 @@ export default function SetBracketsPage() {
     [tagRows]
   );
 
+  const eligibleRows = useMemo(
+    () =>
+      bracketRows.filter(
+        (row) =>
+          rowMatchesText(row, filters.commanderQuery, [
+            "commander_name",
+            "commander_slug",
+            "decision_tag_name",
+          ]) &&
+          passesMin(row, "total_decks", filters.minTotalDecks) &&
+          passesMin(row, "decision_tag_decks", filters.minTagDecks)
+      ),
+    [
+      bracketRows,
+      filters.commanderQuery,
+      filters.minTotalDecks,
+      filters.minTagDecks,
+    ]
+  );
+
   const bracketCounts = useMemo(() => {
     const counts = Object.fromEntries(
       BRACKET_OPTIONS.map((bracket) => [bracket.key, 0])
     );
 
-    for (const row of bracketRows) {
+    for (const row of eligibleRows) {
       counts[row.bracket_key] += 1;
     }
 
     return counts;
-  }, [bracketRows]);
+  }, [eligibleRows]);
 
   const filteredSets = useMemo(
     () =>
@@ -265,17 +288,12 @@ export default function SetBracketsPage() {
   );
 
   const filteredRows = useMemo(() => {
-    const matchingRows = bracketRows.filter(
-      (row) =>
-        rowMatchesText(row, filters.commanderQuery, [
-          "commander_name",
-          "commander_slug",
-          "decision_tag_name",
-        ]) && (!filters.bracket || row.bracket_key === filters.bracket)
+    const matchingRows = eligibleRows.filter(
+      (row) => !filters.bracket || row.bracket_key === filters.bracket
     );
 
     return sortRows(matchingRows, sort.key, sort.direction);
-  }, [bracketRows, filters.commanderQuery, filters.bracket, sort]);
+  }, [eligibleRows, filters.bracket, sort]);
 
   function selectSet(setCode) {
     setSelectedSet(setCode);
@@ -327,6 +345,12 @@ export default function SetBracketsPage() {
       header: "Z-Score",
       sortable: true,
       render: (row) => formatDecimal(row.decision_z),
+    },
+    {
+      key: "decision_tag_decks",
+      header: "Tag Decks",
+      sortable: true,
+      render: (row) => formatNumber(row.decision_tag_decks),
     },
     {
       key: "bracket_reason",
@@ -438,6 +462,26 @@ export default function SetBracketsPage() {
                 <option key={bracket.key} value={bracket.key}>{bracket.label}</option>
               ))}
             </select>
+          </label>
+          <label>
+            Minimum total decks
+            <input
+              type="number"
+              min="0"
+              value={filters.minTotalDecks}
+              onChange={(event) => updateFilter("minTotalDecks", event.target.value)}
+              placeholder="200"
+            />
+          </label>
+          <label>
+            Minimum tag decks
+            <input
+              type="number"
+              min="0"
+              value={filters.minTagDecks}
+              onChange={(event) => updateFilter("minTagDecks", event.target.value)}
+              placeholder="5"
+            />
           </label>
         </div>
       </section>
