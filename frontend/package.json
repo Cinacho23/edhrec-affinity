@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --configLoader runner",
     "build": "vite build --configLoader runner",
+    "test": "node --test src/lib/*.test.js",
     "data:download": "python ../scripts/download_site_data.py --output-dir public/data/latest",
     "lint": "eslint .",
     "preview": "vite preview --configLoader runner"

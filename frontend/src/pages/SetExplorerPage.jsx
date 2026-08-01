@@ -523,6 +523,11 @@ export default function SetExplorerPage() {
               Showing {formatNumber(filteredRows.length)} of{" "}
               {formatNumber(rows.length)} rows
             </p>
+            {selectedSet ? (
+              <Link className="button" to={`/brackets/${selectedSet}`}>
+                View commander brackets
+              </Link>
+            ) : null}
           </div>
 
           {state.loadingRows ? (
