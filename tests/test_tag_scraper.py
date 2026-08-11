@@ -180,7 +180,13 @@ def test_parse_commander_payload_returns_tag_rows() -> None:
     This uses fake fixture data. Do not use live EDHREC counts in unit tests.
     """
     payload = {
-        "num_decks_avg": 1000,
+        "container": {
+            "json_dict": {
+                "card": {
+                    "num_decks": 1000,
+                }
+            }
+        },
         "panels": {
             "taglinks": [
                 {"count": 100, "slug": "power", "value": "Power"},
@@ -220,9 +226,9 @@ def test_parse_commander_payload_returns_tag_rows() -> None:
     assert second["tag_decks"] == 25
 
 
-def test_parse_commander_payload_rejects_missing_num_decks() -> None:
+def test_parse_commander_payload_rejects_missing_deck_count() -> None:
     """
-    num_decks_avg is required because later analysis needs total_decks.
+    A current or legacy deck count is required for later analysis.
     """
     payload = {
         "panels": {
@@ -238,6 +244,46 @@ def test_parse_commander_payload_rejects_missing_num_decks() -> None:
             commander_slug="test-commander",
             scrape_timestamp="2026-05-07T00:00:00Z",
         )
+
+
+def test_scrape_all_commander_tags_fails_when_every_commander_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken upstream schema must fail instead of publishing stale data."""
+    commander_index_path = tmp_path / "commander_index.json"
+    output_dir = tmp_path / "output"
+
+    commander_index_path.write_text(
+        json.dumps([{"commander_slug": "broken-commander"}]),
+        encoding="utf-8",
+    )
+
+    def fake_fetch_json(client, url: str):
+        return {
+            "panels": {
+                "taglinks": [
+                    {"count": 10, "slug": "tokens", "value": "Tokens"},
+                ]
+            }
+        }
+
+    monkeypatch.setattr(tag_scraper, "fetch_json", fake_fetch_json)
+
+    with pytest.raises(RuntimeError, match="produced zero tag rows"):
+        tag_scraper.scrape_all_commander_tags(
+            commander_index_path=commander_index_path,
+            output_dir=output_dir,
+            request_delay_seconds=0,
+            resume=True,
+            client_factory=DummyClient,
+        )
+
+    saved_summary = json.loads(
+        (output_dir / tag_scraper.SUMMARY_JSON_FILENAME).read_text(encoding="utf-8")
+    )
+    assert saved_summary["failed_commander_count_this_run"] == 1
+    assert saved_summary["total_tag_rows_in_output"] == 0
 
 
 def test_parse_commander_payload_rejects_missing_taglinks() -> None:

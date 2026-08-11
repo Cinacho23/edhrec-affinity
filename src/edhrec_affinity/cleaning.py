@@ -34,7 +34,7 @@ cEDH tag rows:
     tag_name = "cEDH"
 
 The cEDH row should already have:
-    tag_decks = cEDH JSON num_decks_avg
+    tag_decks = cEDH filtered-page card deck count
     total_decks = normal commander total deck count
 """
 

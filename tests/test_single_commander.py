@@ -23,7 +23,7 @@ def test_parse_commander_payload_extracts_tags():
     - source type
 
     This fake payload mirrors the real structure:
-    payload["num_decks_avg"]
+    payload["container"]["json_dict"]["card"]["num_decks"]
     payload["panels"]["taglinks"]
     """
 
@@ -33,7 +33,13 @@ def test_parse_commander_payload_extracts_tags():
     # The real EDHREC JSON has many more fields, but the parser does not need
     # all of them.
     fake_payload = {
-        "num_decks_avg": 1000,
+        "container": {
+            "json_dict": {
+                "card": {
+                    "num_decks": 1000,
+                }
+            }
+        },
         "panels": {
             "taglinks": [
                 {"count": 250, "slug": "tokens", "value": "Tokens"},
