@@ -31,6 +31,7 @@ from typing import Any, Callable, Iterable
 
 import httpx
 
+from edhrec_affinity.edhrec_payload import extract_page_deck_count
 from edhrec_affinity.models import CommanderTagRow, utc_now_iso
 
 
@@ -228,7 +229,7 @@ def parse_commander_payload(
         KeyError, TypeError, ValueError, or Pydantic validation errors when
         the payload does not match expectations.
     """
-    total_decks = int(payload["num_decks_avg"])
+    total_decks = extract_page_deck_count(payload)
 
     panels = payload["panels"]
     if not isinstance(panels, dict):
@@ -523,6 +524,10 @@ def scrape_all_commander_tags(
         "resume_enabled": resume,
         "request_delay_seconds": request_delay_seconds,
         "normal_tag_source_type": "commander_json",
+        "total_deck_count_source": (
+            "container.json_dict.card.num_decks "
+            "(legacy num_decks_avg fallback)"
+        ),
         "notes": (
             "This Chat 5 scraper collects normal commander tag data only. "
             "cEDH remains a special route to add separately."
@@ -530,6 +535,13 @@ def scrape_all_commander_tags(
     }
 
     write_json(summary_json_path, summary)
+
+    if commander_records and not all_tag_rows:
+        raise RuntimeError(
+            "Normal tag scrape produced zero tag rows for a non-empty commander "
+            "index. See commander_tag_failures.json for the upstream schema or "
+            "request errors. Refusing to continue with an empty snapshot."
+        )
 
     return summary
 

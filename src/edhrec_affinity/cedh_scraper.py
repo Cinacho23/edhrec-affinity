@@ -14,9 +14,8 @@ Why this file exists:
   We are treating cEDH as its own tag row, but it does not come from
   panels["taglinks"].
 
-- For cEDH, the cEDH-specific JSON page has its own num_decks_avg value.
-  That cEDH num_decks_avg becomes the tag_decks value for the synthetic
-  cEDH tag row.
+- For cEDH, the cEDH-specific JSON page has its own filtered card deck count.
+  That count becomes the tag_decks value for the synthetic cEDH tag row.
 
 Important:
 - total_decks should still represent the commander's normal total deck count.
@@ -44,6 +43,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+from edhrec_affinity.edhrec_payload import extract_page_deck_count
 
 
 # This is the route pattern based on the cEDH special JSON route.
@@ -303,7 +304,8 @@ def parse_cedh_payload(
 
     This is the key cEDH rule:
 
-        cEDH payload["num_decks_avg"] -> tag_decks
+        cEDH payload["container"]["json_dict"]["card"]["num_decks"]
+        -> tag_decks
 
     We intentionally do not read payload["panels"]["taglinks"] here.
     cEDH is treated as its own synthetic tag row.
@@ -328,7 +330,7 @@ def parse_cedh_payload(
         ValueError:
             If counts are invalid.
         KeyError:
-            If num_decks_avg is missing from the cEDH payload.
+            If both the current and legacy deck-count fields are missing.
     """
     if scrape_timestamp is None:
         scrape_timestamp = utc_now_iso()
@@ -338,8 +340,8 @@ def parse_cedh_payload(
     if normal_total_decks <= 0:
         raise ValueError("normal_total_decks must be greater than zero")
 
-    # This is the special cEDH-specific count.
-    cedh_decks = coerce_int(payload["num_decks_avg"], "num_decks_avg")
+    # This is the special cEDH-specific count from the filtered page.
+    cedh_decks = extract_page_deck_count(payload)
 
     # If EDHREC exposes the cEDH route but the count is zero, we do not create
     # a commander-tag row. The caller should write a status record instead.
@@ -600,7 +602,7 @@ def run_cedh_scrape(
                             commander_slug=commander_slug,
                             url=url,
                             status_type="no_cedh_decks",
-                            reason="cEDH JSON num_decks_avg was zero or less",
+                            reason="cEDH filtered JSON deck count was zero or less",
                         ),
                     )
                 else:
@@ -613,7 +615,7 @@ def run_cedh_scrape(
                             commander_slug=commander_slug,
                             url=url,
                             status_type="cedh_row_written",
-                            reason="cEDH row was created from cEDH JSON num_decks_avg",
+                            reason="cEDH row was created from the filtered page deck count",
                             extra={"tag_decks": row["tag_decks"]},
                         ),
                     )
@@ -644,7 +646,10 @@ def run_cedh_scrape(
         "request_delay_seconds": request_delay,
         "resume_enabled": resume,
         "cedh_source_type": "cedh_filtered_json",
-        "cedh_count_source": "cedh_json.num_decks_avg",
+        "cedh_count_source": (
+            "cedh_json.container.json_dict.card.num_decks "
+            "(legacy num_decks_avg fallback)"
+        ),
         "rows_jsonl_path": str(rows_jsonl_path),
         "rows_json_path": str(rows_json_path),
         "status_jsonl_path": str(status_jsonl_path),

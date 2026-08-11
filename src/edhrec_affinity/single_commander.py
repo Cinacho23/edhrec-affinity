@@ -27,6 +27,7 @@ from pathlib import Path
 # It lets Python send requests to URLs and receive responses
 import httpx
 
+from edhrec_affinity.edhrec_payload import extract_page_deck_count
 from edhrec_affinity.models import CommanderScrapeResult, CommanderTagRow, utc_now_iso
 
 # A user-agent identifies your script to the website.
@@ -88,8 +89,8 @@ def fetch_json(url: str) -> dict:
         If the website returns this JSON:
 
         {
-            "num_decks_avg": 5722,
-            "taglinks": [...]
+            "container": {"json_dict": {"card": {"num_decks": 5722}}},
+            "panels": {"taglinks": [...]}
         }
 
         then this function returns it as a Python dict.
@@ -121,7 +122,7 @@ def fetch_json(url: str) -> dict:
         # Convert the JSON response body into a Python dictionary.
         #
         # After this line, you can access fields like:
-        # payload["num_decks_avg"]
+        # payload["container"]["json_dict"]["card"]["num_decks"]
         # payload["panels"]["taglinks"]
         payload = response.json()
         return payload
@@ -177,7 +178,7 @@ def parse_commander_payload(
 
     Important JSON paths confirmed in Chat 3:
         total decks:
-            payload["num_decks_avg"]
+            payload["container"]["json_dict"]["card"]["num_decks"]
 
         normal commander tags:
             payload["panels"]["taglinks"]
@@ -192,8 +193,8 @@ def parse_commander_payload(
     # Later, scrape timestamps will matter for weekly/monthly trend tracking.
     scrape_timestamp = utc_now_iso()
 
-    # Total commander deck count is directly available at the top level.
-    total_decks = int(payload["num_decks_avg"])
+    # Prefer the current nested deck count while supporting saved legacy payloads.
+    total_decks = extract_page_deck_count(payload)
 
     # Tag data is inside payload["panels"]["taglinks"].
     # Each tag object has:

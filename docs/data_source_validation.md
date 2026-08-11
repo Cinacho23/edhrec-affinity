@@ -18,7 +18,8 @@ For each commander, retrieve the network JSON file associated with that commande
 
 Important fields:
 
-- `num_decks_avg`: total number of commander decks
+- `container.json_dict.card.num_decks`: total number of commander decks
+- `num_decks_avg`: legacy total-deck field retained as a compatibility fallback
 - `taglinks`: complete list of available commander tags
 
 Eeach `taglinks` entry contains:

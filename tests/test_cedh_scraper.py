@@ -11,7 +11,7 @@ Why:
 - Unit tests should verify our logic with stable fake data.
 
 The most important behavior:
-- cEDH payload["num_decks_avg"] becomes tag_decks.
+- The filtered page's card deck count becomes tag_decks.
 - We ignore panels["taglinks"] for cEDH.
 - cEDH rows use tag_slug = "cedh".
 - cEDH rows use source_type = "cedh_filtered_json".
@@ -54,15 +54,21 @@ def test_build_cedh_json_url() -> None:
     )
 
 
-def test_parse_cedh_payload_uses_num_decks_avg_as_tag_decks() -> None:
+def test_parse_cedh_payload_uses_filtered_page_deck_count_as_tag_decks() -> None:
     """
-    cEDH parsing should use the cEDH JSON's num_decks_avg as tag_decks.
+    cEDH parsing should use the current filtered-page deck count as tag_decks.
 
     This test deliberately includes fake taglinks with a huge count to prove
     that cEDH does not use panels["taglinks"].
     """
     payload = {
-        "num_decks_avg": 3,
+        "container": {
+            "json_dict": {
+                "card": {
+                    "num_decks": 3,
+                }
+            }
+        },
         "panels": {
             "taglinks": [
                 {"count": 999, "slug": "combo", "value": "Combo"},
@@ -255,7 +261,13 @@ def test_run_cedh_scrape_writes_row_and_status(
     def fake_fetch_json(client, url):
         assert url.endswith("/the-tenth-doctor-rose-tyler/cedh.json")
         return {
-            "num_decks_avg": 3,
+            "container": {
+                "json_dict": {
+                    "card": {
+                        "num_decks": 3,
+                    }
+                }
+            },
             "panels": {
                 "taglinks": [
                     {"count": 999, "slug": "ignored", "value": "Ignored"}
