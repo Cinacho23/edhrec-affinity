@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 
 import CommanderImageGallery from "../components/CommanderImageGallery";
 import SimpleTable from "../components/SimpleTable";
@@ -14,6 +14,7 @@ import {
 
 export default function CommanderDetailPage() {
   const { commanderSlug } = useParams();
+  const navigate = useNavigate();
 
   const [rows, setRows] = useState([]);
   const [state, setState] = useState({ loading: true, error: null });
@@ -33,6 +34,10 @@ export default function CommanderDetailPage() {
   }, [commanderSlug]);
 
   const commander = rows[0];
+
+  function returnToPreviousPage() {
+    navigate(-1);
+  }
 
   const strongestTag = useMemo(() => {
     return [...rows]
@@ -83,9 +88,13 @@ export default function CommanderDetailPage() {
     return (
       <section className="page">
         <p className="error-message">Could not load commander: {state.error}</p>
-        <Link className="detail-back-link" to="/commanders">
-          ← Back to commander search
-        </Link>
+        <button
+          className="detail-back-link"
+          type="button"
+          onClick={returnToPreviousPage}
+        >
+          ← Return to previous page
+        </button>
       </section>
     );
   }
@@ -94,9 +103,13 @@ export default function CommanderDetailPage() {
     return (
       <section className="page">
         <p className="error-message">Commander not found.</p>
-        <Link className="detail-back-link" to="/commanders">
-          ← Back to commander search
-        </Link>
+        <button
+          className="detail-back-link"
+          type="button"
+          onClick={returnToPreviousPage}
+        >
+          ← Return to previous page
+        </button>
       </section>
     );
   }
@@ -104,9 +117,13 @@ export default function CommanderDetailPage() {
   return (
     <section className="page">
       <div className="detail-back-link-wrap">
-        <Link className="detail-back-link" to="/commanders">
-          ← Back to commander search
-        </Link>
+        <button
+          className="detail-back-link"
+          type="button"
+          onClick={returnToPreviousPage}
+        >
+          ← Return to previous page
+        </button>
       </div>
 
       <section className="commander-detail-hero">
