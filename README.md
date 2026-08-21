@@ -16,6 +16,8 @@ This project is not trying to reproduce EDHREC. Its purpose is to add an origina
 - Commander detail pages
 - Global commander-tag leaderboard
 - Tag explorer
+- Set-based commander brackets
+- Theme brackets with a 1.05 theme gate plus bracket-rule-only signal themes
 - Sortable and filterable tables
 - Z-score, percentile, and rank metrics
 - Trend fields across dated snapshots

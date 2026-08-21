@@ -8,6 +8,17 @@ export const ARCHETYPE_TAG_SLUGS = new Set([
   "combo",
 ]);
 
+export const THEME_BRACKET_MIN_Z = 1.05;
+
+export function themeUsesBracketRulesOnly(themeSlug) {
+  const normalizedThemeSlug = normalizeTagSlug({ tag_slug: themeSlug });
+
+  return (
+    normalizedThemeSlug === CEDH_TAG_SLUG ||
+    ARCHETYPE_TAG_SLUGS.has(normalizedThemeSlug)
+  );
+}
+
 export const BRACKET_OPTIONS = [
   { key: "5", label: "Bracket 5", rank: 5 },
   { key: "4/5", label: "Bracket 4/5", rank: 4.5 },
@@ -38,6 +49,15 @@ function getFiniteZ(row) {
 
   const score = Number(row.z);
   return Number.isFinite(score) ? score : null;
+}
+
+function getFiniteNumber(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function getHighestScoredRow(rows, acceptedTags) {
@@ -174,4 +194,134 @@ export function buildCommanderBracketRows(rows) {
       ...classifyCommanderRows(commanderRows),
     };
   });
+}
+
+function getThemeCandidate(rows, themeSlug) {
+  let highest = null;
+
+  function consider(candidate, container, usesThemeFields = false) {
+    const candidateSlug = normalizeTagSlug(
+      usesThemeFields
+        ? {
+            tag_slug: container?.theme_tag_slug,
+            tag_name: container?.theme_tag_name,
+          }
+        : candidate
+    );
+
+    if (candidateSlug !== themeSlug) {
+      return;
+    }
+
+    const score = getFiniteNumber(
+      usesThemeFields ? container?.theme_z : candidate?.z
+    );
+
+    if (
+      highest &&
+      (score === null || (highest.score !== null && score <= highest.score))
+    ) {
+      return;
+    }
+
+    highest = {
+      score,
+      name: usesThemeFields
+        ? container?.theme_tag_name
+        : candidate?.tag_name,
+      decks: usesThemeFields
+        ? container?.theme_tag_decks
+        : candidate?.tag_decks,
+      affinity: usesThemeFields
+        ? container?.theme_affinity_pct
+        : candidate?.tag_affinity_pct,
+    };
+  }
+
+  for (const row of rows) {
+    consider(row, row);
+
+    if (row?.theme_tag_slug || row?.theme_tag_name) {
+      consider(row, row, true);
+    }
+
+    for (const signalRow of row?.bracket_tag_rows || []) {
+      consider(signalRow, row);
+    }
+  }
+
+  return highest;
+}
+
+/**
+ * Build one bracket result per commander for a selected theme.
+ *
+ * A commander is included only when its selected-theme z-score reaches the
+ * theme threshold. Bracket assignment remains entirely delegated to
+ * classifyCommanderRows, preserving the exact cEDH precedence and archetype
+ * boundary behavior used by the set-based Brackets page.
+ *
+ * Rows can either be normal flat tag rows or compact theme export rows with a
+ * bracket_tag_rows array. Supporting both shapes keeps older static datasets
+ * usable through the frontend's commander-detail fallback.
+ */
+export function buildCommanderThemeBracketRows(
+  rows,
+  themeSlug,
+  minThemeZ = THEME_BRACKET_MIN_Z
+) {
+  const normalizedThemeSlug = normalizeTagSlug({ tag_slug: themeSlug });
+  const usesBracketRulesOnly = themeUsesBracketRulesOnly(
+    normalizedThemeSlug
+  );
+
+  if (!normalizedThemeSlug) {
+    return [];
+  }
+
+  const groups = new Map();
+
+  for (const row of rows || []) {
+    const groupKey =
+      row?.commander_slug || row?.commander_name || `unknown-${groups.size}`;
+
+    if (!groups.has(groupKey)) {
+      groups.set(groupKey, []);
+    }
+
+    groups.get(groupKey).push(row);
+  }
+
+  const results = [];
+
+  for (const [groupKey, commanderRows] of groups) {
+    const theme = getThemeCandidate(commanderRows, normalizedThemeSlug);
+
+    if (
+      !theme ||
+      (!usesBracketRulesOnly &&
+        (theme.score === null || theme.score < minThemeZ))
+    ) {
+      continue;
+    }
+
+    const classificationRows = commanderRows.flatMap((row) =>
+      Array.isArray(row?.bracket_tag_rows) ? row.bracket_tag_rows : [row]
+    );
+    const commander = { ...(commanderRows[0] || {}) };
+    delete commander.bracket_tag_rows;
+
+    results.push({
+      ...commander,
+      id: groupKey,
+      theme_tag_name: theme.name || normalizedThemeSlug,
+      theme_tag_slug: normalizedThemeSlug,
+      theme_z: theme.score,
+      theme_tag_decks: theme.decks ?? null,
+      theme_affinity_pct: theme.affinity ?? null,
+      ...classifyCommanderRows(classificationRows),
+    });
+  }
+
+  return results;
 }

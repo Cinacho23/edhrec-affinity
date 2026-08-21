@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildCommanderBracketRows,
+  buildCommanderThemeBracketRows,
   classifyCommanderRows,
 } from "./bracketUtils.js";
 
@@ -61,4 +62,124 @@ test("groups tag rows into one result per commander", () => {
   assert.equal(rows.find((row) => row.commander_slug === "alpha").bracket_key, "3");
   assert.equal(rows.find((row) => row.commander_slug === "alpha").decision_tag_decks, 12);
   assert.equal(rows.find((row) => row.commander_slug === "beta").bracket_key, "1");
+});
+
+test("requires both the selected theme and a Bracket 3 archetype at 1.05", () => {
+  const rows = buildCommanderThemeBracketRows(
+    [
+      {
+        commander_slug: "qualifies",
+        commander_name: "Qualifies",
+        tag_slug: "mutate",
+        tag_name: "Mutate",
+        z: 1.05,
+        tag_decks: 12,
+      },
+      {
+        commander_slug: "qualifies",
+        commander_name: "Qualifies",
+        ...tag("combo", 1.05, "Combo"),
+      },
+      {
+        commander_slug: "weak-theme",
+        commander_name: "Weak Theme",
+        ...tag("mutate", 1.04, "Mutate"),
+      },
+      {
+        commander_slug: "weak-theme",
+        commander_name: "Weak Theme",
+        ...tag("aggro", 4.2, "Aggro"),
+      },
+      {
+        commander_slug: "weak-archetype",
+        commander_name: "Weak Archetype",
+        ...tag("mutate", 2.4, "Mutate"),
+      },
+      {
+        commander_slug: "weak-archetype",
+        commander_name: "Weak Archetype",
+        ...tag("tempo", 1.04, "Tempo"),
+      },
+    ],
+    "mutate"
+  );
+
+  assert.equal(rows.length, 2);
+  assert.equal(rows.find((row) => row.id === "qualifies").bracket_key, "3");
+  assert.equal(rows.find((row) => row.id === "qualifies").theme_z, 1.05);
+  assert.equal(rows.find((row) => row.id === "qualifies").theme_tag_decks, 12);
+  assert.equal(rows.find((row) => row.id === "weak-archetype").bracket_key, "2/3");
+});
+
+test("classifies compact theme export rows with the shared cEDH precedence", () => {
+  const rows = buildCommanderThemeBracketRows(
+    [
+      {
+        commander_slug: "nested",
+        commander_name: "Nested",
+        theme_tag_slug: "mutate",
+        theme_tag_name: "Mutate",
+        theme_z: 2.2,
+        theme_tag_decks: 18,
+        bracket_tag_rows: [
+          tag("cedh", 0.4, "cEDH"),
+          tag("midrange", 3.8, "Midrange"),
+        ],
+      },
+    ],
+    "Mutate"
+  );
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].bracket_key, "4");
+  assert.equal(rows[0].decision_tag_name, "cEDH");
+  assert.equal(rows[0].theme_z, 2.2);
+  assert.equal("bracket_tag_rows" in rows[0], false);
+});
+
+test("uses bracket rules without a second 1.05 gate for bracket-signal themes", () => {
+  const aggroRows = buildCommanderThemeBracketRows(
+    [
+      {
+        commander_slug: "aggro-two",
+        commander_name: "Aggro Two",
+        ...tag("aggro", 0.4, "Aggro"),
+      },
+      {
+        commander_slug: "aggro-one-two",
+        commander_name: "Aggro One Two",
+        ...tag("aggro", 0.02, "Aggro"),
+      },
+      {
+        commander_slug: "aggro-one",
+        commander_name: "Aggro One",
+        ...tag("aggro", 0, "Aggro"),
+      },
+    ],
+    "aggro"
+  );
+  const cedhRows = buildCommanderThemeBracketRows(
+    [
+      {
+        commander_slug: "cedh-four",
+        commander_name: "cEDH Four",
+        ...tag("cedh", 0.4, "cEDH"),
+      },
+      {
+        commander_slug: "cedh-five",
+        commander_name: "cEDH Five",
+        ...tag("cedh", 1.05, "cEDH"),
+      },
+    ],
+    "cedh"
+  );
+
+  assert.deepEqual(
+    aggroRows.map((row) => row.bracket_key),
+    ["2", "1/2", "1"]
+  );
+  assert.deepEqual(
+    cedhRows.map((row) => row.bracket_key),
+    ["4", "5"]
+  );
 });

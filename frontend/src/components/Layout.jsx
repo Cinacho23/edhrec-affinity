@@ -29,6 +29,7 @@ export default function Layout() {
             <NavLink to="/tags">Tag Explorer</NavLink>
             <NavLink to="/sets">Sets</NavLink>
             <NavLink to="/brackets">Brackets</NavLink>
+            <NavLink to="/theme-brackets">Theme Brackets</NavLink>
             <NavLink to="/methodology">Methodology</NavLink>
           </nav>
         </div>

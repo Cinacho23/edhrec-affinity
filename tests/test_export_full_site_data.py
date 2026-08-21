@@ -136,3 +136,97 @@ def test_export_full_site_data_writes_set_files(tmp_path):
 
     fallback_rows = read_json(output_dir / "sets" / "cmm.json")
     assert fallback_rows[0]["origin_set_name"] == "CMM"
+
+
+def test_export_full_site_data_writes_compact_theme_bracket_files(tmp_path):
+    processed_dir = tmp_path / "processed" / "2026-06-21"
+    output_dir = tmp_path / "site"
+
+    write_json(
+        processed_dir / "affinity_rows_with_trends.json",
+        [
+            {
+                "commander_name": "Theme Commander",
+                "commander_slug": "theme-commander",
+                "tag_name": "Mutate",
+                "tag_slug": "mutate",
+                "total_decks": 400,
+                "tag_decks": 40,
+                "tag_affinity_pct": 0.1,
+                "z": 2.4,
+                "rank_within_tag_by_z": 1,
+                "color_identity": ["U", "G"],
+            },
+            {
+                "commander_name": "Theme Commander",
+                "commander_slug": "theme-commander",
+                "tag_name": "Combo",
+                "tag_slug": "combo",
+                "total_decks": 400,
+                "tag_decks": 30,
+                "tag_affinity_pct": 0.075,
+                "z": 1.2,
+            },
+            {
+                "commander_name": "Below Threshold",
+                "commander_slug": "below-threshold",
+                "tag_name": "Mutate",
+                "tag_slug": "mutate",
+                "total_decks": 300,
+                "tag_decks": 8,
+                "tag_affinity_pct": 0.026,
+                "z": 1.04,
+            },
+            {
+                "commander_name": "Below Threshold",
+                "commander_slug": "below-threshold",
+                "tag_name": "Combo",
+                "tag_slug": "combo",
+                "total_decks": 300,
+                "tag_decks": 6,
+                "tag_affinity_pct": 0.02,
+                "z": 0.4,
+            },
+        ],
+    )
+    write_json(processed_dir / "analysis_summary.json", {"ok": True})
+    write_json(processed_dir / "trend_summary.json", {"ok": True})
+    write_json(processed_dir / "tag_summary.json", [])
+
+    manifest = export_full_site_data(
+        processed_dir=processed_dir,
+        output_dir=output_dir,
+        page_size=10,
+        clean_output=True,
+    )
+
+    assert manifest["theme_bracket_export"]["minimum_z"] == 1.05
+
+    theme_index = read_json(output_dir / "theme-brackets" / "index.json")
+    mutate_info = next(
+        theme for theme in theme_index if theme["tag_slug"] == "mutate"
+    )
+    combo_info = next(
+        theme for theme in theme_index if theme["tag_slug"] == "combo"
+    )
+    assert mutate_info["qualified_commander_count"] == 1
+    assert mutate_info["minimum_z"] == 1.05
+    assert mutate_info["qualification_rule"] == "theme_z_and_bracket_rules"
+    assert combo_info["qualified_commander_count"] == 2
+    assert combo_info["minimum_z"] is None
+    assert combo_info["qualification_rule"] == "bracket_rules_only"
+
+    mutate_rows = read_json(output_dir / "theme-brackets" / "mutate.json")
+    assert len(mutate_rows) == 1
+    assert mutate_rows[0]["commander_slug"] == "theme-commander"
+    assert mutate_rows[0]["theme_z"] == 2.4
+    assert mutate_rows[0]["theme_tag_decks"] == 40
+    assert mutate_rows[0]["bracket_tag_rows"] == [
+        {"tag_name": "Combo", "tag_slug": "combo", "z": 1.2, "tag_decks": 30}
+    ]
+
+    combo_rows = read_json(output_dir / "theme-brackets" / "combo.json")
+    assert {row["commander_slug"] for row in combo_rows} == {
+        "theme-commander",
+        "below-threshold",
+    }

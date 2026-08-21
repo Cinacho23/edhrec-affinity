@@ -132,6 +132,36 @@ def build_download_list(base_url: str, output_dir: Path) -> list[str]:
             paths.add(f"tags/{safe_json_filename(tag_slug)}.json")
 
     try:
+        theme_bracket_index = fetch_json(base_url, "theme-brackets/index.json")
+    except RuntimeError as error:
+        if not is_not_found_error(error):
+            raise
+        theme_bracket_index = []
+    else:
+        write_json(
+            output_dir,
+            "theme-brackets/index.json",
+            theme_bracket_index,
+        )
+
+    if not isinstance(theme_bracket_index, list):
+        theme_bracket_index = []
+
+    for theme in theme_bracket_index:
+        if not isinstance(theme, dict):
+            continue
+
+        theme_file = theme.get("file")
+        theme_slug = theme.get("tag_slug") or theme.get("slug")
+
+        if theme_file:
+            paths.add(theme_file)
+        elif theme_slug:
+            paths.add(
+                f"theme-brackets/{safe_json_filename(theme_slug)}.json"
+            )
+
+    try:
         set_index = fetch_json(base_url, "sets/index.json")
     except RuntimeError as error:
         if not is_not_found_error(error):

@@ -15,6 +15,7 @@ it writes:
 
     data/latest/commanders/<commander_slug>.json
     data/latest/tags/<tag_slug>.json
+    data/latest/theme-brackets/<tag_slug>.json
     data/latest/leaderboard/page_0001.json
     data/latest/leaderboard/page_0002.json
 
@@ -40,6 +41,15 @@ import pandas as pd
 
 
 LEADERBOARD_PAGE_SIZE = 500
+THEME_BRACKET_MIN_Z = 1.05
+BRACKET_SIGNAL_TAG_SLUGS = {
+    "cedh",
+    "aggro",
+    "control",
+    "midrange",
+    "tempo",
+    "combo",
+}
 
 SUMMARY_FILES = [
     "analysis_summary.json",
@@ -595,6 +605,124 @@ def export_set_files(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
     }
 
 
+def build_theme_bracket_signal_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "tag_name": row.get("tag_name"),
+        "tag_slug": row.get("tag_slug"),
+        "z": row.get("z"),
+        "tag_decks": row.get("tag_decks"),
+    }
+
+
+def build_theme_bracket_commander_row(
+    theme_row: dict[str, Any],
+    commander_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    bracket_tag_rows = [
+        build_theme_bracket_signal_row(row)
+        for row in commander_rows
+        if safe_json_filename(row.get("tag_slug")) in BRACKET_SIGNAL_TAG_SLUGS
+    ]
+
+    return {
+        "commander_name": theme_row.get("commander_name"),
+        "commander_slug": theme_row.get("commander_slug"),
+        "color_identity": theme_row.get("color_identity"),
+        "total_decks": theme_row.get("total_decks"),
+        "card_image_url": theme_row.get("card_image_url"),
+        "partner_card_image_urls": theme_row.get("partner_card_image_urls"),
+        "scryfall_uri": theme_row.get("scryfall_uri"),
+        "partner_scryfall_uris": theme_row.get("partner_scryfall_uris"),
+        "scryfall_card_names": theme_row.get("scryfall_card_names"),
+        "theme_tag_name": theme_row.get("tag_name"),
+        "theme_tag_slug": theme_row.get("tag_slug"),
+        "theme_z": theme_row.get("z"),
+        "theme_tag_decks": theme_row.get("tag_decks"),
+        "theme_affinity_pct": theme_row.get("tag_affinity_pct"),
+        "theme_rank_within_tag_by_z": theme_row.get("rank_within_tag_by_z"),
+        "bracket_tag_rows": bracket_tag_rows,
+    }
+
+
+def export_theme_bracket_files(
+    df: pd.DataFrame,
+    tag_summary_df: pd.DataFrame | None,
+    output_dir: Path,
+) -> dict[str, Any]:
+    theme_brackets_dir = output_dir / "theme-brackets"
+    theme_brackets_dir.mkdir(parents=True, exist_ok=True)
+
+    commander_rows_by_slug = {
+        str(commander_slug): group.to_dict(orient="records")
+        for commander_slug, group in df.groupby("commander_slug")
+    }
+    tag_index = build_tag_index(df, tag_summary_df)
+    tag_info_by_slug = {
+        safe_json_filename(row.get("tag_slug")): row
+        for row in tag_index.to_dict(orient="records")
+        if has_value(row.get("tag_slug"))
+    }
+    theme_index = []
+    max_commanders = 0
+
+    for raw_theme_slug, group in df.groupby("tag_slug"):
+        theme_slug = safe_json_filename(raw_theme_slug)
+        uses_bracket_rules_only = theme_slug in BRACKET_SIGNAL_TAG_SLUGS
+
+        if uses_bracket_rules_only:
+            qualified = group.copy()
+        else:
+            z_scores = pd.to_numeric(group.get("z"), errors="coerce")
+            qualified = group.loc[z_scores >= THEME_BRACKET_MIN_Z]
+
+        if "commander_slug" in qualified.columns:
+            qualified = qualified.sort_values("z", ascending=False, na_position="last")
+            qualified = qualified.drop_duplicates(subset=["commander_slug"])
+
+        rows = []
+
+        for theme_row in qualified.to_dict(orient="records"):
+            commander_slug = str(theme_row.get("commander_slug") or "")
+            rows.append(
+                build_theme_bracket_commander_row(
+                    theme_row,
+                    commander_rows_by_slug.get(commander_slug, [theme_row]),
+                )
+            )
+
+        filename = f"theme-brackets/{theme_slug}.json"
+        write_json(output_dir / filename, rows)
+        max_commanders = max(max_commanders, len(rows))
+
+        theme_info = dict(tag_info_by_slug.get(theme_slug, {}))
+        theme_info.setdefault("tag_slug", raw_theme_slug)
+        theme_info.setdefault("tag_name", group.iloc[0].get("tag_name"))
+        theme_info["qualified_commander_count"] = len(rows)
+        theme_info["minimum_z"] = (
+            None if uses_bracket_rules_only else THEME_BRACKET_MIN_Z
+        )
+        theme_info["qualification_rule"] = (
+            "bracket_rules_only"
+            if uses_bracket_rules_only
+            else "theme_z_and_bracket_rules"
+        )
+        theme_info["file"] = filename
+        theme_index.append(theme_info)
+
+    theme_index.sort(
+        key=lambda item: str(item.get("tag_name") or item.get("tag_slug") or "").lower()
+    )
+    write_json(theme_brackets_dir / "index.json", theme_index)
+
+    return {
+        "theme_count": len(theme_index),
+        "minimum_z": THEME_BRACKET_MIN_Z,
+        "max_commanders_in_theme_file": max_commanders,
+        "index_file": "theme-brackets/index.json",
+        "file_pattern": "theme-brackets/<tag_slug>.json",
+    }
+
+
 def export_tag_files(
     df: pd.DataFrame,
     tag_summary_df: pd.DataFrame | None,
@@ -722,6 +850,11 @@ def export_full_site_data(
     commander_export = export_commander_files(df, output_dir)
     set_export = export_set_files(df, output_dir)
     tag_export = export_tag_files(df, tag_summary_df, output_dir)
+    theme_bracket_export = export_theme_bracket_files(
+        df,
+        tag_summary_df,
+        output_dir,
+    )
     leaderboard_export = export_leaderboard_pages(df, output_dir, page_size)
 
     manifest = {
@@ -737,6 +870,7 @@ def export_full_site_data(
         "commander_export": commander_export,
         "set_export": set_export,
         "tag_export": tag_export,
+        "theme_bracket_export": theme_bracket_export,
         "leaderboard_export": leaderboard_export,
     }
 
