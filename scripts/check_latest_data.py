@@ -71,6 +71,9 @@ def main() -> None:
     tag_index = read_json_file(args.frontend_data_dir / "tags/index.json")
     commander_index = read_json_file(args.frontend_data_dir / "commanders/index.json")
     sets_index_path = args.frontend_data_dir / "sets/index.json"
+    theme_brackets_index_path = (
+        args.frontend_data_dir / "theme-brackets/index.json"
+    )
 
     if tag_index:
         first_tag_slug = tag_index[0].get("tag_slug") or tag_index[0].get("slug")
@@ -100,6 +103,26 @@ def main() -> None:
                     args.frontend_data_dir
                     / "sets"
                     / f"{safe_json_filename(first_set_code)}.json"
+                )
+
+    if theme_brackets_index_path.exists():
+        theme_bracket_index = read_json_file(theme_brackets_index_path)
+
+        if (
+            isinstance(theme_bracket_index, list)
+            and theme_bracket_index
+            and isinstance(theme_bracket_index[0], dict)
+        ):
+            first_theme_file = theme_bracket_index[0].get("file")
+            first_theme_slug = theme_bracket_index[0].get("tag_slug")
+
+            if first_theme_file:
+                validate_json_file(args.frontend_data_dir / first_theme_file)
+            elif first_theme_slug:
+                validate_json_file(
+                    args.frontend_data_dir
+                    / "theme-brackets"
+                    / f"{safe_json_filename(first_theme_slug)}.json"
                 )
 
     print(f"Validated sharded frontend data in {args.frontend_data_dir}.")

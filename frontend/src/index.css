@@ -1361,8 +1361,13 @@ button:disabled {
 
 .detail-back-link {
   display: inline-flex;
+  padding: 0;
+  border: 0;
+  background: none;
   color: var(--accent);
+  font: inherit;
   font-weight: 800;
+  cursor: pointer;
 }
 
 .detail-back-link:hover {

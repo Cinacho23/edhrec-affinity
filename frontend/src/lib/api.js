@@ -91,6 +91,15 @@ export async function loadSetDetail(setCode) {
   return fetchJson(`sets/${filename}.json`);
 }
 
+export async function loadThemeBracketIndex() {
+  return fetchJson("theme-brackets/index.json");
+}
+
+export async function loadThemeBracketDetail(themeSlug) {
+  const filename = safeJsonFilename(themeSlug);
+  return fetchJson(`theme-brackets/${filename}.json`);
+}
+
 export async function loadLeaderboardIndex() {
   return fetchJson("leaderboard/index.json");
 }
