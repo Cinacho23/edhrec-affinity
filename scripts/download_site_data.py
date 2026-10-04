@@ -103,6 +103,10 @@ def build_download_list(base_url: str, output_dir: Path) -> list[str]:
     write_json(output_dir, "site_manifest.json", manifest)
 
     paths = set(manifest.get("summary_files", {}).values())
+    theme_report_file = manifest.get("theme_report_export", {}).get("file")
+
+    if theme_report_file:
+        paths.add(theme_report_file)
 
     leaderboard_index = fetch_json(base_url, "leaderboard/index.json")
     write_json(output_dir, "leaderboard/index.json", leaderboard_index)

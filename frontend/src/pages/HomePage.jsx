@@ -95,6 +95,9 @@ export default function HomePage() {
           <Link className="button" to="/leaderboard">
             Global Leaderboard
           </Link>
+          <Link className="button" to="/theme-report">
+            Theme Report
+          </Link>
         </div>
       </div>
 

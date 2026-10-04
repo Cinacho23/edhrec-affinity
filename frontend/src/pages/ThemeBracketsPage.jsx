@@ -1,23 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import BracketBadge from "../components/BracketBadge";
 import SimpleTable from "../components/SimpleTable";
 import {
-  loadCommanderDetail,
-  loadTagDetail,
-  loadTagIndex,
-  loadThemeBracketDetail,
-  loadThemeBracketIndex,
-} from "../lib/api";
-import {
-  ARCHETYPE_TAG_SLUGS,
   BRACKET_OPTIONS,
-  CEDH_TAG_SLUG,
-  THEME_BRACKET_MIN_Z,
   buildCommanderThemeBracketRows,
   themeUsesBracketRulesOnly,
 } from "../lib/bracketUtils";
+import { createThemeBracketDataLoader } from "../lib/themeBracketData";
 import {
   formatColorIdentity,
   formatDecimal,
@@ -46,60 +37,16 @@ const DEFAULT_FILTERS = {
 const FILTER_STORAGE_KEY = "edhrec-affinity:theme-brackets:filters";
 const SELECTED_THEME_STORAGE_KEY = "edhrec-affinity:theme-brackets:selected-theme";
 const SORT_STORAGE_KEY = "edhrec-affinity:theme-brackets:sort";
-const COMMANDER_REQUEST_CONCURRENCY = 8;
-const BRACKET_SIGNAL_TAG_SLUGS = [
-  CEDH_TAG_SLUG,
-  ...ARCHETYPE_TAG_SLUGS,
-];
 
 function isAvailableTheme(themeList, themeSlug) {
   return themeList.some((theme) => theme.tag_slug === themeSlug);
-}
-
-async function mapWithConcurrency(items, concurrency, mapper) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (nextIndex < items.length) {
-      const currentIndex = nextIndex;
-      nextIndex += 1;
-      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
-    }
-  }
-
-  const workerCount = Math.min(concurrency, Math.max(items.length, 1));
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  return results;
-}
-
-function qualifiesForTheme(row, themeSlug) {
-  if (themeUsesBracketRulesOnly(themeSlug)) {
-    return true;
-  }
-
-  const score = Number(row?.z);
-  return Number.isFinite(score) && score >= THEME_BRACKET_MIN_Z;
-}
-
-function createThemeRow(themeRow, bracketTagRows) {
-  return {
-    ...themeRow,
-    theme_tag_name: themeRow.tag_name,
-    theme_tag_slug: themeRow.tag_slug,
-    theme_z: themeRow.z,
-    theme_tag_decks: themeRow.tag_decks,
-    theme_affinity_pct: themeRow.tag_affinity_pct,
-    bracket_tag_rows: bracketTagRows,
-  };
 }
 
 export default function ThemeBracketsPage() {
   const { themeSlug: routeThemeSlug = "" } = useParams();
   const navigate = useNavigate();
   const initialRouteThemeRef = useRef(routeThemeSlug.toLowerCase());
-  const commanderDetailCacheRef = useRef(new Map());
-  const bracketSignalRowsCacheRef = useRef(null);
+  const [dataLoader] = useState(createThemeBracketDataLoader);
   const [themes, setThemes] = useState([]);
   const [selectedTheme, setSelectedTheme] = useState("");
   const [themeRows, setThemeRows] = useState([]);
@@ -123,97 +70,11 @@ export default function ThemeBracketsPage() {
     ? normalizedRouteTheme
     : selectedTheme;
 
-  const loadFallbackRows = useCallback(async (themeSlug) => {
-    const tagData = await loadTagDetail(themeSlug);
-    const allThemeRows = Array.isArray(tagData) ? tagData : [];
-    const qualifiedRows = allThemeRows.filter((row) =>
-      qualifiesForTheme(row, themeSlug)
-    );
-
-    if (themeUsesBracketRulesOnly(themeSlug)) {
-      if (!bracketSignalRowsCacheRef.current) {
-        bracketSignalRowsCacheRef.current = (async () => {
-          const rowsByCommander = new Map();
-
-          for (const signalSlug of BRACKET_SIGNAL_TAG_SLUGS) {
-            const signalData =
-              signalSlug === themeSlug
-                ? allThemeRows
-                : await loadTagDetail(signalSlug);
-
-            for (const signalRow of Array.isArray(signalData) ? signalData : []) {
-              const commanderSlug = signalRow.commander_slug;
-
-              if (!commanderSlug) continue;
-
-              if (!rowsByCommander.has(commanderSlug)) {
-                rowsByCommander.set(commanderSlug, []);
-              }
-
-              rowsByCommander.get(commanderSlug).push({
-                tag_name: signalRow.tag_name,
-                tag_slug: signalRow.tag_slug,
-                z: signalRow.z,
-                tag_decks: signalRow.tag_decks,
-              });
-            }
-          }
-
-          return rowsByCommander;
-        })();
-      }
-
-      const rowsByCommander = await bracketSignalRowsCacheRef.current;
-
-      return qualifiedRows.map((themeRow) =>
-        createThemeRow(
-          themeRow,
-          rowsByCommander.get(themeRow.commander_slug) || []
-        )
-      );
-    }
-
-    return mapWithConcurrency(
-      qualifiedRows,
-      COMMANDER_REQUEST_CONCURRENCY,
-      async (themeRow) => {
-        const commanderSlug = themeRow.commander_slug;
-
-        if (!commanderSlug) {
-          return createThemeRow(themeRow, []);
-        }
-
-        if (!commanderDetailCacheRef.current.has(commanderSlug)) {
-          const detailPromise = loadCommanderDetail(commanderSlug).catch(() => []);
-          commanderDetailCacheRef.current.set(commanderSlug, detailPromise);
-        }
-
-        const detailRows = await commanderDetailCacheRef.current.get(
-          commanderSlug
-        );
-
-        return createThemeRow(
-          themeRow,
-          Array.isArray(detailRows) ? detailRows : []
-        );
-      }
-    );
-  }, []);
-
   useEffect(() => {
     async function loadThemes() {
       try {
-        let themeList;
-        let hasThemeBracketFiles = true;
-
-        try {
-          const data = await loadThemeBracketIndex();
-          themeList = Array.isArray(data) ? data : [];
-        } catch {
-          hasThemeBracketFiles = false;
-          const data = await loadTagIndex();
-          themeList = Array.isArray(data) ? data : [];
-        }
+        const { themes: themeList, usesThemeBracketFiles: hasThemeBracketFiles } =
+          await dataLoader.loadIndex();
 
         const initialRouteTheme = initialRouteThemeRef.current;
         const storedTheme = readSessionValue(SELECTED_THEME_STORAGE_KEY, "");
@@ -237,7 +98,7 @@ export default function ThemeBracketsPage() {
     }
 
     loadThemes();
-  }, []);
+  }, [dataLoader]);
 
   useEffect(() => {
     writeSessionValue(FILTER_STORAGE_KEY, filters);
@@ -265,18 +126,7 @@ export default function ThemeBracketsPage() {
       }));
 
       try {
-        let nextRows;
-
-        if (usesThemeBracketFiles) {
-          try {
-            const data = await loadThemeBracketDetail(activeTheme);
-            nextRows = Array.isArray(data) ? data : [];
-          } catch {
-            nextRows = await loadFallbackRows(activeTheme);
-          }
-        } else {
-          nextRows = await loadFallbackRows(activeTheme);
-        }
+        const nextRows = await dataLoader.loadRows(activeTheme, usesThemeBracketFiles);
 
         if (!isCurrent) return;
 
@@ -298,7 +148,7 @@ export default function ThemeBracketsPage() {
     return () => {
       isCurrent = false;
     };
-  }, [activeTheme, usesThemeBracketFiles, loadFallbackRows]);
+  }, [activeTheme, usesThemeBracketFiles, dataLoader]);
 
   const selectedThemeInfo = useMemo(
     () => themes.find((theme) => theme.tag_slug === activeTheme),
