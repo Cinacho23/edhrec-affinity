@@ -2,6 +2,8 @@ import json
 import importlib.util
 from pathlib import Path
 
+import pandas as pd
+
 EXPORT_SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "export_full_site_data.py"
 )
@@ -229,4 +231,145 @@ def test_export_full_site_data_writes_compact_theme_bracket_files(tmp_path):
     assert {row["commander_slug"] for row in combo_rows} == {
         "theme-commander",
         "below-threshold",
+    }
+
+    report = read_json(output_dir / "theme-report.json")
+    assert manifest["theme_report_export"] == {
+        "file": "theme-report.json",
+        "theme_count": 2,
+        "commander_count": 2,
+        "row_count": 3,
+        "minimum_z": 1.05,
+    }
+    mutate_report = next(theme for theme in report["themes"] if theme["tag_slug"] == "mutate")
+    assert mutate_report["rows"] == [
+        {
+            "commander_slug": "theme-commander",
+            "theme_z": 2.4,
+            "theme_tag_decks": 40,
+            "theme_affinity_pct": 0.1,
+        }
+    ]
+
+
+def test_theme_report_matches_theme_brackets_without_deck_minimums(tmp_path):
+    tiny_commander = {
+        "commander_slug": "tiny-commander",
+        "commander_name": "Tiny Commander",
+        "total_decks": 10,
+        "color_identity": ["U"],
+        "tag_decks": 1,
+        "tag_affinity_pct": 0.1,
+    }
+    rows = [
+        {**tiny_commander, "tag_slug": "artifacts", "tag_name": "Artifacts", "z": 1.05},
+        {**tiny_commander, "tag_slug": "artifacts", "tag_name": "Artifacts", "z": 1.06},
+        {
+            **tiny_commander,
+            "commander_slug": "boundary-commander",
+            "tag_slug": "artifacts",
+            "tag_name": "Artifacts",
+            "z": 1.05,
+        },
+        {**tiny_commander, "tag_slug": "snow", "tag_name": "Snow", "z": 1.04},
+    ]
+
+    for slug in ["cedh", "aggro", "control", "midrange", "tempo", "combo"]:
+        rows.extend(
+            [
+                {**tiny_commander, "tag_slug": slug, "tag_name": slug.title(), "z": -2.0},
+                {
+                    **tiny_commander,
+                    "commander_slug": "null-signal-commander",
+                    "commander_name": "Null Signal Commander",
+                    "tag_slug": slug,
+                    "tag_name": slug.title(),
+                    "z": None,
+                },
+            ]
+        )
+
+    df = pd.DataFrame(rows)
+    export_full_site_data_module.export_theme_bracket_files(df, None, tmp_path)
+    metadata = export_full_site_data_module.export_theme_report(df, None, tmp_path)
+    report = read_json(tmp_path / "theme-report.json")
+    commanders = {row["commander_slug"]: row for row in report["commanders"]}
+
+    assert metadata["row_count"] == 14
+    assert metadata["theme_count"] == 8
+    assert metadata["commander_count"] == 3
+    assert commanders["tiny-commander"]["total_decks"] == 10
+    assert len(commanders["tiny-commander"]["bracket_tag_rows"]) == 6
+    assert {theme["tag_slug"] for theme in report["themes"]} == {
+        "artifacts", "snow", "cedh", "aggro", "control", "midrange", "tempo", "combo"
+    }
+
+    for theme in report["themes"]:
+        bracket_rows = read_json(tmp_path / "theme-brackets" / f'{theme["tag_slug"]}.json')
+        assert len(theme["rows"]) == len(bracket_rows)
+
+        for report_row, bracket_row in zip(theme["rows"], bracket_rows):
+            commander = commanders[report_row["commander_slug"]]
+            assert report_row == {key: bracket_row[key] for key in report_row}
+            assert commander == {key: bracket_row[key] for key in commander}
+
+    artifacts = next(theme for theme in report["themes"] if theme["tag_slug"] == "artifacts")
+    assert [row["theme_z"] for row in artifacts["rows"]] == [1.06, 1.05]
+    assert all(row["theme_tag_decks"] == 1 for row in artifacts["rows"])
+    assert next(theme for theme in report["themes"] if theme["tag_slug"] == "snow")["rows"] == []
+
+
+def test_theme_report_retains_empty_themes_and_handles_an_empty_dataset(tmp_path):
+    df = pd.DataFrame(
+        [
+            {
+                "commander_slug": "below-threshold",
+                "tag_slug": "snow",
+                "tag_name": "Snow",
+                "z": 1.04,
+            }
+        ]
+    )
+    metadata = export_full_site_data_module.export_theme_report(df, None, tmp_path)
+    assert metadata["row_count"] == 0
+    assert read_json(tmp_path / "theme-report.json") == {
+        "commanders": [],
+        "themes": [{"tag_slug": "snow", "tag_name": "Snow", "rows": []}],
+    }
+
+    metadata = export_full_site_data_module.export_theme_report(df.iloc[:0], None, tmp_path)
+    assert metadata["row_count"] == metadata["commander_count"] == metadata["theme_count"] == 0
+    assert read_json(tmp_path / "theme-report.json") == {"commanders": [], "themes": []}
+
+
+def test_theme_report_writes_strict_json_for_nonfinite_values(tmp_path):
+    df = pd.DataFrame(
+        [
+            {
+                "commander_slug": "commander",
+                "tag_slug": "combo",
+                "tag_name": "Combo",
+                "total_decks": float("nan"),
+                "tag_decks": float("inf"),
+                "tag_affinity_pct": float("inf"),
+                "z": float("-inf"),
+            }
+        ]
+    )
+    export_full_site_data_module.export_theme_report(df, None, tmp_path)
+
+    def reject_nonfinite(value):
+        raise AssertionError(f"Nonfinite JSON number: {value}")
+
+    report = json.loads(
+        (tmp_path / "theme-report.json").read_text(encoding="utf-8"),
+        parse_constant=reject_nonfinite,
+    )
+    assert report["commanders"][0]["total_decks"] is None
+    assert report["commanders"][0]["bracket_tag_rows"][0]["z"] is None
+    assert report["themes"][0]["rows"][0] == {
+        "commander_slug": "commander",
+        "theme_z": None,
+        "theme_tag_decks": None,
+        "theme_affinity_pct": None,
     }

@@ -9,6 +9,7 @@ import TagExplorerPage from "./pages/TagExplorerPage";
 import SetExplorerPage from "./pages/SetExplorerPage";
 import SetBracketsPage from "./pages/SetBracketsPage";
 import ThemeBracketsPage from "./pages/ThemeBracketsPage";
+import ThemeReportPage from "./pages/ThemeReportPage";
 import MethodologyPage from "./pages/MethodologyPage";
 import NotFoundPage from "./pages/NotFoundPage";
 
@@ -26,6 +27,7 @@ export default function App() {
         <Route path="/brackets/:setCode" element={<SetBracketsPage />} />
         <Route path="/theme-brackets" element={<ThemeBracketsPage />} />
         <Route path="/theme-brackets/:themeSlug" element={<ThemeBracketsPage />} />
+        <Route path="/theme-report" element={<ThemeReportPage />} />
         <Route path="/methodology" element={<MethodologyPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>

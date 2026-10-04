@@ -18,6 +18,7 @@ This project is not trying to reproduce EDHREC. Its purpose is to add an origina
 - Tag explorer
 - Set-based commander brackets
 - Theme brackets with a 1.05 theme gate plus bracket-rule-only signal themes
+- Theme Report: top z-scoring commanders across every theme, overall or per bracket, with adjustable top counts and default minimums of 200 total decks and 5 theme decks
 - Sortable and filterable tables
 - Z-score, percentile, and rank metrics
 - Trend fields across dated snapshots

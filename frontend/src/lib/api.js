@@ -1,4 +1,4 @@
-const BASE_URL = import.meta.env.BASE_URL || "/";
+const BASE_URL = import.meta.env?.BASE_URL || "/";
 
 function getBasePath() {
   return BASE_URL.endsWith("/") ? BASE_URL : `${BASE_URL}/`;
@@ -98,6 +98,10 @@ export async function loadThemeBracketIndex() {
 export async function loadThemeBracketDetail(themeSlug) {
   const filename = safeJsonFilename(themeSlug);
   return fetchJson(`theme-brackets/${filename}.json`);
+}
+
+export async function loadThemeReport() {
+  return fetchJson("theme-report.json");
 }
 
 export async function loadLeaderboardIndex() {
