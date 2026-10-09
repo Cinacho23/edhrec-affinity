@@ -184,16 +184,16 @@ test("uses bracket rules without a second 1.05 gate for bracket-signal themes", 
   );
 });
 
-test("affinity upgrades preserve every legacy bracket boundary and missing signal", () => {
+test("canonical affinity determines every bracket boundary even with divergent legacy scores", () => {
   for (const slug of ["cedh", "combo"]) {
     for (const score of [null, -2, 0, 0.02, 0.05, 0.95, 0.98, 1.05, 2]) {
       const oldRow = { ...tag(slug, score), tag_decks: 17 };
-      const upgraded = { ...oldRow, z: 9, legacy_z: score };
-      const { decision_affinity_z: newAffinity, ...newClassification } = classifyCommanderRows([upgraded]);
-      const { decision_affinity_z: oldAffinity, ...oldClassification } = classifyCommanderRows([oldRow]);
+      const upgraded = { ...oldRow, legacy_z: 9 };
+      const { decision_legacy_z: history, ...newClassification } = classifyCommanderRows([upgraded]);
+      const { decision_legacy_z: noHistory, ...oldClassification } = classifyCommanderRows([oldRow]);
       assert.deepEqual(newClassification, oldClassification);
-      assert.equal(newAffinity, newClassification.decision_tag_slug ? 9 : null);
-      assert.equal(oldAffinity, oldClassification.decision_tag_slug ? score : null);
+      assert.equal(history, newClassification.decision_tag_slug ? 9 : null);
+      assert.equal(noHistory, null);
     }
   }
 });
@@ -213,7 +213,7 @@ test("deciding metrics follow the selected tag instead of the commander's first 
       tag_affinity_adjusted_pct: .18, tag_affinity_lower_pct: .15,
       tag_affinity_upper_pct: .21, rank_within_tag_by_z: 7,
       affinity_model_status: "fitted", affinity_model_version: "beta_binomial_v1" },
-    { ...identity, ...tag("cedh", -.2), legacy_z: .4, tag_affinity_pct: .03,
+    { ...identity, ...tag("cedh", .4), legacy_z: -.2, tag_affinity_pct: .03,
       tag_affinity_adjusted_pct: .025, tag_affinity_lower_pct: .01,
       tag_affinity_upper_pct: .04, rank_within_tag_by_z: 19,
       affinity_model_status: "fitted", affinity_model_version: "beta_binomial_v1" },
@@ -222,7 +222,8 @@ test("deciding metrics follow the selected tag instead of the commander's first 
   assert.equal(decision.bracket_key, "4");
   assert.equal(decision.decision_tag_slug, "cedh");
   assert.equal(decision.decision_z, .4);
-  assert.equal(decision.decision_affinity_z, -.2);
+  assert.equal(decision.decision_affinity_z, .4);
+  assert.equal(decision.decision_legacy_z, -.2);
   assert.equal(decision.decision_tag_affinity_pct, .03);
   assert.equal(decision.decision_tag_affinity_adjusted_pct, .025);
   assert.equal(decision.decision_tag_affinity_lower_pct, .01);
@@ -244,7 +245,7 @@ test("full and compact theme data preserve independent selected and deciding tag
     tag_affinity_lower_pct: .15, tag_affinity_upper_pct: .21,
     tag_decks: 200, rank_within_tag_by_z: 7,
     affinity_model_status: "fitted", affinity_model_version: "beta_binomial_v1" };
-  const deciding = { ...identity, ...tag("cedh", null), legacy_z: .4,
+  const deciding = { ...identity, ...tag("cedh", .4), legacy_z: null,
     tag_affinity_pct: .03, tag_affinity_adjusted_pct: .03,
     tag_affinity_lower_pct: null, tag_affinity_upper_pct: null,
     tag_decks: 30, rank_within_tag_by_z: null,
@@ -252,7 +253,7 @@ test("full and compact theme data preserve independent selected and deciding tag
   const firstUnrelated = { ...identity, ...tag("lands", 99), legacy_z: 4,
     tag_affinity_pct: .9, tag_affinity_adjusted_pct: .899 };
   const compact = { ...identity, theme_tag_slug: "tokens", theme_tag_name: "tokens",
-    theme_z: 1.2, theme_legacy_z: 1.2, theme_affinity_z: 3,
+    theme_z: 3, theme_legacy_z: 1.2, theme_affinity_z: 3,
     theme_tag_decks: 200, theme_affinity_pct: .2, theme_affinity_adjusted_pct: .18,
     theme_affinity_lower_pct: .15, theme_affinity_upper_pct: .21,
     theme_rank_within_tag_by_z: 7, theme_affinity_model_status: "fitted",
@@ -264,21 +265,23 @@ test("full and compact theme data preserve independent selected and deciding tag
   assert.equal(fullResult.theme_affinity_adjusted_pct, .18);
   assert.equal(fullResult.theme_affinity_lower_pct, .15);
   assert.equal(fullResult.theme_affinity_upper_pct, .21);
-  assert.equal(fullResult.theme_z, 1.2);
+  assert.equal(fullResult.theme_z, 3);
+  assert.equal(fullResult.theme_legacy_z, 1.2);
   assert.equal(fullResult.theme_affinity_z, 3);
   assert.equal(fullResult.theme_rank_within_tag_by_z, 7);
   assert.equal(fullResult.decision_tag_affinity_pct, .03);
-  assert.equal(fullResult.decision_affinity_z, null);
+  assert.equal(fullResult.decision_affinity_z, .4);
+  assert.equal(fullResult.decision_legacy_z, null);
   assert.equal(fullResult.decision_tag_affinity_lower_pct, null);
 });
 
 test("missing selected metrics stay null without borrowing unrelated or legacy fields", () => {
   const result = buildCommanderThemeBracketRows([{
-    commander_slug: "missing", theme_tag_slug: "tokens", theme_z: 1.2,
+    commander_slug: "missing", theme_tag_slug: "aggro", theme_z: 1.2,
     theme_affinity_z: null, tag_affinity_pct: .99, tag_affinity_adjusted_pct: .98,
     rank_within_tag_by_z: 1, affinity_model_status: "fitted",
     bracket_tag_rows: [tag("combo", 1.2)],
-  }], "tokens")[0];
+  }], "aggro")[0];
   assert.equal(result.theme_affinity_z, null);
   assert.equal(result.theme_affinity_pct, null);
   assert.equal(result.theme_affinity_adjusted_pct, null);
@@ -288,19 +291,55 @@ test("missing selected metrics stay null without borrowing unrelated or legacy f
   assert.equal(result.decision_tag_affinity_adjusted_pct, null);
 });
 
-test("theme bracket eligibility and displayed score retain legacy affinity", () => {
+test("theme eligibility and bracket assignment use current affinity and preserve history", () => {
   const rows = [
     { commander_slug: "retained", ...tag("tokens", 0.2), legacy_z: 1.2 },
-    { commander_slug: "retained", ...tag("combo", -0.4), legacy_z: 1.05 },
+    { commander_slug: "retained", ...tag("combo", 5), legacy_z: 1.05 },
     { commander_slug: "excluded", ...tag("tokens", 5), legacy_z: 1.04 },
-    { commander_slug: "excluded", ...tag("combo", 5), legacy_z: 1.05 },
-    { commander_slug: "missing", ...tag("tokens", 5), legacy_z: null },
+    { commander_slug: "excluded", ...tag("combo", -.4), legacy_z: 1.05 },
+    { commander_slug: "missing", ...tag("tokens", null), legacy_z: 5 },
   ];
   const results = buildCommanderThemeBracketRows(rows, "tokens");
   assert.equal(results.length, 1);
-  assert.equal(results[0].commander_slug, "retained");
-  assert.equal(results[0].bracket_key, "3");
-  assert.equal(results[0].theme_z, 1.2);
-  assert.equal(results[0].theme_affinity_z, 0.2);
-  assert.equal(results[0].decision_z, 1.05);
+  assert.equal(results[0].commander_slug, "excluded");
+  assert.equal(results[0].bracket_key, "1");
+  assert.equal(results[0].theme_z, 5);
+  assert.equal(results[0].theme_affinity_z, 5);
+  assert.equal(results[0].theme_legacy_z, 1.04);
+  assert.equal(results[0].decision_z, -.4);
+  assert.equal(results[0].decision_legacy_z, 1.05);
+});
+
+test("missing current signal never borrows a legacy score and new-score ties retain input order", () => {
+  const missing = classifyCommanderRows([
+    { ...tag("cedh", null), legacy_z: 9 },
+    { ...tag("combo", .4), legacy_z: 9 },
+  ]);
+  assert.equal(missing.bracket_key, "2");
+  assert.equal(missing.decision_tag_slug, "combo");
+  const tied = classifyCommanderRows([
+    { ...tag("tempo", 1.2), legacy_z: .1 },
+    { ...tag("combo", 1.2), legacy_z: 9 },
+  ]);
+  assert.equal(tied.decision_tag_slug, "tempo");
+});
+
+test("compact selected-theme null stays authoritative over contradictory flat and signal metrics", () => {
+  const rows = [{
+    commander_slug: "missing", theme_tag_slug: "aggro", theme_z: 1.2,
+    theme_affinity_z: null, theme_affinity_pct: null,
+    tag_slug: "aggro", z: 2, tag_affinity_pct: .99,
+    bracket_tag_rows: [{ ...tag("aggro", 1.4), tag_affinity_pct: .8 }],
+  }];
+  const result = buildCommanderThemeBracketRows(rows, "aggro")[0];
+  assert.equal(result.theme_z, null);
+  assert.equal(result.theme_affinity_z, null);
+  assert.equal(result.theme_affinity_pct, null);
+  assert.equal(result.bracket_key, "3");
+  assert.equal(result.decision_z, 1.4);
+  assert.equal(result.decision_tag_affinity_pct, .8);
+  assert.deepEqual(buildCommanderThemeBracketRows([{
+    ...rows[0], theme_tag_slug: "tokens",
+    bracket_tag_rows: [tag("tokens", 3)],
+  }], "tokens"), []);
 });

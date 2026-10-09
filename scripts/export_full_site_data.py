@@ -407,12 +407,9 @@ def sort_for_leaderboard(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def sort_for_commander_detail(df: pd.DataFrame) -> pd.DataFrame:
-    # Preserve the order used to resolve tied legacy bracket signals. The
-    # affinity pages rank/filter using the separate upgraded score themselves.
-    if "legacy_z" in df.columns:
-        return df.sort_values("legacy_z", ascending=False, na_position="last")
     if "z" in df.columns:
-        return df.sort_values("z", ascending=False, na_position="last")
+        columns = [column for column in ["z", "commander_name", "tag_name", "tag_slug"] if column in df.columns]
+        return df.sort_values(columns, ascending=[False, *([True] * (len(columns) - 1))], na_position="last", kind="stable")
 
     if "tag_decks" in df.columns:
         return df.sort_values("tag_decks", ascending=False, na_position="last")
@@ -581,10 +578,11 @@ def export_set_files(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
         sorted_rows = sorted(
             rows,
             key=lambda row: (
-                row.get("legacy_z", row.get("z")) is None,
-                -as_sort_float(row.get("legacy_z", row.get("z"))),
+                not has_value(row.get("z")),
+                -as_sort_float(row.get("z")),
                 str(row.get("commander_name") or ""),
                 str(row.get("tag_name") or ""),
+                str(row.get("tag_slug") or ""),
             ),
         )
         write_json(sets_dir / f"{safe_json_filename(set_code)}.json", sorted_rows)
@@ -639,19 +637,22 @@ def build_theme_bracket_signal_row(row: dict[str, Any]) -> dict[str, Any]:
 def build_theme_bracket_signal_rows(
     commander_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    return [
+    signal_rows = [
         build_theme_bracket_signal_row(row)
         for row in commander_rows
         if safe_json_filename(row.get("tag_slug")) in BRACKET_SIGNAL_TAG_SLUGS
     ]
+    return sorted(signal_rows, key=lambda row: (
+        not has_value(row.get("z")), -as_sort_float(row.get("z")),
+        str(row.get("tag_name") or ""), str(row.get("tag_slug") or ""),
+    ))
 
 
 def qualify_theme_bracket_rows(group: pd.DataFrame, theme_slug: str) -> pd.DataFrame:
     if safe_json_filename(theme_slug) in BRACKET_SIGNAL_TAG_SLUGS:
         qualified = group.copy()
     else:
-        score_column = "legacy_z" if "legacy_z" in group.columns else "z"
-        z_scores = pd.to_numeric(group.get(score_column), errors="coerce")
+        z_scores = pd.to_numeric(group.get("z"), errors="coerce")
         qualified = group.loc[z_scores >= THEME_BRACKET_MIN_Z]
 
     if "commander_slug" in qualified.columns:
@@ -664,7 +665,7 @@ def qualify_theme_bracket_rows(group: pd.DataFrame, theme_slug: str) -> pd.DataF
 def build_theme_affinity_fields(theme_row: dict[str, Any]) -> dict[str, Any]:
     """Keep both score versions and the selected theme's own model metrics."""
     return {
-        "theme_z": theme_row.get("legacy_z") if "legacy_z" in theme_row else theme_row.get("z"),
+        "theme_z": theme_row.get("z"),
         "theme_affinity_z": theme_row.get("z"),
         **({"theme_legacy_z": theme_row["legacy_z"]} if "legacy_z" in theme_row else {}),
         "theme_tag_decks": theme_row.get("tag_decks"),
@@ -738,7 +739,7 @@ def export_theme_bracket_files(
             )
 
         filename = f"theme-brackets/{theme_slug}.json"
-        write_json(output_dir / filename, rows)
+        write_json(output_dir / filename, {"qualification_score_field": "z", "rows": rows})
         max_commanders = max(max_commanders, len(rows))
 
         theme_info = dict(tag_info_by_slug.get(theme_slug, {}))
@@ -753,6 +754,7 @@ def export_theme_bracket_files(
             if uses_bracket_rules_only
             else "theme_z_and_bracket_rules"
         )
+        theme_info["qualification_score_field"] = "z"
         theme_info["file"] = filename
         theme_index.append(theme_info)
 
@@ -764,6 +766,7 @@ def export_theme_bracket_files(
     return {
         "theme_count": len(theme_index),
         "minimum_z": THEME_BRACKET_MIN_Z,
+        "qualification_score_field": "z",
         "max_commanders_in_theme_file": max_commanders,
         "index_file": "theme-brackets/index.json",
         "file_pattern": "theme-brackets/<tag_slug>.json",
@@ -845,7 +848,7 @@ def export_theme_report(
     filename = "theme-report.json"
     write_json(
         output_dir / filename,
-        {"commanders": commanders, "themes": themes},
+        {"commanders": commanders, "themes": themes, "qualification_score_field": "z"},
         compact=True,
     )
 
@@ -855,6 +858,7 @@ def export_theme_report(
         "commander_count": len(commanders),
         "row_count": row_count,
         "minimum_z": THEME_BRACKET_MIN_Z,
+        "qualification_score_field": "z",
     }
 
 

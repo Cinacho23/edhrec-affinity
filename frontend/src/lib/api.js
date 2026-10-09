@@ -97,11 +97,28 @@ export async function loadThemeBracketIndex() {
 
 export async function loadThemeBracketDetail(themeSlug) {
   const filename = safeJsonFilename(themeSlug);
-  return fetchJson(`theme-brackets/${filename}.json`);
+  const theme = await fetchJson(`theme-brackets/${filename}.json`);
+
+  // Validate even empty files: a legacy-gated compact list can omit newly
+  // eligible commanders despite a current index. The loader uses complete
+  // tag data when an outdated compact file is rejected.
+  if (theme?.qualification_score_field !== "z" || !Array.isArray(theme.rows)) {
+    throw new Error("The compact theme uses an outdated qualification score or invalid rows.");
+  }
+
+  return theme.rows;
 }
 
 export async function loadThemeReport() {
-  return fetchJson("theme-report.json");
+  const report = await fetchJson("theme-report.json");
+
+  // Older compact reports omitted rows using legacy scores. The report page
+  // falls back to complete tag data when these rows cannot be recovered here.
+  if (report?.qualification_score_field !== "z") {
+    throw new Error("The compact theme report uses an outdated qualification score.");
+  }
+
+  return report;
 }
 
 export async function loadLeaderboardIndex() {

@@ -61,12 +61,13 @@ export default function ThemeBracketsPage() {
   const [filters, setFilters] = useState(() =>
     readSessionObject(FILTER_STORAGE_KEY, DEFAULT_FILTERS)
   );
-  const [sort, setSort] = useState(() =>
-    readSessionObject(SORT_STORAGE_KEY, {
+  const [sort, setSort] = useState(() => {
+    const stored = readSessionObject(SORT_STORAGE_KEY, {
       key: "bracket_rank",
       direction: "desc",
-    })
-  );
+    });
+    return { ...stored, key: stored.key === "theme_z" ? "theme_affinity_z" : stored.key };
+  });
   const [state, setState] = useState({
     loadingThemes: true,
     loadingRows: false,
@@ -255,12 +256,6 @@ export default function ThemeBracketsPage() {
       ),
     },
     {
-      key: "theme_z",
-      header: "Original Theme Z",
-      sortable: true,
-      render: (row) => formatDecimal(row.theme_z),
-    },
-    {
       key: "theme_tag_decks",
       header: "Theme Decks",
       sortable: true,
@@ -303,7 +298,7 @@ export default function ThemeBracketsPage() {
     },
     {
       key: "decision_z",
-      header: "Original Bracket Z",
+      header: "Bracket Z",
       sortable: true,
       render: (row) => formatDecimal(row.decision_z),
     },
@@ -349,19 +344,22 @@ export default function ThemeBracketsPage() {
   return (
     <section className="page bracket-page theme-bracket-page">
       <div className="page-header">
-        <p className="eyebrow">Theme-level power signals</p>
+        <p className="eyebrow">Theme-level bracket suggestions</p>
         <h1>Theme Brackets</h1>
         <p>
-          For ordinary themes, commanders must have an Original Theme Z of at least
+          For ordinary themes, commanders must have a theme z-score of at least
           1.05 and satisfy the selected bracket. When the selected theme is
           cEDH or one of the five archetypes, only the bracket rules apply.
+          Suggested building brackets give our recommended ceiling from tag
+          associations; actual deck strength depends on the build.
         </p>
         <p>
           Raw and adjusted affinity, the 95% range, z-score, and Rank in Tag
           all describe the selected theme. Rank in Tag compares all reported
-          commanders for that theme, across brackets. Original Theme Z and
-          Original Bracket Z drive the unchanged eligibility and classification
-          rules. “Unadjusted” marks a fallback and — means unavailable.{" "}
+          commanders for that theme, across brackets. Bracket Z describes the
+          Deciding Tag. The same numeric eligibility and bracket cutoffs now
+          use upgraded affinity z-scores. “Unadjusted” marks a fallback and —
+          means unavailable.{" "}
           <Link to="/methodology">How it works</Link>
         </p>
       </div>
@@ -373,13 +371,14 @@ export default function ThemeBracketsPage() {
             <h2 id="theme-rules-title">Two gates, with six exceptions</h2>
           </div>
           <p className="muted">
-            All other themes require Original Theme Z ≥ 1.05 plus the bracket rule.
+            All other themes require theme z ≥ 1.05 plus the bracket rule.
             cEDH, Aggro, Control, Midrange, Tempo, and Combo use only the
-            bracket rules below, using Original Bracket Z. cEDH is always evaluated first.
+            bracket rules below, using Bracket Z. Both scores use the upgraded
+            affinity algorithm. cEDH is always evaluated first.
           </p>
         </div>
         <div className="bracket-rule-grid">
-          <div><strong>Theme</strong><span>Original Theme Z ≥ 1.05, plus bracket</span></div>
+          <div><strong>Theme</strong><span>Theme z ≥ 1.05, plus bracket</span></div>
           <div><strong>6 tags</strong><span>cEDH/archetypes use bracket rules only</span></div>
           <div><strong>5</strong><span>cEDH ≥ 1.05</span></div>
           <div><strong>4/5</strong><span>cEDH &gt; 0.95 and &lt; 1.05</span></div>
@@ -480,8 +479,8 @@ export default function ThemeBracketsPage() {
                         ? `${formatNumber(theme.qualified_commander_count)} · bracket rules only`
                         : "Bracket rules only"
                       : theme.qualified_commander_count !== undefined
-                        ? `${formatNumber(theme.qualified_commander_count)} · original z ≥ 1.05`
-                        : "Original Theme Z ≥ 1.05, plus bracket"}
+                        ? `${formatNumber(theme.qualified_commander_count)} · z ≥ 1.05`
+                        : "Theme z ≥ 1.05, plus bracket"}
                   </small>
                 </button>
               ))
