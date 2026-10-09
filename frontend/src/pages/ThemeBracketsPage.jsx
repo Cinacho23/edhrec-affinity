@@ -4,6 +4,12 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import BracketBadge from "../components/BracketBadge";
 import SimpleTable from "../components/SimpleTable";
 import {
+  formatAdjustedAffinity,
+  formatAffinityInterval,
+  formatAffinityProbability,
+  getThemeAffinityMetrics,
+} from "../lib/affinityDisplay";
+import {
   BRACKET_OPTIONS,
   buildCommanderThemeBracketRows,
   themeUsesBracketRulesOnly,
@@ -13,6 +19,7 @@ import {
   formatColorIdentity,
   formatDecimal,
   formatNumber,
+  formatRank,
 } from "../lib/formatters";
 import {
   readSessionObject,
@@ -249,7 +256,7 @@ export default function ThemeBracketsPage() {
     },
     {
       key: "theme_z",
-      header: "Theme Z",
+      header: "Original Theme Z",
       sortable: true,
       render: (row) => formatDecimal(row.theme_z),
     },
@@ -260,6 +267,35 @@ export default function ThemeBracketsPage() {
       render: (row) => formatNumber(row.theme_tag_decks),
     },
     {
+      key: "theme_affinity_pct",
+      header: "Raw Affinity",
+      sortable: true,
+      render: (row) => formatAffinityProbability(getThemeAffinityMetrics(row).tag_affinity_pct),
+    },
+    {
+      key: "theme_affinity_adjusted_pct",
+      header: "Adjusted Affinity",
+      sortable: true,
+      render: (row) => formatAdjustedAffinity(getThemeAffinityMetrics(row)),
+    },
+    {
+      key: "theme_affinity_interval",
+      header: "95% Range",
+      render: (row) => formatAffinityInterval(getThemeAffinityMetrics(row)),
+    },
+    {
+      key: "theme_affinity_z",
+      header: "Z-Score",
+      sortable: true,
+      render: (row) => formatDecimal(getThemeAffinityMetrics(row).z),
+    },
+    {
+      key: "theme_rank_within_tag_by_z",
+      header: "Rank in Tag",
+      sortable: true,
+      render: (row) => formatRank(getThemeAffinityMetrics(row).rank_within_tag_by_z),
+    },
+    {
       key: "decision_tag_name",
       header: "Deciding Tag",
       sortable: true,
@@ -267,7 +303,7 @@ export default function ThemeBracketsPage() {
     },
     {
       key: "decision_z",
-      header: "Bracket Z",
+      header: "Original Bracket Z",
       sortable: true,
       render: (row) => formatDecimal(row.decision_z),
     },
@@ -316,9 +352,17 @@ export default function ThemeBracketsPage() {
         <p className="eyebrow">Theme-level power signals</p>
         <h1>Theme Brackets</h1>
         <p>
-          For ordinary themes, commanders must have a theme z-score of at least
+          For ordinary themes, commanders must have an Original Theme Z of at least
           1.05 and satisfy the selected bracket. When the selected theme is
           cEDH or one of the five archetypes, only the bracket rules apply.
+        </p>
+        <p>
+          Raw and adjusted affinity, the 95% range, z-score, and Rank in Tag
+          all describe the selected theme. Rank in Tag compares all reported
+          commanders for that theme, across brackets. Original Theme Z and
+          Original Bracket Z drive the unchanged eligibility and classification
+          rules. “Unadjusted” marks a fallback and — means unavailable.{" "}
+          <Link to="/methodology">How it works</Link>
         </p>
       </div>
 
@@ -329,13 +373,13 @@ export default function ThemeBracketsPage() {
             <h2 id="theme-rules-title">Two gates, with six exceptions</h2>
           </div>
           <p className="muted">
-            All other themes require theme z ≥ 1.05 plus the bracket rule.
+            All other themes require Original Theme Z ≥ 1.05 plus the bracket rule.
             cEDH, Aggro, Control, Midrange, Tempo, and Combo use only the
-            bracket rules below. cEDH is always evaluated first.
+            bracket rules below, using Original Bracket Z. cEDH is always evaluated first.
           </p>
         </div>
         <div className="bracket-rule-grid">
-          <div><strong>Theme</strong><span>Ordinary theme z ≥ 1.05, plus bracket</span></div>
+          <div><strong>Theme</strong><span>Original Theme Z ≥ 1.05, plus bracket</span></div>
           <div><strong>6 tags</strong><span>cEDH/archetypes use bracket rules only</span></div>
           <div><strong>5</strong><span>cEDH ≥ 1.05</span></div>
           <div><strong>4/5</strong><span>cEDH &gt; 0.95 and &lt; 1.05</span></div>
@@ -436,8 +480,8 @@ export default function ThemeBracketsPage() {
                         ? `${formatNumber(theme.qualified_commander_count)} · bracket rules only`
                         : "Bracket rules only"
                       : theme.qualified_commander_count !== undefined
-                        ? `${formatNumber(theme.qualified_commander_count)} · z ≥ 1.05`
-                        : "Theme z ≥ 1.05, plus bracket"}
+                        ? `${formatNumber(theme.qualified_commander_count)} · original z ≥ 1.05`
+                        : "Original Theme Z ≥ 1.05, plus bracket"}
                   </small>
                 </button>
               ))

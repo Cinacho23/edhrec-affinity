@@ -80,10 +80,17 @@ function createThemeRow(themeRow, bracketTagRows) {
     ...themeRow,
     theme_tag_name: themeRow.tag_name,
     theme_tag_slug: themeRow.tag_slug,
-    theme_z: themeRow.z,
+    theme_z: getBracketScore(themeRow),
+    theme_affinity_z: themeRow.z ?? null,
     ...(Object.hasOwn(themeRow, "legacy_z") ? { theme_legacy_z: themeRow.legacy_z } : {}),
     theme_tag_decks: themeRow.tag_decks,
     theme_affinity_pct: themeRow.tag_affinity_pct,
+    theme_affinity_adjusted_pct: themeRow.tag_affinity_adjusted_pct ?? null,
+    theme_affinity_lower_pct: themeRow.tag_affinity_lower_pct ?? null,
+    theme_affinity_upper_pct: themeRow.tag_affinity_upper_pct ?? null,
+    theme_affinity_model_status: themeRow.affinity_model_status ?? null,
+    theme_affinity_model_version: themeRow.affinity_model_version ?? null,
+    theme_rank_within_tag_by_z: themeRow.rank_within_tag_by_z ?? null,
     bracket_tag_rows: bracketTagRows,
   };
 }
@@ -176,6 +183,13 @@ export function createThemeBracketDataLoader({
               z: row.z,
               ...(Object.hasOwn(row, "legacy_z") ? { legacy_z: row.legacy_z } : {}),
               tag_decks: row.tag_decks,
+              tag_affinity_pct: row.tag_affinity_pct ?? null,
+              tag_affinity_adjusted_pct: row.tag_affinity_adjusted_pct ?? null,
+              tag_affinity_lower_pct: row.tag_affinity_lower_pct ?? null,
+              tag_affinity_upper_pct: row.tag_affinity_upper_pct ?? null,
+              affinity_model_status: row.affinity_model_status ?? null,
+              affinity_model_version: row.affinity_model_version ?? null,
+              rank_within_tag_by_z: row.rank_within_tag_by_z ?? null,
             });
           }
         }

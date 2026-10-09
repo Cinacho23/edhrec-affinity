@@ -117,3 +117,59 @@ test("invalid compact structures fail and empty themes are retained", () => {
   assert.deepEqual(expandThemeReport(data), data.themes);
   assert.deepEqual(expandThemeReport({ commanders: [], themes: [] }), []);
 });
+
+test("one commander in multiple themes retains each theme's metrics and separate deciding metrics", () => {
+  const groups = expandThemeReport({
+    commanders: [{ ...commander("shared", [{ ...signal("cedh", -.2), legacy_z: .4,
+      tag_affinity_pct: .03, tag_affinity_adjusted_pct: .025,
+      tag_affinity_lower_pct: .01, tag_affinity_upper_pct: .04,
+      rank_within_tag_by_z: 19, affinity_model_status: "fitted",
+      affinity_model_version: "beta_binomial_v1" }]),
+      tag_affinity_pct: .99, tag_affinity_adjusted_pct: .98 }],
+    themes: [
+      { tag_slug: "tokens", tag_name: "Tokens", rows: [{
+        ...themeRow("shared", 1.2), theme_legacy_z: 1.2, theme_affinity_z: 3,
+        theme_affinity_pct: .2, theme_affinity_adjusted_pct: .18,
+        theme_affinity_lower_pct: .15, theme_affinity_upper_pct: .21,
+        theme_rank_within_tag_by_z: 7, theme_affinity_model_status: "fitted",
+        theme_affinity_model_version: "beta_binomial_v1",
+      }] },
+      { tag_slug: "snow", tag_name: "Snow", rows: [{
+        ...themeRow("shared", 1.3), theme_legacy_z: 1.3, theme_affinity_z: 88,
+        theme_affinity_pct: .1, theme_affinity_adjusted_pct: .09,
+        theme_affinity_lower_pct: .08, theme_affinity_upper_pct: .11,
+        theme_rank_within_tag_by_z: 1, theme_affinity_model_status: "fitted",
+        theme_affinity_model_version: "beta_binomial_v1",
+      }] },
+      { tag_slug: "lands", tag_name: "Lands", rows: [{
+        ...themeRow("shared", 1.4), theme_legacy_z: 1.4, theme_affinity_z: null,
+        theme_affinity_pct: .4, theme_affinity_adjusted_pct: null,
+        theme_affinity_lower_pct: null, theme_affinity_upper_pct: null,
+      }] },
+    ],
+  });
+  const prepared = prepareThemeReportRows(groups);
+  const tokens = prepared.find((row) => row.theme_tag_slug === "tokens");
+  const snow = prepared.find((row) => row.theme_tag_slug === "snow");
+  const lands = prepared.find((row) => row.theme_tag_slug === "lands");
+  assert.equal(tokens.theme_z, 3);
+  assert.equal(tokens.theme_affinity_adjusted_pct, .18);
+  assert.equal(tokens.theme_rank_within_tag_by_z, 7);
+  assert.equal(snow.theme_z, 88);
+  assert.equal(snow.theme_affinity_adjusted_pct, .09);
+  assert.equal(snow.theme_rank_within_tag_by_z, 1);
+  assert.equal(lands.theme_z, null);
+  assert.equal(lands.theme_affinity_adjusted_pct, null);
+  assert.equal(lands.theme_affinity_model_status, null);
+  for (const row of prepared) {
+    assert.equal(row.bracket_key, "4");
+    assert.equal(row.decision_z, .4);
+    assert.equal(row.decision_affinity_z, -.2);
+    assert.equal(row.decision_tag_affinity_pct, .03);
+    assert.equal(row.decision_tag_affinity_adjusted_pct, .025);
+    assert.equal(row.decision_tag_affinity_lower_pct, .01);
+    assert.equal(row.decision_tag_affinity_upper_pct, .04);
+    assert.equal(row.decision_rank_within_tag_by_z, 19);
+  }
+  assert.equal(buildThemeReportRows(prepared).some((row) => row.theme_tag_slug === "lands"), false);
+});

@@ -4,6 +4,12 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import BracketBadge from "../components/BracketBadge";
 import SimpleTable from "../components/SimpleTable";
 import {
+  formatAdjustedAffinity,
+  formatAffinityInterval,
+  formatAffinityProbability,
+  getDecisionAffinityMetrics,
+} from "../lib/affinityDisplay";
+import {
   loadCommanderDetail,
   loadCommanderIndex,
   loadSetDetail,
@@ -17,6 +23,7 @@ import {
   formatColorIdentity,
   formatDecimal,
   formatNumber,
+  formatRank,
 } from "../lib/formatters";
 import {
   readSessionObject,
@@ -342,9 +349,38 @@ export default function SetBracketsPage() {
     },
     {
       key: "decision_z",
-      header: "Z-Score",
+      header: "Original Bracket Z",
       sortable: true,
       render: (row) => formatDecimal(row.decision_z),
+    },
+    {
+      key: "decision_tag_affinity_pct",
+      header: "Raw Affinity",
+      sortable: true,
+      render: (row) => formatAffinityProbability(getDecisionAffinityMetrics(row).tag_affinity_pct),
+    },
+    {
+      key: "decision_tag_affinity_adjusted_pct",
+      header: "Adjusted Affinity",
+      sortable: true,
+      render: (row) => formatAdjustedAffinity(getDecisionAffinityMetrics(row)),
+    },
+    {
+      key: "decision_affinity_interval",
+      header: "95% Range",
+      render: (row) => formatAffinityInterval(getDecisionAffinityMetrics(row)),
+    },
+    {
+      key: "decision_affinity_z",
+      header: "Z-Score",
+      sortable: true,
+      render: (row) => formatDecimal(getDecisionAffinityMetrics(row).z),
+    },
+    {
+      key: "decision_rank_within_tag_by_z",
+      header: "Rank in Tag",
+      sortable: true,
+      render: (row) => formatRank(getDecisionAffinityMetrics(row).rank_within_tag_by_z),
     },
     {
       key: "decision_tag_decks",
@@ -397,7 +433,15 @@ export default function SetBracketsPage() {
         <p>
           Choose a Magic set to classify each of its commanders from Bracket 1
           through Bracket 5. In-flux labels identify commanders whose deciding
-          z-score sits between thresholds.
+          Original Bracket Z sits between thresholds.
+        </p>
+        <p>
+          Raw and adjusted affinity, the 95% range, z-score, and Rank in Tag
+          all describe the Deciding Tag. Rank in Tag compares all reported
+          commanders for that tag, across sets and brackets. Original Bracket Z
+          drives the unchanged classification rules; the updated z-score
+          describes affinity. “Unadjusted” marks a fallback and — means
+          unavailable. <Link to="/methodology">How it works</Link>
         </p>
       </div>
 
@@ -409,7 +453,8 @@ export default function SetBracketsPage() {
           </div>
           <p className="muted">
             Aggro, Control, Midrange, Tempo, and Combo are evaluated only after
-            cEDH does not qualify for Bracket 4 or higher.
+            cEDH does not qualify for Bracket 4 or higher. These thresholds use
+            Original Bracket Z.
           </p>
         </div>
         <div className="bracket-rule-grid">

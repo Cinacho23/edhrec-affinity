@@ -163,3 +163,43 @@ test("fallback loaders retain legacy scores after the affinity upgrade", async (
   assert.equal(results[0].decision_z, 0.4);
   assert.equal(results[0].theme_z, 1.2);
 });
+
+test("fallback and compact rows retain exact selected-theme and deciding-tag metric identities", async () => {
+  const theme = { ...tag("alpha", "tokens", 3), legacy_z: 1.2,
+    tag_affinity_pct: .2, tag_affinity_adjusted_pct: .18,
+    tag_affinity_lower_pct: .15, tag_affinity_upper_pct: .21,
+    rank_within_tag_by_z: 7, affinity_model_status: "fitted",
+    affinity_model_version: "beta_binomial_v1" };
+  const decision = { ...tag("alpha", "cedh", null), legacy_z: .4,
+    tag_affinity_pct: .03, tag_affinity_adjusted_pct: .03,
+    tag_affinity_lower_pct: null, tag_affinity_upper_pct: null,
+    rank_within_tag_by_z: null, affinity_model_status: "fallback_fit_failed",
+    affinity_model_version: "beta_binomial_v1" };
+  const compact = { commander_slug: "alpha", commander_name: "alpha", total_decks: 200,
+    theme_tag_slug: "tokens", theme_tag_name: "tokens", theme_z: 1.2,
+    theme_legacy_z: 1.2, theme_affinity_z: 3, theme_tag_decks: 10,
+    theme_affinity_pct: .2, theme_affinity_adjusted_pct: .18,
+    theme_affinity_lower_pct: .15, theme_affinity_upper_pct: .21,
+    theme_rank_within_tag_by_z: 7, theme_affinity_model_status: "fitted",
+    theme_affinity_model_version: "beta_binomial_v1", bracket_tag_rows: [decision] };
+  const source = createSource({
+    ...signalFiles(),
+    "loadTagDetail:tokens": [theme],
+    "loadTagDetail:cedh": [decision],
+    "loadThemeBracketDetail:tokens": [compact],
+  });
+  const loader = createThemeBracketDataLoader({ dataSource: source.dataSource });
+  const fallbackResult = buildCommanderThemeBracketRows(await loader.loadRows("tokens", false), "tokens")[0];
+  const compactResult = buildCommanderThemeBracketRows(await loader.loadRows("tokens", true), "tokens")[0];
+  const fullResult = buildCommanderThemeBracketRows([theme, decision], "tokens")[0];
+  const metrics = (row) => Object.fromEntries(Object.entries(row).filter(([key]) =>
+    key.startsWith("decision_") || key.startsWith("theme_") || key.startsWith("bracket_")
+  ));
+  assert.deepEqual(metrics(fallbackResult), metrics(compactResult));
+  assert.deepEqual(metrics(fallbackResult), metrics(fullResult));
+  assert.equal(fallbackResult.theme_affinity_adjusted_pct, .18);
+  assert.equal(fallbackResult.decision_tag_affinity_pct, .03);
+  assert.equal(fallbackResult.decision_affinity_z, null);
+  assert.equal(fallbackResult.decision_tag_affinity_lower_pct, null);
+  assert.equal(fallbackResult.decision_affinity_model_status, "fallback_fit_failed");
+});

@@ -5,6 +5,8 @@ import {
   formatAdjustedAffinity,
   formatAffinityInterval,
   formatAffinityProbability,
+  getDecisionAffinityMetrics,
+  getThemeAffinityMetrics,
 } from "./affinityDisplay.js";
 
 test("affinity display treats model fields as probabilities, including zero and one", () => {
@@ -13,6 +15,62 @@ test("affinity display treats model fields as probabilities, including zero and 
   assert.equal(formatAffinityProbability("0.2"), "20.00%");
   for (const missing of [null, undefined, "", " ", false, [], NaN, Infinity, -0.1, 20]) {
     assert.equal(formatAffinityProbability(missing), "—");
+  }
+});
+
+test("deciding-tag adapters keep every displayed metric on the deciding tag", () => {
+  const metrics = getDecisionAffinityMetrics({
+    decision_tag_affinity_pct: "0.2",
+    decision_tag_affinity_adjusted_pct: 0.15,
+    decision_tag_affinity_lower_pct: 0.1,
+    decision_tag_affinity_upper_pct: 0.22,
+    decision_affinity_model_status: "fitted",
+    decision_affinity_model_version: "beta_binomial_v1",
+    decision_affinity_z: "0.5",
+    decision_rank_within_tag_by_z: "17",
+    decision_z: 3,
+    tag_affinity_pct: 0.99,
+    z: 9,
+  });
+  assert.equal(formatAffinityProbability(metrics.tag_affinity_pct), "20.00%");
+  assert.equal(formatAdjustedAffinity(metrics), "15.00%");
+  assert.equal(formatAffinityInterval(metrics), "10.00%–22.00%");
+  assert.equal(metrics.z, 0.5);
+  assert.equal(metrics.rank_within_tag_by_z, 17);
+  assert.equal(metrics.affinity_model_version, "beta_binomial_v1");
+});
+
+test("theme adapters retain fallback labels and do not borrow deciding-tag values", () => {
+  const metrics = getThemeAffinityMetrics({
+    theme_affinity_pct: 0.2,
+    theme_affinity_adjusted_pct: 0.2,
+    theme_affinity_lower_pct: null,
+    theme_affinity_upper_pct: null,
+    theme_affinity_model_status: "fallback_sparse",
+    theme_affinity_z: -0.5,
+    theme_rank_within_tag_by_z: 8,
+    decision_affinity_z: 9,
+    decision_tag_affinity_pct: 0.99,
+  });
+  assert.equal(formatAdjustedAffinity(metrics), "20.00% (unadjusted)");
+  assert.equal(formatAffinityInterval(metrics), "—");
+  assert.equal(metrics.z, -0.5);
+  assert.equal(metrics.rank_within_tag_by_z, 8);
+});
+
+test("prefixed adapters preserve absent and explicit-null upgraded scores rather than using legacy scores", () => {
+  for (const [adapt, scoreKey, rankKey, rawKey] of [
+    [getDecisionAffinityMetrics, "decision_affinity_z", "decision_rank_within_tag_by_z", "decision_tag_affinity_pct"],
+    [getThemeAffinityMetrics, "theme_affinity_z", "theme_rank_within_tag_by_z", "theme_affinity_pct"],
+  ]) {
+    for (const missing of [null, undefined, "", " ", false, NaN, Infinity]) {
+      const metrics = adapt({ [scoreKey]: missing, [rankKey]: missing, [rawKey]: missing, decision_z: 4, theme_z: 5, z: 6 });
+      assert.equal(metrics.z, null);
+      assert.equal(metrics.rank_within_tag_by_z, null);
+      assert.equal(formatAffinityProbability(metrics.tag_affinity_pct), "—");
+    }
+    assert.equal(adapt({ [scoreKey]: 0 }).z, 0);
+    assert.equal(adapt({ [rankKey]: 0 }).rank_within_tag_by_z, null);
   }
 });
 
