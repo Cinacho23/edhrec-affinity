@@ -192,8 +192,9 @@ export default function ThemeReportPage() {
         </p>
         <p className="muted">
           Uses the <Link className="table-commander-link" to="/theme-brackets">Theme Brackets rules</Link>:
-          ordinary themes require z ≥ 1.05; cEDH, Aggro, Control, Midrange, Tempo,
+          ordinary themes retain the original affinity z ≥ 1.05 gate; cEDH, Aggro, Control, Midrange, Tempo,
           and Combo use bracket rules only. cEDH takes precedence when assigning brackets.
+          Rankings use the updated affinity score when available.
         </p>
       </div>
 

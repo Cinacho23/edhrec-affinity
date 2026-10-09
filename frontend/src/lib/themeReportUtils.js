@@ -16,6 +16,7 @@ export function prepareThemeReportRows(themeGroups) {
   return (themeGroups || []).flatMap((theme) =>
     buildCommanderThemeBracketRows(theme.rows, theme.tag_slug).map((row) => ({
       ...row,
+      theme_z: Object.hasOwn(row, "theme_affinity_z") ? row.theme_affinity_z : row.theme_z,
       id: JSON.stringify([row.theme_tag_slug, row.id]),
       theme_tag_name: theme.tag_name || row.theme_tag_name,
     }))

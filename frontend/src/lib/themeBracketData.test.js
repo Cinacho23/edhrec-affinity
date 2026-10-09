@@ -146,3 +146,20 @@ test("concurrent mapping preserves input order and rejects invalid limits", asyn
   assert.deepEqual(result, [6, 2, 4]);
   await assert.rejects(mapWithConcurrency([1], 0, (value) => value), /positive integer/);
 });
+
+test("fallback loaders retain legacy scores after the affinity upgrade", async () => {
+  const source = createSource({
+    ...signalFiles(),
+    "loadTagDetail:tokens": [
+      { ...tag("alpha", "tokens", 0.2), legacy_z: 1.2 },
+      { ...tag("beta", "tokens", 5), legacy_z: 1.04 },
+    ],
+    "loadTagDetail:cedh": [{ ...tag("alpha", "cedh", -1), legacy_z: 0.4 }],
+  });
+  const loader = createThemeBracketDataLoader({ dataSource: source.dataSource });
+  const results = buildCommanderThemeBracketRows(await loader.loadRows("tokens", false), "tokens");
+  assert.equal(results.length, 1);
+  assert.equal(results[0].bracket_key, "4");
+  assert.equal(results[0].decision_z, 0.4);
+  assert.equal(results[0].theme_z, 1.2);
+});

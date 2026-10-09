@@ -37,6 +37,48 @@ def test_extract_set_code_from_scryfall_uri():
     assert extract_set_code_from_scryfall_uri(uri) == "khm"
 
 
+def test_upgrade_exports_new_affinity_and_preserves_legacy_bracket_inputs(tmp_path):
+    processed_dir = tmp_path / "processed"
+    output_dir = tmp_path / "site"
+    common = {
+        "commander_name": "Test Commander", "commander_slug": "test",
+        "total_decks": 1000, "tag_decks": 200, "tag_affinity_pct": 0.2,
+        "affinity_model_version": "beta_binomial_v1", "affinity_model_status": "fitted",
+        "tag_affinity_adjusted_pct": 0.19, "tag_affinity_lower_pct": 0.17,
+        "tag_affinity_upper_pct": 0.22,
+        "scryfall_uri": "https://scryfall.com/card/khm/1/test",
+    }
+    write_json(processed_dir / "affinity_rows_with_trends.json", [
+        {**common, "tag_name": "Tokens", "tag_slug": "tokens", "z": 0.2, "legacy_z": 1.2},
+        {**common, "tag_name": "Combo", "tag_slug": "combo", "z": -2, "legacy_z": 1.05},
+        {**common, "tag_name": "Snow", "tag_slug": "snow", "z": 5, "legacy_z": 1.04},
+        {**common, "tag_name": "Lands", "tag_slug": "lands", "z": 5, "legacy_z": None},
+    ])
+    write_json(processed_dir / "analysis_summary.json", {})
+    write_json(processed_dir / "trend_summary.json", {})
+    write_json(processed_dir / "tag_summary.json", [])
+    manifest = export_full_site_data(processed_dir, output_dir, 10, True)
+    assert manifest["affinity_model_version"] == "beta_binomial_v1"
+    set_rows = read_json(output_dir / "sets" / "khm.json")
+    tokens = next(row for row in set_rows if row["tag_slug"] == "tokens")
+    assert tokens["tag_affinity_adjusted_pct"] == 0.19
+    assert tokens["legacy_z"] == 1.2
+    theme_rows = read_json(output_dir / "theme-brackets" / "tokens.json")
+    assert len(theme_rows) == 1
+    assert theme_rows[0]["theme_z"] == 0.2
+    assert theme_rows[0]["theme_legacy_z"] == 1.2
+    assert theme_rows[0]["bracket_tag_rows"] == [{
+        "tag_name": "Combo", "tag_slug": "combo", "z": -2, "legacy_z": 1.05,
+        "tag_decks": 200,
+    }]
+    assert read_json(output_dir / "theme-brackets" / "snow.json") == []
+    assert read_json(output_dir / "theme-brackets" / "lands.json") == []
+    report = read_json(output_dir / "theme-report.json")
+    token_rows = next(theme for theme in report["themes"] if theme["tag_slug"] == "tokens")["rows"]
+    assert token_rows[0]["theme_z"] == 0.2
+    assert token_rows[0]["theme_legacy_z"] == 1.2
+
+
 def test_export_full_site_data_writes_set_files(tmp_path):
     processed_dir = tmp_path / "processed" / "2026-06-21"
     output_dir = tmp_path / "site"

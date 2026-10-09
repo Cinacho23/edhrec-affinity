@@ -1,9 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 
 import CommanderImageGallery from "../components/CommanderImageGallery";
 import SimpleTable from "../components/SimpleTable";
 import { loadCommanderDetail } from "../lib/api";
+import {
+  formatAdjustedAffinity,
+  formatAffinityInterval,
+  formatAffinityProbability,
+} from "../lib/affinityDisplay";
 import {
   formatColorIdentity,
   formatDecimal,
@@ -60,8 +65,18 @@ export default function CommanderDetailPage() {
     },
     {
       key: "tag_affinity_pct",
-      header: "Affinity",
-      render: (row) => formatPercent(row.tag_affinity_pct),
+      header: "Raw Affinity",
+      render: (row) => formatAffinityProbability(row.tag_affinity_pct),
+    },
+    {
+      key: "tag_affinity_adjusted_pct",
+      header: "Adjusted Affinity",
+      render: formatAdjustedAffinity,
+    },
+    {
+      key: "affinity_interval",
+      header: "95% Range",
+      render: formatAffinityInterval,
     },
     {
       key: "z",
@@ -171,6 +186,13 @@ export default function CommanderDetailPage() {
           </div>
           <p className="table-count">{formatNumber(rows.length)} rows</p>
         </div>
+
+        <p className="muted table-note">
+          Raw affinity is the observed share of tagged decks. Adjusted affinity
+          accounts for sample size; its 95% range shows uncertainty under the
+          model. “Unadjusted” rows retain the previous score, and missing
+          estimates or ranges appear as —. <Link to="/methodology">How it works</Link>
+        </p>
 
         <SimpleTable columns={columns} rows={rows} />
       </section>

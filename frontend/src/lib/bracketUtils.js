@@ -42,12 +42,15 @@ function normalizeTagSlug(row) {
     .replace(/^-|-$/g, "");
 }
 
-function getFiniteZ(row) {
-  if (row?.z === null || row?.z === undefined || row?.z === "") {
+// Affinity now has a learned score. Existing bracket rules deliberately use
+// the preserved raw score; a missing legacy score must remain missing.
+export function getBracketScore(row) {
+  const value = Object.hasOwn(row || {}, "legacy_z") ? row.legacy_z : row?.z;
+  if (value === null || value === undefined || value === "") {
     return null;
   }
 
-  const score = Number(row.z);
+  const score = Number(value);
   return Number.isFinite(score) ? score : null;
 }
 
@@ -68,7 +71,7 @@ function getHighestScoredRow(rows, acceptedTags) {
       continue;
     }
 
-    const score = getFiniteZ(row);
+    const score = getBracketScore(row);
 
     if (score === null || (highest && score <= highest.score)) {
       continue;
@@ -216,16 +219,26 @@ function getThemeCandidate(rows, themeSlug) {
     const score = getFiniteNumber(
       usesThemeFields ? container?.theme_z : candidate?.z
     );
+    const hasLegacyScore = Object.hasOwn(
+      usesThemeFields ? container : candidate,
+      usesThemeFields ? "theme_legacy_z" : "legacy_z"
+    );
+    const bracketScore = usesThemeFields
+      ? getFiniteNumber(hasLegacyScore ? container.theme_legacy_z : container.theme_z)
+      : getBracketScore(candidate);
 
     if (
       highest &&
-      (score === null || (highest.score !== null && score <= highest.score))
+      (bracketScore === null ||
+        (highest.bracketScore !== null && bracketScore <= highest.bracketScore))
     ) {
       return;
     }
 
     highest = {
       score,
+      bracketScore,
+      hasLegacyScore,
       name: usesThemeFields
         ? container?.theme_tag_name
         : candidate?.tag_name,
@@ -300,7 +313,7 @@ export function buildCommanderThemeBracketRows(
     if (
       !theme ||
       (!usesBracketRulesOnly &&
-        (theme.score === null || theme.score < minThemeZ))
+        (theme.bracketScore === null || theme.bracketScore < minThemeZ))
     ) {
       continue;
     }
@@ -316,7 +329,8 @@ export function buildCommanderThemeBracketRows(
       id: groupKey,
       theme_tag_name: theme.name || normalizedThemeSlug,
       theme_tag_slug: normalizedThemeSlug,
-      theme_z: theme.score,
+      theme_z: theme.bracketScore,
+      ...(theme.hasLegacyScore ? { theme_affinity_z: theme.score } : {}),
       theme_tag_decks: theme.decks ?? null,
       theme_affinity_pct: theme.affinity ?? null,
       ...classifyCommanderRows(classificationRows),

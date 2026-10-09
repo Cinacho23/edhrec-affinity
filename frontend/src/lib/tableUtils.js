@@ -9,25 +9,42 @@ export function getValue(row, key) {
 }
 
 export function asNumber(value) {
-  if (value === null || value === undefined || value === "") {
+  if (
+    (typeof value !== "number" && typeof value !== "string") ||
+    (typeof value === "string" && value.trim() === "")
+  ) {
     return null;
   }
 
   const number = Number(value);
 
-  return Number.isNaN(number) ? null : number;
+  return Number.isFinite(number) ? number : null;
 }
 
 export function compareValues(a, b, direction = "desc") {
+  const isMissing = (value) =>
+    value === null ||
+    value === undefined ||
+    (typeof value === "string" && value.trim() === "") ||
+    (typeof value === "number" && !Number.isFinite(value));
+  const aMissing = isMissing(a);
+  const bMissing = isMissing(b);
+
+  // Unavailable estimates should never outrank scored rows, in either direction.
+  if (aMissing || bMissing) {
+    if (aMissing && bMissing) return 0;
+    return aMissing ? 1 : -1;
+  }
+
   const aNumber = asNumber(a);
   const bNumber = asNumber(b);
 
   let result;
 
   if (aNumber !== null || bNumber !== null) {
-    if (aNumber === null) result = 1;
-    else if (bNumber === null) result = -1;
-    else result = aNumber - bNumber;
+    if (aNumber === null) return 1;
+    if (bNumber === null) return -1;
+    result = aNumber - bNumber;
   } else {
     result = String(a ?? "").localeCompare(String(b ?? ""));
   }

@@ -211,3 +211,23 @@ test("handles empty reports and normalizes invalid or fractional top counts", ()
   assert.equal(buildThemeReportRows(rows, { minTotalDecks: "201" }).length, 0);
   assert.equal(buildThemeReportRows(rows, { minThemeDecks: "6" }).length, 0);
 });
+
+test("report ranks upgraded affinity while keeping legacy theme gates and brackets", () => {
+  const prepared = tokens([
+    commander("highest-new", 3, {
+      theme_legacy_z: 1.1,
+      bracket_tag_rows: [{ ...signal("combo", -2), legacy_z: 1.05 }],
+    }),
+    commander("highest-old", 1, {
+      theme_legacy_z: 4,
+      bracket_tag_rows: [{ ...signal("cedh", -2), legacy_z: 0.4 }],
+    }),
+    commander("excluded-by-old-gate", 9, { theme_legacy_z: 1.04 }),
+  ]);
+  assert.equal(prepared.length, 2);
+  assert.equal(prepared.find((row) => row.commander_slug === "highest-new").bracket_key, "3");
+  assert.equal(prepared.find((row) => row.commander_slug === "highest-old").bracket_key, "4");
+  const report = buildThemeReportRows(prepared);
+  assert.equal(report[0].commander_slug, "highest-new");
+  assert.equal(report[0].theme_z, 3);
+});

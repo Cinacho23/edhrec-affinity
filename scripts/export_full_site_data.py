@@ -58,6 +58,13 @@ SUMMARY_FILES = [
     "tag_summary.json",
 ]
 
+AFFINITY_MODEL_FIELDS = [
+    "legacy_z", "affinity_model_version", "affinity_model_status",
+    "tag_affinity_adjusted_pct", "tag_affinity_lower_pct", "tag_affinity_upper_pct",
+    "tag_prior_mean_pct", "tag_prior_strength", "tag_prior_std_pct",
+    "tag_reference_row_count",
+]
+
 
 def safe_json_filename(value: str) -> str:
     value = str(value).strip().lower()
@@ -400,6 +407,10 @@ def sort_for_leaderboard(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def sort_for_commander_detail(df: pd.DataFrame) -> pd.DataFrame:
+    # Preserve the order used to resolve tied legacy bracket signals. The
+    # affinity pages rank/filter using the separate upgraded score themselves.
+    if "legacy_z" in df.columns:
+        return df.sort_values("legacy_z", ascending=False, na_position="last")
     if "z" in df.columns:
         return df.sort_values("z", ascending=False, na_position="last")
 
@@ -520,6 +531,7 @@ def build_set_commander_row(
         "scryfall_set_uri": origin_set.get("scryfall_set_uri"),
         "set_uri": origin_set.get("set_uri"),
         "origin_sets": row.get("origin_sets"),
+        **{field: row[field] for field in AFFINITY_MODEL_FIELDS if field in row},
     }
 
 
@@ -569,8 +581,8 @@ def export_set_files(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
         sorted_rows = sorted(
             rows,
             key=lambda row: (
-                row.get("z") is None,
-                -as_sort_float(row.get("z")),
+                row.get("legacy_z", row.get("z")) is None,
+                -as_sort_float(row.get("legacy_z", row.get("z"))),
                 str(row.get("commander_name") or ""),
                 str(row.get("tag_name") or ""),
             ),
@@ -613,6 +625,7 @@ def build_theme_bracket_signal_row(row: dict[str, Any]) -> dict[str, Any]:
         "tag_slug": row.get("tag_slug"),
         "z": row.get("z"),
         "tag_decks": row.get("tag_decks"),
+        **({"legacy_z": row["legacy_z"]} if "legacy_z" in row else {}),
     }
 
 
@@ -630,7 +643,8 @@ def qualify_theme_bracket_rows(group: pd.DataFrame, theme_slug: str) -> pd.DataF
     if safe_json_filename(theme_slug) in BRACKET_SIGNAL_TAG_SLUGS:
         qualified = group.copy()
     else:
-        z_scores = pd.to_numeric(group.get("z"), errors="coerce")
+        score_column = "legacy_z" if "legacy_z" in group.columns else "z"
+        z_scores = pd.to_numeric(group.get(score_column), errors="coerce")
         qualified = group.loc[z_scores >= THEME_BRACKET_MIN_Z]
 
     if "commander_slug" in qualified.columns:
@@ -657,6 +671,7 @@ def build_theme_bracket_commander_row(
         "theme_tag_name": theme_row.get("tag_name"),
         "theme_tag_slug": theme_row.get("tag_slug"),
         "theme_z": theme_row.get("z"),
+        **({"theme_legacy_z": theme_row["legacy_z"]} if "legacy_z" in theme_row else {}),
         "theme_tag_decks": theme_row.get("tag_decks"),
         "theme_affinity_pct": theme_row.get("tag_affinity_pct"),
         "theme_rank_within_tag_by_z": theme_row.get("rank_within_tag_by_z"),
@@ -751,6 +766,7 @@ def export_theme_report(
             "tag_slug",
             "tag_name",
             "z",
+            "legacy_z",
             "tag_decks",
             "tag_affinity_pct",
         ],
@@ -770,6 +786,7 @@ def export_theme_report(
             {
                 "commander_slug": row.get("commander_slug"),
                 "theme_z": row.get("z"),
+                **({"theme_legacy_z": row["legacy_z"]} if "legacy_z" in row else {}),
                 "theme_tag_decks": row.get("tag_decks"),
                 "theme_affinity_pct": row.get("tag_affinity_pct"),
             }
@@ -975,6 +992,9 @@ def export_full_site_data(
         "theme_report_export": theme_report_export,
         "leaderboard_export": leaderboard_export,
     }
+    if "affinity_model_version" in df.columns:
+        versions = df["affinity_model_version"].dropna().unique().tolist()
+        manifest["affinity_model_version"] = versions[0] if len(versions) == 1 else None
 
     write_json(output_dir / "site_manifest.json", manifest)
 

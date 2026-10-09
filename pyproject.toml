@@ -33,6 +33,7 @@ dependencies = [
     "httpx",
     "pydantic",
     "pandas",
+    "scipy>=1.13",
 ]
 
 # Optional dependency groups
