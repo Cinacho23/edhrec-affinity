@@ -183,3 +183,30 @@ test("uses bracket rules without a second 1.05 gate for bracket-signal themes", 
     ["4", "5"]
   );
 });
+
+test("affinity upgrades preserve every legacy bracket boundary and missing signal", () => {
+  for (const slug of ["cedh", "combo"]) {
+    for (const score of [null, -2, 0, 0.02, 0.05, 0.95, 0.98, 1.05, 2]) {
+      const oldRow = { ...tag(slug, score), tag_decks: 17 };
+      const upgraded = { ...oldRow, z: 9, legacy_z: score };
+      assert.deepEqual(classifyCommanderRows([upgraded]), classifyCommanderRows([oldRow]));
+    }
+  }
+});
+
+test("theme bracket eligibility and displayed score retain legacy affinity", () => {
+  const rows = [
+    { commander_slug: "retained", ...tag("tokens", 0.2), legacy_z: 1.2 },
+    { commander_slug: "retained", ...tag("combo", -0.4), legacy_z: 1.05 },
+    { commander_slug: "excluded", ...tag("tokens", 5), legacy_z: 1.04 },
+    { commander_slug: "excluded", ...tag("combo", 5), legacy_z: 1.05 },
+    { commander_slug: "missing", ...tag("tokens", 5), legacy_z: null },
+  ];
+  const results = buildCommanderThemeBracketRows(rows, "tokens");
+  assert.equal(results.length, 1);
+  assert.equal(results[0].commander_slug, "retained");
+  assert.equal(results[0].bracket_key, "3");
+  assert.equal(results[0].theme_z, 1.2);
+  assert.equal(results[0].theme_affinity_z, 0.2);
+  assert.equal(results[0].decision_z, 1.05);
+});

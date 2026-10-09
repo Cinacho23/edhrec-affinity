@@ -87,6 +87,9 @@ NUMERIC_TREND_SPECS = {
     "rank_within_tag_by_z": "rank_within_tag_by_z",
 }
 
+MODEL_COLUMNS = ["affinity_model_version", "affinity_model_status"]
+LEGACY_MODEL_VERSION = "legacy_z_v1"
+
 
 # Percent-change fields are only useful for count-style metrics.
 # We do not calculate z_pct_change or rank_pct_change because those are not
@@ -351,11 +354,16 @@ def _comparison_subset(df: pd.DataFrame) -> pd.DataFrame:
     """
 
     requested_columns = list(
-        dict.fromkeys(IDENTITY_COLUMNS + list(NUMERIC_TREND_SPECS.keys()))
+        dict.fromkeys(IDENTITY_COLUMNS + list(NUMERIC_TREND_SPECS.keys()) + MODEL_COLUMNS)
     )
     columns = _available_columns(df, requested_columns)
 
-    return df[columns].copy()
+    result = df[columns].copy()
+    if "affinity_model_version" not in result:
+        result["affinity_model_version"] = LEGACY_MODEL_VERSION
+    if "affinity_model_status" not in result:
+        result["affinity_model_status"] = "legacy"
+    return result
 
 
 def _coalesce_identity_columns(merged: pd.DataFrame) -> pd.DataFrame:
@@ -494,6 +502,30 @@ def compute_trends(
     )
     trend_df["rank_within_tag_by_z_delta"] = trend_df["rank_delta"]
 
+    # A formula migration is not a change in deck-building behavior. Also
+    # suppress comparisons when a tag switches between a fitted model and
+    # the legacy fallback within the same model version.
+    for column in MODEL_COLUMNS:
+        for suffix in ["current", "previous"]:
+            trend_df[f"{column}_{suffix}"] = merged[f"{column}_{suffix}"]
+
+    same_version = (
+        merged["affinity_model_version_current"].notna()
+        & merged["affinity_model_version_previous"].notna()
+        & merged["affinity_model_version_current"].eq(merged["affinity_model_version_previous"])
+    )
+    same_method = merged["affinity_model_status_current"].eq("fitted").eq(
+        merged["affinity_model_status_previous"].eq("fitted")
+    )
+    existing = trend_df["snapshot_status"].eq("existing")
+    incompatible = existing & ~(same_version & same_method)
+    trend_df["score_trend_status"] = "no_previous_pair"
+    trend_df.loc[existing, "score_trend_status"] = "comparable"
+    trend_df.loc[existing & ~same_version, "score_trend_status"] = "algorithm_changed"
+    trend_df.loc[existing & same_version & ~same_method, "score_trend_status"] = "model_changed"
+    for column in ["z_delta", "rank_delta", "rank_within_tag_by_z_delta"]:
+        trend_df.loc[incompatible, column] = float("nan")
+
     return trend_df
 
 
@@ -515,6 +547,10 @@ def compute_first_run_trends(
     trend_df["current_snapshot"] = current_snapshot
     trend_df["previous_snapshot"] = pd.NA
     trend_df["snapshot_status"] = "no_previous_snapshot"
+    trend_df["score_trend_status"] = "no_previous_snapshot"
+    for column in MODEL_COLUMNS:
+        trend_df[f"{column}_current"] = trend_df[column]
+        trend_df[f"{column}_previous"] = pd.NA
 
     for source_column, output_base in NUMERIC_TREND_SPECS.items():
         if source_column in current_df.columns:
@@ -553,7 +589,9 @@ def merge_trends_into_current_rows(
     trend_columns = [
         column
         for column in trend_df.columns
-        if column not in IDENTITY_COLUMNS or column in KEY_COLUMNS
+        if column in KEY_COLUMNS or (
+            column not in IDENTITY_COLUMNS and column not in current_df.columns
+        )
     ]
 
     current_trends = trend_df[
@@ -607,6 +645,10 @@ def build_trend_summary(
             trend_df["affinity_pct_delta"].notna().sum()
         ),
         "rows_with_z_delta": int(trend_df["z_delta"].notna().sum()),
+        "score_trend_status_row_counts": {
+            str(status): int(count)
+            for status, count in trend_df["score_trend_status"].value_counts().items()
+        },
         "rows_with_rank_delta": int(trend_df["rank_delta"].notna().sum()),
         "output_files": {
             "trend_rows": TREND_ROWS_FILENAME,

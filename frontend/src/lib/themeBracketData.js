@@ -4,6 +4,7 @@ import {
   CEDH_TAG_SLUG,
   THEME_BRACKET_MIN_Z,
   classifyCommanderRows,
+  getBracketScore,
   themeUsesBracketRulesOnly,
 } from "./bracketUtils.js";
 
@@ -70,8 +71,8 @@ function createRequestLimiter(concurrency) {
 
 function qualifiesForTheme(row, themeSlug) {
   if (themeUsesBracketRulesOnly(themeSlug)) return true;
-  const score = Number(row?.z);
-  return Number.isFinite(score) && score >= THEME_BRACKET_MIN_Z;
+  const score = getBracketScore(row);
+  return score !== null && score >= THEME_BRACKET_MIN_Z;
 }
 
 function createThemeRow(themeRow, bracketTagRows) {
@@ -80,6 +81,7 @@ function createThemeRow(themeRow, bracketTagRows) {
     theme_tag_name: themeRow.tag_name,
     theme_tag_slug: themeRow.tag_slug,
     theme_z: themeRow.z,
+    ...(Object.hasOwn(themeRow, "legacy_z") ? { theme_legacy_z: themeRow.legacy_z } : {}),
     theme_tag_decks: themeRow.tag_decks,
     theme_affinity_pct: themeRow.tag_affinity_pct,
     bracket_tag_rows: bracketTagRows,
@@ -97,8 +99,7 @@ function hasDecidingSignalTie(rows) {
   return rows.filter(
     (row) =>
       tags.has(row.tag_slug) &&
-      row.z !== null && row.z !== undefined && row.z !== "" &&
-      Number(row.z) === decision.decision_z
+      getBracketScore(row) === decision.decision_z
   ).length > 1;
 }
 
@@ -173,6 +174,7 @@ export function createThemeBracketDataLoader({
               tag_name: row.tag_name,
               tag_slug: row.tag_slug,
               z: row.z,
+              ...(Object.hasOwn(row, "legacy_z") ? { legacy_z: row.legacy_z } : {}),
               tag_decks: row.tag_decks,
             });
           }

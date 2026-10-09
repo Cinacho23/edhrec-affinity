@@ -5,10 +5,14 @@ import SimpleTable from "../components/SimpleTable";
 import TrendBadge from "../components/TrendBadge";
 import { loadLeaderboardIndex, loadLeaderboardPage } from "../lib/api";
 import {
+  formatAdjustedAffinity,
+  formatAffinityInterval,
+  formatAffinityProbability,
+} from "../lib/affinityDisplay";
+import {
   formatColorIdentity,
   formatDecimal,
   formatNumber,
-  formatPercent,
   formatRank,
 } from "../lib/formatters";
 import {
@@ -183,9 +187,20 @@ export default function GlobalLeaderboardPage() {
     },
     {
       key: "tag_affinity_pct",
-      header: "Affinity",
+      header: "Raw Affinity",
       sortable: true,
-      render: (row) => formatPercent(row.tag_affinity_pct),
+      render: (row) => formatAffinityProbability(row.tag_affinity_pct),
+    },
+    {
+      key: "tag_affinity_adjusted_pct",
+      header: "Adjusted Affinity",
+      sortable: true,
+      render: formatAdjustedAffinity,
+    },
+    {
+      key: "affinity_interval",
+      header: "95% Range",
+      render: formatAffinityInterval,
     },
     {
       key: "z",
@@ -249,6 +264,17 @@ export default function GlobalLeaderboardPage() {
         <p>
           The leaderboard is served in static shards. Filters and sorting apply to
           the currently loaded leaderboard page.
+        </p>
+        <p>
+          Raw affinity is the observed share of tagged decks. Adjusted affinity
+          pulls smaller samples toward the tag baseline, and its 95% range shows
+          uncertainty under the model. The z-score measures specialization relative to other
+          commanders with that tag. <Link to="/methodology">How it works</Link>
+        </p>
+        <p className="muted">
+          “Unadjusted” means there was insufficient evidence to fit the model
+          reliably; that row retains the previous score. Missing estimates and
+          ranges appear as —.
         </p>
       </div>
 

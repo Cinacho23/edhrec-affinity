@@ -203,7 +203,7 @@ def test_ranks_reset_inside_each_tag() -> None:
     assert int(epsilon["rank_within_tag_by_tag_decks"]) == 1
 
 
-def test_percentile_within_tag_uses_affinity_percentage() -> None:
+def test_percentile_within_tag_uses_score() -> None:
     """
     Percentile should be low for the lowest affinity row and 1.0 for the
     highest affinity row inside a tag.
@@ -217,6 +217,10 @@ def test_percentile_within_tag_uses_affinity_percentage() -> None:
     assert alpha["percentile_within_tag"] == pytest.approx(1 / 3)
     assert beta["percentile_within_tag"] == pytest.approx(2 / 3)
     assert gamma["percentile_within_tag"] == pytest.approx(1.0)
+
+    # Sparse tags use the legacy formula, but record that explicitly.
+    assert gamma["legacy_z"] == gamma["z"]
+    assert gamma["affinity_model_status"] == "fallback_sparse"
 
 
 def test_sample_size_flags_identify_default_filter_failures() -> None:
@@ -315,6 +319,8 @@ def test_tag_summary_has_one_row_per_tag() -> None:
     assert tokens_summary["tag_mean_pct"] == pytest.approx(0.20)
     assert tokens_summary["tag_std_pct"] == pytest.approx(0.10)
     assert tokens_summary["max_z"] == pytest.approx(1.0)
+    assert tokens_summary["affinity_model_status"] == "fallback_sparse"
+    assert tokens_summary["tag_reference_row_count"] == 3
 
 
 def test_write_analysis_outputs_creates_expected_files(tmp_path) -> None:
@@ -352,6 +358,10 @@ def test_write_analysis_outputs_creates_expected_files(tmp_path) -> None:
     assert summary["unique_commander_count"] == 7
     assert summary["unique_tag_count"] == 3
     assert summary["global_leaderboard_row_count"] == 3
+    assert summary["affinity_model_version"] == "beta_binomial_v1"
+    assert summary["affinity_model_status_tag_counts"] == {
+        "fallback_sparse": 2, "fallback_invariant": 1,
+    }
 
     with (output_dir / GLOBAL_LEADERBOARD_FILENAME).open(
         "r",

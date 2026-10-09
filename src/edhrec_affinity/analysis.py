@@ -32,10 +32,13 @@ Important design decision:
 Core formula:
     tag_affinity_pct = tag_decks / total_decks
 
-Z-score formula:
-    z = (tag_affinity_pct - tag_mean_pct) / tag_std_pct
+Legacy descriptive formula (preserved as legacy_z):
+    legacy_z = (tag_affinity_pct - tag_mean_pct) / tag_std_pct
 
-Where tag_mean_pct and tag_std_pct are calculated separately inside each tag.
+For fitted tags, a beta-binomial model learns a reference mean and latent
+between-commander spread, shrinks uncertain affinity estimates toward that
+mean, and computes z = (adjusted_affinity - prior_mean) / prior_std.
+Sparse/invariant/failed tags explicitly fall back to the legacy formula.
 """
 
 from __future__ import annotations
@@ -47,6 +50,13 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from edhrec_affinity.affinity_model import (
+    AFFINITY_MODEL_VERSION,
+    MIN_REFERENCE_COMMANDERS,
+    REFERENCE_MIN_TOTAL_DECKS,
+    add_reliability_adjusted_affinity,
+)
 
 
 # Default filters for the first version of the leaderboard.
@@ -98,6 +108,16 @@ PREFERRED_COLUMN_ORDER = [
     "tag_mean_pct",
     "tag_std_pct",
     "tag_row_count",
+    "tag_affinity_adjusted_pct",
+    "tag_affinity_lower_pct",
+    "tag_affinity_upper_pct",
+    "tag_prior_mean_pct",
+    "tag_prior_strength",
+    "tag_prior_std_pct",
+    "tag_reference_row_count",
+    "affinity_model_version",
+    "affinity_model_status",
+    "legacy_z",
     "z",
     "rank_within_tag_by_z",
     "rank_within_tag_by_pct",
@@ -191,6 +211,10 @@ def validate_analysis_input(df: pd.DataFrame) -> pd.DataFrame:
             validated[column] = pd.to_numeric(validated[column], errors="raise")
         except Exception as exc:  # pragma: no cover - exact pandas error may vary
             raise ValueError(f"Column {column!r} must contain numeric values.") from exc
+
+        values = validated[column].to_numpy(dtype=float)
+        if not np.isfinite(values).all() or (values != np.floor(values)).any():
+            raise ValueError(f"Column {column!r} must contain finite integer deck counts.")
 
     # total_decks must be greater than zero because it is used as a denominator.
     non_positive_total_mask = validated["total_decks"] <= 0
@@ -316,7 +340,7 @@ def add_ranks_and_percentiles(df: pd.DataFrame) -> pd.DataFrame:
 
     percentile_within_tag:
         A decimal percentile from 0 to 1.
-        A value near 1 means the row is near the top of its tag.
+        A value near 1 means the row's score is near the top of its tag.
     """
     result = df.copy()
 
@@ -338,10 +362,9 @@ def add_ranks_and_percentiles(df: pd.DataFrame) -> pd.DataFrame:
         .astype("Int64")
     )
 
-    # Percentile is calculated ascending so the highest affinity percentage
-    # receives the largest percentile value.
+    # Percentile follows the score used for ranking, including shrinkage.
     result["percentile_within_tag"] = (
-        result.groupby("tag_slug")["tag_affinity_pct"]
+        result.groupby("tag_slug")["z"]
         .rank(method="average", pct=True, ascending=True)
     )
 
@@ -375,9 +398,7 @@ def add_sample_size_flags(
 
     result["analysis_eligible"] = (
         result["passes_default_filters"]
-        & result["z"].notna()
-        & result["tag_std_pct"].notna()
-        & (result["tag_std_pct"] > 0)
+        & np.isfinite(result["z"])
         & (result["tag_row_count"] > 1)
     )
 
@@ -410,7 +431,7 @@ def prepare_analysis_table(
         1. validate input
         2. calculate affinity percentage
         3. calculate tag baselines
-        4. calculate z-scores
+        4. calculate legacy z and reliability-adjusted affinity scores
         5. calculate ranks and percentiles
         6. add sample-size flags
     """
@@ -418,6 +439,7 @@ def prepare_analysis_table(
     analyzed = add_affinity_percentage(analyzed)
     analyzed = add_tag_baselines(analyzed)
     analyzed = add_z_scores(analyzed)
+    analyzed = add_reliability_adjusted_affinity(analyzed)
     analyzed = add_ranks_and_percentiles(analyzed)
     analyzed = add_sample_size_flags(
         analyzed,
@@ -495,6 +517,12 @@ def build_tag_summary(analysis_df: pd.DataFrame) -> pd.DataFrame:
             eligible_row_count=("analysis_eligible", "sum"),
             tag_mean_pct=("tag_affinity_pct", "mean"),
             tag_std_pct=("tag_affinity_pct", "std"),
+            tag_prior_mean_pct=("tag_prior_mean_pct", "first"),
+            tag_prior_strength=("tag_prior_strength", "first"),
+            tag_prior_std_pct=("tag_prior_std_pct", "first"),
+            tag_reference_row_count=("tag_reference_row_count", "first"),
+            affinity_model_version=("affinity_model_version", "first"),
+            affinity_model_status=("affinity_model_status", "first"),
             max_z=("z", "max"),
             max_tag_decks=("tag_decks", "max"),
             max_total_decks=("total_decks", "max"),
@@ -570,6 +598,19 @@ def build_analysis_summary(
         "unique_tag_count": int(analysis_df["tag_slug"].nunique()),
         "analysis_eligible_row_count": int(analysis_df["analysis_eligible"].sum()),
         "rows_with_missing_z": int(analysis_df["z"].isna().sum()),
+        "affinity_model_version": AFFINITY_MODEL_VERSION,
+        "affinity_model_status_row_counts": {
+            str(status): int(count)
+            for status, count in analysis_df["affinity_model_status"].value_counts().items()
+        },
+        "affinity_model_status_tag_counts": {
+            str(status): int(count)
+            for status, count in tag_summary["affinity_model_status"].value_counts().items()
+        },
+        "reference_min_total_decks": REFERENCE_MIN_TOTAL_DECKS,
+        "minimum_reference_commanders": MIN_REFERENCE_COMMANDERS,
+        "reference_scope": "reported commander-tag rows; absent tags are not inferred zeros",
+        "posterior_interval": "95% Beta interval conditional on fitted prior and binomial model",
         "min_total_decks_default": int(min_total_decks),
         "min_tag_decks_default": int(min_tag_decks),
         "output_files": {

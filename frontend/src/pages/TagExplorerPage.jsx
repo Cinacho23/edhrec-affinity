@@ -5,10 +5,14 @@ import SimpleTable from "../components/SimpleTable";
 import TrendBadge from "../components/TrendBadge";
 import { loadTagDetail, loadTagIndex } from "../lib/api";
 import {
+  formatAdjustedAffinity,
+  formatAffinityInterval,
+  formatAffinityProbability,
+} from "../lib/affinityDisplay";
+import {
   formatColorIdentity,
   formatDecimal,
   formatNumber,
-  formatPercent,
   formatRank,
 } from "../lib/formatters";
 import {
@@ -127,6 +131,7 @@ export default function TagExplorerPage() {
   const selectedTagInfo = useMemo(() => {
     return tags.find((tag) => tag.tag_slug === selectedTag);
   }, [tags, selectedTag]);
+  const tagModel = rows[0]?.tag_slug === selectedTag ? rows[0] : null;
 
   const filteredRows = useMemo(() => {
     const filtered = rows.filter((row) => {
@@ -197,9 +202,20 @@ export default function TagExplorerPage() {
     },
     {
       key: "tag_affinity_pct",
-      header: "Affinity",
+      header: "Raw Affinity",
       sortable: true,
-      render: (row) => formatPercent(row.tag_affinity_pct),
+      render: (row) => formatAffinityProbability(row.tag_affinity_pct),
+    },
+    {
+      key: "tag_affinity_adjusted_pct",
+      header: "Adjusted Affinity",
+      sortable: true,
+      render: formatAdjustedAffinity,
+    },
+    {
+      key: "affinity_interval",
+      header: "95% Range",
+      render: formatAffinityInterval,
     },
     {
       key: "z",
@@ -264,6 +280,15 @@ export default function TagExplorerPage() {
           Select a tag to load the complete commander ranking file for that tag.
           Filters and sorting apply to all loaded rows for the selected tag.
         </p>
+        <p>
+          Compare the observed raw affinity with the sample-size-adjusted
+          estimate and its 95% range. The z-score ranks specialization for the
+          selected tag. <Link to="/methodology">How it works</Link>
+        </p>
+        <p className="muted">
+          “Unadjusted” means the previous score is retained because a reliable
+          model could not be fitted. Missing estimates and ranges appear as —.
+        </p>
       </div>
 
       <section className="tag-selector-panel">
@@ -298,7 +323,24 @@ export default function TagExplorerPage() {
             <span>Tag slug</span>
             <strong>{selectedTag}</strong>
           </div>
+          <div>
+            <span>Tag baseline</span>
+            <strong>{formatAffinityProbability(tagModel?.tag_prior_mean_pct)}</strong>
+          </div>
+          <div>
+            <span>Baseline spread</span>
+            <strong>{formatAffinityProbability(tagModel?.tag_prior_std_pct)}</strong>
+          </div>
+          <div>
+            <span>Reference commanders</span>
+            <strong>{formatNumber(tagModel?.tag_reference_row_count)}</strong>
+          </div>
         </div>
+        <p className="muted">
+          The baseline and spread describe reported commanders with at least
+          200 total decks, before display filters. They are unavailable when
+          the model cannot be fitted.
+        </p>
       </section>
 
       <section className="filter-panel">
