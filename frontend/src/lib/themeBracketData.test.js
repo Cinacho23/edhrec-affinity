@@ -42,7 +42,7 @@ function signalFiles() {
 }
 
 test("reuses compact index and theme requests without loading legacy data", async () => {
-  const themes = [{ tag_slug: "tokens", tag_name: "Tokens" }];
+  const themes = [{ tag_slug: "tokens", tag_name: "Tokens", qualification_score_field: "z" }];
   const rows = [{ commander_slug: "alpha", theme_tag_slug: "tokens", theme_z: 3 }];
   const source = createSource({
     "loadThemeBracketIndex:": themes,
@@ -92,7 +92,7 @@ test("missing compact files use the same legacy rows", async () => {
   assert.equal(rows[0].theme_z, 2);
 });
 
-test("legacy ordinary themes retain commander ordering for tied deciding tags", async () => {
+test("all fallback themes retain commander ordering for tied deciding tags", async () => {
   const source = createSource({
     ...signalFiles(),
     "loadTagDetail:tokens": [tag("alpha", "tokens", 2)],
@@ -109,7 +109,7 @@ test("legacy ordinary themes retain commander ordering for tied deciding tags", 
   ]);
   assert.equal(buildCommanderThemeBracketRows(tokens, "tokens")[0].decision_tag_slug, "combo");
   assert.equal(buildCommanderThemeBracketRows(mutate, "mutate")[0].decision_tag_slug, "combo");
-  assert.equal(buildCommanderThemeBracketRows(aggro, "aggro")[0].decision_tag_slug, "aggro");
+  assert.equal(buildCommanderThemeBracketRows(aggro, "aggro")[0].decision_tag_slug, "combo");
   assert.equal(source.calls.filter((call) => call === "loadCommanderDetail:alpha").length, 1);
 });
 
@@ -147,21 +147,24 @@ test("concurrent mapping preserves input order and rejects invalid limits", asyn
   await assert.rejects(mapWithConcurrency([1], 0, (value) => value), /positive integer/);
 });
 
-test("fallback loaders retain legacy scores after the affinity upgrade", async () => {
+test("fallback loaders use current scores for eligibility and classification", async () => {
   const source = createSource({
     ...signalFiles(),
     "loadTagDetail:tokens": [
       { ...tag("alpha", "tokens", 0.2), legacy_z: 1.2 },
       { ...tag("beta", "tokens", 5), legacy_z: 1.04 },
     ],
-    "loadTagDetail:cedh": [{ ...tag("alpha", "cedh", -1), legacy_z: 0.4 }],
+    "loadTagDetail:cedh": [{ ...tag("beta", "cedh", .4), legacy_z: -1 }],
   });
   const loader = createThemeBracketDataLoader({ dataSource: source.dataSource });
   const results = buildCommanderThemeBracketRows(await loader.loadRows("tokens", false), "tokens");
   assert.equal(results.length, 1);
+  assert.equal(results[0].commander_slug, "beta");
   assert.equal(results[0].bracket_key, "4");
   assert.equal(results[0].decision_z, 0.4);
-  assert.equal(results[0].theme_z, 1.2);
+  assert.equal(results[0].theme_z, 5);
+  assert.equal(results[0].theme_legacy_z, 1.04);
+  assert.equal(results[0].decision_legacy_z, -1);
 });
 
 test("fallback and compact rows retain exact selected-theme and deciding-tag metric identities", async () => {
@@ -170,13 +173,13 @@ test("fallback and compact rows retain exact selected-theme and deciding-tag met
     tag_affinity_lower_pct: .15, tag_affinity_upper_pct: .21,
     rank_within_tag_by_z: 7, affinity_model_status: "fitted",
     affinity_model_version: "beta_binomial_v1" };
-  const decision = { ...tag("alpha", "cedh", null), legacy_z: .4,
+  const decision = { ...tag("alpha", "cedh", .4), legacy_z: null,
     tag_affinity_pct: .03, tag_affinity_adjusted_pct: .03,
     tag_affinity_lower_pct: null, tag_affinity_upper_pct: null,
     rank_within_tag_by_z: null, affinity_model_status: "fallback_fit_failed",
     affinity_model_version: "beta_binomial_v1" };
   const compact = { commander_slug: "alpha", commander_name: "alpha", total_decks: 200,
-    theme_tag_slug: "tokens", theme_tag_name: "tokens", theme_z: 1.2,
+    theme_tag_slug: "tokens", theme_tag_name: "tokens", theme_z: 3,
     theme_legacy_z: 1.2, theme_affinity_z: 3, theme_tag_decks: 10,
     theme_affinity_pct: .2, theme_affinity_adjusted_pct: .18,
     theme_affinity_lower_pct: .15, theme_affinity_upper_pct: .21,
@@ -186,6 +189,7 @@ test("fallback and compact rows retain exact selected-theme and deciding-tag met
     ...signalFiles(),
     "loadTagDetail:tokens": [theme],
     "loadTagDetail:cedh": [decision],
+    "loadThemeBracketIndex:": [{ tag_slug: "tokens", qualification_score_field: "z" }],
     "loadThemeBracketDetail:tokens": [compact],
   });
   const loader = createThemeBracketDataLoader({ dataSource: source.dataSource });
@@ -199,7 +203,46 @@ test("fallback and compact rows retain exact selected-theme and deciding-tag met
   assert.deepEqual(metrics(fallbackResult), metrics(fullResult));
   assert.equal(fallbackResult.theme_affinity_adjusted_pct, .18);
   assert.equal(fallbackResult.decision_tag_affinity_pct, .03);
-  assert.equal(fallbackResult.decision_affinity_z, null);
+  assert.equal(fallbackResult.decision_affinity_z, .4);
+  assert.equal(fallbackResult.decision_legacy_z, null);
   assert.equal(fallbackResult.decision_tag_affinity_lower_pct, null);
   assert.equal(fallbackResult.decision_affinity_model_status, "fallback_fit_failed");
+});
+
+test("unmarked compact collections fall back to complete tags to recover new qualifiers", async () => {
+  const source = createSource({
+    ...signalFiles(),
+    "loadThemeBracketIndex:": [{ tag_slug: "tokens", tag_name: "Tokens", qualified_commander_count: 0 }],
+    "loadTagIndex:": [{ tag_slug: "tokens", tag_name: "Tokens", commander_count: 3 }, { tag_slug: "snow" }],
+    "loadThemeBracketDetail:tokens": [],
+    "loadTagDetail:tokens": [
+      { ...tag("old-qualifier", "tokens", .2), legacy_z: 2 },
+      { ...tag("new-qualifier", "tokens", 2), legacy_z: .2 },
+      { ...tag("missing-score", "tokens", null), legacy_z: 2 },
+    ],
+    "loadTagDetail:combo": [{ ...tag("new-qualifier", "combo", 1.2), legacy_z: .2 }],
+  });
+  const loader = createThemeBracketDataLoader({ dataSource: source.dataSource });
+  const index = await loader.loadIndex();
+  assert.equal(index.usesThemeBracketFiles, false);
+  assert.deepEqual(index.themes, [
+    { tag_slug: "tokens", tag_name: "Tokens", commander_count: 3 }, { tag_slug: "snow" },
+  ]);
+  const results = buildCommanderThemeBracketRows(await loader.loadRows("tokens"), "tokens");
+  assert.deepEqual(results.map((row) => row.commander_slug), ["new-qualifier"]);
+  assert.equal(results[0].bracket_key, "3");
+  assert.equal(source.calls.includes("loadThemeBracketDetail:tokens"), false);
+});
+
+test("marked collections with rejected stale details use complete tag data", async () => {
+  const source = createSource({
+    ...signalFiles(),
+    "loadThemeBracketIndex:": [{ tag_slug: "tokens", qualification_score_field: "z" }],
+    // The API rejects an old detail array without the qualification marker.
+    "loadTagDetail:tokens": [tag("new-qualifier", "tokens", 2)],
+  });
+  const loader = createThemeBracketDataLoader({ dataSource: source.dataSource });
+  const results = buildCommanderThemeBracketRows(await loader.loadRows("tokens"), "tokens");
+  assert.equal(results[0].commander_slug, "new-qualifier");
+  assert.equal(source.calls.includes("loadThemeBracketDetail:tokens"), true);
 });

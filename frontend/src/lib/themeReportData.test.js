@@ -120,7 +120,7 @@ test("invalid compact structures fail and empty themes are retained", () => {
 
 test("one commander in multiple themes retains each theme's metrics and separate deciding metrics", () => {
   const groups = expandThemeReport({
-    commanders: [{ ...commander("shared", [{ ...signal("cedh", -.2), legacy_z: .4,
+    commanders: [{ ...commander("shared", [{ ...signal("cedh", .4), legacy_z: -.2,
       tag_affinity_pct: .03, tag_affinity_adjusted_pct: .025,
       tag_affinity_lower_pct: .01, tag_affinity_upper_pct: .04,
       rank_within_tag_by_z: 19, affinity_model_status: "fitted",
@@ -158,13 +158,12 @@ test("one commander in multiple themes retains each theme's metrics and separate
   assert.equal(snow.theme_z, 88);
   assert.equal(snow.theme_affinity_adjusted_pct, .09);
   assert.equal(snow.theme_rank_within_tag_by_z, 1);
-  assert.equal(lands.theme_z, null);
-  assert.equal(lands.theme_affinity_adjusted_pct, null);
-  assert.equal(lands.theme_affinity_model_status, null);
+  assert.equal(lands, undefined);
   for (const row of prepared) {
     assert.equal(row.bracket_key, "4");
     assert.equal(row.decision_z, .4);
-    assert.equal(row.decision_affinity_z, -.2);
+    assert.equal(row.decision_affinity_z, .4);
+    assert.equal(row.decision_legacy_z, -.2);
     assert.equal(row.decision_tag_affinity_pct, .03);
     assert.equal(row.decision_tag_affinity_adjusted_pct, .025);
     assert.equal(row.decision_tag_affinity_lower_pct, .01);

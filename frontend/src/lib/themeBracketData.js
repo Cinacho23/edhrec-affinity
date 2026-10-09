@@ -148,10 +148,13 @@ export function createThemeBracketDataLoader({
     if (!indexPromise) {
       indexPromise = (async () => {
         try {
-          return {
-            themes: await requestRows("loadThemeBracketIndex"),
-            usesThemeBracketFiles: true,
-          };
+          const themes = await requestRows("loadThemeBracketIndex");
+          // Earlier collections omitted rows using the legacy score gate and
+          // expose stale qualified counts. Recover themes and rows from tags.
+          if (themes.every((theme) => theme.qualification_score_field === "z")) {
+            return { themes, usesThemeBracketFiles: true };
+          }
+          return { themes: await requestRows("loadTagIndex"), usesThemeBracketFiles: false };
         } catch {
           return {
             themes: await requestRows("loadTagIndex"),
@@ -202,8 +205,7 @@ export function createThemeBracketDataLoader({
 
   function loadCommanderSignals(commanderSlug, signals) {
     if (!commanderSignals.has(commanderSlug)) {
-      // Ordinary themes previously read commander details, whose ordering
-      // determines the deciding tag when signals tie. Preserve that rare case.
+      // Commander details provide authoritative ordering for exact score ties.
       commanderSignals.set(commanderSlug, hasDecidingSignalTie(signals)
         ? requestRows("loadCommanderDetail", commanderSlug)
         : Promise.resolve(signals));
@@ -217,11 +219,9 @@ export function createThemeBracketDataLoader({
     if (qualifiedRows.length === 0) return [];
 
     const signalsByCommander = await loadSignalRows();
-    const bracketRulesOnly = themeUsesBracketRulesOnly(themeSlug);
-
     return mapWithConcurrency(qualifiedRows, concurrency, async (row) => {
       const signals = signalsByCommander.get(row.commander_slug) || [];
-      const bracketRows = bracketRulesOnly || !row.commander_slug
+      const bracketRows = !row.commander_slug
         ? signals
         : await loadCommanderSignals(row.commander_slug, signals);
       return createThemeRow(row, bracketRows);
@@ -233,10 +233,13 @@ export function createThemeBracketDataLoader({
     if (!themeRows.has(key)) {
       themeRows.set(key, (async () => {
         if (usesThemeBracketFiles) {
-          try {
-            return await requestRows("loadThemeBracketDetail", themeSlug);
-          } catch {
-            // Older exports and deployments can have only some compact files.
+          const index = await loadIndex().catch(() => null);
+          if (index?.usesThemeBracketFiles) {
+            try {
+              return await requestRows("loadThemeBracketDetail", themeSlug);
+            } catch {
+              // Partial exports can lack a compact file; complete tags remain.
+            }
           }
         }
         return loadFallbackRows(themeSlug);

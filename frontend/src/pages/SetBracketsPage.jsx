@@ -79,12 +79,13 @@ export default function SetBracketsPage() {
   const [filters, setFilters] = useState(() =>
     readSessionObject(FILTER_STORAGE_KEY, DEFAULT_FILTERS)
   );
-  const [sort, setSort] = useState(() =>
-    readSessionObject(SORT_STORAGE_KEY, {
+  const [sort, setSort] = useState(() => {
+    const stored = readSessionObject(SORT_STORAGE_KEY, {
       key: "bracket_rank",
       direction: "desc",
-    })
-  );
+    });
+    return { ...stored, key: stored.key === "decision_z" ? "decision_affinity_z" : stored.key };
+  });
   const [usesExportedSetFiles, setUsesExportedSetFiles] = useState(true);
   const [state, setState] = useState({
     loadingSets: true,
@@ -348,12 +349,6 @@ export default function SetBracketsPage() {
       render: (row) => row.decision_tag_name || "—",
     },
     {
-      key: "decision_z",
-      header: "Original Bracket Z",
-      sortable: true,
-      render: (row) => formatDecimal(row.decision_z),
-    },
-    {
       key: "decision_tag_affinity_pct",
       header: "Raw Affinity",
       sortable: true,
@@ -372,7 +367,7 @@ export default function SetBracketsPage() {
     },
     {
       key: "decision_affinity_z",
-      header: "Z-Score",
+      header: "Bracket Z",
       sortable: true,
       render: (row) => formatDecimal(getDecisionAffinityMetrics(row).z),
     },
@@ -428,19 +423,20 @@ export default function SetBracketsPage() {
   return (
     <section className="page bracket-page">
       <div className="page-header">
-        <p className="eyebrow">Set-level power signals</p>
+        <p className="eyebrow">Set-level bracket suggestions</p>
         <h1>Commander Brackets</h1>
         <p>
-          Choose a Magic set to classify each of its commanders from Bracket 1
-          through Bracket 5. In-flux labels identify commanders whose deciding
-          Original Bracket Z sits between thresholds.
+          Choose a Magic set to see suggested building brackets for its
+          commanders. These labels give our recommended ceiling from observed
+          tag associations; actual deck strength depends on the build. In-flux
+          labels identify commanders whose Bracket Z sits between thresholds.
         </p>
         <p>
-          Raw and adjusted affinity, the 95% range, z-score, and Rank in Tag
+          Raw and adjusted affinity, the 95% range, Bracket Z, and Rank in Tag
           all describe the Deciding Tag. Rank in Tag compares all reported
-          commanders for that tag, across sets and brackets. Original Bracket Z
-          drives the unchanged classification rules; the updated z-score
-          describes affinity. “Unadjusted” marks a fallback and — means
+          commanders for that tag, across sets and brackets. The same numeric
+          bracket cutoffs now use the upgraded affinity z-score. “Unadjusted”
+          marks a fallback and — means
           unavailable. <Link to="/methodology">How it works</Link>
         </p>
       </div>
@@ -454,7 +450,7 @@ export default function SetBracketsPage() {
           <p className="muted">
             Aggro, Control, Midrange, Tempo, and Combo are evaluated only after
             cEDH does not qualify for Bracket 4 or higher. These thresholds use
-            Original Bracket Z.
+            Bracket Z, the deciding tag’s upgraded affinity score.
           </p>
         </div>
         <div className="bracket-rule-grid">

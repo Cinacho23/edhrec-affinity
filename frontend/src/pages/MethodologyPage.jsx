@@ -179,19 +179,35 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
         <h2>8. Brackets and cEDH</h2>
 
         <p>
-          Revised affinity scores rank the Leaderboard, Tag Explorer, and Theme
-          Report. Bracket classification and existing theme eligibility cutoffs
-          continue to use the previous raw-affinity z-score and unchanged
-          thresholds. Affinity should not be read as evidence that a commander
-          or a particular deck belongs in a bracket.
+          The upgraded affinity z-score is used consistently for rankings,
+          bracket suggestions, and theme eligibility. The numeric bracket
+          cutoffs remain 0, 0.05, 0.95, and 1.05, including the existing in-flux
+          bands. cEDH is evaluated first; when it does not qualify for Bracket 4
+          or higher, Aggro, Control, Midrange, Tempo, and Combo are considered.
+          Ordinary themes still require a theme z-score of at least 1.05.
+          cEDH and those five archetype themes use only the bracket rules.
+          The score inputs have changed, so commanders can receive different
+          suggestions even though the numeric cutoffs are unchanged.
+        </p>
+        <p>
+          A bracket label is our suggested building bracket and recommended
+          ceiling, inferred from observed commander-tag associations. These
+          cutoffs are recommendation rules rather than a calibrated measure of
+          deck power. A particular deck’s strength and appropriate play
+          experience depend on its card choices, construction, and intent.
+          Using the same upgraded score throughout the site makes the rules
+          consistent; it does not mathematically guarantee a power ceiling.
         </p>
         <p>
           Affinity columns on Sets describe the tag named in each row. On
           Brackets they describe the deciding archetype or cEDH tag; if there
           is no deciding tag, those values are unavailable. Theme Brackets and
-          Theme Report show the selected theme’s affinity. The original bracket
-          and theme eligibility scores are labeled separately from the revised
-          affinity z-score.
+          Theme Report show the selected theme’s affinity. Their theme z-score
+          and Bracket Z can differ because they describe different tags.
+          Bracket Z is the deciding tag’s upgraded affinity z-score, not a
+          separate measure of deck power. The unadjusted fallbacks described
+          above remain explicit; missing scores are unavailable and do not
+          qualify for a score threshold.
         </p>
         <p>
           cEDH is represented as a normalized tag but comes from a special

@@ -31,13 +31,20 @@ def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_theme_rows(path: Path):
+    data = read_json(path)
+    assert data["qualification_score_field"] == "z"
+    assert isinstance(data["rows"], list)
+    return data["rows"]
+
+
 def test_extract_set_code_from_scryfall_uri():
     uri = "https://scryfall.com/card/khm/179/jorn-god-of-winter"
 
     assert extract_set_code_from_scryfall_uri(uri) == "khm"
 
 
-def test_upgrade_exports_new_affinity_and_preserves_legacy_bracket_inputs(tmp_path):
+def test_upgrade_exports_current_theme_qualification_and_preserves_legacy_history(tmp_path):
     processed_dir = tmp_path / "processed"
     output_dir = tmp_path / "site"
     common = {
@@ -50,12 +57,12 @@ def test_upgrade_exports_new_affinity_and_preserves_legacy_bracket_inputs(tmp_pa
         "scryfall_uri": "https://scryfall.com/card/khm/1/test",
     }
     write_json(processed_dir / "affinity_rows_with_trends.json", [
-        {**common, "tag_name": "Tokens", "tag_slug": "tokens", "z": 0.2, "legacy_z": 1.2},
-        {**common, "tag_name": "Combo", "tag_slug": "combo", "z": -2, "legacy_z": 1.05,
+        {**common, "tag_name": "Tokens", "tag_slug": "tokens", "z": 3, "legacy_z": .2},
+        {**common, "tag_name": "Combo", "tag_slug": "combo", "z": 1.05, "legacy_z": -2,
          "tag_decks": 30, "tag_affinity_pct": .03, "tag_affinity_adjusted_pct": .029,
          "tag_affinity_lower_pct": .02, "tag_affinity_upper_pct": .04, "rank_within_tag_by_z": 9},
-        {**common, "tag_name": "Snow", "tag_slug": "snow", "z": 5, "legacy_z": 1.04},
-        {**common, "tag_name": "Lands", "tag_slug": "lands", "z": 5, "legacy_z": None},
+        {**common, "tag_name": "Snow", "tag_slug": "snow", "z": 1.04, "legacy_z": 5},
+        {**common, "tag_name": "Lands", "tag_slug": "lands", "z": None, "legacy_z": 5},
     ])
     write_json(processed_dir / "analysis_summary.json", {})
     write_json(processed_dir / "trend_summary.json", {})
@@ -65,12 +72,12 @@ def test_upgrade_exports_new_affinity_and_preserves_legacy_bracket_inputs(tmp_pa
     set_rows = read_json(output_dir / "sets" / "khm.json")
     tokens = next(row for row in set_rows if row["tag_slug"] == "tokens")
     assert tokens["tag_affinity_adjusted_pct"] == 0.19
-    assert tokens["legacy_z"] == 1.2
-    theme_rows = read_json(output_dir / "theme-brackets" / "tokens.json")
+    assert tokens["legacy_z"] == .2
+    theme_rows = read_theme_rows(output_dir / "theme-brackets" / "tokens.json")
     assert len(theme_rows) == 1
-    assert theme_rows[0]["theme_z"] == 1.2
-    assert theme_rows[0]["theme_affinity_z"] == 0.2
-    assert theme_rows[0]["theme_legacy_z"] == 1.2
+    assert theme_rows[0]["theme_z"] == 3
+    assert theme_rows[0]["theme_affinity_z"] == 3
+    assert theme_rows[0]["theme_legacy_z"] == .2
     assert theme_rows[0]["theme_affinity_pct"] == .2
     assert theme_rows[0]["theme_affinity_adjusted_pct"] == .19
     assert theme_rows[0]["theme_affinity_lower_pct"] == .17
@@ -79,19 +86,20 @@ def test_upgrade_exports_new_affinity_and_preserves_legacy_bracket_inputs(tmp_pa
     assert theme_rows[0]["theme_affinity_model_version"] == "beta_binomial_v1"
     assert theme_rows[0]["theme_rank_within_tag_by_z"] == 2
     assert theme_rows[0]["bracket_tag_rows"] == [{
-        "tag_name": "Combo", "tag_slug": "combo", "z": -2, "legacy_z": 1.05,
+        "tag_name": "Combo", "tag_slug": "combo", "z": 1.05, "legacy_z": -2,
         "tag_decks": 30, "tag_affinity_pct": .03, "tag_affinity_adjusted_pct": .029,
         "tag_affinity_lower_pct": .02, "tag_affinity_upper_pct": .04,
         "affinity_model_status": "fitted", "affinity_model_version": "beta_binomial_v1",
         "rank_within_tag_by_z": 9,
     }]
-    assert read_json(output_dir / "theme-brackets" / "snow.json") == []
-    assert read_json(output_dir / "theme-brackets" / "lands.json") == []
+    assert read_theme_rows(output_dir / "theme-brackets" / "snow.json") == []
+    assert read_theme_rows(output_dir / "theme-brackets" / "lands.json") == []
     report = read_json(output_dir / "theme-report.json")
     token_rows = next(theme for theme in report["themes"] if theme["tag_slug"] == "tokens")["rows"]
-    assert token_rows[0]["theme_z"] == 1.2
-    assert token_rows[0]["theme_affinity_z"] == 0.2
-    assert token_rows[0]["theme_legacy_z"] == 1.2
+    assert report["qualification_score_field"] == "z"
+    assert token_rows[0]["theme_z"] == 3
+    assert token_rows[0]["theme_affinity_z"] == 3
+    assert token_rows[0]["theme_legacy_z"] == .2
     assert token_rows[0] == {key: theme_rows[0][key] for key in token_rows[0]}
     assert report["commanders"][0]["bracket_tag_rows"] == theme_rows[0]["bracket_tag_rows"]
 
@@ -262,6 +270,7 @@ def test_export_full_site_data_writes_compact_theme_bracket_files(tmp_path):
     )
 
     assert manifest["theme_bracket_export"]["minimum_z"] == 1.05
+    assert manifest["theme_bracket_export"]["qualification_score_field"] == "z"
 
     theme_index = read_json(output_dir / "theme-brackets" / "index.json")
     mutate_info = next(
@@ -273,11 +282,13 @@ def test_export_full_site_data_writes_compact_theme_bracket_files(tmp_path):
     assert mutate_info["qualified_commander_count"] == 1
     assert mutate_info["minimum_z"] == 1.05
     assert mutate_info["qualification_rule"] == "theme_z_and_bracket_rules"
+    assert mutate_info["qualification_score_field"] == "z"
     assert combo_info["qualified_commander_count"] == 2
     assert combo_info["minimum_z"] is None
     assert combo_info["qualification_rule"] == "bracket_rules_only"
+    assert combo_info["qualification_score_field"] == "z"
 
-    mutate_rows = read_json(output_dir / "theme-brackets" / "mutate.json")
+    mutate_rows = read_theme_rows(output_dir / "theme-brackets" / "mutate.json")
     assert len(mutate_rows) == 1
     assert mutate_rows[0]["commander_slug"] == "theme-commander"
     assert mutate_rows[0]["theme_z"] == 2.4
@@ -290,7 +301,7 @@ def test_export_full_site_data_writes_compact_theme_bracket_files(tmp_path):
          "rank_within_tag_by_z": None}
     ]
 
-    combo_rows = read_json(output_dir / "theme-brackets" / "combo.json")
+    combo_rows = read_theme_rows(output_dir / "theme-brackets" / "combo.json")
     assert {row["commander_slug"] for row in combo_rows} == {
         "theme-commander",
         "below-threshold",
@@ -303,6 +314,7 @@ def test_export_full_site_data_writes_compact_theme_bracket_files(tmp_path):
         "commander_count": 2,
         "row_count": 3,
         "minimum_z": 1.05,
+        "qualification_score_field": "z",
     }
     mutate_report = next(theme for theme in report["themes"] if theme["tag_slug"] == "mutate")
     assert mutate_report["rows"] == [
@@ -375,7 +387,7 @@ def test_theme_report_matches_theme_brackets_without_deck_minimums(tmp_path):
     }
 
     for theme in report["themes"]:
-        bracket_rows = read_json(tmp_path / "theme-brackets" / f'{theme["tag_slug"]}.json')
+        bracket_rows = read_theme_rows(tmp_path / "theme-brackets" / f'{theme["tag_slug"]}.json')
         assert len(theme["rows"]) == len(bracket_rows)
 
         for report_row, bracket_row in zip(theme["rows"], bracket_rows):
@@ -405,11 +417,14 @@ def test_theme_report_retains_empty_themes_and_handles_an_empty_dataset(tmp_path
     assert read_json(tmp_path / "theme-report.json") == {
         "commanders": [],
         "themes": [{"tag_slug": "snow", "tag_name": "Snow", "rows": []}],
+        "qualification_score_field": "z",
     }
 
     metadata = export_full_site_data_module.export_theme_report(df.iloc[:0], None, tmp_path)
     assert metadata["row_count"] == metadata["commander_count"] == metadata["theme_count"] == 0
-    assert read_json(tmp_path / "theme-report.json") == {"commanders": [], "themes": []}
+    assert read_json(tmp_path / "theme-report.json") == {
+        "commanders": [], "themes": [], "qualification_score_field": "z"
+    }
 
 
 def test_theme_report_writes_strict_json_for_nonfinite_values(tmp_path):
@@ -486,10 +501,13 @@ def test_compact_metrics_preserve_explicit_missing_score_and_signal_source_ident
         "theme_affinity_model_version": "affinity_model_version",
         "theme_rank_within_tag_by_z": "rank_within_tag_by_z",
         "theme_affinity_z": "z",
-        "theme_z": "legacy_z",
+        "theme_z": "z",
+        "theme_legacy_z": "legacy_z",
     }
     for canonical in rows:
-        compact = read_json(tmp_path / "theme-brackets" / f'{canonical["tag_slug"]}.json')[0]
+        if canonical["tag_slug"] == "lands":
+            continue
+        compact = read_theme_rows(tmp_path / "theme-brackets" / f'{canonical["tag_slug"]}.json')[0]
         report_row = next(theme for theme in report["themes"] if theme["tag_slug"] == canonical["tag_slug"])["rows"][0]
         for destination, source in mappings.items():
             assert compact[destination] == canonical.get(source)
@@ -500,8 +518,43 @@ def test_compact_metrics_preserve_explicit_missing_score_and_signal_source_ident
                        "tag_affinity_upper_pct", "affinity_model_status", "affinity_model_version",
                        "rank_within_tag_by_z", "z", "legacy_z"]:
             assert signal[source] == rows[-1][source]
-    lands = read_json(tmp_path / "theme-brackets/lands.json")[0]
-    assert lands["theme_z"] == 1.4
-    assert lands["theme_affinity_z"] is None
-    assert lands["theme_affinity_adjusted_pct"] is None
-    assert lands["theme_affinity_model_status"] is None
+    assert read_theme_rows(tmp_path / "theme-brackets/lands.json") == []
+    assert next(theme for theme in report["themes"] if theme["tag_slug"] == "lands")["rows"] == []
+
+
+def test_current_score_order_and_ties_match_sets_commanders_and_compact_signals(tmp_path):
+    processed_dir = tmp_path / "processed"
+    output_dir = tmp_path / "site"
+    common = {
+        "commander_slug": "shared", "commander_name": "Shared", "total_decks": 1000,
+        "tag_decks": 10, "tag_affinity_pct": .01,
+        "scryfall_uri": "https://scryfall.com/card/khm/1/shared",
+    }
+    rows = [
+        {**common, "tag_slug": "tempo", "tag_name": "Tempo", "z": 1, "legacy_z": 100},
+        {**common, "tag_slug": "combo", "tag_name": "Combo", "z": 2, "legacy_z": 99},
+        {**common, "tag_slug": "aggro", "tag_name": "Aggro", "z": 2, "legacy_z": .01},
+        {**common, "tag_slug": "cedh", "tag_name": "cEDH", "z": None, "legacy_z": 5},
+        {**common, "tag_slug": "tokens", "tag_name": "Tokens", "z": 2, "legacy_z": 9},
+        {**common, "tag_slug": "tokens", "tag_name": "Tokens", "z": 3, "legacy_z": 1},
+    ]
+    write_json(processed_dir / "affinity_rows_with_trends.json", rows)
+    write_json(processed_dir / "analysis_summary.json", {})
+    write_json(processed_dir / "trend_summary.json", {})
+    write_json(processed_dir / "tag_summary.json", [])
+    export_full_site_data(processed_dir, output_dir, 10, True)
+
+    def signal_order(records):
+        return [row["tag_slug"] for row in records if row["tag_slug"] in {"cedh", "aggro", "combo", "tempo"}]
+
+    expected = ["aggro", "combo", "tempo", "cedh"]
+    assert signal_order(read_json(output_dir / "commanders/shared.json")) == expected
+    assert signal_order(read_json(output_dir / "sets/khm.json")) == expected
+    theme = read_theme_rows(output_dir / "theme-brackets/tokens.json")[0]
+    assert signal_order(theme["bracket_tag_rows"]) == expected
+    assert theme["theme_z"] == theme["theme_affinity_z"] == 3
+    assert theme["theme_legacy_z"] == 1
+    report = read_json(output_dir / "theme-report.json")
+    assert signal_order(report["commanders"][0]["bracket_tag_rows"]) == expected
+    theme_report = next(theme for theme in report["themes"] if theme["tag_slug"] == "tokens")["rows"][0]
+    assert theme_report["theme_z"] == 3

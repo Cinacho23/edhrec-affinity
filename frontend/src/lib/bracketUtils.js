@@ -42,10 +42,10 @@ function normalizeTagSlug(row) {
     .replace(/^-|-$/g, "");
 }
 
-// Affinity now has a learned score. Existing bracket rules deliberately use
-// the preserved raw score; a missing legacy score must remain missing.
+// Bracket rules and affinity use the same canonical score. Legacy scores are
+// retained only as history; they cannot replace an unavailable current score.
 export function getBracketScore(row) {
-  const value = Object.hasOwn(row || {}, "legacy_z") ? row.legacy_z : row?.z;
+  const value = row?.z;
   if (value === null || value === undefined || value === "") {
     return null;
   }
@@ -94,6 +94,7 @@ function createClassification(key, scoredRow, reason) {
     decision_tag_name: scoredRow?.row?.tag_name || null,
     decision_tag_slug: scoredRow ? normalizeTagSlug(scoredRow.row) : null,
     decision_z: scoredRow?.score ?? null,
+    decision_legacy_z: getFiniteNumber(decidingTag?.legacy_z),
     decision_tag_decks: scoredRow?.row?.tag_decks ?? null,
     decision_tag_affinity_pct: getFiniteNumber(decidingTag?.tag_affinity_pct),
     decision_tag_affinity_adjusted_pct: getFiniteNumber(decidingTag?.tag_affinity_adjusted_pct),
@@ -234,21 +235,20 @@ function getThemeCandidate(rows, themeSlug) {
       usesThemeFields ? container : candidate,
       usesThemeFields ? "theme_legacy_z" : "legacy_z"
     );
-    const bracketScore = usesThemeFields
-      ? getFiniteNumber(hasLegacyScore ? container.theme_legacy_z : container.theme_z)
-      : getBracketScore(candidate);
+    const legacyScore = getFiniteNumber(usesThemeFields
+      ? container?.theme_legacy_z
+      : candidate?.legacy_z);
 
     if (
       highest &&
-      (bracketScore === null ||
-        (highest.bracketScore !== null && bracketScore <= highest.bracketScore))
+      (score === null || (highest.score !== null && score <= highest.score))
     ) {
       return;
     }
 
     highest = {
       score,
-      bracketScore,
+      legacyScore,
       hasLegacyScore,
       name: usesThemeFields
         ? container?.theme_tag_name
@@ -280,15 +280,20 @@ function getThemeCandidate(rows, themeSlug) {
     };
   }
 
-  for (const row of rows) {
-    consider(row, row);
-
-    if (row?.theme_tag_slug || row?.theme_tag_name) {
-      consider(row, row, true);
-    }
-
-    for (const signalRow of row?.bracket_tag_rows || []) {
-      consider(signalRow, row);
+  const selectedThemeRows = rows.filter((row) =>
+    (row?.theme_tag_slug || row?.theme_tag_name) &&
+    normalizeTagSlug({ tag_slug: row.theme_tag_slug, tag_name: row.theme_tag_name }) === themeSlug
+  );
+  if (selectedThemeRows.length > 0) {
+    // A compact selected-theme record is authoritative, including explicit
+    // nulls. Its signals describe bracket decisions, not substitute metrics.
+    for (const row of selectedThemeRows) consider(row, row, true);
+  } else {
+    for (const row of rows) {
+      consider(row, row);
+      for (const signalRow of row?.bracket_tag_rows || []) {
+        consider(signalRow, row);
+      }
     }
   }
 
@@ -342,7 +347,7 @@ export function buildCommanderThemeBracketRows(
     if (
       !theme ||
       (!usesBracketRulesOnly &&
-        (theme.bracketScore === null || theme.bracketScore < minThemeZ))
+        (theme.score === null || theme.score < minThemeZ))
     ) {
       continue;
     }
@@ -358,8 +363,8 @@ export function buildCommanderThemeBracketRows(
       id: groupKey,
       theme_tag_name: theme.name || normalizedThemeSlug,
       theme_tag_slug: normalizedThemeSlug,
-      theme_z: theme.bracketScore,
-      ...(theme.hasLegacyScore ? { theme_legacy_z: theme.bracketScore } : {}),
+      theme_z: theme.score,
+      ...(theme.hasLegacyScore ? { theme_legacy_z: theme.legacyScore } : {}),
       theme_affinity_z: theme.score,
       theme_tag_decks: theme.decks ?? null,
       theme_affinity_pct: getFiniteNumber(theme.affinity),
