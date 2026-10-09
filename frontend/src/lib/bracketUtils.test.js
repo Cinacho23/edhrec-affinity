@@ -189,9 +189,103 @@ test("affinity upgrades preserve every legacy bracket boundary and missing signa
     for (const score of [null, -2, 0, 0.02, 0.05, 0.95, 0.98, 1.05, 2]) {
       const oldRow = { ...tag(slug, score), tag_decks: 17 };
       const upgraded = { ...oldRow, z: 9, legacy_z: score };
-      assert.deepEqual(classifyCommanderRows([upgraded]), classifyCommanderRows([oldRow]));
+      const { decision_affinity_z: newAffinity, ...newClassification } = classifyCommanderRows([upgraded]);
+      const { decision_affinity_z: oldAffinity, ...oldClassification } = classifyCommanderRows([oldRow]);
+      assert.deepEqual(newClassification, oldClassification);
+      assert.equal(newAffinity, newClassification.decision_tag_slug ? 9 : null);
+      assert.equal(oldAffinity, oldClassification.decision_tag_slug ? score : null);
     }
   }
+});
+
+function ownMetrics(row) {
+  return Object.fromEntries(Object.entries(row).filter(([key]) =>
+    key.startsWith("decision_") || key.startsWith("theme_") || key.startsWith("bracket_")
+  ));
+}
+
+test("deciding metrics follow the selected tag instead of the commander's first row", () => {
+  const identity = { commander_slug: "alpha", commander_name: "Alpha" };
+  const rows = [
+    { ...identity, ...tag("tokens", 88), legacy_z: 2, tag_affinity_pct: .9,
+      tag_affinity_adjusted_pct: .89, rank_within_tag_by_z: 1 },
+    { ...identity, ...tag("combo", 3), legacy_z: 1.2, tag_affinity_pct: .2,
+      tag_affinity_adjusted_pct: .18, tag_affinity_lower_pct: .15,
+      tag_affinity_upper_pct: .21, rank_within_tag_by_z: 7,
+      affinity_model_status: "fitted", affinity_model_version: "beta_binomial_v1" },
+    { ...identity, ...tag("cedh", -.2), legacy_z: .4, tag_affinity_pct: .03,
+      tag_affinity_adjusted_pct: .025, tag_affinity_lower_pct: .01,
+      tag_affinity_upper_pct: .04, rank_within_tag_by_z: 19,
+      affinity_model_status: "fitted", affinity_model_version: "beta_binomial_v1" },
+  ];
+  const decision = buildCommanderBracketRows(rows)[0];
+  assert.equal(decision.bracket_key, "4");
+  assert.equal(decision.decision_tag_slug, "cedh");
+  assert.equal(decision.decision_z, .4);
+  assert.equal(decision.decision_affinity_z, -.2);
+  assert.equal(decision.decision_tag_affinity_pct, .03);
+  assert.equal(decision.decision_tag_affinity_adjusted_pct, .025);
+  assert.equal(decision.decision_tag_affinity_lower_pct, .01);
+  assert.equal(decision.decision_tag_affinity_upper_pct, .04);
+  assert.equal(decision.decision_rank_within_tag_by_z, 19);
+  assert.equal(decision.decision_affinity_model_status, "fitted");
+  assert.equal(decision.decision_affinity_model_version, "beta_binomial_v1");
+
+  const alphaNoCompetitive = buildCommanderBracketRows(rows.slice(0, 2))[0];
+  assert.equal(alphaNoCompetitive.decision_tag_slug, "combo");
+  assert.equal(alphaNoCompetitive.decision_tag_affinity_pct, .2);
+  assert.equal(alphaNoCompetitive.decision_affinity_z, 3);
+});
+
+test("full and compact theme data preserve independent selected and deciding tag metrics", () => {
+  const identity = { commander_slug: "alpha", commander_name: "Alpha" };
+  const theme = { ...identity, ...tag("tokens", 3), legacy_z: 1.2,
+    tag_affinity_pct: .2, tag_affinity_adjusted_pct: .18,
+    tag_affinity_lower_pct: .15, tag_affinity_upper_pct: .21,
+    tag_decks: 200, rank_within_tag_by_z: 7,
+    affinity_model_status: "fitted", affinity_model_version: "beta_binomial_v1" };
+  const deciding = { ...identity, ...tag("cedh", null), legacy_z: .4,
+    tag_affinity_pct: .03, tag_affinity_adjusted_pct: .03,
+    tag_affinity_lower_pct: null, tag_affinity_upper_pct: null,
+    tag_decks: 30, rank_within_tag_by_z: null,
+    affinity_model_status: "fallback_fit_failed", affinity_model_version: "beta_binomial_v1" };
+  const firstUnrelated = { ...identity, ...tag("lands", 99), legacy_z: 4,
+    tag_affinity_pct: .9, tag_affinity_adjusted_pct: .899 };
+  const compact = { ...identity, theme_tag_slug: "tokens", theme_tag_name: "tokens",
+    theme_z: 1.2, theme_legacy_z: 1.2, theme_affinity_z: 3,
+    theme_tag_decks: 200, theme_affinity_pct: .2, theme_affinity_adjusted_pct: .18,
+    theme_affinity_lower_pct: .15, theme_affinity_upper_pct: .21,
+    theme_rank_within_tag_by_z: 7, theme_affinity_model_status: "fitted",
+    theme_affinity_model_version: "beta_binomial_v1", bracket_tag_rows: [deciding] };
+  const fullResult = buildCommanderThemeBracketRows([firstUnrelated, theme, deciding], "tokens")[0];
+  const compactResult = buildCommanderThemeBracketRows([compact], "tokens")[0];
+  assert.deepEqual(ownMetrics(fullResult), ownMetrics(compactResult));
+  assert.equal(fullResult.theme_affinity_pct, .2);
+  assert.equal(fullResult.theme_affinity_adjusted_pct, .18);
+  assert.equal(fullResult.theme_affinity_lower_pct, .15);
+  assert.equal(fullResult.theme_affinity_upper_pct, .21);
+  assert.equal(fullResult.theme_z, 1.2);
+  assert.equal(fullResult.theme_affinity_z, 3);
+  assert.equal(fullResult.theme_rank_within_tag_by_z, 7);
+  assert.equal(fullResult.decision_tag_affinity_pct, .03);
+  assert.equal(fullResult.decision_affinity_z, null);
+  assert.equal(fullResult.decision_tag_affinity_lower_pct, null);
+});
+
+test("missing selected metrics stay null without borrowing unrelated or legacy fields", () => {
+  const result = buildCommanderThemeBracketRows([{
+    commander_slug: "missing", theme_tag_slug: "tokens", theme_z: 1.2,
+    theme_affinity_z: null, tag_affinity_pct: .99, tag_affinity_adjusted_pct: .98,
+    rank_within_tag_by_z: 1, affinity_model_status: "fitted",
+    bracket_tag_rows: [tag("combo", 1.2)],
+  }], "tokens")[0];
+  assert.equal(result.theme_affinity_z, null);
+  assert.equal(result.theme_affinity_pct, null);
+  assert.equal(result.theme_affinity_adjusted_pct, null);
+  assert.equal(result.theme_rank_within_tag_by_z, null);
+  assert.equal(result.theme_affinity_model_status, null);
+  assert.equal(result.decision_tag_affinity_pct, null);
+  assert.equal(result.decision_tag_affinity_adjusted_pct, null);
 });
 
 test("theme bracket eligibility and displayed score retain legacy affinity", () => {

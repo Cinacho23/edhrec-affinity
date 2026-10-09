@@ -625,6 +625,13 @@ def build_theme_bracket_signal_row(row: dict[str, Any]) -> dict[str, Any]:
         "tag_slug": row.get("tag_slug"),
         "z": row.get("z"),
         "tag_decks": row.get("tag_decks"),
+        "tag_affinity_pct": row.get("tag_affinity_pct"),
+        "tag_affinity_adjusted_pct": row.get("tag_affinity_adjusted_pct"),
+        "tag_affinity_lower_pct": row.get("tag_affinity_lower_pct"),
+        "tag_affinity_upper_pct": row.get("tag_affinity_upper_pct"),
+        "affinity_model_status": row.get("affinity_model_status"),
+        "affinity_model_version": row.get("affinity_model_version"),
+        "rank_within_tag_by_z": row.get("rank_within_tag_by_z"),
         **({"legacy_z": row["legacy_z"]} if "legacy_z" in row else {}),
     }
 
@@ -654,6 +661,23 @@ def qualify_theme_bracket_rows(group: pd.DataFrame, theme_slug: str) -> pd.DataF
     return qualified
 
 
+def build_theme_affinity_fields(theme_row: dict[str, Any]) -> dict[str, Any]:
+    """Keep both score versions and the selected theme's own model metrics."""
+    return {
+        "theme_z": theme_row.get("legacy_z") if "legacy_z" in theme_row else theme_row.get("z"),
+        "theme_affinity_z": theme_row.get("z"),
+        **({"theme_legacy_z": theme_row["legacy_z"]} if "legacy_z" in theme_row else {}),
+        "theme_tag_decks": theme_row.get("tag_decks"),
+        "theme_affinity_pct": theme_row.get("tag_affinity_pct"),
+        "theme_affinity_adjusted_pct": theme_row.get("tag_affinity_adjusted_pct"),
+        "theme_affinity_lower_pct": theme_row.get("tag_affinity_lower_pct"),
+        "theme_affinity_upper_pct": theme_row.get("tag_affinity_upper_pct"),
+        "theme_affinity_model_status": theme_row.get("affinity_model_status"),
+        "theme_affinity_model_version": theme_row.get("affinity_model_version"),
+        "theme_rank_within_tag_by_z": theme_row.get("rank_within_tag_by_z"),
+    }
+
+
 def build_theme_bracket_commander_row(
     theme_row: dict[str, Any],
     commander_rows: list[dict[str, Any]],
@@ -670,11 +694,7 @@ def build_theme_bracket_commander_row(
         "scryfall_card_names": theme_row.get("scryfall_card_names"),
         "theme_tag_name": theme_row.get("tag_name"),
         "theme_tag_slug": theme_row.get("tag_slug"),
-        "theme_z": theme_row.get("z"),
-        **({"theme_legacy_z": theme_row["legacy_z"]} if "legacy_z" in theme_row else {}),
-        "theme_tag_decks": theme_row.get("tag_decks"),
-        "theme_affinity_pct": theme_row.get("tag_affinity_pct"),
-        "theme_rank_within_tag_by_z": theme_row.get("rank_within_tag_by_z"),
+        **build_theme_affinity_fields(theme_row),
         "bracket_tag_rows": build_theme_bracket_signal_rows(commander_rows),
     }
 
@@ -766,9 +786,10 @@ def export_theme_report(
             "tag_slug",
             "tag_name",
             "z",
-            "legacy_z",
             "tag_decks",
             "tag_affinity_pct",
+            "rank_within_tag_by_z",
+            *AFFINITY_MODEL_FIELDS,
         ],
     )
     tag_info_by_slug = {
@@ -785,10 +806,7 @@ def export_theme_report(
         rows = [
             {
                 "commander_slug": row.get("commander_slug"),
-                "theme_z": row.get("z"),
-                **({"theme_legacy_z": row["legacy_z"]} if "legacy_z" in row else {}),
-                "theme_tag_decks": row.get("tag_decks"),
-                "theme_affinity_pct": row.get("tag_affinity_pct"),
+                **build_theme_affinity_fields(row),
             }
             for row in qualified.to_dict(orient="records")
         ]

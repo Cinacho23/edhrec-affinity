@@ -3,6 +3,11 @@ import { Link } from "react-router-dom";
 
 import SimpleTable from "../components/SimpleTable";
 import {
+  formatAdjustedAffinity,
+  formatAffinityInterval,
+  formatAffinityProbability,
+} from "../lib/affinityDisplay";
+import {
   loadCommanderDetail,
   loadCommanderIndex,
   loadSetDetail,
@@ -12,7 +17,7 @@ import {
   formatColorIdentity,
   formatDecimal,
   formatNumber,
-  formatPercent,
+  formatRank,
 } from "../lib/formatters";
 import {
   readSessionObject,
@@ -329,12 +334,6 @@ export default function SetExplorerPage() {
       render: (row) => row.tag_name || "-",
     },
     {
-      key: "z",
-      header: "Z-Score",
-      sortable: true,
-      render: (row) => formatDecimal(row.z),
-    },
-    {
       key: "total_decks",
       header: "Total Decks",
       sortable: true,
@@ -348,9 +347,32 @@ export default function SetExplorerPage() {
     },
     {
       key: "tag_affinity_pct",
-      header: "Affinity",
+      header: "Raw Affinity",
       sortable: true,
-      render: (row) => formatPercent(row.tag_affinity_pct),
+      render: (row) => formatAffinityProbability(row.tag_affinity_pct),
+    },
+    {
+      key: "tag_affinity_adjusted_pct",
+      header: "Adjusted Affinity",
+      sortable: true,
+      render: formatAdjustedAffinity,
+    },
+    {
+      key: "affinity_interval",
+      header: "95% Range",
+      render: formatAffinityInterval,
+    },
+    {
+      key: "z",
+      header: "Z-Score",
+      sortable: true,
+      render: (row) => formatDecimal(row.z),
+    },
+    {
+      key: "rank_within_tag_by_z",
+      header: "Rank in Tag",
+      sortable: true,
+      render: (row) => formatRank(row.rank_within_tag_by_z),
     },
     {
       key: "origin_set_name",
@@ -384,6 +406,13 @@ export default function SetExplorerPage() {
         <p>
           Browse Magic sets, then inspect commander/tag rows for cards that
           originated in the selected set.
+        </p>
+        <p>
+          Affinity, its 95% range, and z-score describe the tag in each row.
+          Rank in Tag compares the commander with all reported commanders for
+          that tag, across sets. Adjusted affinity accounts for sample size;
+          “unadjusted” marks a fallback and — means unavailable.{" "}
+          <Link to="/methodology">How it works</Link>
         </p>
       </div>
 

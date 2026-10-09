@@ -167,6 +167,12 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
           baseline or recalculating the score. In particular, the 5-tagged-deck
           display cutoff does not remove rows from the model’s reference group.
         </p>
+        <p>
+          “Rank in tag” compares the commander with all reported commanders for
+          that tag, before page filters. It is not a rank within the selected
+          set or bracket. Theme Report also has a separate rank within the
+          filtered theme or theme-and-bracket group.
+        </p>
       </section>
 
       <section className="method-section">
@@ -178,6 +184,14 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
           continue to use the previous raw-affinity z-score and unchanged
           thresholds. Affinity should not be read as evidence that a commander
           or a particular deck belongs in a bracket.
+        </p>
+        <p>
+          Affinity columns on Sets describe the tag named in each row. On
+          Brackets they describe the deciding archetype or cEDH tag; if there
+          is no deciding tag, those values are unavailable. Theme Brackets and
+          Theme Report show the selected theme’s affinity. The original bracket
+          and theme eligibility scores are labeled separately from the revised
+          affinity z-score.
         </p>
         <p>
           cEDH is represented as a normalized tag but comes from a special
