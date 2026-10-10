@@ -1,4 +1,14 @@
+import {
+  getBuildRarity,
+  getDecisionAffinityMetrics,
+  getThemeAffinityMetrics,
+} from "./affinityDisplay.js";
+
 export function getValue(row, key) {
+  if (key === "build_rarity") return getBuildRarity(row);
+  if (key === "decision_build_rarity") return getBuildRarity(getDecisionAffinityMetrics(row));
+  if (key === "theme_build_rarity") return getBuildRarity(getThemeAffinityMetrics(row));
+
   const value = row?.[key];
 
   if (value === null || value === undefined) {
@@ -103,7 +113,7 @@ export function passesMin(row, key, minValue) {
     return true;
   }
 
-  const rowValue = asNumber(row?.[key]);
+  const rowValue = asNumber(getValue(row, key));
   const filterValue = asNumber(minValue);
 
   if (filterValue === null) {
@@ -122,7 +132,7 @@ export function passesMax(row, key, maxValue) {
     return true;
   }
 
-  const rowValue = asNumber(row?.[key]);
+  const rowValue = asNumber(getValue(row, key));
   const filterValue = asNumber(maxValue);
 
   if (filterValue === null) {

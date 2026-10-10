@@ -83,3 +83,27 @@ export function formatAffinityInterval(row) {
 
   return `${formatAffinityProbability(lower)}–${formatAffinityProbability(upper)}`;
 }
+
+// Inverse estimated tag share within this commander. This is a readable
+// transformation of affinity, not a cross-commander score or a new model.
+export function getBuildRarity(row) {
+  const affinity = probability(row?.tag_affinity_adjusted_pct);
+  if (affinity === null || affinity === 0) return null;
+
+  const rarity = 1 / affinity;
+  return Number.isFinite(rarity) ? rarity : null;
+}
+
+export function formatBuildRarity(row) {
+  const rarity = getBuildRarity(row);
+  if (rarity === null) return "—";
+
+  const value = new Intl.NumberFormat("en-US", {
+    maximumFractionDigits: 1,
+  }).format(rarity);
+  const display = `≈1 in ${value}`;
+
+  return row?.affinity_model_status && row.affinity_model_status !== "fitted"
+    ? `${display} (unadjusted)`
+    : display;
+}

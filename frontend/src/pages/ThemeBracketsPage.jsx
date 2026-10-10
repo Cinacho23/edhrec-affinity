@@ -7,6 +7,7 @@ import {
   formatAdjustedAffinity,
   formatAffinityInterval,
   formatAffinityProbability,
+  formatBuildRarity,
   getThemeAffinityMetrics,
 } from "../lib/affinityDisplay";
 import {
@@ -274,6 +275,12 @@ export default function ThemeBracketsPage() {
       render: (row) => formatAdjustedAffinity(getThemeAffinityMetrics(row)),
     },
     {
+      key: "theme_build_rarity",
+      header: "Build Rarity",
+      sortable: true,
+      render: (row) => formatBuildRarity(getThemeAffinityMetrics(row)),
+    },
+    {
       key: "theme_affinity_interval",
       header: "95% Range",
       render: (row) => formatAffinityInterval(getThemeAffinityMetrics(row)),
@@ -361,6 +368,11 @@ export default function ThemeBracketsPage() {
           use upgraded affinity z-scores. “Unadjusted” marks a fallback and —
           means unavailable.{" "}
           <Link to="/methodology">How it works</Link>
+        </p>
+        <p>
+          Build Rarity describes the selected theme as approximately 1 in N decks
+          for this commander. A higher N means that theme is less common for the
+          commander; it does not measure how well the build works.
         </p>
       </div>
 

@@ -7,6 +7,7 @@ import {
   formatAdjustedAffinity,
   formatAffinityInterval,
   formatAffinityProbability,
+  formatBuildRarity,
   getDecisionAffinityMetrics,
 } from "../lib/affinityDisplay";
 import {
@@ -361,6 +362,12 @@ export default function SetBracketsPage() {
       render: (row) => formatAdjustedAffinity(getDecisionAffinityMetrics(row)),
     },
     {
+      key: "decision_build_rarity",
+      header: "Build Rarity",
+      sortable: true,
+      render: (row) => formatBuildRarity(getDecisionAffinityMetrics(row)),
+    },
+    {
       key: "decision_affinity_interval",
       header: "95% Range",
       render: (row) => formatAffinityInterval(getDecisionAffinityMetrics(row)),
@@ -438,6 +445,11 @@ export default function SetBracketsPage() {
           bracket cutoffs now use the upgraded affinity z-score. “Unadjusted”
           marks a fallback and — means
           unavailable. <Link to="/methodology">How it works</Link>
+        </p>
+        <p>
+          Build Rarity describes the Deciding Tag as approximately 1 in N decks
+          for this commander. A higher N means that tag is less common for the
+          commander; it does not measure how well the build works.
         </p>
       </div>
 

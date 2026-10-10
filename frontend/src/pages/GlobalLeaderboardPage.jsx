@@ -8,6 +8,7 @@ import {
   formatAdjustedAffinity,
   formatAffinityInterval,
   formatAffinityProbability,
+  formatBuildRarity,
 } from "../lib/affinityDisplay";
 import {
   formatColorIdentity,
@@ -37,6 +38,7 @@ const DEFAULT_FILTERS = {
   query: "",
   minTotalDecks: "200",
   minTagDecks: "5",
+  minBuildRarity: "",
   minZ: "",
   maxZ: "",
   trendStatus: "",
@@ -123,6 +125,7 @@ export default function GlobalLeaderboardPage() {
         ]) &&
         passesMin(row, "total_decks", filters.minTotalDecks) &&
         passesMin(row, "tag_decks", filters.minTagDecks) &&
+        passesMin(row, "build_rarity", filters.minBuildRarity) &&
         passesMin(row, "z", filters.minZ) &&
         passesMax(row, "z", filters.maxZ) &&
         (!filters.trendStatus || row.trend_status === filters.trendStatus)
@@ -198,6 +201,12 @@ export default function GlobalLeaderboardPage() {
       render: formatAdjustedAffinity,
     },
     {
+      key: "build_rarity",
+      header: "Build Rarity",
+      sortable: true,
+      render: formatBuildRarity,
+    },
+    {
       key: "affinity_interval",
       header: "95% Range",
       render: formatAffinityInterval,
@@ -270,6 +279,11 @@ export default function GlobalLeaderboardPage() {
           pulls smaller samples toward the tag baseline, and its 95% range shows
           uncertainty under the model. The z-score measures specialization relative to other
           commanders with that tag. <Link to="/methodology">How it works</Link>
+        </p>
+        <p>
+          Build Rarity expresses adjusted affinity as approximately 1 in N decks
+          for this commander. A higher N means the row’s tag is less common for
+          that commander; it does not measure how well the build works.
         </p>
         <p className="muted">
           “Unadjusted” means there was insufficient evidence to fit the model
@@ -365,6 +379,18 @@ export default function GlobalLeaderboardPage() {
               value={filters.minTagDecks}
               onChange={(event) => updateFilter("minTagDecks", event.target.value)}
               placeholder="5"
+            />
+          </label>
+
+          <label>
+            Minimum build rarity (1 in N)
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={filters.minBuildRarity}
+              onChange={(event) => updateFilter("minBuildRarity", event.target.value)}
+              placeholder="50"
             />
           </label>
 

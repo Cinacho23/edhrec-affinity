@@ -6,6 +6,7 @@ import {
   formatAdjustedAffinity,
   formatAffinityInterval,
   formatAffinityProbability,
+  formatBuildRarity,
 } from "../lib/affinityDisplay";
 import {
   loadCommanderDetail,
@@ -358,6 +359,12 @@ export default function SetExplorerPage() {
       render: formatAdjustedAffinity,
     },
     {
+      key: "build_rarity",
+      header: "Build Rarity",
+      sortable: true,
+      render: formatBuildRarity,
+    },
+    {
       key: "affinity_interval",
       header: "95% Range",
       render: formatAffinityInterval,
@@ -413,6 +420,11 @@ export default function SetExplorerPage() {
           that tag, across sets. Adjusted affinity accounts for sample size;
           “unadjusted” marks a fallback and — means unavailable.{" "}
           <Link to="/methodology">How it works</Link>
+        </p>
+        <p>
+          Build Rarity expresses adjusted affinity as approximately 1 in N decks
+          for this commander. A higher N means the row’s tag is less common for
+          that commander; it does not measure how well the build works.
         </p>
       </div>
 
