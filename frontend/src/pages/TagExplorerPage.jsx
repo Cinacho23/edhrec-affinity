@@ -8,6 +8,7 @@ import {
   formatAdjustedAffinity,
   formatAffinityInterval,
   formatAffinityProbability,
+  formatBuildRarity,
 } from "../lib/affinityDisplay";
 import {
   formatColorIdentity,
@@ -37,6 +38,7 @@ const DEFAULT_FILTERS = {
   query: "",
   minTotalDecks: "200",
   minTagDecks: "5",
+  minBuildRarity: "",
   minZ: "",
   maxZ: "",
   trendStatus: "",
@@ -144,6 +146,7 @@ export default function TagExplorerPage() {
         ]) &&
         passesMin(row, "total_decks", filters.minTotalDecks) &&
         passesMin(row, "tag_decks", filters.minTagDecks) &&
+        passesMin(row, "build_rarity", filters.minBuildRarity) &&
         passesMin(row, "z", filters.minZ) &&
         passesMax(row, "z", filters.maxZ) &&
         (!filters.trendStatus || row.trend_status === filters.trendStatus)
@@ -211,6 +214,12 @@ export default function TagExplorerPage() {
       header: "Adjusted Affinity",
       sortable: true,
       render: formatAdjustedAffinity,
+    },
+    {
+      key: "build_rarity",
+      header: "Build Rarity",
+      sortable: true,
+      render: formatBuildRarity,
     },
     {
       key: "affinity_interval",
@@ -284,6 +293,11 @@ export default function TagExplorerPage() {
           Compare the observed raw affinity with the sample-size-adjusted
           estimate and its 95% range. The z-score ranks specialization for the
           selected tag. <Link to="/methodology">How it works</Link>
+        </p>
+        <p>
+          Build Rarity expresses adjusted affinity as approximately 1 in N decks
+          for this commander. A higher N means the selected tag is less common
+          for that commander; it does not measure how well the build works.
         </p>
         <p className="muted">
           “Unadjusted” means the previous score is retained because a reliable
@@ -383,6 +397,18 @@ export default function TagExplorerPage() {
               value={filters.minTagDecks}
               onChange={(event) => updateFilter("minTagDecks", event.target.value)}
               placeholder="5"
+            />
+          </label>
+
+          <label>
+            Minimum build rarity (1 in N)
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={filters.minBuildRarity}
+              onChange={(event) => updateFilter("minBuildRarity", event.target.value)}
+              placeholder="50"
             />
           </label>
 

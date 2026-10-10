@@ -10,7 +10,8 @@ export default function MethodologyPage() {
           EDHREC tag. We keep the observed percentage and also estimate an
           adjusted percentage that accounts for sample size. The z-score
           compares that adjusted estimate with the tag’s usual variation
-          between commanders.
+          between commanders. Build Rarity expresses how uncommon the tagged
+          build is within this particular commander’s decks.
         </p>
       </section>
 
@@ -127,7 +128,58 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
       </section>
 
       <section className="method-section">
-        <h2>6. Fit safeguards and fallbacks</h2>
+        <h2>6. Build Rarity</h2>
+
+        <pre><code>build rarity N = 1 / adjusted affinity</code></pre>
+        <p>
+          Build Rarity displays the same adjusted affinity as “≈ 1 in N.”
+          Affinity is a fraction in this formula: 20% is 0.20 and gives
+          approximately 1 in 5; 2% gives 1 in 50; 0.2% gives 1 in 500. A higher
+          N means the tag is less common within this commander’s recorded deck
+          population. It is a way to explore unusual builds, without requiring
+          a negative z-score.
+        </p>
+        <p>
+          The two metrics answer different questions. Build Rarity asks how
+          uncommon this tag is for this commander. The z-score compares the
+          commander’s affinity with other commanders for the same tag. A tag
+          can be rare for a commander and still have a positive z-score if it
+          is even rarer among other commanders.
+        </p>
+        <p>
+          This is a reciprocal of the existing adjusted estimate, not a new
+          statistical model, a prediction of future decks, or a waiting time
+          until another tagged deck appears. The existing 95% affinity range
+          describes uncertainty in the underlying share; a wide range also
+          means the rarity estimate is less precise. Rarity does not establish
+          that a build is viable, powerful, or a good fit for the commander.
+          Even a commander’s leading tag can have a small reported share, so
+          there is no universal rarity cutoff for calling a build off-meta.
+        </p>
+        <p>
+          Explicit model fallbacks retain raw affinity as their estimate and
+          show “unadjusted.” Older exports without an adjusted estimate show —,
+          even when raw affinity is available. Missing tag rows and zero or
+          missing usable estimates also show —; they are not treated as
+          infinitely rare builds. Tags can overlap, and unreported tags are
+          not filled with zeros.
+        </p>
+        <p>
+          The Quirky Builds report selects the highest Build Rarity values per
+          theme, or per theme and commander bracket. It includes observed
+          builds regardless of whether their z-score is positive, negative, or
+          unavailable. Its default filters require 200 total decks, 5 tagged
+          decks, and rarity of at least 1 in 50 (an adjusted share of at most
+          2%). These are editable starting filters, not a universal definition
+          of off-meta. Filters apply before selecting the top builds. Ties use
+          tagged decks, then total decks, then commander name and slug.
+          Brackets describe the commander’s existing recommendation; they do
+          not rate the power of the unusual build.
+        </p>
+      </section>
+
+      <section className="method-section">
+        <h2>7. Fit safeguards and fallbacks</h2>
 
         <p>
           A tag needs at least five distinct reference commanders and varying
@@ -151,7 +203,7 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
       </section>
 
       <section className="method-section">
-        <h2>7. Rankings and display filters</h2>
+        <h2>8. Rankings and display filters</h2>
 
         <p>
           Within-tag z-score ranks and percentiles use the revised
@@ -182,7 +234,7 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
       </section>
 
       <section className="method-section">
-        <h2>8. Brackets and cEDH</h2>
+        <h2>9. Brackets and cEDH</h2>
 
         <p>
           The upgraded affinity z-score is used consistently for rankings,
@@ -205,8 +257,8 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
           consistent; it does not mathematically guarantee a power ceiling.
         </p>
         <p>
-          Affinity columns on Sets describe the tag named in each row. On
-          Brackets they describe the deciding archetype or cEDH tag; if there
+          Affinity and Build Rarity columns on Sets describe the tag named in
+          each row. On Brackets they describe the deciding archetype or cEDH tag; if there
           is no deciding tag, those values are unavailable. Theme Brackets and
           Theme Report show the selected theme’s affinity. Their theme z-score
           and Bracket Z can differ because they describe different tags.
@@ -224,7 +276,7 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
       </section>
 
       <section className="method-section">
-        <h2>9. Snapshot trends</h2>
+        <h2>10. Snapshot trends</h2>
 
         <p>
           Trends compare consecutive processed snapshots. A change in affinity
@@ -239,7 +291,7 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
       </section>
 
       <section className="method-section">
-        <h2>10. Interpretation and data limits</h2>
+        <h2>11. Interpretation and data limits</h2>
 
         <p>
           The model estimates associations within the collected EDHREC data.

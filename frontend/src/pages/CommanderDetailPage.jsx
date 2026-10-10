@@ -8,6 +8,7 @@ import {
   formatAdjustedAffinity,
   formatAffinityInterval,
   formatAffinityProbability,
+  formatBuildRarity,
 } from "../lib/affinityDisplay";
 import {
   getVisibleCommanderTagRows,
@@ -20,12 +21,15 @@ import {
   formatPercent,
   formatRank,
 } from "../lib/formatters";
+import { passesMin, sortRows, toggleSortDirection } from "../lib/tableUtils";
 
 export default function CommanderDetailPage() {
   const { commanderSlug } = useParams();
   const navigate = useNavigate();
 
   const [rows, setRows] = useState([]);
+  const [minBuildRarity, setMinBuildRarity] = useState("");
+  const [sort, setSort] = useState({ key: "z", direction: "desc" });
   const [state, setState] = useState({ loading: true, error: null });
 
   useEffect(() => {
@@ -45,6 +49,18 @@ export default function CommanderDetailPage() {
   const commander = rows[0];
   const tagRows = useMemo(() => getVisibleCommanderTagRows(rows), [rows]);
 
+  const visibleRows = useMemo(() => {
+    const filtered = tagRows.filter((row) => passesMin(row, "build_rarity", minBuildRarity));
+    return sortRows(filtered, sort.key, sort.direction);
+  }, [tagRows, minBuildRarity, sort]);
+
+  function handleSort(key) {
+    setSort((current) => ({
+      key,
+      direction: toggleSortDirection(current.key, key, current.direction),
+    }));
+  }
+
   function returnToPreviousPage() {
     navigate(-1);
   }
@@ -62,21 +78,30 @@ export default function CommanderDetailPage() {
   }, [tagRows]);
 
   const columns = [
-    { key: "tag_name", header: "Tag" },
+    { key: "tag_name", header: "Tag", sortable: true },
     {
       key: "tag_decks",
       header: "Tag Decks",
+      sortable: true,
       render: (row) => formatNumber(row.tag_decks),
     },
     {
       key: "tag_affinity_pct",
       header: "Raw Affinity",
+      sortable: true,
       render: (row) => formatAffinityProbability(row.tag_affinity_pct),
     },
     {
       key: "tag_affinity_adjusted_pct",
       header: "Adjusted Affinity",
+      sortable: true,
       render: formatAdjustedAffinity,
+    },
+    {
+      key: "build_rarity",
+      header: "Build Rarity",
+      sortable: true,
+      render: formatBuildRarity,
     },
     {
       key: "affinity_interval",
@@ -86,16 +111,19 @@ export default function CommanderDetailPage() {
     {
       key: "z",
       header: "Z-Score",
+      sortable: true,
       render: (row) => formatDecimal(row.z),
     },
     {
       key: "rank_within_tag_by_z",
       header: "Rank",
+      sortable: true,
       render: (row) => formatRank(row.rank_within_tag_by_z),
     },
     {
       key: "percentile_within_tag",
       header: "Percentile",
+      sortable: true,
       render: (row) => formatPercent(row.percentile_within_tag),
     },
   ];
@@ -189,21 +217,43 @@ export default function CommanderDetailPage() {
             <p className="eyebrow">Commander tags</p>
             <h2>Complete tag table</h2>
           </div>
-          <p className="table-count">{formatNumber(tagRows.length)} rows</p>
+          <p className="table-count">{formatNumber(visibleRows.length)} of {formatNumber(tagRows.length)} rows</p>
         </div>
 
         <p className="muted table-note">
           Tags appear with at least {MIN_COMMANDER_TAG_DECKS} decks for this commander.
           {" "}Raw affinity is the observed share of tagged decks. Adjusted affinity
           accounts for sample size; its 95% range shows uncertainty under the
-          model. “Unadjusted” rows retain the previous score, and missing
+          model. Build Rarity shows how uncommon a tag is within this commander:
+          ≈1 in 50 means an estimated 2% share. Higher values mean rarer builds.
+          Sort Build Rarity to explore uncommon themes, then check whether the
+          commander’s abilities support the idea. “Unadjusted” rows retain the
+          previous score, and missing
           estimates or ranges appear as —. <Link to="/methodology">How it works</Link>
         </p>
 
+        <div className="filter-grid">
+          <label>
+            <span>Minimum build rarity (1 in N)</span>
+            <input
+              type="number"
+              min="1"
+              step="any"
+              value={minBuildRarity}
+              onChange={(event) => setMinBuildRarity(event.target.value)}
+              placeholder="e.g. 50"
+            />
+          </label>
+        </div>
         <SimpleTable
           columns={columns}
-          rows={tagRows}
-          emptyMessage={`No tags have at least ${MIN_COMMANDER_TAG_DECKS} decks for this commander.`}
+          rows={visibleRows}
+          sortKey={sort.key}
+          sortDirection={sort.direction}
+          onSort={handleSort}
+          emptyMessage={tagRows.length === 0
+            ? `No tags have at least ${MIN_COMMANDER_TAG_DECKS} decks for this commander.`
+            : "No reported tags match this rarity filter."}
         />
       </section>
     </section>

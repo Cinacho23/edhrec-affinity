@@ -332,6 +332,20 @@ def test_export_full_site_data_writes_compact_theme_bracket_files(tmp_path):
             "theme_rank_within_tag_by_z": 1,
         }
     ]
+    quirky = read_json(output_dir / "quirky-builds.json")
+    assert manifest["quirky_builds_export"] == {
+        "file": "quirky-builds.json",
+        "theme_count": 2,
+        "commander_count": 2,
+        "row_count": 4,
+        "schema_version": 1,
+        "coverage": "all_observed_commander_tags",
+    }
+    mutate_quirky = next(theme for theme in quirky["themes"] if theme["tag_slug"] == "mutate")
+    assert {
+        dict(zip(quirky["row_fields"], row))["commander_slug"]
+        for row in mutate_quirky["rows"]
+    } == {"theme-commander", "below-threshold"}
 
 
 def test_theme_report_matches_theme_brackets_without_deck_minimums(tmp_path):
@@ -558,3 +572,143 @@ def test_current_score_order_and_ties_match_sets_commanders_and_compact_signals(
     assert signal_order(report["commanders"][0]["bracket_tag_rows"]) == expected
     theme_report = next(theme for theme in report["themes"] if theme["tag_slug"] == "tokens")["rows"][0]
     assert theme_report["theme_z"] == 3
+
+
+def test_quirky_report_preserves_all_observed_pairs_and_their_own_affinity(tmp_path):
+    common = {
+        "commander_slug": "shared", "commander_name": "Shared",
+        "total_decks": 1000, "color_identity": ["U", "B"],
+        "affinity_model_status": "fitted", "affinity_model_version": "beta_binomial_v1",
+    }
+    rows = [
+        {**common, "tag_slug": "vehicles", "tag_name": "Vehicles", "z": -1.5,
+         "legacy_z": 2, "tag_decks": 5, "tag_affinity_pct": .005,
+         "tag_affinity_adjusted_pct": .006, "tag_affinity_lower_pct": .002,
+         "tag_affinity_upper_pct": .012, "rank_within_tag_by_z": 123},
+        {**common, "tag_slug": "sagas", "tag_name": "Sagas", "z": None,
+         "legacy_z": 3, "tag_decks": 1, "tag_affinity_pct": .001,
+         "tag_affinity_adjusted_pct": .002, "tag_affinity_lower_pct": .0001,
+         "tag_affinity_upper_pct": .008, "rank_within_tag_by_z": None},
+        # A build can be rare within its commander while above-reference for
+        # a niche tag; rarity reports must retain positive scores too.
+        {**common, "tag_slug": "snow", "tag_name": "Snow", "z": 3,
+         "legacy_z": -1, "tag_decks": 10, "tag_affinity_pct": .01,
+         "tag_affinity_adjusted_pct": .011, "tag_affinity_lower_pct": .005,
+         "tag_affinity_upper_pct": .018, "rank_within_tag_by_z": 7},
+        {**common, "tag_slug": "combo", "tag_name": "Combo", "z": 1,
+         "legacy_z": 10, "tag_decks": 30, "tag_affinity_pct": .03,
+         "tag_affinity_adjusted_pct": .032},
+        {**common, "tag_slug": "aggro", "tag_name": "Aggro", "z": 1,
+         "legacy_z": -10, "tag_decks": 20, "tag_affinity_pct": .02,
+         "tag_affinity_adjusted_pct": .021},
+        {**common, "tag_slug": "cedh", "tag_name": "cEDH", "z": None,
+         "legacy_z": 5, "tag_decks": 1, "tag_affinity_pct": .001},
+        {"commander_slug": "tiny", "commander_name": "Tiny", "total_decks": 2,
+         "tag_slug": "vehicles", "tag_name": "Vehicles", "z": .01,
+         "tag_decks": 1, "tag_affinity_pct": .5, "tag_affinity_adjusted_pct": .4},
+    ]
+    df = pd.DataFrame(rows)
+    metadata = export_full_site_data_module.export_quirky_builds_report(df, None, tmp_path)
+    report = read_json(tmp_path / "quirky-builds.json")
+    assert report["schema_version"] == 1
+    assert report["coverage"] == "all_observed_commander_tags"
+    assert metadata["row_count"] == len(rows)
+    assert metadata["theme_count"] == 6
+    assert metadata["commander_count"] == 2
+    assert len(report["row_fields"]) == len(set(report["row_fields"]))
+    assert report["row_fields"][0] == "commander_slug"
+    assert "theme_legacy_z" in report["row_fields"]
+    actual = {
+        (theme["tag_slug"], row[0]): dict(zip(report["row_fields"], row))
+        for theme in report["themes"]
+        for row in theme["rows"]
+    }
+    mappings = {
+        "theme_z": "z", "theme_affinity_z": "z", "theme_legacy_z": "legacy_z",
+        "theme_tag_decks": "tag_decks", "theme_affinity_pct": "tag_affinity_pct",
+        "theme_affinity_adjusted_pct": "tag_affinity_adjusted_pct",
+        "theme_affinity_lower_pct": "tag_affinity_lower_pct",
+        "theme_affinity_upper_pct": "tag_affinity_upper_pct",
+        "theme_affinity_model_status": "affinity_model_status",
+        "theme_affinity_model_version": "affinity_model_version",
+        "theme_rank_within_tag_by_z": "rank_within_tag_by_z",
+    }
+    for source in rows:
+        row = actual[(source["tag_slug"], source["commander_slug"])]
+        for destination, key in mappings.items():
+            assert row[destination] == source.get(key)
+    commanders = {row["commander_slug"]: row for row in report["commanders"]}
+    assert commanders["shared"]["total_decks"] == 1000
+    assert commanders["shared"]["color_identity"] == ["U", "B"]
+    assert [row["tag_slug"] for row in commanders["shared"]["bracket_tag_rows"]] == [
+        "aggro", "combo", "cedh"
+    ]
+    assert commanders["shared"]["bracket_tag_rows"][1]["tag_affinity_adjusted_pct"] == .032
+    assert commanders["tiny"]["total_decks"] == 2
+    assert commanders["tiny"]["bracket_tag_rows"] == []
+
+
+def test_quirky_report_deduplicates_using_current_score_not_legacy_score(tmp_path):
+    common = {
+        "commander_slug": "shared", "commander_name": "Shared", "total_decks": 1000,
+        "tag_slug": "vehicles", "tag_name": "Vehicles", "tag_decks": 5,
+    }
+    df = pd.DataFrame([
+        {**common, "z": -.5, "legacy_z": 100, "tag_affinity_adjusted_pct": .01},
+        {**common, "z": -.4, "legacy_z": -100, "tag_affinity_adjusted_pct": .02},
+        {**common, "z": None, "legacy_z": 200, "tag_affinity_adjusted_pct": .03},
+    ])
+    metadata = export_full_site_data_module.export_quirky_builds_report(df, None, tmp_path)
+    report = read_json(tmp_path / "quirky-builds.json")
+    assert metadata["row_count"] == 1
+    row = dict(zip(report["row_fields"], report["themes"][0]["rows"][0]))
+    assert row["theme_affinity_z"] == -.4
+    assert row["theme_legacy_z"] == -100
+    assert row["theme_affinity_adjusted_pct"] == .02
+
+
+def test_quirky_report_handles_empty_and_scoreless_datasets(tmp_path):
+    metadata = export_full_site_data_module.export_quirky_builds_report(
+        pd.DataFrame(), None, tmp_path
+    )
+    report = read_json(tmp_path / "quirky-builds.json")
+    assert metadata["row_count"] == metadata["commander_count"] == metadata["theme_count"] == 0
+    assert report["commanders"] == report["themes"] == []
+    assert "theme_affinity_adjusted_pct" in report["row_fields"]
+    assert "theme_legacy_z" not in report["row_fields"]
+
+    df = pd.DataFrame([{
+        "commander_slug": "scoreless", "tag_slug": "vehicles", "tag_name": "Vehicles",
+        "tag_decks": 1, "total_decks": 10, "tag_affinity_adjusted_pct": .08,
+    }])
+    metadata = export_full_site_data_module.export_quirky_builds_report(df, None, tmp_path)
+    report = read_json(tmp_path / "quirky-builds.json")
+    row = dict(zip(report["row_fields"], report["themes"][0]["rows"][0]))
+    assert metadata["row_count"] == 1
+    assert row["theme_affinity_z"] is None
+    assert row["theme_affinity_adjusted_pct"] == .08
+
+
+def test_quirky_report_writes_strict_json_for_nonfinite_affinities_and_signals(tmp_path):
+    df = pd.DataFrame([{
+        "commander_slug": "commander", "tag_slug": "combo", "tag_name": "Combo",
+        "total_decks": float("nan"), "tag_decks": float("inf"),
+        "tag_affinity_pct": float("inf"), "tag_affinity_adjusted_pct": float("-inf"),
+        "tag_affinity_lower_pct": float("nan"), "tag_affinity_upper_pct": float("inf"),
+        "rank_within_tag_by_z": float("inf"), "z": float("-inf"),
+        "legacy_z": float("inf"),
+    }])
+    export_full_site_data_module.export_quirky_builds_report(df, None, tmp_path)
+
+    def reject_nonfinite(value):
+        raise AssertionError(f"Nonfinite JSON number: {value}")
+
+    report = json.loads(
+        (tmp_path / "quirky-builds.json").read_text(encoding="utf-8"),
+        parse_constant=reject_nonfinite,
+    )
+    assert report["commanders"][0]["total_decks"] is None
+    assert report["commanders"][0]["bracket_tag_rows"][0]["z"] is None
+    row = dict(zip(report["row_fields"], report["themes"][0]["rows"][0]))
+    assert row["commander_slug"] == "commander"
+    assert all(value is None for key, value in row.items() if key != "commander_slug")

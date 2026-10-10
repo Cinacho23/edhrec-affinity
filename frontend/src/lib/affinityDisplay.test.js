@@ -5,6 +5,8 @@ import {
   formatAdjustedAffinity,
   formatAffinityInterval,
   formatAffinityProbability,
+  formatBuildRarity,
+  getBuildRarity,
   getDecisionAffinityMetrics,
   getThemeAffinityMetrics,
 } from "./affinityDisplay.js";
@@ -16,6 +18,39 @@ test("affinity display treats model fields as probabilities, including zero and 
   for (const missing of [null, undefined, "", " ", false, [], NaN, Infinity, -0.1, 20]) {
     assert.equal(formatAffinityProbability(missing), "—");
   }
+});
+
+test("build rarity describes within-commander frequency independently of specialization z", () => {
+  for (const [affinity, rarity] of [[0.2, 5], [0.02, 50], [0.002, 500], [1, 1]]) {
+    const row = { tag_affinity_adjusted_pct: affinity, affinity_model_status: "fitted", z: 4 };
+    assert.equal(getBuildRarity(row), rarity);
+    assert.equal(formatBuildRarity(row), `≈1 in ${rarity}`);
+    assert.equal(getBuildRarity({ ...row, z: -0.5 }), rarity);
+  }
+  assert.equal(formatBuildRarity({ tag_affinity_adjusted_pct: "0.0581651449" }), "≈1 in 17.2");
+});
+
+test("build rarity uses the adjusted estimate and labels explicit unadjusted fallbacks", () => {
+  assert.equal(getBuildRarity({ tag_affinity_pct: 0.01, tag_affinity_adjusted_pct: 0.02 }), 50);
+  assert.equal(formatBuildRarity({ tag_affinity_adjusted_pct: 0.02, affinity_model_status: "fallback_sparse" }), "≈1 in 50 (unadjusted)");
+  assert.equal(getBuildRarity({ tag_affinity_pct: 0.02 }), null);
+  for (const value of [null, undefined, "", " ", false, [], NaN, Infinity, -0.1, 20, 0, Number.MIN_VALUE]) {
+    assert.equal(getBuildRarity({ tag_affinity_adjusted_pct: value }), null);
+    assert.equal(formatBuildRarity({ tag_affinity_adjusted_pct: value }), "—");
+  }
+});
+
+test("build rarity for theme and bracket rows uses the displayed tag without borrowing another tag", () => {
+  const row = {
+    tag_affinity_adjusted_pct: 0.9,
+    theme_affinity_adjusted_pct: 0.02,
+    theme_affinity_model_status: "fitted",
+    decision_tag_affinity_adjusted_pct: 0.2,
+    decision_affinity_model_status: "fitted",
+  };
+  assert.equal(formatBuildRarity(getThemeAffinityMetrics(row)), "≈1 in 50");
+  assert.equal(formatBuildRarity(getDecisionAffinityMetrics(row)), "≈1 in 5");
+  assert.equal(getBuildRarity(getThemeAffinityMetrics({ ...row, theme_affinity_adjusted_pct: null })), null);
 });
 
 test("deciding-tag adapters keep every displayed metric on the deciding tag", () => {

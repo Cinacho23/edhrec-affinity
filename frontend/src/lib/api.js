@@ -121,6 +121,10 @@ export async function loadThemeReport() {
   return report;
 }
 
+export async function loadQuirkyBuildsReport() {
+  return fetchJson("quirky-builds.json");
+}
+
 export async function loadLeaderboardIndex() {
   return fetchJson("leaderboard/index.json");
 }

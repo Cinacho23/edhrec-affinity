@@ -10,26 +10,24 @@ import {
   formatBuildRarity,
   getThemeAffinityMetrics,
 } from "../lib/affinityDisplay";
-import { loadThemeReport } from "../lib/api";
 import { BRACKET_OPTIONS } from "../lib/bracketUtils";
 import { formatDecimal, formatNumber, formatRank } from "../lib/formatters";
 import { readSessionObject, writeSessionValue } from "../lib/persistentState";
-import { rowMatchesText, sortRows, toggleSortDirection } from "../lib/tableUtils";
-import { createThemeBracketDataLoader, mapWithConcurrency } from "../lib/themeBracketData";
-import { expandThemeReport } from "../lib/themeReportData";
+import { createQuirkyBuildsDataLoader } from "../lib/quirkyBuildsData";
 import {
-  DEFAULT_THEME_REPORT_FILTERS,
-  buildThemeReportRows,
-  prepareThemeReportRows,
-} from "../lib/themeReportUtils";
+  DEFAULT_QUIRKY_BUILDS_FILTERS,
+  buildQuirkyBuildsRows,
+  prepareQuirkyBuildsRows,
+} from "../lib/quirkyBuildsUtils";
+import { rowMatchesText, sortRows, toggleSortDirection } from "../lib/tableUtils";
 
-const FILTER_STORAGE_KEY = "edhrec-affinity:theme-report:filters";
+const FILTER_STORAGE_KEY = "edhrec-affinity:quirky-builds:filters";
 const PAGE_SIZE = 100;
 
-export default function ThemeReportPage() {
+export default function QuirkyBuildsPage() {
   const loaderRef = useRef(null);
   const [filters, setFilters] = useState(() => {
-    const stored = readSessionObject(FILTER_STORAGE_KEY, DEFAULT_THEME_REPORT_FILTERS);
+    const stored = readSessionObject(FILTER_STORAGE_KEY, DEFAULT_QUIRKY_BUILDS_FILTERS);
     return {
       ...stored,
       brackets: Array.isArray(stored.brackets)
@@ -41,54 +39,27 @@ export default function ThemeReportPage() {
   const [page, setPage] = useState(1);
   const [retry, setRetry] = useState(0);
   const [data, setData] = useState({ themes: [], rows: [] });
-  const [state, setState] = useState({ loading: true, loaded: 0, total: 0, error: null });
+  const [state, setState] = useState({ loading: true, error: null });
 
   useEffect(() => {
     let isCurrent = true;
-    let loadFailed = false;
-    loaderRef.current ??= { brackets: createThemeBracketDataLoader(), report: null };
+    loaderRef.current ??= createQuirkyBuildsDataLoader();
     const loader = loaderRef.current;
 
     async function loadData() {
-      setState({ loading: true, loaded: 0, total: 0, error: null });
+      setState({ loading: true, error: null });
 
       try {
-        let groups;
-
-        try {
-          // Reuse the in-flight compact request when React remounts the effect.
-          loader.report ??= loadThemeReport().then(expandThemeReport);
-          groups = await loader.report;
-        } catch {
-          loader.report = null;
-          if (!isCurrent) return;
-
-          const { themes, usesThemeBracketFiles } = await loader.brackets.loadIndex();
-          if (!isCurrent) return;
-
-          let loaded = 0;
-          setState({ loading: true, loaded, total: themes.length, error: null });
-          groups = await mapWithConcurrency(themes, 8, async (theme) => {
-            if (!isCurrent || loadFailed) return null;
-            const rows = await loader.brackets.loadRows(theme.tag_slug, usesThemeBracketFiles);
-            loaded += 1;
-            if (isCurrent && !loadFailed && (loaded % 10 === 0 || loaded === themes.length)) {
-              setState({ loading: true, loaded, total: themes.length, error: null });
-            }
-            return { ...theme, rows };
-          });
-        }
-
+        const groups = await loader.loadReport();
         if (!isCurrent) return;
         setData({
           themes: groups.map(({ tag_slug, tag_name }) => ({ tag_slug, tag_name })),
-          rows: prepareThemeReportRows(groups),
+          rows: prepareQuirkyBuildsRows(groups),
         });
-        setState({ loading: false, loaded: groups.length, total: groups.length, error: null });
+        setState({ loading: false, error: null });
       } catch (error) {
-        loadFailed = true;
         if (isCurrent) {
-          setState({ loading: false, loaded: 0, total: 0, error: error.message });
+          setState({ loading: false, error: error.message });
         }
       }
     }
@@ -102,7 +73,7 @@ export default function ThemeReportPage() {
   }, [filters]);
 
   const rankedRows = useMemo(
-    () => buildThemeReportRows(data.rows, filters),
+    () => buildQuirkyBuildsRows(data.rows, filters),
     [data.rows, filters]
   );
   const sortedRows = useMemo(
@@ -122,6 +93,10 @@ export default function ThemeReportPage() {
   const currentPage = Math.min(page, pageCount);
   const pageRows = sortedRows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
   const perBracket = filters.groupBy === "bracket";
+  const minimumRarity = Number(filters.minBuildRarity);
+  const maximumShare = Number.isFinite(minimumRarity) && minimumRarity >= 1
+    ? formatAffinityProbability(1 / minimumRarity)
+    : null;
 
   function updateFilter(key, value) {
     setFilters((current) => ({ ...current, [key]: value }));
@@ -135,7 +110,7 @@ export default function ThemeReportPage() {
   }
 
   function resetFilters() {
-    setFilters({ ...DEFAULT_THEME_REPORT_FILTERS, brackets: [] });
+    setFilters({ ...DEFAULT_QUIRKY_BUILDS_FILTERS, brackets: [] });
     setSort({ key: "", direction: "desc" });
     setPage(1);
   }
@@ -151,7 +126,7 @@ export default function ThemeReportPage() {
   const columns = [
     {
       key: "theme_tag_name", header: "Theme", sortable: true,
-      render: (row) => <Link className="table-commander-link" to={`/theme-brackets/${row.theme_tag_slug}`}>{row.theme_tag_name}</Link>,
+      render: (row) => row.theme_tag_name,
     },
     {
       key: "report_rank", header: perBracket ? "Rank in bracket" : "Rank in theme",
@@ -166,16 +141,16 @@ export default function ThemeReportPage() {
       render: (row) => <span title={row.bracket_reason}><BracketBadge bracketKey={row.bracket_key} label={row.bracket_label} /></span>,
     },
     {
+      key: "theme_build_rarity", header: "Build Rarity", sortable: true,
+      render: (row) => formatBuildRarity(getThemeAffinityMetrics(row)),
+    },
+    {
       key: "theme_affinity_pct", header: "Raw Affinity", sortable: true,
       render: (row) => formatAffinityProbability(getThemeAffinityMetrics(row).tag_affinity_pct),
     },
     {
       key: "theme_affinity_adjusted_pct", header: "Adjusted Affinity", sortable: true,
       render: (row) => formatAdjustedAffinity(getThemeAffinityMetrics(row)),
-    },
-    {
-      key: "theme_build_rarity", header: "Build Rarity", sortable: true,
-      render: (row) => formatBuildRarity(getThemeAffinityMetrics(row)),
     },
     {
       key: "theme_affinity_interval", header: "95% Range",
@@ -209,42 +184,41 @@ export default function ThemeReportPage() {
   ];
 
   return (
-    <section className="page theme-report-page">
+    <section className="page theme-report-page quirky-builds-page">
       <div className="page-header">
-        <p className="eyebrow">Leaders across every theme</p>
-        <h1>Theme Report</h1>
+        <p className="eyebrow">Uncommon ways to build</p>
+        <h1>Quirky Builds</h1>
         <p>
-          Find the highest theme z-scores across all themes. Choose the top commanders
+          Find the rarest observed builds across every theme. Choose the top commanders
           per theme, or rank commanders separately within each bracket for every theme.
         </p>
+        <p>
+          Build Rarity describes the row’s theme as approximately 1 in N decks
+          for this commander, calculated from adjusted affinity. Higher N means
+          a less common build: 1 in 50 is an estimated 2% share. Rarity identifies
+          off-meta ideas; it does not measure strength or show that a build works.
+          Check the commander’s abilities and the observed deck counts when choosing an idea.
+        </p>
         <p className="muted">
-          Uses the <Link className="table-commander-link" to="/theme-brackets">Theme Brackets rules</Link>:
-          ordinary themes require theme z ≥ 1.05; cEDH, Aggro, Control, Midrange, Tempo,
-          and Combo use bracket rules only. cEDH takes precedence when assigning brackets.
-          Theme eligibility, bracket suggestions, and rankings use the upgraded
-          affinity score with the same numeric cutoffs.
+          Every reported theme can qualify, regardless of its z-score. Missing themes
+          are not treated as zero-share builds. Brackets use the existing archetype
+          and cEDH signals, with cEDH taking precedence; the theme’s rarity does not
+          change the suggested building bracket.
         </p>
         <p>
           Raw and adjusted affinity, the 95% range, z-score, and Rank in Tag
           describe the row’s theme. Rank in Tag compares all reported commanders
-          for that theme; Rank in {perBracket ? "bracket" : "theme"} follows
-          this report’s filters. Bracket Z describes the deciding tag used for
-          the suggested building bracket, our recommended ceiling from tag
-          associations. Actual deck strength depends on the build. “Unadjusted”
-          marks a fallback and — means
-          unavailable. <Link to="/methodology">How it works</Link>
-        </p>
-        <p>
-          Build Rarity describes the row’s theme as approximately 1 in N decks
-          for this commander. A higher N means that theme is less common for the
-          commander; it does not measure how well the build works.
+          for that theme by z-score; Rank in {perBracket ? "bracket" : "theme"} follows
+          this report’s rarity ranking and filters. Bracket Z describes the deciding
+          tag used for the suggested building bracket. “Unadjusted” marks a fallback
+          and — means unavailable. <Link to="/methodology">How it works</Link>
         </p>
       </div>
 
-      <section className="filter-panel" aria-labelledby="report-filters-title">
+      <section className="filter-panel" aria-labelledby="quirky-filters-title">
         <div className="filter-panel-header">
           <div>
-            <h2 id="report-filters-title">Report options</h2>
+            <h2 id="quirky-filters-title">Report options</h2>
             <p className="muted">Filters apply before the top commanders are selected.</p>
           </div>
           <button type="button" onClick={resetFilters}>Reset filters</button>
@@ -284,6 +258,14 @@ export default function ThemeReportPage() {
             <input type="number" min="0" value={filters.minThemeDecks} placeholder="5"
               onChange={(event) => updateFilter("minThemeDecks", event.target.value)} />
           </label>
+          <label>
+            Minimum Build Rarity (1 in N)
+            <input type="number" min="1" step="1" value={filters.minBuildRarity} placeholder="50"
+              onChange={(event) => updateFilter("minBuildRarity", event.target.value)} />
+            <small className="muted">
+              {maximumShare ? `Estimated share of ${maximumShare} or less.` : "Higher N selects rarer builds."}
+            </small>
+          </label>
         </div>
         <fieldset className="theme-report-brackets">
           <legend>Brackets to include</legend>
@@ -302,17 +284,12 @@ export default function ThemeReportPage() {
       </section>
 
       {state.loading ? (
-        <section className="panel" aria-label="Loading report">
-          <p className="muted" role="status">
-            {state.total > 0
-              ? `Loading themes: ${formatNumber(state.loaded)} of ${formatNumber(state.total)}…`
-              : "Loading theme report…"}
-          </p>
-          {state.total > 0 && <progress value={state.loaded} max={state.total} aria-label="Themes loaded" />}
+        <section className="panel" aria-label="Loading quirky builds report">
+          <p className="muted" role="status">Loading quirky builds report…</p>
         </section>
       ) : state.error ? (
         <section className="panel" role="alert">
-          <p className="error-message">Could not load the complete theme report: {state.error}</p>
+          <p className="error-message">Could not load the complete quirky builds report: {state.error}</p>
           <button type="button" onClick={() => {
             loaderRef.current = null;
             setRetry((current) => current + 1);
@@ -320,11 +297,11 @@ export default function ThemeReportPage() {
         </section>
       ) : (
         <>
-          <section className="data-table-section" aria-labelledby="theme-report-results-title">
+          <section className="data-table-section" aria-labelledby="quirky-results-title">
             <div className="table-toolbar">
               <div>
-                <p className="eyebrow">Ranked by theme z-score</p>
-                <h2 id="theme-report-results-title">{perBracket ? "Leaders by theme and bracket" : "Leaders by theme"}</h2>
+                <p className="eyebrow">Ranked by Build Rarity</p>
+                <h2 id="quirky-results-title">{perBracket ? "Rarest builds by theme and bracket" : "Rarest builds by theme"}</h2>
                 <p className="table-count" role="status">
                   {formatNumber(rankedRows.length)} results across {formatNumber(representedThemes.size)} of {formatNumber(matchingThemes.length)} matching themes
                 </p>
@@ -332,12 +309,12 @@ export default function ThemeReportPage() {
               {sort.key && <button type="button" onClick={() => { setSort({ key: "", direction: "desc" }); setPage(1); }}>Restore theme order</button>}
             </div>
             <p className="muted theme-report-note">
-              Ranks use the highest theme Z within each {perBracket ? "theme and bracket" : "theme"}.
+              Ranks use the highest Build Rarity within each {perBracket ? "theme and bracket" : "theme"}.
               Ties use theme decks, then total decks, then commander name.
-              Only commanders with a numeric theme z-score can be ranked.
+              Only observed builds with a positive adjusted affinity can be ranked.
             </p>
             <SimpleTable columns={columns} rows={pageRows} sortKey={sort.key} sortDirection={sort.direction}
-              onSort={handleSort} emptyMessage="No commanders match the themes, brackets, and current filters." />
+              onSort={handleSort} emptyMessage="No builds match the themes, brackets, and current rarity filters." />
             {pageCount > 1 && (
               <nav className="pagination-bar" aria-label="Report pages">
                 <span>{formatNumber((currentPage - 1) * PAGE_SIZE + 1)}–{formatNumber(Math.min(currentPage * PAGE_SIZE, sortedRows.length))} of {formatNumber(sortedRows.length)}</span>
@@ -349,7 +326,7 @@ export default function ThemeReportPage() {
           </section>
           {emptyThemes.length > 0 && (
             <details className="panel theme-report-empty-themes">
-              <summary>{formatNumber(emptyThemes.length)} themes have no ranked commanders with these filters</summary>
+              <summary>{formatNumber(emptyThemes.length)} themes have no ranked builds with these filters</summary>
               <p className="muted">{emptyThemes.map((theme) => theme.tag_name || theme.tag_slug).join(" · ")}</p>
             </details>
           )}
