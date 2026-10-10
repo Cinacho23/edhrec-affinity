@@ -168,6 +168,12 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
           display cutoff does not remove rows from the model’s reference group.
         </p>
         <p>
+          Commander detail pages show only tags with at least 5 tagged decks.
+          Their tag counts and strongest and largest tag summaries use the same
+          minimum. Commanders remain visible even when none of their tags meet
+          this minimum.
+        </p>
+        <p>
           “Rank in tag” compares the commander with all reported commanders for
           that tag, before page filters. It is not a rank within the selected
           set or bracket. Theme Report also has a separate rank within the

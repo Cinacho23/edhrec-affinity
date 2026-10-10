@@ -10,6 +10,10 @@ import {
   formatAffinityProbability,
 } from "../lib/affinityDisplay";
 import {
+  getVisibleCommanderTagRows,
+  MIN_COMMANDER_TAG_DECKS,
+} from "../lib/commanderUtils";
+import {
   formatColorIdentity,
   formatDecimal,
   formatNumber,
@@ -39,22 +43,23 @@ export default function CommanderDetailPage() {
   }, [commanderSlug]);
 
   const commander = rows[0];
+  const tagRows = useMemo(() => getVisibleCommanderTagRows(rows), [rows]);
 
   function returnToPreviousPage() {
     navigate(-1);
   }
 
   const strongestTag = useMemo(() => {
-    return [...rows]
+    return [...tagRows]
       .filter((row) => row.z !== null && row.z !== undefined)
       .sort((a, b) => Number(b.z) - Number(a.z))[0];
-  }, [rows]);
+  }, [tagRows]);
 
   const largestTag = useMemo(() => {
-    return [...rows]
+    return [...tagRows]
       .filter((row) => row.tag_decks !== null && row.tag_decks !== undefined)
       .sort((a, b) => Number(b.tag_decks) - Number(a.tag_decks))[0];
-  }, [rows]);
+  }, [tagRows]);
 
   const columns = [
     { key: "tag_name", header: "Tag" },
@@ -159,7 +164,7 @@ export default function CommanderDetailPage() {
           <div className="commander-detail-meta">
             <span className="pill">{formatColorIdentity(commander.color_identity)}</span>
             <span className="pill">{formatNumber(commander.total_decks)} decks</span>
-            <span className="pill">{formatNumber(rows.length)} tags</span>
+            <span className="pill">{formatNumber(tagRows.length)} tags</span>
           </div>
 
           {strongestTag ? (
@@ -184,17 +189,22 @@ export default function CommanderDetailPage() {
             <p className="eyebrow">Commander tags</p>
             <h2>Complete tag table</h2>
           </div>
-          <p className="table-count">{formatNumber(rows.length)} rows</p>
+          <p className="table-count">{formatNumber(tagRows.length)} rows</p>
         </div>
 
         <p className="muted table-note">
-          Raw affinity is the observed share of tagged decks. Adjusted affinity
+          Tags appear with at least {MIN_COMMANDER_TAG_DECKS} decks for this commander.
+          {" "}Raw affinity is the observed share of tagged decks. Adjusted affinity
           accounts for sample size; its 95% range shows uncertainty under the
           model. “Unadjusted” rows retain the previous score, and missing
           estimates or ranges appear as —. <Link to="/methodology">How it works</Link>
         </p>
 
-        <SimpleTable columns={columns} rows={rows} />
+        <SimpleTable
+          columns={columns}
+          rows={tagRows}
+          emptyMessage={`No tags have at least ${MIN_COMMANDER_TAG_DECKS} decks for this commander.`}
+        />
       </section>
     </section>
   );
