@@ -164,6 +164,18 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
           infinitely rare builds. Tags can overlap, and unreported tags are
           not filled with zeros.
         </p>
+        <p>
+          The Quirky Builds report selects the highest Build Rarity values per
+          theme, or per theme and commander bracket. It includes observed
+          builds regardless of whether their z-score is positive, negative, or
+          unavailable. Its default filters require 200 total decks, 5 tagged
+          decks, and rarity of at least 1 in 50 (an adjusted share of at most
+          2%). These are editable starting filters, not a universal definition
+          of off-meta. Filters apply before selecting the top builds. Ties use
+          tagged decks, then total decks, then commander name and slug.
+          Brackets describe the commander’s existing recommendation; they do
+          not rate the power of the unusual build.
+        </p>
       </section>
 
       <section className="method-section">

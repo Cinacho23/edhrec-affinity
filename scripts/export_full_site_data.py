@@ -17,6 +17,7 @@ it writes:
     data/latest/tags/<tag_slug>.json
     data/latest/theme-brackets/<tag_slug>.json
     data/latest/theme-report.json
+    data/latest/quirky-builds.json
     data/latest/leaderboard/page_0001.json
     data/latest/leaderboard/page_0002.json
 
@@ -862,6 +863,109 @@ def export_theme_report(
     }
 
 
+def export_quirky_builds_report(
+    df: pd.DataFrame,
+    tag_summary_df: pd.DataFrame | None,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Export every observed commander/theme pair without theme eligibility gates.
+
+    Row values follow one shared field list rather than repeating field names
+    for every pair. Commander metadata and bracket signals are also shared so
+    uncommon themes do not require downloading all complete tag files.
+    """
+    row_fields = ["commander_slug", *build_theme_affinity_fields({})]
+    if "legacy_z" in df.columns:
+        row_fields.append("theme_legacy_z")
+
+    themes = []
+    commanders = []
+    row_count = 0
+
+    if not df.empty:
+        report_df = select_existing_columns(
+            df,
+            [
+                "commander_slug",
+                "commander_name",
+                "total_decks",
+                "color_identity",
+                "tag_slug",
+                "tag_name",
+                "z",
+                "tag_decks",
+                "tag_affinity_pct",
+                "rank_within_tag_by_z",
+                *AFFINITY_MODEL_FIELDS,
+            ],
+        )
+        tag_info_by_slug = {
+            safe_json_filename(row.get("tag_slug")): row
+            for row in build_tag_index(df, tag_summary_df).to_dict(orient="records")
+            if has_value(row.get("tag_slug"))
+        }
+
+        for raw_theme_slug, group in report_df.groupby("tag_slug"):
+            # Match canonical commander ordering when duplicate source rows
+            # exist, without imposing any z-score or deck-count threshold.
+            observed = sort_for_commander_detail(group).drop_duplicates(
+                subset=["commander_slug"]
+            )
+            rows = []
+            for row in observed.to_dict(orient="records"):
+                fields = {
+                    "commander_slug": row.get("commander_slug"),
+                    **build_theme_affinity_fields(row),
+                }
+                rows.append([fields.get(field) for field in row_fields])
+
+            theme_info = tag_info_by_slug.get(safe_json_filename(raw_theme_slug), {})
+            themes.append({
+                "tag_slug": raw_theme_slug,
+                "tag_name": theme_info.get("tag_name") or group.iloc[0].get("tag_name"),
+                "rows": rows,
+            })
+            row_count += len(rows)
+
+        for commander_slug, group in report_df.groupby("commander_slug"):
+            commander_rows = group.to_dict(orient="records")
+            row = commander_rows[0]
+            commanders.append({
+                "commander_slug": commander_slug,
+                "commander_name": row.get("commander_name"),
+                "total_decks": row.get("total_decks"),
+                "color_identity": row.get("color_identity"),
+                "bracket_tag_rows": build_theme_bracket_signal_rows(commander_rows),
+            })
+
+    themes.sort(
+        key=lambda item: str(item.get("tag_name") or item.get("tag_slug") or "").lower()
+    )
+    filename = "quirky-builds.json"
+    schema_version = 1
+    coverage = "all_observed_commander_tags"
+    write_json(
+        output_dir / filename,
+        {
+            "schema_version": schema_version,
+            "coverage": coverage,
+            "row_fields": row_fields,
+            "commanders": commanders,
+            "themes": themes,
+        },
+        compact=True,
+    )
+
+    return {
+        "file": filename,
+        "theme_count": len(themes),
+        "commander_count": len(commanders),
+        "row_count": row_count,
+        "schema_version": schema_version,
+        "coverage": coverage,
+    }
+
+
 def export_tag_files(
     df: pd.DataFrame,
     tag_summary_df: pd.DataFrame | None,
@@ -995,6 +1099,7 @@ def export_full_site_data(
         output_dir,
     )
     theme_report_export = export_theme_report(df, tag_summary_df, output_dir)
+    quirky_builds_export = export_quirky_builds_report(df, tag_summary_df, output_dir)
     leaderboard_export = export_leaderboard_pages(df, output_dir, page_size)
 
     manifest = {
@@ -1012,6 +1117,7 @@ def export_full_site_data(
         "tag_export": tag_export,
         "theme_bracket_export": theme_bracket_export,
         "theme_report_export": theme_report_export,
+        "quirky_builds_export": quirky_builds_export,
         "leaderboard_export": leaderboard_export,
     }
     if "affinity_model_version" in df.columns:
