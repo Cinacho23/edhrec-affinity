@@ -13,7 +13,7 @@ This project is not trying to reproduce EDHREC. Its purpose is to add an origina
 ## Main features
 
 - Commander search
-- Commander detail pages
+- Commander detail pages with a minimum of 5 tagged decks per displayed tag
 - Global commander-tag leaderboard
 - Tag explorer
 - Set-based commander brackets

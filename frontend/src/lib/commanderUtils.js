@@ -19,6 +19,20 @@
   trend-merged output.
 */
 
+export const MIN_COMMANDER_TAG_DECKS = 5;
+
+export function getVisibleCommanderTagRows(rows) {
+  return rows.filter((row) => {
+    const value = row.tag_decks;
+    const count =
+      typeof value === "number" || typeof value === "string"
+        ? Number(value)
+        : Number.NaN;
+
+    return Number.isFinite(count) && count >= MIN_COMMANDER_TAG_DECKS;
+  });
+}
+
 export function firstNonEmpty(...values) {
   for (const value of values) {
     if (value !== null && value !== undefined && value !== "") {
