@@ -1,4 +1,5 @@
 import "./CommanderColors.css";
+import { normalizeColorIdentity } from "../lib/colorIdentity.js";
 
 const COLOR_NAMES = {
   W: "White",
@@ -8,26 +9,10 @@ const COLOR_NAMES = {
   G: "Green",
   C: "Colorless",
 };
-const COLOR_ORDER = ["W", "U", "B", "R", "G"];
-
-function getColors(value) {
-  if (value == null) return null;
-  const text = (Array.isArray(value) ? value.join("") : String(value))
-    .trim()
-    .toUpperCase();
-
-  if ((Array.isArray(value) && value.length === 0) || text === "C" || text === "COLORLESS") {
-    return ["C"];
-  }
-
-  // Accept arrays, compact WUBRG codes, and legacy comma-separated codes.
-  const codes = text.replace(/[\s,'"[\]{}]/g, "");
-  if (!codes || !/^[WUBRG]+$/.test(codes)) return null;
-  return COLOR_ORDER.filter((color) => codes.includes(color));
-}
 
 export default function CommanderColors({ colorIdentity }) {
-  const colors = getColors(colorIdentity);
+  const identity = normalizeColorIdentity(colorIdentity);
+  const colors = identity === null ? null : (identity || "C").split("");
 
   if (!colors) {
     return <span className="commander-colors commander-colors--unknown" aria-label="Colors unknown" title="Colors unknown">—</span>;

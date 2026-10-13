@@ -40,6 +40,7 @@ import React from "react";
 import CommanderName from "../components/CommanderName";
 import CommanderColors from "../components/CommanderColors";
 import TrendBadge from "../components/TrendBadge";
+import { getColorIdentityRank, normalizeColorIdentity } from "./colorIdentity.js";
 
 import {
   formatDecimal,
@@ -50,6 +51,18 @@ import {
   getColorIdentity,
   getNumber,
 } from "./filterUtils";
+
+function getSortableColorIdentity(row) {
+  const identity = normalizeColorIdentity(getColorIdentity(row));
+  return identity === null ? undefined : identity || "C";
+}
+
+function compareColorIdentities(rowA, rowB, columnId) {
+  return (
+    getColorIdentityRank(rowA.getValue(columnId)) -
+    getColorIdentityRank(rowB.getValue(columnId))
+  );
+}
 
 /*
   firstNonEmpty() chooses the first usable value from a list.
@@ -193,7 +206,10 @@ export function createLeaderboardColumns() {
     {
       id: "color_identity",
       header: "Colors",
-      accessorFn: getColorIdentity,
+      accessorFn: getSortableColorIdentity,
+      sortingFn: compareColorIdentities,
+      sortUndefined: "last",
+      sortDescFirst: false,
       cell: (info) => React.createElement(CommanderColors, { colorIdentity: info.getValue() }),
     },
     {
@@ -271,7 +287,10 @@ export function createTagExplorerColumns() {
     {
       id: "color_identity",
       header: "Colors",
-      accessorFn: getColorIdentity,
+      accessorFn: getSortableColorIdentity,
+      sortingFn: compareColorIdentities,
+      sortUndefined: "last",
+      sortDescFirst: false,
       cell: (info) => React.createElement(CommanderColors, { colorIdentity: info.getValue() }),
     },
     {

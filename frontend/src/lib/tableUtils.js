@@ -3,8 +3,10 @@ import {
   getDecisionAffinityMetrics,
   getThemeAffinityMetrics,
 } from "./affinityDisplay.js";
+import { getColorIdentityRank } from "./colorIdentity.js";
 
 export function getValue(row, key) {
+  if (key === "color_identity") return getColorIdentityRank(row?.[key]);
   if (key === "build_rarity") return getBuildRarity(row);
   if (key === "decision_build_rarity") return getBuildRarity(getDecisionAffinityMetrics(row));
   if (key === "theme_build_rarity") return getBuildRarity(getThemeAffinityMetrics(row));
@@ -74,7 +76,7 @@ export function sortRows(rows, sortKey, sortDirection = "desc") {
 
 export function toggleSortDirection(currentKey, nextKey, currentDirection) {
   if (currentKey !== nextKey) {
-    return "desc";
+    return nextKey === "color_identity" ? "asc" : "desc";
   }
 
   return currentDirection === "desc" ? "asc" : "desc";
