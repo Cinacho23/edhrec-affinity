@@ -989,7 +989,8 @@ button:disabled {
   white-space: nowrap;
 }
 
-.theme-report-note {
+.theme-report-note,
+.table-note {
   margin: 0;
   padding: 1rem;
   font-size: 0.85rem;

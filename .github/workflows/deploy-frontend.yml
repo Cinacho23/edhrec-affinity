@@ -101,6 +101,12 @@ jobs:
             exit 1
           fi
 
+      - name: Upgrade cached affinity analysis
+        shell: bash
+        run: |
+          python scripts/recompute_affinity.py \
+            --processed-dir "${RESTORED_PROCESSED_DIR}"
+
       - name: Export sharded frontend data
         shell: bash
         run: |
@@ -145,4 +151,3 @@ jobs:
       - name: Deploy GitHub Pages site
         id: deployment
         uses: actions/deploy-pages@v4
-

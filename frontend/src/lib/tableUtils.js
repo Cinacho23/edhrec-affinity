@@ -1,4 +1,14 @@
+import {
+  getBuildRarity,
+  getDecisionAffinityMetrics,
+  getThemeAffinityMetrics,
+} from "./affinityDisplay.js";
+
 export function getValue(row, key) {
+  if (key === "build_rarity") return getBuildRarity(row);
+  if (key === "decision_build_rarity") return getBuildRarity(getDecisionAffinityMetrics(row));
+  if (key === "theme_build_rarity") return getBuildRarity(getThemeAffinityMetrics(row));
+
   const value = row?.[key];
 
   if (value === null || value === undefined) {
@@ -9,25 +19,42 @@ export function getValue(row, key) {
 }
 
 export function asNumber(value) {
-  if (value === null || value === undefined || value === "") {
+  if (
+    (typeof value !== "number" && typeof value !== "string") ||
+    (typeof value === "string" && value.trim() === "")
+  ) {
     return null;
   }
 
   const number = Number(value);
 
-  return Number.isNaN(number) ? null : number;
+  return Number.isFinite(number) ? number : null;
 }
 
 export function compareValues(a, b, direction = "desc") {
+  const isMissing = (value) =>
+    value === null ||
+    value === undefined ||
+    (typeof value === "string" && value.trim() === "") ||
+    (typeof value === "number" && !Number.isFinite(value));
+  const aMissing = isMissing(a);
+  const bMissing = isMissing(b);
+
+  // Unavailable estimates should never outrank scored rows, in either direction.
+  if (aMissing || bMissing) {
+    if (aMissing && bMissing) return 0;
+    return aMissing ? 1 : -1;
+  }
+
   const aNumber = asNumber(a);
   const bNumber = asNumber(b);
 
   let result;
 
   if (aNumber !== null || bNumber !== null) {
-    if (aNumber === null) result = 1;
-    else if (bNumber === null) result = -1;
-    else result = aNumber - bNumber;
+    if (aNumber === null) return 1;
+    if (bNumber === null) return -1;
+    result = aNumber - bNumber;
   } else {
     result = String(a ?? "").localeCompare(String(b ?? ""));
   }
@@ -86,7 +113,7 @@ export function passesMin(row, key, minValue) {
     return true;
   }
 
-  const rowValue = asNumber(row?.[key]);
+  const rowValue = asNumber(getValue(row, key));
   const filterValue = asNumber(minValue);
 
   if (filterValue === null) {
@@ -105,7 +132,7 @@ export function passesMax(row, key, maxValue) {
     return true;
   }
 
-  const rowValue = asNumber(row?.[key]);
+  const rowValue = asNumber(getValue(row, key));
   const filterValue = asNumber(maxValue);
 
   if (filterValue === null) {

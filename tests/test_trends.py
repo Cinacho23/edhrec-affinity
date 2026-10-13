@@ -20,6 +20,7 @@ from edhrec_affinity.trends import (
     TREND_SUMMARY_FILENAME,
     compute_trends,
     find_previous_snapshot,
+    merge_trends_into_current_rows,
     run_trend_pipeline,
     safe_pct_change,
     validate_unique_keys,
@@ -220,6 +221,67 @@ def test_safe_pct_change_returns_na_for_zero_or_missing_previous():
     assert result.iloc[0] == pytest.approx(0.20)
     assert pd.isna(result.iloc[1])
     assert pd.isna(result.iloc[2])
+
+
+@pytest.mark.parametrize(
+    ("previous_model", "current_model", "expected_status", "comparable"),
+    [
+        ({}, {"affinity_model_version": "beta_binomial_v1", "affinity_model_status": "fitted"}, "algorithm_changed", False),
+        (
+            {"affinity_model_version": "beta_binomial_v1", "affinity_model_status": "fallback_sparse"},
+            {"affinity_model_version": "beta_binomial_v1", "affinity_model_status": "fitted"},
+            "model_changed", False,
+        ),
+        (
+            {"affinity_model_version": "beta_binomial_v1", "affinity_model_status": "fitted"},
+            {"affinity_model_version": "beta_binomial_v1", "affinity_model_status": "fitted"},
+            "comparable", True,
+        ),
+    ],
+)
+def test_score_trends_require_the_same_algorithm_and_method(
+    previous_model, current_model, expected_status, comparable,
+):
+    old = affinity_row(commander_slug="alpha", tag_slug="tokens", total_decks=200,
+                       tag_decks=20, affinity_pct=0.1, z=1.0, rank=3)
+    new = affinity_row(commander_slug="alpha", tag_slug="tokens", total_decks=300,
+                       tag_decks=60, affinity_pct=0.2, z=2.0, rank=1)
+    current = pd.DataFrame([{**new, **current_model}])
+    trends = compute_trends(current, pd.DataFrame([{**old, **previous_model}]),
+                            current_snapshot="2026-10-08", previous_snapshot="2026-10-01")
+    row = trends.iloc[0]
+    assert row["score_trend_status"] == expected_status
+    assert row["tag_decks_delta"] == 40
+    assert row["affinity_pct_delta"] == pytest.approx(0.1)
+    if comparable:
+        assert row["z_delta"] == 1.0
+        assert row["rank_delta"] == 2
+    else:
+        assert pd.isna(row["z_delta"])
+        assert pd.isna(row["rank_delta"])
+        assert pd.isna(row["rank_within_tag_by_z_delta"])
+
+    merged = merge_trends_into_current_rows(current, trends)
+    assert merged.iloc[0]["z"] == 2.0
+    assert "z_x" not in merged and "z_y" not in merged
+
+
+def test_first_run_merge_keeps_canonical_new_affinity_fields():
+    current = pd.DataFrame([{
+        **affinity_row(commander_slug="alpha", tag_slug="tokens", total_decks=200,
+                       tag_decks=20, affinity_pct=0.1, z=1.0, rank=3),
+        "affinity_model_version": "beta_binomial_v1",
+        "affinity_model_status": "fitted",
+        "tag_affinity_adjusted_pct": 0.09,
+        "legacy_z": 1.5,
+    }])
+    trends = compute_trends(current, None, current_snapshot="2026-10-08", previous_snapshot=None)
+    merged = merge_trends_into_current_rows(current, trends)
+    assert merged.iloc[0]["z"] == 1.0
+    assert merged.iloc[0]["legacy_z"] == 1.5
+    assert merged.iloc[0]["affinity_model_version"] == "beta_binomial_v1"
+    assert merged.iloc[0]["tag_affinity_adjusted_pct"] == 0.09
+    assert merged.iloc[0]["score_trend_status"] == "no_previous_snapshot"
 
 
 def test_first_run_trends_mark_no_previous_snapshot():

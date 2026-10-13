@@ -1,10 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 
 import BracketBadge from "../components/BracketBadge";
 import CommanderName from "../components/CommanderName";
 import CommanderColors from "../components/CommanderColors";
 import SimpleTable from "../components/SimpleTable";
+import {
+  formatAdjustedAffinity,
+  formatAffinityInterval,
+  formatAffinityProbability,
+  formatBuildRarity,
+  getDecisionAffinityMetrics,
+} from "../lib/affinityDisplay";
 import {
   loadCommanderDetail,
   loadCommanderIndex,
@@ -18,6 +25,7 @@ import {
 import {
   formatDecimal,
   formatNumber,
+  formatRank,
 } from "../lib/formatters";
 import {
   readSessionObject,
@@ -73,12 +81,13 @@ export default function SetBracketsPage() {
   const [filters, setFilters] = useState(() =>
     readSessionObject(FILTER_STORAGE_KEY, DEFAULT_FILTERS)
   );
-  const [sort, setSort] = useState(() =>
-    readSessionObject(SORT_STORAGE_KEY, {
+  const [sort, setSort] = useState(() => {
+    const stored = readSessionObject(SORT_STORAGE_KEY, {
       key: "bracket_rank",
       direction: "desc",
-    })
-  );
+    });
+    return { ...stored, key: stored.key === "decision_z" ? "decision_affinity_z" : stored.key };
+  });
   const [usesExportedSetFiles, setUsesExportedSetFiles] = useState(true);
   const [state, setState] = useState({
     loadingSets: true,
@@ -340,10 +349,39 @@ export default function SetBracketsPage() {
       render: (row) => row.decision_tag_name || "—",
     },
     {
-      key: "decision_z",
-      header: "Z-Score",
+      key: "decision_tag_affinity_pct",
+      header: "Raw Affinity",
       sortable: true,
-      render: (row) => formatDecimal(row.decision_z),
+      render: (row) => formatAffinityProbability(getDecisionAffinityMetrics(row).tag_affinity_pct),
+    },
+    {
+      key: "decision_tag_affinity_adjusted_pct",
+      header: "Adjusted Affinity",
+      sortable: true,
+      render: (row) => formatAdjustedAffinity(getDecisionAffinityMetrics(row)),
+    },
+    {
+      key: "decision_build_rarity",
+      header: "Build Rarity",
+      sortable: true,
+      render: (row) => formatBuildRarity(getDecisionAffinityMetrics(row)),
+    },
+    {
+      key: "decision_affinity_interval",
+      header: "95% Range",
+      render: (row) => formatAffinityInterval(getDecisionAffinityMetrics(row)),
+    },
+    {
+      key: "decision_affinity_z",
+      header: "Bracket Z",
+      sortable: true,
+      render: (row) => formatDecimal(getDecisionAffinityMetrics(row).z),
+    },
+    {
+      key: "decision_rank_within_tag_by_z",
+      header: "Rank in Tag",
+      sortable: true,
+      render: (row) => formatRank(getDecisionAffinityMetrics(row).rank_within_tag_by_z),
     },
     {
       key: "decision_tag_decks",
@@ -391,12 +429,26 @@ export default function SetBracketsPage() {
   return (
     <section className="page bracket-page">
       <div className="page-header">
-        <p className="eyebrow">Set-level power signals</p>
+        <p className="eyebrow">Set-level bracket suggestions</p>
         <h1>Commander Brackets</h1>
         <p>
-          Choose a Magic set to classify each of its commanders from Bracket 1
-          through Bracket 5. In-flux labels identify commanders whose deciding
-          z-score sits between thresholds.
+          Choose a Magic set to see suggested building brackets for its
+          commanders. These labels give our recommended ceiling from observed
+          tag associations; actual deck strength depends on the build. In-flux
+          labels identify commanders whose Bracket Z sits between thresholds.
+        </p>
+        <p>
+          Raw and adjusted affinity, the 95% range, Bracket Z, and Rank in Tag
+          all describe the Deciding Tag. Rank in Tag compares all reported
+          commanders for that tag, across sets and brackets. The same numeric
+          bracket cutoffs now use the upgraded affinity z-score. “Unadjusted”
+          marks a fallback and — means
+          unavailable. <Link to="/methodology">How it works</Link>
+        </p>
+        <p>
+          Build Rarity describes the Deciding Tag as approximately 1 in N decks
+          for this commander. A higher N means that tag is less common for the
+          commander; it does not measure how well the build works.
         </p>
       </div>
 
@@ -408,7 +460,8 @@ export default function SetBracketsPage() {
           </div>
           <p className="muted">
             Aggro, Control, Midrange, Tempo, and Combo are evaluated only after
-            cEDH does not qualify for Bracket 4 or higher.
+            cEDH does not qualify for Bracket 4 or higher. These thresholds use
+            Bracket Z, the deciding tag’s upgraded affinity score.
           </p>
         </div>
         <div className="bracket-rule-grid">

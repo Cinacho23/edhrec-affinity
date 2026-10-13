@@ -4,6 +4,7 @@ import {
   CEDH_TAG_SLUG,
   THEME_BRACKET_MIN_Z,
   classifyCommanderRows,
+  getBracketScore,
   themeUsesBracketRulesOnly,
 } from "./bracketUtils.js";
 
@@ -70,8 +71,8 @@ function createRequestLimiter(concurrency) {
 
 function qualifiesForTheme(row, themeSlug) {
   if (themeUsesBracketRulesOnly(themeSlug)) return true;
-  const score = Number(row?.z);
-  return Number.isFinite(score) && score >= THEME_BRACKET_MIN_Z;
+  const score = getBracketScore(row);
+  return score !== null && score >= THEME_BRACKET_MIN_Z;
 }
 
 function createThemeRow(themeRow, bracketTagRows) {
@@ -79,9 +80,17 @@ function createThemeRow(themeRow, bracketTagRows) {
     ...themeRow,
     theme_tag_name: themeRow.tag_name,
     theme_tag_slug: themeRow.tag_slug,
-    theme_z: themeRow.z,
+    theme_z: getBracketScore(themeRow),
+    theme_affinity_z: themeRow.z ?? null,
+    ...(Object.hasOwn(themeRow, "legacy_z") ? { theme_legacy_z: themeRow.legacy_z } : {}),
     theme_tag_decks: themeRow.tag_decks,
     theme_affinity_pct: themeRow.tag_affinity_pct,
+    theme_affinity_adjusted_pct: themeRow.tag_affinity_adjusted_pct ?? null,
+    theme_affinity_lower_pct: themeRow.tag_affinity_lower_pct ?? null,
+    theme_affinity_upper_pct: themeRow.tag_affinity_upper_pct ?? null,
+    theme_affinity_model_status: themeRow.affinity_model_status ?? null,
+    theme_affinity_model_version: themeRow.affinity_model_version ?? null,
+    theme_rank_within_tag_by_z: themeRow.rank_within_tag_by_z ?? null,
     bracket_tag_rows: bracketTagRows,
   };
 }
@@ -97,8 +106,7 @@ function hasDecidingSignalTie(rows) {
   return rows.filter(
     (row) =>
       tags.has(row.tag_slug) &&
-      row.z !== null && row.z !== undefined && row.z !== "" &&
-      Number(row.z) === decision.decision_z
+      getBracketScore(row) === decision.decision_z
   ).length > 1;
 }
 
@@ -140,10 +148,13 @@ export function createThemeBracketDataLoader({
     if (!indexPromise) {
       indexPromise = (async () => {
         try {
-          return {
-            themes: await requestRows("loadThemeBracketIndex"),
-            usesThemeBracketFiles: true,
-          };
+          const themes = await requestRows("loadThemeBracketIndex");
+          // Earlier collections omitted rows using the legacy score gate and
+          // expose stale qualified counts. Recover themes and rows from tags.
+          if (themes.every((theme) => theme.qualification_score_field === "z")) {
+            return { themes, usesThemeBracketFiles: true };
+          }
+          return { themes: await requestRows("loadTagIndex"), usesThemeBracketFiles: false };
         } catch {
           return {
             themes: await requestRows("loadTagIndex"),
@@ -173,7 +184,15 @@ export function createThemeBracketDataLoader({
               tag_name: row.tag_name,
               tag_slug: row.tag_slug,
               z: row.z,
+              ...(Object.hasOwn(row, "legacy_z") ? { legacy_z: row.legacy_z } : {}),
               tag_decks: row.tag_decks,
+              tag_affinity_pct: row.tag_affinity_pct ?? null,
+              tag_affinity_adjusted_pct: row.tag_affinity_adjusted_pct ?? null,
+              tag_affinity_lower_pct: row.tag_affinity_lower_pct ?? null,
+              tag_affinity_upper_pct: row.tag_affinity_upper_pct ?? null,
+              affinity_model_status: row.affinity_model_status ?? null,
+              affinity_model_version: row.affinity_model_version ?? null,
+              rank_within_tag_by_z: row.rank_within_tag_by_z ?? null,
             });
           }
         }
@@ -186,8 +205,7 @@ export function createThemeBracketDataLoader({
 
   function loadCommanderSignals(commanderSlug, signals) {
     if (!commanderSignals.has(commanderSlug)) {
-      // Ordinary themes previously read commander details, whose ordering
-      // determines the deciding tag when signals tie. Preserve that rare case.
+      // Commander details provide authoritative ordering for exact score ties.
       commanderSignals.set(commanderSlug, hasDecidingSignalTie(signals)
         ? requestRows("loadCommanderDetail", commanderSlug)
         : Promise.resolve(signals));
@@ -201,11 +219,9 @@ export function createThemeBracketDataLoader({
     if (qualifiedRows.length === 0) return [];
 
     const signalsByCommander = await loadSignalRows();
-    const bracketRulesOnly = themeUsesBracketRulesOnly(themeSlug);
-
     return mapWithConcurrency(qualifiedRows, concurrency, async (row) => {
       const signals = signalsByCommander.get(row.commander_slug) || [];
-      const bracketRows = bracketRulesOnly || !row.commander_slug
+      const bracketRows = !row.commander_slug
         ? signals
         : await loadCommanderSignals(row.commander_slug, signals);
       return createThemeRow(row, bracketRows);
@@ -217,10 +233,13 @@ export function createThemeBracketDataLoader({
     if (!themeRows.has(key)) {
       themeRows.set(key, (async () => {
         if (usesThemeBracketFiles) {
-          try {
-            return await requestRows("loadThemeBracketDetail", themeSlug);
-          } catch {
-            // Older exports and deployments can have only some compact files.
+          const index = await loadIndex().catch(() => null);
+          if (index?.usesThemeBracketFiles) {
+            try {
+              return await requestRows("loadThemeBracketDetail", themeSlug);
+            } catch {
+              // Partial exports can lack a compact file; complete tags remain.
+            }
           }
         }
         return loadFallbackRows(themeSlug);

@@ -98,6 +98,9 @@ export default function HomePage() {
           <Link className="button" to="/theme-report">
             Theme Report
           </Link>
+          <Link className="button" to="/quirky-builds">
+            Quirky Builds
+          </Link>
         </div>
       </div>
 

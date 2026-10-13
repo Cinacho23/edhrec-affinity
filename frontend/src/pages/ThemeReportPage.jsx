@@ -5,9 +5,16 @@ import BracketBadge from "../components/BracketBadge";
 import CommanderName from "../components/CommanderName";
 import CommanderColors from "../components/CommanderColors";
 import SimpleTable from "../components/SimpleTable";
+import {
+  formatAdjustedAffinity,
+  formatAffinityInterval,
+  formatAffinityProbability,
+  formatBuildRarity,
+  getThemeAffinityMetrics,
+} from "../lib/affinityDisplay";
 import { loadThemeReport } from "../lib/api";
 import { BRACKET_OPTIONS } from "../lib/bracketUtils";
-import { formatDecimal, formatNumber } from "../lib/formatters";
+import { formatDecimal, formatNumber, formatRank } from "../lib/formatters";
 import { readSessionObject, writeSessionValue } from "../lib/persistentState";
 import { rowMatchesText, sortRows, toggleSortDirection } from "../lib/tableUtils";
 import { createThemeBracketDataLoader, mapWithConcurrency } from "../lib/themeBracketData";
@@ -165,8 +172,28 @@ export default function ThemeReportPage() {
       render: (row) => <span title={row.bracket_reason}><BracketBadge bracketKey={row.bracket_key} label={row.bracket_label} /></span>,
     },
     {
-      key: "theme_z", header: "Theme Z", sortable: true,
-      render: (row) => formatDecimal(row.theme_z),
+      key: "theme_affinity_pct", header: "Raw Affinity", sortable: true,
+      render: (row) => formatAffinityProbability(getThemeAffinityMetrics(row).tag_affinity_pct),
+    },
+    {
+      key: "theme_affinity_adjusted_pct", header: "Adjusted Affinity", sortable: true,
+      render: (row) => formatAdjustedAffinity(getThemeAffinityMetrics(row)),
+    },
+    {
+      key: "theme_build_rarity", header: "Build Rarity", sortable: true,
+      render: (row) => formatBuildRarity(getThemeAffinityMetrics(row)),
+    },
+    {
+      key: "theme_affinity_interval", header: "95% Range",
+      render: (row) => formatAffinityInterval(getThemeAffinityMetrics(row)),
+    },
+    {
+      key: "theme_affinity_z", header: "Z-Score", sortable: true,
+      render: (row) => formatDecimal(getThemeAffinityMetrics(row).z),
+    },
+    {
+      key: "theme_rank_within_tag_by_z", header: "Rank in Tag", sortable: true,
+      render: (row) => formatRank(getThemeAffinityMetrics(row).rank_within_tag_by_z),
     },
     {
       key: "theme_tag_decks", header: "Theme Decks", sortable: true,
@@ -181,7 +208,7 @@ export default function ThemeReportPage() {
       render: (row) => (
         <span className="theme-report-signal" title={row.bracket_reason}>
           {row.decision_tag_name || "—"}
-          {row.decision_z !== null && <small>Bracket Z {formatDecimal(row.decision_z)}</small>}
+          {row.decision_z !== null && row.decision_z !== undefined && <small>Bracket Z {formatDecimal(row.decision_z)}</small>}
         </span>
       ),
     },
@@ -198,8 +225,25 @@ export default function ThemeReportPage() {
         </p>
         <p className="muted">
           Uses the <Link className="table-commander-link" to="/theme-brackets">Theme Brackets rules</Link>:
-          ordinary themes require z ≥ 1.05; cEDH, Aggro, Control, Midrange, Tempo,
+          ordinary themes require theme z ≥ 1.05; cEDH, Aggro, Control, Midrange, Tempo,
           and Combo use bracket rules only. cEDH takes precedence when assigning brackets.
+          Theme eligibility, bracket suggestions, and rankings use the upgraded
+          affinity score with the same numeric cutoffs.
+        </p>
+        <p>
+          Raw and adjusted affinity, the 95% range, z-score, and Rank in Tag
+          describe the row’s theme. Rank in Tag compares all reported commanders
+          for that theme; Rank in {perBracket ? "bracket" : "theme"} follows
+          this report’s filters. Bracket Z describes the deciding tag used for
+          the suggested building bracket, our recommended ceiling from tag
+          associations. Actual deck strength depends on the build. “Unadjusted”
+          marks a fallback and — means
+          unavailable. <Link to="/methodology">How it works</Link>
+        </p>
+        <p>
+          Build Rarity describes the row’s theme as approximately 1 in N decks
+          for this commander. A higher N means that theme is less common for the
+          commander; it does not measure how well the build works.
         </p>
       </div>
 

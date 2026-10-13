@@ -5,6 +5,12 @@ import CommanderName from "../components/CommanderName";
 import CommanderColors from "../components/CommanderColors";
 import SimpleTable from "../components/SimpleTable";
 import {
+  formatAdjustedAffinity,
+  formatAffinityInterval,
+  formatAffinityProbability,
+  formatBuildRarity,
+} from "../lib/affinityDisplay";
+import {
   loadCommanderDetail,
   loadCommanderIndex,
   loadSetDetail,
@@ -13,7 +19,7 @@ import {
 import {
   formatDecimal,
   formatNumber,
-  formatPercent,
+  formatRank,
 } from "../lib/formatters";
 import {
   readSessionObject,
@@ -328,12 +334,6 @@ export default function SetExplorerPage() {
       render: (row) => row.tag_name || "-",
     },
     {
-      key: "z",
-      header: "Z-Score",
-      sortable: true,
-      render: (row) => formatDecimal(row.z),
-    },
-    {
       key: "total_decks",
       header: "Total Decks",
       sortable: true,
@@ -347,9 +347,38 @@ export default function SetExplorerPage() {
     },
     {
       key: "tag_affinity_pct",
-      header: "Affinity",
+      header: "Raw Affinity",
       sortable: true,
-      render: (row) => formatPercent(row.tag_affinity_pct),
+      render: (row) => formatAffinityProbability(row.tag_affinity_pct),
+    },
+    {
+      key: "tag_affinity_adjusted_pct",
+      header: "Adjusted Affinity",
+      sortable: true,
+      render: formatAdjustedAffinity,
+    },
+    {
+      key: "build_rarity",
+      header: "Build Rarity",
+      sortable: true,
+      render: formatBuildRarity,
+    },
+    {
+      key: "affinity_interval",
+      header: "95% Range",
+      render: formatAffinityInterval,
+    },
+    {
+      key: "z",
+      header: "Z-Score",
+      sortable: true,
+      render: (row) => formatDecimal(row.z),
+    },
+    {
+      key: "rank_within_tag_by_z",
+      header: "Rank in Tag",
+      sortable: true,
+      render: (row) => formatRank(row.rank_within_tag_by_z),
     },
     {
       key: "origin_set_name",
@@ -383,6 +412,18 @@ export default function SetExplorerPage() {
         <p>
           Browse Magic sets, then inspect commander/tag rows for cards that
           originated in the selected set.
+        </p>
+        <p>
+          Affinity, its 95% range, and z-score describe the tag in each row.
+          Rank in Tag compares the commander with all reported commanders for
+          that tag, across sets. Adjusted affinity accounts for sample size;
+          “unadjusted” marks a fallback and — means unavailable.{" "}
+          <Link to="/methodology">How it works</Link>
+        </p>
+        <p>
+          Build Rarity expresses adjusted affinity as approximately 1 in N decks
+          for this commander. A higher N means the row’s tag is less common for
+          that commander; it does not measure how well the build works.
         </p>
       </div>
 

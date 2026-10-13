@@ -17,6 +17,7 @@ it writes:
     data/latest/tags/<tag_slug>.json
     data/latest/theme-brackets/<tag_slug>.json
     data/latest/theme-report.json
+    data/latest/quirky-builds.json
     data/latest/leaderboard/page_0001.json
     data/latest/leaderboard/page_0002.json
 
@@ -67,6 +68,13 @@ SUMMARY_FILES = [
     "analysis_summary.json",
     "trend_summary.json",
     "tag_summary.json",
+]
+
+AFFINITY_MODEL_FIELDS = [
+    "legacy_z", "affinity_model_version", "affinity_model_status",
+    "tag_affinity_adjusted_pct", "tag_affinity_lower_pct", "tag_affinity_upper_pct",
+    "tag_prior_mean_pct", "tag_prior_strength", "tag_prior_std_pct",
+    "tag_reference_row_count",
 ]
 
 
@@ -515,7 +523,8 @@ def sort_for_leaderboard(df: pd.DataFrame) -> pd.DataFrame:
 
 def sort_for_commander_detail(df: pd.DataFrame) -> pd.DataFrame:
     if "z" in df.columns:
-        return df.sort_values("z", ascending=False, na_position="last")
+        columns = [column for column in ["z", "commander_name", "tag_name", "tag_slug"] if column in df.columns]
+        return df.sort_values(columns, ascending=[False, *([True] * (len(columns) - 1))], na_position="last", kind="stable")
 
     if "tag_decks" in df.columns:
         return df.sort_values("tag_decks", ascending=False, na_position="last")
@@ -636,6 +645,7 @@ def build_set_commander_row(
         "scryfall_set_uri": origin_set.get("scryfall_set_uri"),
         "set_uri": origin_set.get("set_uri"),
         "origin_sets": row.get("origin_sets"),
+        **{field: row[field] for field in AFFINITY_MODEL_FIELDS if field in row},
     }
 
 
@@ -685,10 +695,11 @@ def export_set_files(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
         sorted_rows = sorted(
             rows,
             key=lambda row: (
-                row.get("z") is None,
+                not has_value(row.get("z")),
                 -as_sort_float(row.get("z")),
                 str(row.get("commander_name") or ""),
                 str(row.get("tag_name") or ""),
+                str(row.get("tag_slug") or ""),
             ),
         )
         write_json(sets_dir / f"{safe_json_filename(set_code)}.json", sorted_rows)
@@ -729,17 +740,29 @@ def build_theme_bracket_signal_row(row: dict[str, Any]) -> dict[str, Any]:
         "tag_slug": row.get("tag_slug"),
         "z": row.get("z"),
         "tag_decks": row.get("tag_decks"),
+        "tag_affinity_pct": row.get("tag_affinity_pct"),
+        "tag_affinity_adjusted_pct": row.get("tag_affinity_adjusted_pct"),
+        "tag_affinity_lower_pct": row.get("tag_affinity_lower_pct"),
+        "tag_affinity_upper_pct": row.get("tag_affinity_upper_pct"),
+        "affinity_model_status": row.get("affinity_model_status"),
+        "affinity_model_version": row.get("affinity_model_version"),
+        "rank_within_tag_by_z": row.get("rank_within_tag_by_z"),
+        **({"legacy_z": row["legacy_z"]} if "legacy_z" in row else {}),
     }
 
 
 def build_theme_bracket_signal_rows(
     commander_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    return [
+    signal_rows = [
         build_theme_bracket_signal_row(row)
         for row in commander_rows
         if safe_json_filename(row.get("tag_slug")) in BRACKET_SIGNAL_TAG_SLUGS
     ]
+    return sorted(signal_rows, key=lambda row: (
+        not has_value(row.get("z")), -as_sort_float(row.get("z")),
+        str(row.get("tag_name") or ""), str(row.get("tag_slug") or ""),
+    ))
 
 
 def qualify_theme_bracket_rows(group: pd.DataFrame, theme_slug: str) -> pd.DataFrame:
@@ -754,6 +777,23 @@ def qualify_theme_bracket_rows(group: pd.DataFrame, theme_slug: str) -> pd.DataF
         qualified = qualified.drop_duplicates(subset=["commander_slug"])
 
     return qualified
+
+
+def build_theme_affinity_fields(theme_row: dict[str, Any]) -> dict[str, Any]:
+    """Keep both score versions and the selected theme's own model metrics."""
+    return {
+        "theme_z": theme_row.get("z"),
+        "theme_affinity_z": theme_row.get("z"),
+        **({"theme_legacy_z": theme_row["legacy_z"]} if "legacy_z" in theme_row else {}),
+        "theme_tag_decks": theme_row.get("tag_decks"),
+        "theme_affinity_pct": theme_row.get("tag_affinity_pct"),
+        "theme_affinity_adjusted_pct": theme_row.get("tag_affinity_adjusted_pct"),
+        "theme_affinity_lower_pct": theme_row.get("tag_affinity_lower_pct"),
+        "theme_affinity_upper_pct": theme_row.get("tag_affinity_upper_pct"),
+        "theme_affinity_model_status": theme_row.get("affinity_model_status"),
+        "theme_affinity_model_version": theme_row.get("affinity_model_version"),
+        "theme_rank_within_tag_by_z": theme_row.get("rank_within_tag_by_z"),
+    }
 
 
 def build_theme_bracket_commander_row(
@@ -773,10 +813,7 @@ def build_theme_bracket_commander_row(
         "scryfall_card_names": theme_row.get("scryfall_card_names"),
         "theme_tag_name": theme_row.get("tag_name"),
         "theme_tag_slug": theme_row.get("tag_slug"),
-        "theme_z": theme_row.get("z"),
-        "theme_tag_decks": theme_row.get("tag_decks"),
-        "theme_affinity_pct": theme_row.get("tag_affinity_pct"),
-        "theme_rank_within_tag_by_z": theme_row.get("rank_within_tag_by_z"),
+        **build_theme_affinity_fields(theme_row),
         "bracket_tag_rows": build_theme_bracket_signal_rows(commander_rows),
     }
 
@@ -820,7 +857,7 @@ def export_theme_bracket_files(
             )
 
         filename = f"theme-brackets/{theme_slug}.json"
-        write_json(output_dir / filename, rows)
+        write_json(output_dir / filename, {"qualification_score_field": "z", "rows": rows})
         max_commanders = max(max_commanders, len(rows))
 
         theme_info = dict(tag_info_by_slug.get(theme_slug, {}))
@@ -835,6 +872,7 @@ def export_theme_bracket_files(
             if uses_bracket_rules_only
             else "theme_z_and_bracket_rules"
         )
+        theme_info["qualification_score_field"] = "z"
         theme_info["file"] = filename
         theme_index.append(theme_info)
 
@@ -846,6 +884,7 @@ def export_theme_bracket_files(
     return {
         "theme_count": len(theme_index),
         "minimum_z": THEME_BRACKET_MIN_Z,
+        "qualification_score_field": "z",
         "max_commanders_in_theme_file": max_commanders,
         "index_file": "theme-brackets/index.json",
         "file_pattern": "theme-brackets/<tag_slug>.json",
@@ -876,6 +915,8 @@ def export_theme_report(
             "z",
             "tag_decks",
             "tag_affinity_pct",
+            "rank_within_tag_by_z",
+            *AFFINITY_MODEL_FIELDS,
         ],
     )
     tag_info_by_slug = {
@@ -892,9 +933,7 @@ def export_theme_report(
         rows = [
             {
                 "commander_slug": row.get("commander_slug"),
-                "theme_z": row.get("z"),
-                "theme_tag_decks": row.get("tag_decks"),
-                "theme_affinity_pct": row.get("tag_affinity_pct"),
+                **build_theme_affinity_fields(row),
             }
             for row in qualified.to_dict(orient="records")
         ]
@@ -939,7 +978,7 @@ def export_theme_report(
     filename = "theme-report.json"
     write_json(
         output_dir / filename,
-        {"commanders": commanders, "themes": themes},
+        {"commanders": commanders, "themes": themes, "qualification_score_field": "z"},
         compact=True,
     )
 
@@ -949,6 +988,122 @@ def export_theme_report(
         "commander_count": len(commanders),
         "row_count": row_count,
         "minimum_z": THEME_BRACKET_MIN_Z,
+        "qualification_score_field": "z",
+    }
+
+
+def export_quirky_builds_report(
+    df: pd.DataFrame,
+    tag_summary_df: pd.DataFrame | None,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Export every observed commander/theme pair without theme eligibility gates.
+
+    Row values follow one shared field list rather than repeating field names
+    for every pair. Commander metadata and bracket signals are also shared so
+    uncommon themes do not require downloading all complete tag files.
+    """
+    row_fields = ["commander_slug", *build_theme_affinity_fields({})]
+    if "legacy_z" in df.columns:
+        row_fields.append("theme_legacy_z")
+
+    themes = []
+    commanders = []
+    row_count = 0
+
+    if not df.empty:
+        report_df = select_existing_columns(
+            df,
+            [
+                "commander_slug",
+                "commander_name",
+                "total_decks",
+                "color_identity",
+                "commander_cards",
+                "card_image_url",
+                "partner_card_image_urls",
+                "scryfall_uri",
+                "partner_scryfall_uris",
+                "scryfall_card_names",
+                "tag_slug",
+                "tag_name",
+                "z",
+                "tag_decks",
+                "tag_affinity_pct",
+                "rank_within_tag_by_z",
+                *AFFINITY_MODEL_FIELDS,
+            ],
+        )
+        tag_info_by_slug = {
+            safe_json_filename(row.get("tag_slug")): row
+            for row in build_tag_index(df, tag_summary_df).to_dict(orient="records")
+            if has_value(row.get("tag_slug"))
+        }
+
+        for raw_theme_slug, group in report_df.groupby("tag_slug"):
+            # Match canonical commander ordering when duplicate source rows
+            # exist, without imposing any z-score or deck-count threshold.
+            observed = sort_for_commander_detail(group).drop_duplicates(
+                subset=["commander_slug"]
+            )
+            rows = []
+            for row in observed.to_dict(orient="records"):
+                fields = {
+                    "commander_slug": row.get("commander_slug"),
+                    **build_theme_affinity_fields(row),
+                }
+                rows.append([fields.get(field) for field in row_fields])
+
+            theme_info = tag_info_by_slug.get(safe_json_filename(raw_theme_slug), {})
+            themes.append({
+                "tag_slug": raw_theme_slug,
+                "tag_name": theme_info.get("tag_name") or group.iloc[0].get("tag_name"),
+                "rows": rows,
+            })
+            row_count += len(rows)
+
+        for commander_slug, group in report_df.groupby("commander_slug"):
+            commander_rows = group.to_dict(orient="records")
+            row = commander_rows[0]
+            commanders.append({
+                "commander_slug": commander_slug,
+                "commander_name": row.get("commander_name"),
+                "total_decks": row.get("total_decks"),
+                "color_identity": row.get("color_identity"),
+                "commander_cards": row.get("commander_cards"),
+                "card_image_url": row.get("card_image_url"),
+                "partner_card_image_urls": row.get("partner_card_image_urls"),
+                "scryfall_uri": row.get("scryfall_uri"),
+                "partner_scryfall_uris": row.get("partner_scryfall_uris"),
+                "scryfall_card_names": row.get("scryfall_card_names"),
+                "bracket_tag_rows": build_theme_bracket_signal_rows(commander_rows),
+            })
+
+    themes.sort(
+        key=lambda item: str(item.get("tag_name") or item.get("tag_slug") or "").lower()
+    )
+    filename = "quirky-builds.json"
+    schema_version = 1
+    coverage = "all_observed_commander_tags"
+    write_json(
+        output_dir / filename,
+        {
+            "schema_version": schema_version,
+            "coverage": coverage,
+            "row_fields": row_fields,
+            "commanders": commanders,
+            "themes": themes,
+        },
+        compact=True,
+    )
+
+    return {
+        "file": filename,
+        "theme_count": len(themes),
+        "commander_count": len(commanders),
+        "row_count": row_count,
+        "schema_version": schema_version,
+        "coverage": coverage,
     }
 
 
@@ -1086,6 +1241,7 @@ def export_full_site_data(
         output_dir,
     )
     theme_report_export = export_theme_report(df, tag_summary_df, output_dir)
+    quirky_builds_export = export_quirky_builds_report(df, tag_summary_df, output_dir)
     leaderboard_export = export_leaderboard_pages(df, output_dir, page_size)
 
     manifest = {
@@ -1103,8 +1259,12 @@ def export_full_site_data(
         "tag_export": tag_export,
         "theme_bracket_export": theme_bracket_export,
         "theme_report_export": theme_report_export,
+        "quirky_builds_export": quirky_builds_export,
         "leaderboard_export": leaderboard_export,
     }
+    if "affinity_model_version" in df.columns:
+        versions = df["affinity_model_version"].dropna().unique().tolist()
+        manifest["affinity_model_version"] = versions[0] if len(versions) == 1 else None
 
     write_json(output_dir / "site_manifest.json", manifest)
 

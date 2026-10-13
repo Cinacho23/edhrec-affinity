@@ -211,3 +211,27 @@ test("handles empty reports and normalizes invalid or fractional top counts", ()
   assert.equal(buildThemeReportRows(rows, { minTotalDecks: "201" }).length, 0);
   assert.equal(buildThemeReportRows(rows, { minThemeDecks: "6" }).length, 0);
 });
+
+test("report gates, ranks and classifies upgraded affinity while preserving history", () => {
+  const prepared = tokens([
+    commander("highest-new", 3, {
+      theme_legacy_z: 1.1,
+      bracket_tag_rows: [{ ...signal("combo", -2), legacy_z: 1.05 }],
+    }),
+    commander("highest-old", 1, {
+      theme_legacy_z: 4,
+      bracket_tag_rows: [{ ...signal("cedh", -2), legacy_z: 0.4 }],
+    }),
+    commander("newly-qualified", 9, { theme_legacy_z: 1.04,
+      bracket_tag_rows: [{ ...signal("cedh", .4), legacy_z: -2 }],
+    }),
+  ]);
+  assert.equal(prepared.length, 2);
+  assert.equal(prepared.find((row) => row.commander_slug === "highest-new").bracket_key, "1");
+  assert.equal(prepared.find((row) => row.commander_slug === "highest-old"), undefined);
+  assert.equal(prepared.find((row) => row.commander_slug === "newly-qualified").bracket_key, "4");
+  const report = buildThemeReportRows(prepared);
+  assert.equal(report[0].commander_slug, "newly-qualified");
+  assert.equal(report[0].theme_z, 9);
+  assert.equal(report[0].theme_legacy_z, 1.04);
+});

@@ -42,12 +42,15 @@ function normalizeTagSlug(row) {
     .replace(/^-|-$/g, "");
 }
 
-function getFiniteZ(row) {
-  if (row?.z === null || row?.z === undefined || row?.z === "") {
+// Bracket rules and affinity use the same canonical score. Legacy scores are
+// retained only as history; they cannot replace an unavailable current score.
+export function getBracketScore(row) {
+  const value = row?.z;
+  if (value === null || value === undefined || value === "") {
     return null;
   }
 
-  const score = Number(row.z);
+  const score = Number(value);
   return Number.isFinite(score) ? score : null;
 }
 
@@ -68,7 +71,7 @@ function getHighestScoredRow(rows, acceptedTags) {
       continue;
     }
 
-    const score = getFiniteZ(row);
+    const score = getBracketScore(row);
 
     if (score === null || (highest && score <= highest.score)) {
       continue;
@@ -82,6 +85,7 @@ function getHighestScoredRow(rows, acceptedTags) {
 
 function createClassification(key, scoredRow, reason) {
   const bracket = BRACKET_BY_KEY.get(key);
+  const decidingTag = scoredRow?.row;
 
   return {
     bracket_key: bracket.key,
@@ -90,7 +94,16 @@ function createClassification(key, scoredRow, reason) {
     decision_tag_name: scoredRow?.row?.tag_name || null,
     decision_tag_slug: scoredRow ? normalizeTagSlug(scoredRow.row) : null,
     decision_z: scoredRow?.score ?? null,
+    decision_legacy_z: getFiniteNumber(decidingTag?.legacy_z),
     decision_tag_decks: scoredRow?.row?.tag_decks ?? null,
+    decision_tag_affinity_pct: getFiniteNumber(decidingTag?.tag_affinity_pct),
+    decision_tag_affinity_adjusted_pct: getFiniteNumber(decidingTag?.tag_affinity_adjusted_pct),
+    decision_tag_affinity_lower_pct: getFiniteNumber(decidingTag?.tag_affinity_lower_pct),
+    decision_tag_affinity_upper_pct: getFiniteNumber(decidingTag?.tag_affinity_upper_pct),
+    decision_affinity_model_status: decidingTag?.affinity_model_status ?? null,
+    decision_affinity_model_version: decidingTag?.affinity_model_version ?? null,
+    decision_affinity_z: getFiniteNumber(decidingTag?.z),
+    decision_rank_within_tag_by_z: getFiniteNumber(decidingTag?.rank_within_tag_by_z),
     bracket_reason: reason,
   };
 }
@@ -213,9 +226,18 @@ function getThemeCandidate(rows, themeSlug) {
       return;
     }
 
-    const score = getFiniteNumber(
-      usesThemeFields ? container?.theme_z : candidate?.z
+    const score = getFiniteNumber(usesThemeFields
+      ? Object.hasOwn(container, "theme_affinity_z")
+        ? container.theme_affinity_z
+        : container.theme_z
+      : candidate?.z);
+    const hasLegacyScore = Object.hasOwn(
+      usesThemeFields ? container : candidate,
+      usesThemeFields ? "theme_legacy_z" : "legacy_z"
     );
+    const legacyScore = getFiniteNumber(usesThemeFields
+      ? container?.theme_legacy_z
+      : candidate?.legacy_z);
 
     if (
       highest &&
@@ -226,6 +248,8 @@ function getThemeCandidate(rows, themeSlug) {
 
     highest = {
       score,
+      legacyScore,
+      hasLegacyScore,
       name: usesThemeFields
         ? container?.theme_tag_name
         : candidate?.tag_name,
@@ -235,18 +259,41 @@ function getThemeCandidate(rows, themeSlug) {
       affinity: usesThemeFields
         ? container?.theme_affinity_pct
         : candidate?.tag_affinity_pct,
+      adjustedAffinity: usesThemeFields
+        ? container?.theme_affinity_adjusted_pct
+        : candidate?.tag_affinity_adjusted_pct,
+      lowerAffinity: usesThemeFields
+        ? container?.theme_affinity_lower_pct
+        : candidate?.tag_affinity_lower_pct,
+      upperAffinity: usesThemeFields
+        ? container?.theme_affinity_upper_pct
+        : candidate?.tag_affinity_upper_pct,
+      modelStatus: usesThemeFields
+        ? container?.theme_affinity_model_status
+        : candidate?.affinity_model_status,
+      modelVersion: usesThemeFields
+        ? container?.theme_affinity_model_version
+        : candidate?.affinity_model_version,
+      rank: usesThemeFields
+        ? container?.theme_rank_within_tag_by_z
+        : candidate?.rank_within_tag_by_z,
     };
   }
 
-  for (const row of rows) {
-    consider(row, row);
-
-    if (row?.theme_tag_slug || row?.theme_tag_name) {
-      consider(row, row, true);
-    }
-
-    for (const signalRow of row?.bracket_tag_rows || []) {
-      consider(signalRow, row);
+  const selectedThemeRows = rows.filter((row) =>
+    (row?.theme_tag_slug || row?.theme_tag_name) &&
+    normalizeTagSlug({ tag_slug: row.theme_tag_slug, tag_name: row.theme_tag_name }) === themeSlug
+  );
+  if (selectedThemeRows.length > 0) {
+    // A compact selected-theme record is authoritative, including explicit
+    // nulls. Its signals describe bracket decisions, not substitute metrics.
+    for (const row of selectedThemeRows) consider(row, row, true);
+  } else {
+    for (const row of rows) {
+      consider(row, row);
+      for (const signalRow of row?.bracket_tag_rows || []) {
+        consider(signalRow, row);
+      }
     }
   }
 
@@ -317,8 +364,16 @@ export function buildCommanderThemeBracketRows(
       theme_tag_name: theme.name || normalizedThemeSlug,
       theme_tag_slug: normalizedThemeSlug,
       theme_z: theme.score,
+      ...(theme.hasLegacyScore ? { theme_legacy_z: theme.legacyScore } : {}),
+      theme_affinity_z: theme.score,
       theme_tag_decks: theme.decks ?? null,
-      theme_affinity_pct: theme.affinity ?? null,
+      theme_affinity_pct: getFiniteNumber(theme.affinity),
+      theme_affinity_adjusted_pct: getFiniteNumber(theme.adjustedAffinity),
+      theme_affinity_lower_pct: getFiniteNumber(theme.lowerAffinity),
+      theme_affinity_upper_pct: getFiniteNumber(theme.upperAffinity),
+      theme_affinity_model_status: theme.modelStatus ?? null,
+      theme_affinity_model_version: theme.modelVersion ?? null,
+      theme_rank_within_tag_by_z: getFiniteNumber(theme.rank),
       ...classifyCommanderRows(classificationRows),
     });
   }

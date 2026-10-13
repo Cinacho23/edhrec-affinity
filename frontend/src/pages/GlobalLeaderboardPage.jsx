@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 
 import CommanderName from "../components/CommanderName";
 import CommanderColors from "../components/CommanderColors";
@@ -6,9 +7,14 @@ import SimpleTable from "../components/SimpleTable";
 import TrendBadge from "../components/TrendBadge";
 import { loadLeaderboardIndex, loadLeaderboardPage } from "../lib/api";
 import {
+  formatAdjustedAffinity,
+  formatAffinityInterval,
+  formatAffinityProbability,
+  formatBuildRarity,
+} from "../lib/affinityDisplay";
+import {
   formatDecimal,
   formatNumber,
-  formatPercent,
   formatRank,
 } from "../lib/formatters";
 import {
@@ -33,6 +39,7 @@ const DEFAULT_FILTERS = {
   query: "",
   minTotalDecks: "200",
   minTagDecks: "5",
+  minBuildRarity: "",
   minZ: "",
   maxZ: "",
   trendStatus: "",
@@ -119,6 +126,7 @@ export default function GlobalLeaderboardPage() {
         ]) &&
         passesMin(row, "total_decks", filters.minTotalDecks) &&
         passesMin(row, "tag_decks", filters.minTagDecks) &&
+        passesMin(row, "build_rarity", filters.minBuildRarity) &&
         passesMin(row, "z", filters.minZ) &&
         passesMax(row, "z", filters.maxZ) &&
         (!filters.trendStatus || row.trend_status === filters.trendStatus)
@@ -181,9 +189,26 @@ export default function GlobalLeaderboardPage() {
     },
     {
       key: "tag_affinity_pct",
-      header: "Affinity",
+      header: "Raw Affinity",
       sortable: true,
-      render: (row) => formatPercent(row.tag_affinity_pct),
+      render: (row) => formatAffinityProbability(row.tag_affinity_pct),
+    },
+    {
+      key: "tag_affinity_adjusted_pct",
+      header: "Adjusted Affinity",
+      sortable: true,
+      render: formatAdjustedAffinity,
+    },
+    {
+      key: "build_rarity",
+      header: "Build Rarity",
+      sortable: true,
+      render: formatBuildRarity,
+    },
+    {
+      key: "affinity_interval",
+      header: "95% Range",
+      render: formatAffinityInterval,
     },
     {
       key: "z",
@@ -247,6 +272,22 @@ export default function GlobalLeaderboardPage() {
         <p>
           The leaderboard is served in static shards. Filters and sorting apply to
           the currently loaded leaderboard page.
+        </p>
+        <p>
+          Raw affinity is the observed share of tagged decks. Adjusted affinity
+          pulls smaller samples toward the tag baseline, and its 95% range shows
+          uncertainty under the model. The z-score measures specialization relative to other
+          commanders with that tag. <Link to="/methodology">How it works</Link>
+        </p>
+        <p>
+          Build Rarity expresses adjusted affinity as approximately 1 in N decks
+          for this commander. A higher N means the row’s tag is less common for
+          that commander; it does not measure how well the build works.
+        </p>
+        <p className="muted">
+          “Unadjusted” means there was insufficient evidence to fit the model
+          reliably; that row retains the previous score. Missing estimates and
+          ranges appear as —.
         </p>
       </div>
 
@@ -337,6 +378,18 @@ export default function GlobalLeaderboardPage() {
               value={filters.minTagDecks}
               onChange={(event) => updateFilter("minTagDecks", event.target.value)}
               placeholder="5"
+            />
+          </label>
+
+          <label>
+            Minimum build rarity (1 in N)
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={filters.minBuildRarity}
+              onChange={(event) => updateFilter("minBuildRarity", event.target.value)}
+              placeholder="50"
             />
           </label>
 
