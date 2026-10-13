@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import BracketBadge from "../components/BracketBadge";
+import CommanderName from "../components/CommanderName";
+import CommanderColors from "../components/CommanderColors";
 import SimpleTable from "../components/SimpleTable";
 import { loadThemeReport } from "../lib/api";
 import { BRACKET_OPTIONS } from "../lib/bracketUtils";
@@ -152,7 +154,11 @@ export default function ThemeReportPage() {
     },
     {
       key: "commander_name", header: "Commander", sortable: true,
-      render: (row) => <Link className="table-commander-link" to={`/commanders/${row.commander_slug}`}>{row.commander_name}</Link>,
+      render: (row) => <CommanderName commander={row} className="table-commander-link" />,
+    },
+    {
+      key: "color_identity", header: "Colors", sortable: true,
+      render: (row) => <CommanderColors colorIdentity={row.color_identity} />,
     },
     {
       key: "bracket_rank", header: "Bracket", sortable: true,

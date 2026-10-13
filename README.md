@@ -23,6 +23,8 @@ This project is not trying to reproduce EDHREC. Its purpose is to add an origina
 - Z-score, percentile, and rank metrics
 - Trend fields across dated snapshots
 - Scryfall-based card images and color identity
+- Compact card previews on commander-name hover or keyboard focus, including partners, backgrounds, and both faces of double-faced cards
+- Accessible colour indicators in commander rows; press Escape to dismiss a preview
 - Static frontend deployment through GitHub Pages
 
 ## Architecture

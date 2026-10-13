@@ -1,0 +1,30 @@
+.commander-colors {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.commander-colors__pip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.45rem;
+  height: 1.45rem;
+  flex: 0 0 1.45rem;
+  border: 1px solid rgb(255 255 255 / 25%);
+  border-radius: 50%;
+  font-size: 0.72rem;
+  font-weight: 800;
+  line-height: 1;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 20%);
+}
+
+.commander-colors__pip--w { background: #f5eed8; color: #4c4228; }
+.commander-colors__pip--u { background: #a9d8f0; color: #103f5a; }
+.commander-colors__pip--b { background: #514658; color: #ffffff; }
+.commander-colors__pip--r { background: #f3a191; color: #652619; }
+.commander-colors__pip--g { background: #a8d5ad; color: #234d2a; }
+.commander-colors__pip--c { background: #bec5cd; color: #303b49; }
+.commander-colors--unknown { opacity: 0.7; }

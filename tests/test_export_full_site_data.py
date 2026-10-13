@@ -373,3 +373,172 @@ def test_theme_report_writes_strict_json_for_nonfinite_values(tmp_path):
         "theme_tag_decks": None,
         "theme_affinity_pct": None,
     }
+
+
+def test_export_recovers_cached_faces_for_every_commander_surface(tmp_path):
+    processed_dir = tmp_path / "processed"
+    output_dir = tmp_path / "site"
+    cards = [
+        {
+            "name": "Front // Back",
+            "scryfall_uri": "https://scryfall.com/card/tst/1/front",
+            "card_faces": [
+                {"name": "Front", "image_uris": {"normal": "front.jpg"}},
+                {"name": "Back", "image_uris": {"normal": "back.jpg"}},
+            ],
+        },
+        {
+            "name": "Background",
+            "scryfall_uri": "https://scryfall.com/card/tst/2/background",
+            "image_uris": {"normal": "background.jpg"},
+        },
+    ]
+    write_json(
+        processed_dir / "scryfall_lookup_cache.json",
+        {"exact:front": cards[0], "exact:background": cards[1]},
+    )
+    write_json(
+        processed_dir / "affinity_rows_with_trends.json",
+        [{
+            "commander_slug": "front-background",
+            "commander_name": "Front // Background",
+            "scryfall_card_names": ["Front // Back", "Background"],
+            "card_image_url": "front.jpg",
+            "partner_card_image_urls": ["front.jpg", "background.jpg"],
+            "scryfall_uri": cards[0]["scryfall_uri"],
+            "color_identity": ["U", "G"],
+            "tag_slug": "snow",
+            "tag_name": "Snow",
+            "z": 2.4,
+            "tag_decks": 3,
+            "total_decks": 10,
+        }],
+    )
+
+    write_json(processed_dir / "analysis_summary.json", {})
+    write_json(processed_dir / "trend_summary.json", {})
+    write_json(processed_dir / "tag_summary.json", [])
+    export_full_site_data(
+        processed_dir=processed_dir, output_dir=output_dir, page_size=10, clean_output=False
+    )
+
+    expected = [
+        {
+            "name": "Front // Back",
+            "scryfall_uri": cards[0]["scryfall_uri"],
+            "faces": [
+                {"name": "Front", "image_url": "front.jpg"},
+                {"name": "Back", "image_url": "back.jpg"},
+            ],
+        },
+        {
+            "name": "Background",
+            "scryfall_uri": cards[1]["scryfall_uri"],
+            "faces": [{"name": "Background", "image_url": "background.jpg"}],
+        },
+    ]
+    files = [
+        "commanders/index.json", "commanders/front-background.json", "sets/tst.json",
+        "tags/snow.json", "theme-brackets/snow.json", "leaderboard/page_0001.json",
+    ]
+    for filename in files:
+        row = read_json(output_dir / filename)[0]
+        assert row["commander_cards"] == expected, filename
+        assert row["color_identity"] == ["U", "G"], filename
+
+    report_row = read_json(output_dir / "theme-report.json")["commanders"][0]
+    assert report_row["commander_cards"] == expected
+    assert report_row["partner_card_image_urls"] == ["front.jpg", "background.jpg"]
+
+
+def test_incomplete_cache_leaves_legacy_metadata_for_frontend_fallback(tmp_path):
+    cache_path = tmp_path / "cache.json"
+    write_json(cache_path, {"exact:partner": {"name": "Partner", "image_uris": {"normal": "p.jpg"}}})
+    df = pd.DataFrame([{
+        "commander_slug": "pair",
+        "commander_name": "Partner // Background",
+        "scryfall_card_names": ["Partner", "Background"],
+        "partner_card_image_urls": ["p.jpg", "b.jpg"],
+    }])
+    upgraded = export_full_site_data_module.ensure_commander_card_metadata(df, cache_path)
+    assert "commander_cards" not in upgraded.columns
+    assert upgraded.iloc[0]["partner_card_image_urls"] == ["p.jpg", "b.jpg"]
+
+
+def test_meld_cache_migration_waits_for_result_and_keeps_one_commander(tmp_path):
+    cache_path = tmp_path / "cache.json"
+    card = {
+        "name": "Bruna, the Fading Light",
+        "layout": "meld",
+        "image_uris": {"normal": "bruna-front.jpg"},
+        "all_parts": [{
+            "name": "Brisela, Voice of Nightmares",
+            "component": "meld_result",
+            "uri": "https://api.scryfall.com/cards/brisela",
+        }],
+    }
+    cache = {"exact:bruna, the fading light": card}
+    df = pd.DataFrame([{
+        "commander_slug": "bruna",
+        "commander_name": card["name"],
+        "scryfall_card_names": [card["name"]],
+        "card_image_url": "bruna-front.jpg",
+    }])
+    write_json(cache_path, cache)
+    upgraded = export_full_site_data_module.ensure_commander_card_metadata(df, cache_path)
+    assert "commander_cards" not in upgraded.columns
+
+    cache["uri:https://api.scryfall.com/cards/brisela"] = {
+        "name": "Brisela, Voice of Nightmares",
+        "image_uris": {"normal": "brisela-back.jpg"},
+    }
+    write_json(cache_path, cache)
+    upgraded = export_full_site_data_module.ensure_commander_card_metadata(df, cache_path)
+    previews = upgraded.iloc[0]["commander_cards"]
+    assert len(previews) == 1
+    assert previews[0]["name"] == card["name"]
+    assert [face["image_url"] for face in previews[0]["faces"]] == [
+        "bruna-front.jpg", "brisela-back.jpg"
+    ]
+
+
+def test_partial_partner_metadata_recovers_both_cards_and_color_union(tmp_path):
+    cache_path = tmp_path / "cache.json"
+    first = {"name": "First", "color_identity": ["U", "R"], "image_uris": {"normal": "first.jpg"}}
+    second = {"name": "Second", "color_identity": ["W", "R"], "image_uris": {"normal": "second.jpg"}}
+    write_json(cache_path, {"exact:first": first, "exact:second": second})
+    # The old early-return lookup can retain only the SECOND member of a pair.
+    df = pd.DataFrame([{
+        "commander_slug": "pair",
+        "commander_name": "First // Second (Commander)",
+        "scryfall_card_names": ["Second"],
+        "partner_card_image_urls": ["second.jpg"],
+        "color_identity": ["W", "R"],
+    }])
+    upgraded = export_full_site_data_module.ensure_commander_card_metadata(df, cache_path)
+    previews = upgraded.iloc[0]["commander_cards"]
+    assert [card["name"] for card in previews] == ["First", "Second"]
+    assert [card["faces"][0]["image_url"] for card in previews] == ["first.jpg", "second.jpg"]
+    assert upgraded.iloc[0]["color_identity"] == ["W", "U", "R"]
+
+
+def test_partial_partner_colors_recover_from_standalone_rows_without_cache(tmp_path):
+    df = pd.DataFrame([
+        {
+            "commander_slug": "pair",
+            "commander_name": "First // Second (Commander)",
+            "scryfall_card_names": ["First"],
+            "color_identity": ["U", "R"],
+        },
+        {"commander_slug": "first", "commander_name": "First (Commander)", "color_identity": ["U", "R"]},
+        {"commander_slug": "second", "commander_name": "Second (Commander)", "color_identity": ["W", "R"]},
+    ])
+    upgraded = export_full_site_data_module.ensure_commander_card_metadata(df, tmp_path / "missing.json")
+    assert upgraded.iloc[0]["color_identity"] == ["W", "U", "R"]
+    assert "commander_cards" not in upgraded.columns
+
+    # If a member is unknown, keep the legacy data incomplete for runtime lookup.
+    unknown_member = df.iloc[:2]
+    unchanged = export_full_site_data_module.ensure_commander_card_metadata(unknown_member, tmp_path / "missing.json")
+    assert unchanged.iloc[0]["color_identity"] == ["U", "R"]
+    assert "commander_cards" not in unchanged.columns

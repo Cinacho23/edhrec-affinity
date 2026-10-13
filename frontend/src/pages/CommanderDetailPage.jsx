@@ -2,10 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
 import CommanderImageGallery from "../components/CommanderImageGallery";
+import CommanderName from "../components/CommanderName";
+import CommanderColors from "../components/CommanderColors";
 import SimpleTable from "../components/SimpleTable";
 import { loadCommanderDetail } from "../lib/api";
 import {
-  formatColorIdentity,
   formatDecimal,
   formatNumber,
   formatPercent,
@@ -129,20 +130,16 @@ export default function CommanderDetailPage() {
       <section className="commander-detail-hero">
         <div className="commander-detail-hero__image-wrap">
           <CommanderImageGallery
-            commanderName={commander.commander_name}
-            cardImageUrl={commander.card_image_url}
-            partnerCardImageUrls={commander.partner_card_image_urls}
-            scryfallUri={commander.scryfall_uri}
-            partnerScryfallUris={commander.partner_scryfall_uris}
+            commander={commander}
             variant="detail"
           />
         </div>
 
         <div className="commander-detail-hero__content">
-          <h1>{commander.commander_name}</h1>
+          <h1><CommanderName commander={commander} linked={false} /></h1>
 
           <div className="commander-detail-meta">
-            <span className="pill">{formatColorIdentity(commander.color_identity)}</span>
+            <CommanderColors colorIdentity={commander.color_identity} />
             <span className="pill">{formatNumber(commander.total_decks)} decks</span>
             <span className="pill">{formatNumber(rows.length)} tags</span>
           </div>

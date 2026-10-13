@@ -36,8 +36,9 @@
 */
 
 import React from "react";
-import { Link } from "react-router";
 
+import CommanderName from "../components/CommanderName";
+import CommanderColors from "../components/CommanderColors";
 import TrendBadge from "../components/TrendBadge";
 
 import {
@@ -73,10 +74,6 @@ function firstNonEmpty(...values) {
 
 function getCommanderName(row) {
   return firstNonEmpty(row.commander_name, row.commander, "Unknown commander");
-}
-
-function getCommanderSlug(row) {
-  return firstNonEmpty(row.commander_slug, row.slug);
 }
 
 function getTagName(row) {
@@ -170,50 +167,6 @@ function formatPercentFromDecimal(value) {
   return `${(numericValue * 100).toFixed(2)}%`;
 }
 
-function formatColorIdentity(value) {
-  /*
-    Scryfall-enriched rows may store color_identity as:
-      ["W", "U"]
-
-    Older rows may store it as:
-      "WU"
-
-    This cell displays both safely.
-  */
-  if (Array.isArray(value)) {
-    return value.length > 0 ? value.join("") : "—";
-  }
-
-  return value || "—";
-}
-
-function CommanderNameLink({ row }) {
-  /*
-    Clickable commander-name cell.
-
-    If commander_slug exists, link to the commander detail page.
-
-    If commander_slug is missing for any unexpected row, fall back to plain
-    text so the table does not crash.
-  */
-  const commanderName = getCommanderName(row);
-  const commanderSlug = getCommanderSlug(row);
-
-  if (!commanderSlug) {
-    return React.createElement("span", null, commanderName);
-  }
-
-  return React.createElement(
-    Link,
-    {
-      to: `/commanders/${encodeURIComponent(commanderSlug)}`,
-      className: "table-commander-link",
-      title: `View details for ${commanderName}`,
-    },
-    commanderName
-  );
-}
-
 export function createLeaderboardColumns() {
   return [
     {
@@ -226,8 +179,9 @@ export function createLeaderboardColumns() {
         the displayed commander name becomes a React Router Link.
       */
       cell: (info) =>
-        React.createElement(CommanderNameLink, {
-          row: info.row.original,
+        React.createElement(CommanderName, {
+          commander: info.row.original,
+          className: "table-commander-link",
         }),
     },
     {
@@ -240,7 +194,7 @@ export function createLeaderboardColumns() {
       id: "color_identity",
       header: "Colors",
       accessorFn: getColorIdentity,
-      cell: (info) => formatColorIdentity(info.getValue()),
+      cell: (info) => React.createElement(CommanderColors, { colorIdentity: info.getValue() }),
     },
     {
       id: "total_decks",
@@ -309,15 +263,16 @@ export function createTagExplorerColumns() {
         Same clickable commander-name cell for the Tag Explorer.
       */
       cell: (info) =>
-        React.createElement(CommanderNameLink, {
-          row: info.row.original,
+        React.createElement(CommanderName, {
+          commander: info.row.original,
+          className: "table-commander-link",
         }),
     },
     {
       id: "color_identity",
       header: "Colors",
       accessorFn: getColorIdentity,
-      cell: (info) => formatColorIdentity(info.getValue()),
+      cell: (info) => React.createElement(CommanderColors, { colorIdentity: info.getValue() }),
     },
     {
       id: "z",

@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import CommanderImageGallery from "../components/CommanderImageGallery";
+import CommanderName from "../components/CommanderName";
+import CommanderColors from "../components/CommanderColors";
 import { loadCommanderIndex } from "../lib/api";
-import { formatColorIdentity, formatNumber } from "../lib/formatters";
+import { formatNumber } from "../lib/formatters";
 
 export default function CommanderSearchPage() {
   const [commanders, setCommanders] = useState([]);
@@ -88,11 +90,7 @@ export default function CommanderSearchPage() {
           <article className="commander-card" key={commander.commander_slug}>
             <div className="commander-card__image-wrap">
               <CommanderImageGallery
-                commanderName={commander.commander_name}
-                cardImageUrl={commander.card_image_url}
-                partnerCardImageUrls={commander.partner_card_image_urls}
-                scryfallUri={commander.scryfall_uri}
-                partnerScryfallUris={commander.partner_scryfall_uris}
+                commander={commander}
                 variant="card"
               />
             </div>
@@ -101,14 +99,12 @@ export default function CommanderSearchPage() {
               <div className="commander-card__header">
                 <div>
                   <h2>
-                    <Link
+                    <CommanderName
+                      commander={commander}
                       className="commander-card__title-link"
-                      to={`/commanders/${commander.commander_slug}`}
-                    >
-                      {commander.commander_name}
-                    </Link>
+                    />
                   </h2>
-                  <p>{formatColorIdentity(commander.color_identity)}</p>
+                  <p><CommanderColors colorIdentity={commander.color_identity} /></p>
                 </div>
 
                 <span className="pill">

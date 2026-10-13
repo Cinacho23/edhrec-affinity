@@ -1,0 +1,75 @@
+.commander-gallery {
+  display: grid;
+  gap: 12px;
+  width: 100%;
+}
+
+.commander-gallery--detail {
+  grid-template-columns: repeat(auto-fit, minmax(125px, 1fr));
+}
+
+.commander-gallery__face {
+  margin: 0;
+  min-width: 0;
+}
+
+.commander-gallery__face a {
+  display: block;
+  border-radius: 9px;
+}
+
+.commander-gallery__face a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.commander-gallery .commander-gallery__image {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 488 / 680;
+  object-fit: contain;
+  border-radius: 9px;
+  background: #0b0d12;
+}
+
+.commander-gallery__face figcaption {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.commander-gallery--stacked {
+  grid-template-columns: repeat(5, 1fr);
+  grid-template-rows: 18px auto 18px;
+  gap: 0;
+  isolation: isolate;
+}
+
+.commander-gallery--stacked .commander-gallery__face:first-child {
+  grid-area: 2 / 1 / 4 / 5;
+  z-index: 2;
+}
+
+.commander-gallery--stacked .commander-gallery__face:last-child {
+  grid-area: 1 / 2 / 3 / 6;
+  z-index: 1;
+}
+
+.commander-gallery--stacked .commander-gallery__face:hover,
+.commander-gallery--stacked .commander-gallery__face:focus-within {
+  z-index: 3;
+}
+
+.commander-gallery__placeholder {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  aspect-ratio: 488 / 680;
+  border-radius: 9px;
+  background: #0b0d12;
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-align: center;
+}

@@ -5,6 +5,8 @@
   caveats, equations, and maybe charts.
 */
 
+import CommanderName from "../components/CommanderName";
+
 export default function MethodologyPage() {
   return (
     <div className="page page--narrow">
@@ -24,7 +26,10 @@ export default function MethodologyPage() {
 
         <p>
           Each row represents one commander-tag pair. For example, one row might
-          describe how many Jasmine Boreal of the Seven decks are associated
+          describe how many <CommanderName
+            commander={{ commander_name: "Jasmine Boreal of the Seven", commander_slug: "jasmine-boreal-of-the-seven" }}
+            className="table-commander-link"
+          /> decks are associated
           with the Vanilla tag.
         </p>
       </section>

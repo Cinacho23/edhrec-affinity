@@ -174,9 +174,11 @@ function getPartnerScryfallUris(row) {
 }
 
 function getScryfallCardNames(row) {
+  // Legendary names commonly contain commas; a scalar is one card name.
+  const names = (value) => Array.isArray(value) ? value : value ? [value] : [];
   return uniqueNonEmpty([
-    ...normalizeArray(row.scryfall_card_names),
-    ...normalizeArray(row.partner_card_names),
+    ...names(row.scryfall_card_names),
+    ...names(row.partner_card_names),
   ]);
 }
 
@@ -295,6 +297,7 @@ export function groupRowsByCommander(rows) {
         scryfall_uri: row.scryfall_uri,
         partner_scryfall_uris: row.partner_scryfall_uris,
         scryfall_card_names: row.scryfall_card_names,
+        commander_cards: row.commander_cards,
         trend_status: row.trend_status,
         best_rank_delta: null,
         rows: [],
@@ -304,6 +307,11 @@ export function groupRowsByCommander(rows) {
     const commander = commanderMap.get(commanderSlug);
 
     commander.rows.push(row);
+
+    if ((!commander.commander_cards || commander.commander_cards.length === 0)
+      && row.commander_cards?.length) {
+      commander.commander_cards = row.commander_cards;
+    }
 
     if (getNumeric(row.total_decks, 0) > getNumeric(commander.total_decks, 0)) {
       commander.total_decks = row.total_decks;
