@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+import CommanderName from "../components/CommanderName";
+import CommanderColors from "../components/CommanderColors";
 import SimpleTable from "../components/SimpleTable";
 import TrendBadge from "../components/TrendBadge";
 import { loadLeaderboardIndex, loadLeaderboardPage } from "../lib/api";
@@ -11,7 +13,6 @@ import {
   formatBuildRarity,
 } from "../lib/affinityDisplay";
 import {
-  formatColorIdentity,
   formatDecimal,
   formatNumber,
   formatRank,
@@ -159,16 +160,14 @@ export default function GlobalLeaderboardPage() {
       header: "Commander",
       sortable: true,
       render: (row) => (
-        <Link className="table-commander-link" to={`/commanders/${row.commander_slug}`}>
-          {row.commander_name}
-        </Link>
+        <CommanderName commander={row} className="table-commander-link" />
       ),
     },
     {
       key: "color_identity",
       header: "Colors",
       sortable: true,
-      render: (row) => formatColorIdentity(row.color_identity),
+      render: (row) => <CommanderColors colorIdentity={row.color_identity} />,
     },
     {
       key: "tag_name",

@@ -1,3 +1,5 @@
+import CommanderName from "../components/CommanderName";
+
 export default function MethodologyPage() {
   return (
     <div className="page page--narrow">
@@ -19,7 +21,15 @@ export default function MethodologyPage() {
         <h2>1. Observed affinity</h2>
 
         <p>
-          Each row represents one commander-tag pair. Let k be the number of
+          Each row represents one commander-tag pair. For example, one row might
+          describe how many <CommanderName
+            commander={{ commander_name: "Jasmine Boreal of the Seven", commander_slug: "jasmine-boreal-of-the-seven" }}
+            className="table-commander-link"
+          /> decks are associated
+          with the Vanilla tag.
+        </p>
+        <p>
+          Let k be the number of
           tagged decks and n the commander’s total deck count. Raw affinity is:
         </p>
         <pre><code>raw affinity = k / n</code></pre>
