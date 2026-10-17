@@ -113,6 +113,22 @@
   margin: 0;
 }
 
+.theme-tree-empty-toggle {
+  margin: 0.65rem 0 0.4rem;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.82rem;
+}
+
+.theme-tree-empty-toggle[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.theme-tree-summary .theme-tree-empty-description {
+  margin: 0;
+  font-size: 0.78rem;
+}
+
 .theme-tree-workspace {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 310px;
