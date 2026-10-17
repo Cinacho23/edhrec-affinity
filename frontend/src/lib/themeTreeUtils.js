@@ -1,6 +1,5 @@
 import { asNumber } from "./tableUtils.js";
 
-const AUTOMATIC_SUBSET_LIMIT = 7;
 export const THEME_TREE_MIN_TOTAL_DECKS = 200;
 export const THEME_TREE_MIN_TAG_DECKS = 5;
 
@@ -29,53 +28,38 @@ export function combineThemeTreeSubsets(left, right) {
   return uniqueSortedSlugs([...left.tagSlugs, ...right.tagSlugs]);
 }
 
-/**
- * Show every nonempty subset for up to seven themes. Larger selections start
- * with single themes, a prefix chain, and the root, then keep every explicitly
- * requested subset. Edges are the transitive reduction of the visible subsets.
- */
-export function buildThemeTreeNodes(selectedTags, expandedSubsets = []) {
+/** Show every nonempty subset, connected to every immediate superset. */
+export function buildThemeTreeNodes(selectedTags) {
   const tagsBySlug = new Map(selectedTags
     .filter((tag) => typeof tag?.tag_slug === "string" && tag.tag_slug !== "")
     .map((tag) => [tag.tag_slug, tag]));
   const slugs = [...tagsBySlug.keys()].sort();
-  const subsets = new Map();
-  const addSubset = (tagSlugs) => {
-    const canonical = uniqueSortedSlugs(tagSlugs);
-    if (canonical.length === 0 || canonical.some((slug) => !tagsBySlug.has(slug))) return;
-    subsets.set(themeSubsetId(canonical), canonical);
-  };
-
-  if (slugs.length <= AUTOMATIC_SUBSET_LIMIT) {
-    for (let mask = 1; mask < 2 ** slugs.length; mask += 1) {
-      addSubset(slugs.filter((_, index) => mask & (1 << index)));
+  // Extend each existing subset once per theme. This produces the full power
+  // set without a theme-count threshold or JavaScript's 32-bit bitwise limit.
+  const subsets = [[]];
+  for (const slug of slugs) {
+    const previousCount = subsets.length;
+    for (let index = 0; index < previousCount; index += 1) {
+      subsets.push([...subsets[index], slug]);
     }
-  } else {
-    for (const slug of slugs) addSubset([slug]);
-    for (let length = 2; length <= slugs.length; length += 1) addSubset(slugs.slice(0, length));
   }
-  for (const subset of expandedSubsets) addSubset(subset);
-
-  const nodes = [...subsets.entries()].map(([id, tagSlugs]) => {
+  const nodes = subsets.slice(1).map((tagSlugs) => {
     const tags = tagSlugs.map((slug) => tagsBySlug.get(slug));
-    return { id, tagSlugs, tags, label: tags.map((tag) => tag.tag_name || tag.tag_slug).join(" + ") };
+    return {
+      id: JSON.stringify(tagSlugs),
+      tagSlugs,
+      tags,
+      label: tags.map((tag) => tag.tag_name || tag.tag_slug).join(" + "),
+    };
   }).sort((left, right) => left.tagSlugs.length - right.tagSlugs.length || left.id.localeCompare(right.id, "en"));
-  const bits = new Map(slugs.map((slug, index) => [slug, 1n << BigInt(index)]));
-  const masks = new Map(nodes.map((node) => [node.id,
-    node.tagSlugs.reduce((mask, slug) => mask | bits.get(slug), 0n),
-  ]));
   const edges = [];
-
+  // With all subsets present, an immediate connection removes exactly one
+  // theme. Generate those edges directly instead of comparing every node pair.
   for (const node of nodes) {
-    const mask = masks.get(node.id);
-    const nearestSupersets = [];
-    for (const candidate of nodes) {
-      if (candidate.tagSlugs.length <= node.tagSlugs.length) continue;
-      const candidateMask = masks.get(candidate.id);
-      if ((mask & candidateMask) !== mask) continue;
-      if (nearestSupersets.some((nearer) => (nearer & candidateMask) === nearer)) continue;
-      nearestSupersets.push(candidateMask);
-      edges.push({ source: node.id, target: candidate.id });
+    if (node.tagSlugs.length <= 1) continue;
+    for (let index = 0; index < node.tagSlugs.length; index += 1) {
+      const childSlugs = [...node.tagSlugs.slice(0, index), ...node.tagSlugs.slice(index + 1)];
+      edges.push({ source: JSON.stringify(childSlugs), target: node.id });
     }
   }
 
@@ -84,7 +68,7 @@ export function buildThemeTreeNodes(selectedTags, expandedSubsets = []) {
     nodes,
     edges,
     totalPossibleNodes,
-    fullyExpanded: BigInt(nodes.length) === BigInt(totalPossibleNodes),
+    fullyExpanded: true,
     rootId: slugs.length ? themeSubsetId(slugs) : null,
   };
 }
@@ -105,7 +89,10 @@ function compareCommanders(left, right) {
 /** Filter every constituent tag before choosing each combination's winner. */
 export function rankThemeTreeNodes(nodes, rowsByTag) {
   const qualifyingByTag = new Map();
-  const selectedSlugs = new Set(nodes.flatMap((node) => node.tagSlugs));
+  const selectedSlugs = new Set();
+  for (const node of nodes) {
+    for (const slug of node.tagSlugs) selectedSlugs.add(slug);
+  }
   for (const slug of selectedSlugs) {
     const rows = rowsByTag.get(slug);
     if (!Array.isArray(rows)) throw new Error(`Missing complete tag data for ${slug}.`);
@@ -141,9 +128,8 @@ export function rankThemeTreeNodes(nodes, rowsByTag) {
         break;
       }
     }
-    // Prefix reuse makes a large initial graph linear in theme-file size,
-    // rather than rescanning every tag of every prefix for each commander.
-    // Iteration also avoids a recursion limit for large selections.
+    // Reuse each subset's cached prefix so only its final tag needs a new
+    // intersection. Iteration also supports callers passing unordered nodes.
     for (let length = firstMissingLength; length <= tagSlugs.length; length += 1) {
       const key = JSON.stringify(tagSlugs.slice(0, length));
       const nextTag = qualifyingByTag.get(tagSlugs[length - 1]);

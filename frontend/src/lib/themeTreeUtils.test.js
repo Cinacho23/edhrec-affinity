@@ -19,26 +19,28 @@ function row(commander_slug, tag_slug, z, extra = {}) {
 
 function assertReducedAndConnected(graph) {
   const nodesById = new Map(graph.nodes.map((node) => [node.id, node]));
+  assert.equal(nodesById.size, graph.nodes.length, "Every subset has a unique identity");
   const supersets = new Map(graph.nodes.map((node) => [node.id, []]));
+  const edgeIds = new Set();
   for (const edge of graph.edges) {
     const source = nodesById.get(edge.source);
     const target = nodesById.get(edge.target);
-    assert.ok(source.tagSlugs.length < target.tagSlugs.length);
+    assert.ok(source && target, "Both endpoints are visible nodes");
+    assert.equal(source.tagSlugs.length + 1, target.tagSlugs.length, "Each edge adds exactly one theme");
     assert.ok(source.tagSlugs.every((slug) => target.tagSlugs.includes(slug)));
-    assert.equal(graph.nodes.some((middle) =>
-      middle.tagSlugs.length > source.tagSlugs.length && middle.tagSlugs.length < target.tagSlugs.length &&
-      source.tagSlugs.every((slug) => middle.tagSlugs.includes(slug)) &&
-      middle.tagSlugs.every((slug) => target.tagSlugs.includes(slug))
-    ), false, "No edge may bypass a visible intermediate subset");
+    const edgeId = JSON.stringify([edge.source, edge.target]);
+    assert.equal(edgeIds.has(edgeId), false, "Every edge is unique");
+    edgeIds.add(edgeId);
     supersets.get(edge.source).push(edge.target);
   }
-  function reachesRoot(id, visited = new Set()) {
-    if (id === graph.rootId) return true;
-    if (visited.has(id)) return false;
-    visited.add(id);
-    return supersets.get(id).some((next) => reachesRoot(next, visited));
+  const reachesRoot = new Set([graph.rootId]);
+  const themeCount = nodesById.get(graph.rootId)?.tagSlugs.length || 0;
+  for (const node of [...graph.nodes].reverse()) {
+    assert.equal(node.id, themeSubsetId(node.tagSlugs), "Every identity is canonical");
+    assert.equal(supersets.get(node.id).length, themeCount - node.tagSlugs.length);
+    if (supersets.get(node.id).some((next) => reachesRoot.has(next))) reachesRoot.add(node.id);
+    assert.ok(reachesRoot.has(node.id), `${node.id} reaches root`);
   }
-  for (const node of graph.nodes) assert.ok(reachesRoot(node.id), `${node.id} reaches root`);
 }
 
 test("three themes create all seven combinations and nine immediate-subset edges", () => {
@@ -54,9 +56,9 @@ test("three themes create all seven combinations and nine immediate-subset edges
   assertReducedAndConnected(graph);
 });
 
-test("up to seven themes materialize every subset with canonical identities", () => {
+test("duplicate theme selections materialize each canonical subset only once", () => {
   const tags = Array.from({ length: 7 }, (_, index) => tag(`theme-${index}`));
-  const graph = buildThemeTreeNodes([...tags, tags[0]], [["theme-1", "theme-0", "theme-1"]]);
+  const graph = buildThemeTreeNodes([...tags, tags[0]]);
   assert.equal(graph.nodes.length, 127);
   assert.equal(graph.edges.length, 441);
   assert.equal(graph.totalPossibleNodes, "127");
@@ -64,33 +66,44 @@ test("up to seven themes materialize every subset with canonical identities", ()
   assert.equal(graph.fullyExpanded, true);
 });
 
-test("large graphs preserve expansions and unions while every node remains connected to the root", () => {
-  const tags = Array.from({ length: 8 }, (_, index) => tag(`theme-${index}`));
-  const initial = buildThemeTreeNodes(tags);
-  assert.equal(initial.nodes.length, 15);
-  assert.equal(initial.totalPossibleNodes, "255");
-  assert.equal(initial.fullyExpanded, false);
-  const left = initial.nodes.find((node) => node.id === themeSubsetId(["theme-6"]));
-  const right = initial.nodes.find((node) => node.id === themeSubsetId(["theme-7"]));
+for (const [themeCount, nodeCount, edgeCount] of [[8, 255, 1016], [10, 1023, 5110], [12, 4095, 24564]]) {
+  test(`${themeCount} themes automatically show all ${nodeCount} combinations and ${edgeCount} immediate connections`, () => {
+    const tags = Array.from({ length: themeCount }, (_, index) => tag(`theme-${index}`));
+    const graph = buildThemeTreeNodes(tags);
+    assert.equal(graph.nodes.length, nodeCount);
+    assert.equal(graph.edges.length, edgeCount);
+    assert.equal(graph.totalPossibleNodes, String(nodeCount));
+    assert.equal(graph.fullyExpanded, true);
+    const layerCounts = new Map();
+    for (const node of graph.nodes) {
+      layerCounts.set(node.tagSlugs.length, (layerCounts.get(node.tagSlugs.length) || 0) + 1);
+    }
+    let combinations = 1;
+    for (let layer = 1; layer <= themeCount; layer += 1) {
+      combinations = combinations * (themeCount - layer + 1) / layer;
+      assert.equal(layerCounts.get(layer), combinations, `Layer ${layer} contains every combination`);
+    }
+    assertReducedAndConnected(graph);
+  });
+}
+
+test("combined nodes and all immediate children already exist in a full graph", () => {
+  const graph = buildThemeTreeNodes(Array.from({ length: 8 }, (_, index) => tag(`theme-${index}`)));
+  const left = graph.nodes.find((node) => node.id === themeSubsetId(["theme-6"]));
+  const right = graph.nodes.find((node) => node.id === themeSubsetId(["theme-7"]));
   const union = combineThemeTreeSubsets(left, right);
   assert.deepEqual(union, ["theme-6", "theme-7"]);
-  const root = initial.nodes.find((node) => node.id === initial.rootId);
+  const root = graph.nodes.find((node) => node.id === graph.rootId);
   const children = getThemeTreeChildren(root);
   assert.equal(children.length, 8);
-  const expanded = buildThemeTreeNodes(tags, [union, ...children, ["theme-1", "theme-4", "theme-7"]]);
   for (const subset of [union, ...children, ["theme-1", "theme-4", "theme-7"]]) {
-    assert.ok(expanded.nodes.some((node) => node.id === themeSubsetId(subset)));
+    assert.ok(graph.nodes.some((node) => node.id === themeSubsetId(subset)));
   }
   assert.deepEqual(getThemeTreeChildren(left), []);
-  assertReducedAndConnected(initial);
-  assertReducedAndConnected(expanded);
 });
 
-test("theme selection has no fixed hard cap and exact possible counts exceed Number precision", () => {
-  const graph = buildThemeTreeNodes(Array.from({ length: 80 }, (_, index) => tag(`theme-${String(index).padStart(2, "0")}`)));
-  assert.equal(graph.nodes.length, 159);
-  assert.equal(graph.totalPossibleNodes, "1208925819614629174706175");
-  assert.equal(graph.nodes.at(-1).tagSlugs.length, 80);
+test("exact possible counts exceed Number precision without materializing the graph", () => {
+  assert.equal(getThemeTreeSubsetCount(80), "1208925819614629174706175");
   assert.equal(getThemeTreeSubsetCount(0), "0");
   assert.throws(() => getThemeTreeSubsetCount(-1), /non-negative integer/);
   assert.deepEqual(buildThemeTreeNodes([]), {

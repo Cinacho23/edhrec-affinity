@@ -20,7 +20,7 @@ This project is not trying to reproduce EDHREC. Its purpose is to add an origina
 - Set-based commander brackets
 - Theme brackets with a 1.0 theme gate plus bracket-rule-only signal themes
 - Theme Report: top z-scoring commanders across every theme, overall or per bracket, with adjustable top counts and default minimums of 200 total decks and 5 theme decks
-- Theme Tree: explore every selected-theme combination in a zoomable graph, led by the highest cumulative z-score among commanders with at least 200 total decks, at least 5 decks in every constituent tag, and every tag z-score above 1; large selections expand on demand
+- Theme Tree: automatically show every selected-theme combination in a zoomable graph with no theme-count cutoff, led by the highest cumulative z-score among commanders with at least 200 total decks, at least 5 decks in every constituent tag, and every tag z-score above 1. Graph calculations run in a background worker; the complete graph grows exponentially and remains subject to browser time and memory limits.
 - Quirky Builds: rarest observed builds per theme or theme and bracket, ranked by Build Rarity without a z-score gate; adjustable deck-count and rarity filters
 - Sortable and filterable tables
 - Z-score, percentile, and rank metrics
