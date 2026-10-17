@@ -1,6 +1,8 @@
 import { asNumber } from "./tableUtils.js";
 
 const AUTOMATIC_SUBSET_LIMIT = 7;
+export const THEME_TREE_MIN_TOTAL_DECKS = 200;
+export const THEME_TREE_MIN_TAG_DECKS = 5;
 
 function uniqueSortedSlugs(slugs) {
   return [...new Set(slugs.filter((slug) => typeof slug === "string" && slug !== ""))].sort();
@@ -100,7 +102,7 @@ function compareCommanders(left, right) {
   ) || String(left.commander_slug).localeCompare(String(right.commander_slug), "en");
 }
 
-/** Find a separate cumulative-score winner for every visible combination. */
+/** Filter every constituent tag before choosing each combination's winner. */
 export function rankThemeTreeNodes(nodes, rowsByTag) {
   const qualifyingByTag = new Map();
   const selectedSlugs = new Set(nodes.flatMap((node) => node.tagSlugs));
@@ -110,7 +112,13 @@ export function rankThemeTreeNodes(nodes, rowsByTag) {
     const commanders = new Map();
     for (const row of rows) {
       const z = asNumber(row?.z);
-      if (!row?.commander_slug || row.tag_slug !== slug || z === null || z <= 1) continue;
+      const totalDecks = asNumber(row?.total_decks);
+      const tagDecks = asNumber(row?.tag_decks);
+      if (
+        !row?.commander_slug || row.tag_slug !== slug || z === null || z <= 1 ||
+        totalDecks === null || totalDecks < THEME_TREE_MIN_TOTAL_DECKS ||
+        tagDecks === null || tagDecks < THEME_TREE_MIN_TAG_DECKS
+      ) continue;
       const previous = commanders.get(row.commander_slug);
       if (!previous || z > previous.z || (z === previous.z && compareCommanders(row, previous.row) < 0)) {
         commanders.set(row.commander_slug, { row, z });

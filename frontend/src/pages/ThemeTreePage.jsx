@@ -4,6 +4,8 @@ import { Link } from "react-router-dom";
 import { formatDecimal, formatNumber } from "../lib/formatters";
 import { themeTreeDataLoader } from "../lib/themeTreeData";
 import {
+  THEME_TREE_MIN_TAG_DECKS,
+  THEME_TREE_MIN_TOTAL_DECKS,
   buildThemeTreeNodes,
   combineThemeTreeSubsets,
   getThemeTreeChildren,
@@ -191,7 +193,7 @@ function TreeCanvas({ nodes, edges, selectedIds, onSelect, loading, focusRequest
               <span className="theme-tree-node__meta">{node.tagSlugs.length === 1 ? "Single theme" : `${node.tagSlugs.length} themes`}{selected && <span>Selected</span>}</span>
               <strong>{loading ? "Loading commanders…" : node.winner?.commander_name || node.winner?.commander_slug || "No qualifying commander"}</strong>
               <span className="theme-tree-node__themes" title={node.label}>{node.label}</span>
-              <span className="theme-tree-node__score">{loading ? "Calculating scores" : node.winner ? `Σ z ${formatDecimal(node.winner.cumulative_z)}` : "No match with every z > 1"}</span>
+              <span className="theme-tree-node__score">{loading ? "Calculating scores" : node.winner ? `Σ z ${formatDecimal(node.winner.cumulative_z)}` : "No match meets all minimums"}</span>
             </button>;
           })}
         </div>
@@ -288,7 +290,7 @@ export default function ThemeTreePage() {
     <div className="page-header theme-tree-heading">
       <p className="eyebrow">Explore shared affinities</p>
       <h1>Theme Tree</h1>
-      <p>Find the leading commander for every combination of your themes. Each node adds its themes’ z-scores; a commander qualifies only when <strong>every score is above 1</strong>.</p>
+      <p>Find the leading commander for every combination of your themes. Each node adds its themes’ z-scores. Commanders need at least <strong>{THEME_TREE_MIN_TOTAL_DECKS} total decks</strong>, with at least <strong>{THEME_TREE_MIN_TAG_DECKS} decks and a z-score above 1 in every theme</strong> included in the node.</p>
     </div>
 
     <section className="theme-tree-picker panel" aria-labelledby="tree-themes-title">
@@ -330,7 +332,7 @@ export default function ThemeTreePage() {
               <dl className="theme-tree-breakdown">{activeNode.winner.cumulative_tag_scores.map((tag) => <div key={tag.tag_slug}><dt>{tag.tag_name || tag.tag_slug}</dt><dd>{formatDecimal(tag.z)}</dd></div>)}</dl>
               <Link className="theme-tree-commander-link" to={`/commanders/${activeNode.winner.commander_slug}`}>View commander →</Link>
             </>}
-            {!loading && !error && <p className="muted">{formatNumber(activeNode.qualifyingCommanderCount)} commanders have z &gt; 1 for every theme in this node.</p>}
+            {!loading && !error && <p className="muted">{formatNumber(activeNode.qualifyingCommanderCount)} commanders have at least {THEME_TREE_MIN_TOTAL_DECKS} total decks, with at least {THEME_TREE_MIN_TAG_DECKS} decks and z &gt; 1 in every theme in this node.</p>}
             <div className="theme-tree-detail__actions">
               <button type="button" onClick={() => setFocusRequest({ id: activeNode.id, token: Date.now() })}>Focus this node</button>
               {activeNode.tagSlugs.length > 1 && <button type="button" onClick={() => showSubsets(getThemeTreeChildren(activeNode), activeNode.tagSlugs)}>Expand immediate subsets</button>}
