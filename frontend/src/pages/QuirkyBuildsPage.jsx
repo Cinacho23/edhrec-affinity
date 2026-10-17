@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import BracketBadge from "../components/BracketBadge";
+import CumulativeTagFilter from "../components/CumulativeTagFilter";
 import CommanderName from "../components/CommanderName";
 import CommanderColors from "../components/CommanderColors";
 import SimpleTable from "../components/SimpleTable";
@@ -13,6 +14,7 @@ import {
   getThemeAffinityMetrics,
 } from "../lib/affinityDisplay";
 import { BRACKET_OPTIONS } from "../lib/bracketUtils";
+import { cumulativeZColumn } from "../lib/cumulativeTagUtils";
 import { formatDecimal, formatNumber, formatRank } from "../lib/formatters";
 import { readSessionObject, writeSessionValue } from "../lib/persistentState";
 import { createQuirkyBuildsDataLoader } from "../lib/quirkyBuildsData";
@@ -22,11 +24,14 @@ import {
   prepareQuirkyBuildsRows,
 } from "../lib/quirkyBuildsUtils";
 import { rowMatchesText, sortRows, toggleSortDirection } from "../lib/tableUtils";
+import { useCumulativeTags } from "../lib/useCumulativeTags";
 
 const FILTER_STORAGE_KEY = "edhrec-affinity:quirky-builds:filters";
 const PAGE_SIZE = 100;
 
 export default function QuirkyBuildsPage() {
+  const cumulative = useCumulativeTags();
+  const { filterRows: filterCumulativeRows, active: cumulativeActive } = cumulative;
   const loaderRef = useRef(null);
   const [filters, setFilters] = useState(() => {
     const stored = readSessionObject(FILTER_STORAGE_KEY, DEFAULT_QUIRKY_BUILDS_FILTERS);
@@ -75,8 +80,11 @@ export default function QuirkyBuildsPage() {
   }, [filters]);
 
   const rankedRows = useMemo(
-    () => buildQuirkyBuildsRows(data.rows, filters),
-    [data.rows, filters]
+    () => buildQuirkyBuildsRows(filterCumulativeRows(data.rows), {
+      ...filters,
+      rankBy: cumulativeActive ? "cumulative_z" : "theme_build_rarity",
+    }),
+    [data.rows, filters, filterCumulativeRows, cumulativeActive]
   );
   const sortedRows = useMemo(
     () => sortRows(rankedRows, sort.key, sort.direction),
@@ -112,6 +120,7 @@ export default function QuirkyBuildsPage() {
   }
 
   function resetFilters() {
+    cumulative.setQuery("");
     setFilters({ ...DEFAULT_QUIRKY_BUILDS_FILTERS, brackets: [] });
     setSort({ key: "", direction: "desc" });
     setPage(1);
@@ -142,6 +151,7 @@ export default function QuirkyBuildsPage() {
       key: "color_identity", header: "Colors", sortable: true,
       render: (row) => <CommanderColors colorIdentity={row.color_identity} />,
     },
+    ...(cumulativeActive ? [cumulativeZColumn] : []),
     {
       key: "bracket_rank", header: "Bracket", sortable: true,
       render: (row) => <span title={row.bracket_reason}><BracketBadge bracketKey={row.bracket_key} label={row.bracket_label} /></span>,
@@ -215,11 +225,17 @@ export default function QuirkyBuildsPage() {
           Raw and adjusted affinity, the 95% range, z-score, and Rank in Tag
           describe the row’s theme. Rank in Tag compares all reported commanders
           for that theme by z-score; Rank in {perBracket ? "bracket" : "theme"} follows
-          this report’s rarity ranking and filters. Bracket Z describes the deciding
+          this report’s {cumulativeActive ? "cumulative z-score" : "rarity"} ranking and filters. Bracket Z describes the deciding
           tag used for the suggested building bracket. “Unadjusted” marks a fallback
           and — means unavailable. <Link to="/methodology">How it works</Link>
         </p>
       </div>
+
+      <CumulativeTagFilter filter={cumulative} onChange={(query) => {
+        cumulative.setQuery(query);
+        setSort({ key: query.trim() ? "cumulative_z" : "", direction: "desc" });
+        setPage(1);
+      }} />
 
       <section className="filter-panel" aria-labelledby="quirky-filters-title">
         <div className="filter-panel-header">
@@ -306,17 +322,22 @@ export default function QuirkyBuildsPage() {
           <section className="data-table-section" aria-labelledby="quirky-results-title">
             <div className="table-toolbar">
               <div>
-                <p className="eyebrow">Ranked by Build Rarity</p>
-                <h2 id="quirky-results-title">{perBracket ? "Rarest builds by theme and bracket" : "Rarest builds by theme"}</h2>
+                <p className="eyebrow">Ranked by {cumulativeActive ? "cumulative z-score" : "Build Rarity"}</p>
+                <h2 id="quirky-results-title">{cumulativeActive ? "Matching builds" : "Rarest builds"} by {perBracket ? "theme and bracket" : "theme"}</h2>
                 <p className="table-count" role="status">
                   {formatNumber(rankedRows.length)} results across {formatNumber(representedThemes.size)} of {formatNumber(matchingThemes.length)} matching themes
                 </p>
               </div>
-              {sort.key && <button type="button" onClick={() => { setSort({ key: "", direction: "desc" }); setPage(1); }}>Restore theme order</button>}
+              {(sort.key !== (cumulativeActive ? "cumulative_z" : "") || sort.direction !== "desc") && (
+                <button type="button" onClick={() => {
+                  setSort({ key: cumulativeActive ? "cumulative_z" : "", direction: "desc" });
+                  setPage(1);
+                }}>Restore {cumulativeActive ? "cumulative" : "theme"} order</button>
+              )}
             </div>
             <p className="muted theme-report-note">
-              Ranks use the highest Build Rarity within each {perBracket ? "theme and bracket" : "theme"}.
-              Ties use theme decks, then total decks, then commander name.
+              Ranks use the highest {cumulativeActive ? "cumulative Z" : "Build Rarity"} within each {perBracket ? "theme and bracket" : "theme"}.
+              Ties use {cumulativeActive ? "Build Rarity, then " : ""}theme decks, then total decks, then commander name.
               Only observed builds with a positive adjusted affinity can be ranked.
             </p>
             <SimpleTable columns={columns} rows={pageRows} sortKey={sort.key} sortDirection={sort.direction}

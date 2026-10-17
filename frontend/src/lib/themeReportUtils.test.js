@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { BRACKET_OPTIONS } from "./bracketUtils.js";
+import { applyCumulativeTagScores, buildCumulativeTagScores } from "./cumulativeTagUtils.js";
 import {
   DEFAULT_THEME_REPORT_FILTERS,
   buildThemeReportRows,
@@ -61,8 +62,8 @@ test("defaults select one winner per theme with at least 200 total and 5 theme d
 
 test("preparation enforces ordinary-theme eligibility and allows all six signal-theme exceptions", () => {
   const ordinaryRows = tokens([
-    commander("qualifies", 1.05),
-    commander("below-threshold", 1.049),
+    commander("qualifies", 1),
+    commander("below-threshold", 0.999),
     commander("missing-score", null),
   ]);
   assert.deepEqual(ordinaryRows.map((row) => row.commander_slug), ["qualifies"]);
@@ -80,21 +81,21 @@ test("preparation enforces ordinary-theme eligibility and allows all six signal-
     )
   );
   assert.equal(buildThemeReportRows(rows).length, 6);
-  assert.equal(rows.find((row) => row.theme_tag_slug === "cedh").bracket_key, "1");
-  assert.ok(rows.filter((row) => row.theme_tag_slug !== "cedh").every((row) => row.bracket_key === "1/2"));
+  assert.equal(rows.find((row) => row.theme_tag_slug === "cedh").bracket_key, "4");
+  assert.ok(rows.filter((row) => row.theme_tag_slug !== "cedh").every((row) => row.bracket_key === "2"));
 });
 
 test("preparation preserves all bracket boundaries and cEDH precedence", () => {
   const examples = [
     ["cedh-high", "cedh", 1.05, "5"],
-    ["cedh-split", "cedh", 1, "4/5"],
+    ["cedh-boundary", "cedh", 1, "5"],
     ["cedh-upper", "cedh", 0.95, "4"],
     ["cedh-lower", "cedh", 0.05, "4"],
     ["archetype-high", "combo", 1.05, "3"],
-    ["archetype-split", "combo", 1, "2/3"],
+    ["archetype-boundary", "combo", 1, "3"],
     ["archetype-upper", "combo", 0.95, "2"],
     ["archetype-lower", "combo", 0.05, "2"],
-    ["archetype-low-split", "combo", 0.02, "1/2"],
+    ["archetype-positive", "combo", 0.02, "2"],
     ["archetype-zero", "combo", 0, "1"],
   ];
   const rows = tokens(
@@ -154,7 +155,7 @@ test("ranks top N independently per theme and per bracket, and displays themes a
     [["artifact-winner", 1], ["top-high", 1], ["second-high", 2], ["top-low", 1], ["second-low", 2]]
   );
   assert.equal(buildThemeReportRows(rows, { groupBy: "bracket", brackets: ["5", "1"] }).length, 3);
-  assert.equal(buildThemeReportRows(rows, { groupBy: "bracket", brackets: ["2/3", "4/5"] }).length, 0);
+  assert.equal(buildThemeReportRows(rows, { groupBy: "bracket", brackets: ["2", "4"] }).length, 0);
 });
 
 test("only finite theme z-scores are ranked, including zero and negative signal-theme scores", () => {
@@ -218,7 +219,7 @@ test("report gates, ranks and classifies upgraded affinity while preserving hist
       theme_legacy_z: 1.1,
       bracket_tag_rows: [{ ...signal("combo", -2), legacy_z: 1.05 }],
     }),
-    commander("highest-old", 1, {
+    commander("highest-old", 0.99, {
       theme_legacy_z: 4,
       bracket_tag_rows: [{ ...signal("cedh", -2), legacy_z: 0.4 }],
     }),
@@ -234,4 +235,36 @@ test("report gates, ranks and classifies upgraded affinity while preserving hist
   assert.equal(report[0].commander_slug, "newly-qualified");
   assert.equal(report[0].theme_z, 9);
   assert.equal(report[0].theme_legacy_z, 1.04);
+});
+
+test("combined tag filtering and ranking select the winner before the per-theme top N limit", () => {
+  const rows = tokens([
+    commander("excluded-theme-leader", 20),
+    commander("theme-leader", 10),
+    commander("cumulative-leader", 2),
+    commander("tied-cumulative", 1.5),
+  ]);
+  const tagGroups = [
+    { tag_slug: "elves", rows: [
+      { commander_slug: "excluded-theme-leader", tag_slug: "elves", z: 30 },
+      { commander_slug: "theme-leader", tag_slug: "elves", z: 12.12 },
+      { commander_slug: "cumulative-leader", tag_slug: "elves", z: 20 },
+      { commander_slug: "tied-cumulative", tag_slug: "elves", z: 20 },
+    ] },
+    { tag_slug: "good-stuff", rows: [
+      { commander_slug: "excluded-theme-leader", tag_slug: "good-stuff", z: 0.59 },
+      { commander_slug: "theme-leader", tag_slug: "good-stuff", z: 9.12 },
+      { commander_slug: "cumulative-leader", tag_slug: "good-stuff", z: 10 },
+      { commander_slug: "tied-cumulative", tag_slug: "good-stuff", z: 10 },
+    ] },
+  ];
+  const filtered = applyCumulativeTagScores(rows, buildCumulativeTagScores(tagGroups));
+  const result = buildThemeReportRows(filtered, { rankBy: "cumulative_z" });
+  assert.equal(result.length, 1);
+  assert.equal(result[0].commander_slug, "cumulative-leader");
+  assert.equal(result[0].cumulative_z, 30);
+  assert.equal(result[0].report_rank, 1);
+  assert.deepEqual(buildThemeReportRows(filtered, { rankBy: "cumulative_z", topCount: "3" })
+    .map((row) => row.commander_slug), ["cumulative-leader", "tied-cumulative", "theme-leader"]);
+  assert.equal(buildThemeReportRows(rows)[0].commander_slug, "excluded-theme-leader");
 });

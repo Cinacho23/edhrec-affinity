@@ -248,14 +248,14 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
 
         <p>
           The upgraded affinity z-score is used consistently for rankings,
-          bracket suggestions, and theme eligibility. The numeric bracket
-          cutoffs remain 0, 0.05, 0.95, and 1.05, including the existing in-flux
-          bands. cEDH is evaluated first; when it does not qualify for Bracket 4
-          or higher, Aggro, Control, Midrange, Tempo, and Combo are considered.
-          Ordinary themes still require a theme z-score of at least 1.05.
-          cEDH and those five archetype themes use only the bracket rules.
-          The score inputs have changed, so commanders can receive different
-          suggestions even though the numeric cutoffs are unchanged.
+          bracket suggestions, and theme eligibility. Brackets use cutoffs at
+          0 and 1. A cEDH score of at least 1 gives Bracket 5; a positive score
+          below 1 gives Bracket 4. Otherwise, the strongest of Aggro, Control,
+          Midrange, Tempo, and Combo determines the bracket: at least 1 gives
+          Bracket 3, above 0 and below 1 gives Bracket 2, and 0 or below gives
+          Bracket 1. Commanders without a scored archetype also use Bracket 1.
+          Ordinary themes require a theme z-score of at least 1. cEDH and
+          those five archetype themes use only the bracket rules.
         </p>
         <p>
           A bracket label is our suggested building bracket and recommended

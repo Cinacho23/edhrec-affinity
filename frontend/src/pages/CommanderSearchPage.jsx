@@ -4,10 +4,18 @@ import { Link } from "react-router-dom";
 import CommanderImageGallery from "../components/CommanderImageGallery";
 import CommanderName from "../components/CommanderName";
 import CommanderColors from "../components/CommanderColors";
+import CumulativeTagFilter from "../components/CumulativeTagFilter";
+import SimpleTable from "../components/SimpleTable";
 import { loadCommanderIndex } from "../lib/api";
-import { formatNumber } from "../lib/formatters";
+import { cumulativeZColumn } from "../lib/cumulativeTagUtils";
+import { formatDecimal, formatNumber } from "../lib/formatters";
+import { sortRows, toggleSortDirection } from "../lib/tableUtils";
+import { useCumulativeTags } from "../lib/useCumulativeTags";
 
 export default function CommanderSearchPage() {
+  const cumulative = useCumulativeTags();
+  const { filterRows: filterCumulativeRows, active: cumulativeActive } = cumulative;
+  const [sort, setSort] = useState({ key: "cumulative_z", direction: "desc" });
   const [commanders, setCommanders] = useState([]);
   const [query, setQuery] = useState("");
   const [visibleCount, setVisibleCount] = useState(100);
@@ -35,18 +43,24 @@ export default function CommanderSearchPage() {
   const filteredCommanders = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
 
-    if (!normalizedQuery) {
-      return commanders;
-    }
-
-    return commanders.filter((commander) =>
+    const matching = filterCumulativeRows(commanders).filter((commander) =>
       String(commander.commander_name || "")
         .toLowerCase()
         .includes(normalizedQuery)
     );
-  }, [commanders, query]);
+    return cumulativeActive ? sortRows(matching, sort.key, sort.direction) : matching;
+  }, [commanders, query, filterCumulativeRows, cumulativeActive, sort]);
 
   const visibleCommanders = filteredCommanders.slice(0, visibleCount);
+  const columns = [
+    { key: "commander_name", header: "Commander", sortable: true,
+      render: (row) => <CommanderName commander={row} className="table-commander-link" /> },
+    cumulativeZColumn,
+    { key: "cumulative_tag_scores", header: "Selected tag z-scores",
+      render: (row) => row.cumulative_tag_scores.map((tag) => `${tag.tag_name}: ${formatDecimal(tag.z)}`).join(" + ") },
+    { key: "color_identity", header: "Colors", render: (row) => <CommanderColors colorIdentity={row.color_identity} /> },
+    { key: "total_decks", header: "Total Decks", sortable: true, render: (row) => formatNumber(row.total_decks) },
+  ];
 
   if (state.loading) {
     return <p className="muted">Loading commander index…</p>;
@@ -63,8 +77,15 @@ export default function CommanderSearchPage() {
         <p>
           Commanders are shown by popularity by default. Search all commanders in
           the exported dataset and click a commander to load its complete tag table.
+          Combine tags to rank commanders by their cumulative z-score.
         </p>
       </div>
+
+      <CumulativeTagFilter filter={cumulative} onChange={(value) => {
+        cumulative.setQuery(value);
+        setSort({ key: "cumulative_z", direction: "desc" });
+        setVisibleCount(100);
+      }} />
 
       <div className="search-panel">
         <label htmlFor="commander-search">Search commander name</label>
@@ -85,7 +106,12 @@ export default function CommanderSearchPage() {
         {formatNumber(filteredCommanders.length)} matching commanders.
       </p>
 
-      <div className="commander-grid">
+      {cumulativeActive ? (
+        <SimpleTable columns={columns} rows={visibleCommanders}
+          emptyMessage={cumulative.loading ? "Loading tag scores…" : "No commanders match every selected tag and the current search."}
+          sortKey={sort.key} sortDirection={sort.direction}
+          onSort={(key) => setSort((current) => ({ key, direction: toggleSortDirection(current.key, key, current.direction) }))} />
+      ) : <div className="commander-grid">
         {visibleCommanders.map((commander) => (
           <article className="commander-card" key={commander.commander_slug}>
             <div className="commander-card__image-wrap">
@@ -121,7 +147,7 @@ export default function CommanderSearchPage() {
             </div>
           </article>
         ))}
-      </div>
+      </div>}
 
       {visibleCount < filteredCommanders.length ? (
         <div className="load-more-wrap">

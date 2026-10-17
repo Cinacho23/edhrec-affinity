@@ -13,12 +13,14 @@ This project is not trying to reproduce EDHREC. Its purpose is to add an origina
 ## Main features
 
 - Commander search
+- Cumulative tag filters across commander list pages: every selected tag must have z > 1, with matching commanders sorted by their summed z-scores
 - Commander detail pages with a minimum of 5 tagged decks per displayed tag
 - Global commander-tag leaderboard
 - Tag explorer
 - Set-based commander brackets
-- Theme brackets with a 1.05 theme gate plus bracket-rule-only signal themes
+- Theme brackets with a 1.0 theme gate plus bracket-rule-only signal themes
 - Theme Report: top z-scoring commanders across every theme, overall or per bracket, with adjustable top counts and default minimums of 200 total decks and 5 theme decks
+- Theme Tree: explore every selected-theme combination in a zoomable graph, led by the highest cumulative z-score with every constituent tag above 1; large selections expand on demand
 - Quirky Builds: rarest observed builds per theme or theme and bracket, ranked by Build Rarity without a z-score gate; adjustable deck-count and rarity filters
 - Sortable and filterable tables
 - Z-score, percentile, and rank metrics

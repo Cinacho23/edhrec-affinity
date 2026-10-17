@@ -42,8 +42,9 @@ function compareDescendingNumbers(a, b) {
 }
 
 /**
- * Rank by theme z-score, breaking ties by theme decks, total decks (both
- * descending), then commander name and slug (alphabetically). Every filter is
+ * Rank by theme z-score, with cumulative z-score taking precedence when selected.
+ * Ties use theme decks, total decks (both descending), then commander name and
+ * slug (alphabetically). Every filter is
  * applied before selecting the top N, so a filtered-out winner cannot hide the
  * next eligible commander. Each theme/bracket pair has its own rank in bracket
  * mode. Missing or non-finite scores cannot win a z-score report, including for
@@ -92,6 +93,9 @@ export function buildThemeReportRows(preparedRows, filters = {}) {
     rows
       .sort(
         (a, b) =>
+          (activeFilters.rankBy === "cumulative_z"
+            ? compareDescendingNumbers(a.cumulative_z, b.cumulative_z)
+            : 0) ||
           compareDescendingNumbers(a.theme_z, b.theme_z) ||
           compareDescendingNumbers(a.theme_tag_decks, b.theme_tag_decks) ||
           compareDescendingNumbers(a.total_decks, b.total_decks) ||

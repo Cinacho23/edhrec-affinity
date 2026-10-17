@@ -14,7 +14,15 @@ test("compact report loading rejects legacy-qualified data so complete tags can 
     });
     await assert.rejects(loadThemeReport(), /outdated qualification score/);
 
-    const upgradedReport = { ...legacyReport, qualification_score_field: "z" };
+    for (const minimum_z of [undefined, 1.05]) {
+      globalThis.fetch = async () => ({
+        ok: true,
+        text: async () => JSON.stringify({ ...legacyReport, qualification_score_field: "z", minimum_z }),
+      });
+      await assert.rejects(loadThemeReport(), /outdated qualification score or threshold/);
+    }
+
+    const upgradedReport = { ...legacyReport, qualification_score_field: "z", minimum_z: 1 };
     globalThis.fetch = async () => ({
       ok: true,
       text: async () => JSON.stringify(upgradedReport),
@@ -34,9 +42,16 @@ test("compact theme loading rejects old empty lists and unwraps upgraded qualifi
 
     const eligible = { commander_slug: "newly-eligible", theme_affinity_z: 1.4 };
     for (const rows of [[], [eligible]]) {
+      for (const minimum_z of [undefined, 1.05]) {
+        globalThis.fetch = async () => ({
+          ok: true,
+          text: async () => JSON.stringify({ qualification_score_field: "z", minimum_z, rows }),
+        });
+        await assert.rejects(loadThemeBracketDetail("tokens"), /outdated qualification score or threshold/);
+      }
       globalThis.fetch = async () => ({
         ok: true,
-        text: async () => JSON.stringify({ qualification_score_field: "z", rows }),
+        text: async () => JSON.stringify({ qualification_score_field: "z", minimum_z: 1, rows }),
       });
       assert.deepEqual(await loadThemeBracketDetail("tokens"), rows);
     }

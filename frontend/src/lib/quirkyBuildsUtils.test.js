@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { applyCumulativeTagScores, buildCumulativeTagScores } from "./cumulativeTagUtils.js";
 
 import {
   DEFAULT_QUIRKY_BUILDS_FILTERS,
@@ -138,4 +139,36 @@ test("the selected theme keeps its own affinity while cEDH determines the comman
   assert.equal(result.theme_build_rarity, 1000);
   assert.equal(result.decision_tag_affinity_adjusted_pct, 0.2);
   assert.equal(result.theme_affinity_z, -0.5);
+});
+
+test("combined tag scores filter and rank before selecting the top rare builds", () => {
+  const rows = tokens([
+    build("excluded-rarest", 0.0001),
+    build("rarest-match", 0.001),
+    build("cumulative-leader", 0.002),
+    build("tied-cumulative", 0.003),
+  ]);
+  const tagGroups = [
+    { tag_slug: "elves", rows: [
+      { commander_slug: "excluded-rarest", tag_slug: "elves", z: 30 },
+      { commander_slug: "rarest-match", tag_slug: "elves", z: 12.12 },
+      { commander_slug: "cumulative-leader", tag_slug: "elves", z: 20 },
+      { commander_slug: "tied-cumulative", tag_slug: "elves", z: 20 },
+    ] },
+    { tag_slug: "good-stuff", rows: [
+      { commander_slug: "excluded-rarest", tag_slug: "good-stuff", z: 1 },
+      { commander_slug: "rarest-match", tag_slug: "good-stuff", z: 9.12 },
+      { commander_slug: "cumulative-leader", tag_slug: "good-stuff", z: 10 },
+      { commander_slug: "tied-cumulative", tag_slug: "good-stuff", z: 10 },
+    ] },
+  ];
+  const filtered = applyCumulativeTagScores(rows, buildCumulativeTagScores(tagGroups));
+  const result = buildQuirkyBuildsRows(filtered, { rankBy: "cumulative_z" });
+  assert.equal(result.length, 1);
+  assert.equal(result[0].commander_slug, "cumulative-leader");
+  assert.equal(result[0].cumulative_z, 30);
+  assert.equal(result[0].report_rank, 1);
+  assert.deepEqual(buildQuirkyBuildsRows(filtered, { rankBy: "cumulative_z", topCount: "3" })
+    .map((row) => row.commander_slug), ["cumulative-leader", "tied-cumulative", "rarest-match"]);
+  assert.equal(buildQuirkyBuildsRows(rows)[0].commander_slug, "excluded-rarest");
 });

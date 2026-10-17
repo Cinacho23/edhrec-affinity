@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+import CumulativeTagFilter from "../components/CumulativeTagFilter";
 import CommanderName from "../components/CommanderName";
 import CommanderColors from "../components/CommanderColors";
 import SimpleTable from "../components/SimpleTable";
 import TrendBadge from "../components/TrendBadge";
 import { loadTagDetail, loadTagIndex } from "../lib/api";
+import { cumulativeZColumn } from "../lib/cumulativeTagUtils";
+import { useCumulativeTags } from "../lib/useCumulativeTags";
 import {
   formatAdjustedAffinity,
   formatAffinityInterval,
@@ -53,6 +56,8 @@ function isAvailableTag(tagList, tagSlug) {
 }
 
 export default function TagExplorerPage() {
+  const cumulative = useCumulativeTags();
+  const { filterRows: filterCumulativeRows, active: cumulativeActive } = cumulative;
   const [tags, setTags] = useState([]);
   const [selectedTag, setSelectedTag] = useState("");
   const [rows, setRows] = useState([]);
@@ -137,7 +142,7 @@ export default function TagExplorerPage() {
   const tagModel = rows[0]?.tag_slug === selectedTag ? rows[0] : null;
 
   const filteredRows = useMemo(() => {
-    const filtered = rows.filter((row) => {
+    const filtered = filterCumulativeRows(rows).filter((row) => {
       return (
         rowMatchesText(row, filters.query, [
           "commander_name",
@@ -155,7 +160,7 @@ export default function TagExplorerPage() {
     });
 
     return sortRows(filtered, sortKey, sortDirection);
-  }, [rows, filters, sortKey, sortDirection]);
+  }, [rows, filters, sortKey, sortDirection, filterCumulativeRows]);
 
   function updateFilter(key, value) {
     setFilters((current) => ({
@@ -166,6 +171,9 @@ export default function TagExplorerPage() {
 
   function resetFilters() {
     setFilters({ ...DEFAULT_FILTERS });
+    cumulative.setQuery("");
+    setSortKey("rank_within_tag_by_z");
+    setSortDirection("asc");
   }
 
   function handleSort(nextKey) {
@@ -184,6 +192,7 @@ export default function TagExplorerPage() {
         <CommanderName commander={row} className="table-commander-link" />
       ),
     },
+    ...(cumulativeActive ? [cumulativeZColumn] : []),
     {
       key: "color_identity",
       header: "Colors",
@@ -448,6 +457,15 @@ export default function TagExplorerPage() {
           </label>
         </div>
       </section>
+
+      <CumulativeTagFilter
+        filter={cumulative}
+        onChange={(query) => {
+          cumulative.setQuery(query);
+          setSortKey(query.trim() ? "cumulative_z" : "rank_within_tag_by_z");
+          setSortDirection(query.trim() ? "desc" : "asc");
+        }}
+      />
 
       <section className="data-table-section">
         <div className="table-toolbar">

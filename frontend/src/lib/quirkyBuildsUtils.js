@@ -44,7 +44,7 @@ function compareText(a, b) {
   return String(a || "").localeCompare(String(b || ""), "en");
 }
 
-/** Filter before selecting the rarest N builds in each theme/bracket group. */
+/** Filter before selecting the top N by rarity or selected cumulative tag score. */
 export function buildQuirkyBuildsRows(preparedRows, filters = {}) {
   const active = { ...DEFAULT_QUIRKY_BUILDS_FILTERS, ...filters };
   const requestedCount = Number(active.topCount);
@@ -80,6 +80,9 @@ export function buildQuirkyBuildsRows(preparedRows, filters = {}) {
 
   const ranked = [...groups.values()].flatMap((rows) =>
     [...rows].sort((a, b) =>
+      (active.rankBy === "cumulative_z"
+        ? compareValues(a.cumulative_z, b.cumulative_z, "desc")
+        : 0) ||
       compareValues(a.theme_build_rarity, b.theme_build_rarity, "desc") ||
       compareValues(a.theme_tag_decks, b.theme_tag_decks, "desc") ||
       compareValues(a.total_decks, b.total_decks, "desc") ||

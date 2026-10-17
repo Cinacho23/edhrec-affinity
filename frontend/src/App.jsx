@@ -10,6 +10,7 @@ import SetExplorerPage from "./pages/SetExplorerPage";
 import SetBracketsPage from "./pages/SetBracketsPage";
 import ThemeBracketsPage from "./pages/ThemeBracketsPage";
 import ThemeReportPage from "./pages/ThemeReportPage";
+import ThemeTreePage from "./pages/ThemeTreePage";
 import QuirkyBuildsPage from "./pages/QuirkyBuildsPage";
 import MethodologyPage from "./pages/MethodologyPage";
 import NotFoundPage from "./pages/NotFoundPage";
@@ -29,6 +30,7 @@ export default function App() {
         <Route path="/theme-brackets" element={<ThemeBracketsPage />} />
         <Route path="/theme-brackets/:themeSlug" element={<ThemeBracketsPage />} />
         <Route path="/theme-report" element={<ThemeReportPage />} />
+        <Route path="/theme-tree" element={<ThemeTreePage />} />
         <Route path="/quirky-builds" element={<QuirkyBuildsPage />} />
         <Route path="/methodology" element={<MethodologyPage />} />
         <Route path="*" element={<NotFoundPage />} />
