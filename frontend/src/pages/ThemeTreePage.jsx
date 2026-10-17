@@ -206,6 +206,7 @@ export default function ThemeTreePage() {
   const [index, setIndex] = useState({ tags: [], loading: true, error: null });
   const [selectedSlugs, setSelectedSlugs] = useState([]);
   const [query, setQuery] = useState("");
+  const [showEmptyNodes, setShowEmptyNodes] = useState(true);
   const [selectedIds, setSelectedIds] = useState([]);
   const [focusRequest, setFocusRequest] = useState(null);
   const [result, setResult] = useState({ key: null, rows: EMPTY_ROWS, error: null });
@@ -274,13 +275,24 @@ export default function ThemeTreePage() {
   const buildingGraph = selectedTags.length > 0 && !loadingData && !error && computed.key !== dataKey;
   const loading = loadingData || buildingGraph;
   const graph = !loading && !error && computed.key === dataKey ? computed.graph || EMPTY_GRAPH : EMPTY_GRAPH;
-  const nodes = graph.nodes;
+  const nodes = useMemo(() => showEmptyNodes ? graph.nodes : graph.nodes.filter((node) => node.winner), [graph.nodes, showEmptyNodes]);
   const totalPossibleNodes = getThemeTreeSubsetCount(selectedTags.length);
-  const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
-  const activeNode = nodeById.get(selectedIds.at(-1)) || nodeById.get(graph.rootId);
+  const nodeById = useMemo(() => new Map(graph.nodes.map((node) => [node.id, node])), [graph.nodes]);
+  const edges = useMemo(() => showEmptyNodes ? graph.edges : graph.edges.filter((edge) =>
+    nodeById.get(edge.source)?.winner && nodeById.get(edge.target)?.winner
+  ), [graph.edges, nodeById, showEmptyNodes]);
+  const activeNode = nodeById.get(selectedIds.at(-1)) || nodes.find((node) => node.id === graph.rootId) || nodes.at(-1);
+  const activeNodeHidden = activeNode && !showEmptyNodes && !activeNode.winner;
   const searchMatches = index.tags.filter((tag) => !selectedSlugs.includes(tag.tag_slug) && `${tag.tag_name} ${tag.tag_slug}`.toLowerCase().includes(query.trim().toLowerCase())).slice(0, 12);
   const themesToAdd = activeNode ? selectedTags.filter((tag) => !activeNode.tagSlugs.includes(tag.tag_slug)) : [];
-  const pair = selectedIds.map((id) => nodeById.get(id)).filter(Boolean);
+  const pair = selectedIds.map((id) => nodeById.get(id)).filter((node) => node && (showEmptyNodes || node.winner));
+
+  function toggleEmptyNodes() {
+    setShowEmptyNodes(!showEmptyNodes);
+    if (showEmptyNodes) setSelectedIds((previous) => previous.filter((id) => nodeById.get(id)?.winner));
+    setFocusRequest(null);
+    setAddToNode("");
+  }
 
   function changeThemes(slugs) {
     setSelectedSlugs(slugs);
@@ -298,7 +310,7 @@ export default function ThemeTreePage() {
     if (slugs?.length) {
       const id = themeSubsetId(slugs);
       setSelectedIds([id]);
-      setFocusRequest({ id, token: Date.now() });
+      setFocusRequest(showEmptyNodes || nodeById.get(id)?.winner ? { id, token: Date.now() } : null);
       setAddToNode("");
     }
   }
@@ -340,16 +352,22 @@ export default function ThemeTreePage() {
 
     {selectedTags.length > 0 && <>
       <div className="theme-tree-summary">
-        <div><strong>{formatNumber(nodes.length)} visible nodes</strong><span> of {BigInt(totalPossibleNodes).toLocaleString("en-US")} combinations</span></div>
-        <p>Every nonempty combination is included automatically, including empty results. There is no theme cutoff. Each added theme roughly doubles the graph, so large selections take more time and memory.</p>
+        <div>
+          <div aria-live="polite"><strong>{formatNumber(nodes.length)} visible nodes</strong><span> of {BigInt(totalPossibleNodes).toLocaleString("en-US")} combinations</span></div>
+          <button className="theme-tree-empty-toggle" type="button" aria-label="Show empty nodes" aria-pressed={showEmptyNodes} onClick={toggleEmptyNodes}>Show empty nodes: {showEmptyNodes ? "On" : "Off"}</button>
+          <p className="theme-tree-empty-description">Empty nodes have no qualifying commander.{!showEmptyNodes && !loading && !error && ` ${formatNumber(graph.nodes.length - nodes.length)} hidden.`}</p>
+        </div>
+        <p>Every nonempty combination is generated automatically. There is no theme cutoff. Each added theme roughly doubles the graph, so large selections take more time and memory.</p>
       </div>
+      {!loading && !error && !showEmptyNodes && nodes.length === 0 && <p role="status">No combinations have a qualifying commander. Turn on “Show empty nodes” to see all combinations.</p>}
       <div className="theme-tree-workspace">
-        <TreeCanvas key={selectionKey} nodes={nodes} edges={graph.edges} selectedIds={selectedIds} onSelect={selectNode} loading={loading || Boolean(error)} focusRequest={focusRequest} />
+        <TreeCanvas key={`${selectionKey}:${showEmptyNodes}`} nodes={nodes} edges={edges} selectedIds={selectedIds} onSelect={selectNode} loading={loading || Boolean(error)} focusRequest={focusRequest} />
         <aside className="theme-tree-detail panel" aria-label="Selected combination">
-          <div className="theme-tree-detail__heading"><p className="eyebrow">{selectedIds.length ? "Selected combination" : "Full combination"}</p><span className="theme-tree-count">{activeNode?.tagSlugs.length || 0} themes</span></div>
+          <div className="theme-tree-detail__heading"><p className="eyebrow">{!activeNode ? "No visible combination" : !selectedIds.length && activeNode.id === graph.rootId ? "Full combination" : "Selected combination"}</p><span className="theme-tree-count">{activeNode?.tagSlugs.length || 0} themes</span></div>
           {activeNode && <>
             <h2>{loading || error ? "Waiting for scores" : activeNode.winner?.commander_name || activeNode.winner?.commander_slug || "No qualifying commander"}</h2>
             <p className="theme-tree-detail__themes">{activeNode.label}</p>
+            {activeNodeHidden && <p role="status">This combination is hidden because it has no qualifying commander. Turn on “Show empty nodes” to display it.</p>}
             {!loading && !error && activeNode.winner && <>
               <div className="theme-tree-total"><span>Cumulative z-score</span><strong>{formatDecimal(activeNode.winner.cumulative_z)}</strong></div>
               <dl className="theme-tree-breakdown">{activeNode.winner.cumulative_tag_scores.map((tag) => <div key={tag.tag_slug}><dt>{tag.tag_name || tag.tag_slug}</dt><dd>{formatDecimal(tag.z)}</dd></div>)}</dl>
@@ -357,7 +375,7 @@ export default function ThemeTreePage() {
             </>}
             {!loading && !error && <p className="muted">{formatNumber(activeNode.qualifyingCommanderCount)} commanders have at least {THEME_TREE_MIN_TOTAL_DECKS} total decks, with at least {THEME_TREE_MIN_TAG_DECKS} decks and z &gt; 1 in every theme in this node.</p>}
             <div className="theme-tree-detail__actions">
-              <button type="button" onClick={() => setFocusRequest({ id: activeNode.id, token: Date.now() })}>Focus this node</button>
+              <button type="button" disabled={activeNodeHidden} onClick={() => setFocusRequest({ id: activeNode.id, token: Date.now() })}>Focus this node</button>
             </div>
             <section className="theme-tree-combine">
               <h3>Combine two nodes</h3>
