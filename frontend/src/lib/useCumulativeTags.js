@@ -4,8 +4,8 @@ import { applyCumulativeTagScores, resolveCumulativeTags } from "./cumulativeTag
 
 const EMPTY_SCORES = new Map();
 
-export function useCumulativeTags() {
-  const [query, setQuery] = useState("");
+export function useCumulativeTags(initialQuery = "") {
+  const [query, setQuery] = useState(() => typeof initialQuery === "string" ? initialQuery : "");
   const [index, setIndex] = useState({ tags: [], loading: true, error: null });
   const [result, setResult] = useState({ key: null, scores: EMPTY_SCORES, error: null });
   const [attempt, setAttempt] = useState(0);
