@@ -3,6 +3,8 @@ import { Link } from "react-router-dom";
 
 import BracketBadge from "../components/BracketBadge";
 import CumulativeTagFilter from "../components/CumulativeTagFilter";
+import CommanderName from "../components/CommanderName";
+import CommanderColors from "../components/CommanderColors";
 import SimpleTable from "../components/SimpleTable";
 import {
   formatAdjustedAffinity,
@@ -143,7 +145,11 @@ export default function QuirkyBuildsPage() {
     },
     {
       key: "commander_name", header: "Commander", sortable: true,
-      render: (row) => <Link className="table-commander-link" to={`/commanders/${row.commander_slug}`}>{row.commander_name}</Link>,
+      render: (row) => <CommanderName commander={row} className="table-commander-link" />,
+    },
+    {
+      key: "color_identity", header: "Colors", sortable: true,
+      render: (row) => <CommanderColors colorIdentity={row.color_identity} />,
     },
     ...(cumulativeActive ? [cumulativeZColumn] : []),
     {

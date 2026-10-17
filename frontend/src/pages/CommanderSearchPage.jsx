@@ -2,11 +2,13 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import CommanderImageGallery from "../components/CommanderImageGallery";
+import CommanderName from "../components/CommanderName";
+import CommanderColors from "../components/CommanderColors";
 import CumulativeTagFilter from "../components/CumulativeTagFilter";
 import SimpleTable from "../components/SimpleTable";
 import { loadCommanderIndex } from "../lib/api";
 import { cumulativeZColumn } from "../lib/cumulativeTagUtils";
-import { formatColorIdentity, formatDecimal, formatNumber } from "../lib/formatters";
+import { formatDecimal, formatNumber } from "../lib/formatters";
 import { sortRows, toggleSortDirection } from "../lib/tableUtils";
 import { useCumulativeTags } from "../lib/useCumulativeTags";
 
@@ -52,11 +54,11 @@ export default function CommanderSearchPage() {
   const visibleCommanders = filteredCommanders.slice(0, visibleCount);
   const columns = [
     { key: "commander_name", header: "Commander", sortable: true,
-      render: (row) => <Link className="table-commander-link" to={`/commanders/${row.commander_slug}`}>{row.commander_name}</Link> },
+      render: (row) => <CommanderName commander={row} className="table-commander-link" /> },
     cumulativeZColumn,
     { key: "cumulative_tag_scores", header: "Selected tag z-scores",
       render: (row) => row.cumulative_tag_scores.map((tag) => `${tag.tag_name}: ${formatDecimal(tag.z)}`).join(" + ") },
-    { key: "color_identity", header: "Colors", render: (row) => formatColorIdentity(row.color_identity) },
+    { key: "color_identity", header: "Colors", render: (row) => <CommanderColors colorIdentity={row.color_identity} /> },
     { key: "total_decks", header: "Total Decks", sortable: true, render: (row) => formatNumber(row.total_decks) },
   ];
 
@@ -114,11 +116,7 @@ export default function CommanderSearchPage() {
           <article className="commander-card" key={commander.commander_slug}>
             <div className="commander-card__image-wrap">
               <CommanderImageGallery
-                commanderName={commander.commander_name}
-                cardImageUrl={commander.card_image_url}
-                partnerCardImageUrls={commander.partner_card_image_urls}
-                scryfallUri={commander.scryfall_uri}
-                partnerScryfallUris={commander.partner_scryfall_uris}
+                commander={commander}
                 variant="card"
               />
             </div>
@@ -127,14 +125,12 @@ export default function CommanderSearchPage() {
               <div className="commander-card__header">
                 <div>
                   <h2>
-                    <Link
+                    <CommanderName
+                      commander={commander}
                       className="commander-card__title-link"
-                      to={`/commanders/${commander.commander_slug}`}
-                    >
-                      {commander.commander_name}
-                    </Link>
+                    />
                   </h2>
-                  <p>{formatColorIdentity(commander.color_identity)}</p>
+                  <p><CommanderColors colorIdentity={commander.color_identity} /></p>
                 </div>
 
                 <span className="pill">

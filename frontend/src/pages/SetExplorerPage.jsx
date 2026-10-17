@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import CumulativeTagFilter from "../components/CumulativeTagFilter";
+import CommanderName from "../components/CommanderName";
+import CommanderColors from "../components/CommanderColors";
 import SimpleTable from "../components/SimpleTable";
 import { cumulativeZColumn } from "../lib/cumulativeTagUtils";
 import { useCumulativeTags } from "../lib/useCumulativeTags";
@@ -18,7 +20,6 @@ import {
   loadSetIndex,
 } from "../lib/api";
 import {
-  formatColorIdentity,
   formatDecimal,
   formatNumber,
   formatRank,
@@ -326,9 +327,7 @@ export default function SetExplorerPage() {
       header: "Commander",
       sortable: true,
       render: (row) => (
-        <Link className="table-commander-link" to={`/commanders/${row.commander_slug}`}>
-          {row.commander_name}
-        </Link>
+        <CommanderName commander={row} className="table-commander-link" />
       ),
     },
     ...(cumulativeActive ? [cumulativeZColumn] : []),
@@ -336,7 +335,7 @@ export default function SetExplorerPage() {
       key: "color_identity",
       header: "Colors",
       sortable: true,
-      render: (row) => formatColorIdentity(row.color_identity),
+      render: (row) => <CommanderColors colorIdentity={row.color_identity} />,
     },
     {
       key: "tag_name",

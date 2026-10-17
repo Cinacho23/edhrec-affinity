@@ -1,9 +1,10 @@
 import { Link } from "react-router";
 
 import CommanderImageGallery from "./CommanderImageGallery.jsx";
+import CommanderName from "./CommanderName.jsx";
+import CommanderColors from "./CommanderColors.jsx";
 
 import {
-  formatColorIdentity,
   formatNumber,
   formatPercent,
   formatSignedNumber,
@@ -22,7 +23,6 @@ import {
 */
 
 export default function CommanderCard({ commander }) {
-  const colorDisplay = formatColorIdentity(commander.color_identity);
   const detailPath = `/commanders/${commander.commander_slug}`;
 
   return (
@@ -30,7 +30,7 @@ export default function CommanderCard({ commander }) {
       <div className="commander-card__image-wrap">
         <CommanderImageGallery
           commander={commander}
-          size="card"
+          variant="card"
           linked
           linkTo={detailPath}
         />
@@ -40,9 +40,7 @@ export default function CommanderCard({ commander }) {
         <div className="commander-card__header">
           <div>
             <h2>
-              <Link className="commander-card__title-link" to={detailPath}>
-                {commander.commander_name}
-              </Link>
+              <CommanderName commander={commander} className="commander-card__title-link" />
             </h2>
 
             <p className="muted">
@@ -61,9 +59,7 @@ export default function CommanderCard({ commander }) {
             ) : null}
           </div>
 
-          <span className="pill" title={colorDisplay}>
-            {colorDisplay}
-          </span>
+          <CommanderColors colorIdentity={commander.color_identity} />
         </div>
 
         <section className="tag-preview" aria-label="Top tag affinities">

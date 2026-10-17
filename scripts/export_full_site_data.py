@@ -41,6 +41,17 @@ from typing import Any
 
 import pandas as pd
 
+from edhrec_affinity.scryfall_enrichment import (
+    build_commander_cards,
+    get_card_image_url,
+    get_meld_result_part,
+    load_cache,
+    make_uri_cache_key,
+    make_cache_key,
+    ordered_color_identity,
+    split_commander_name_candidates,
+)
+
 
 LEADERBOARD_PAGE_SIZE = 500
 THEME_BRACKET_MIN_Z = 1
@@ -385,6 +396,109 @@ def select_existing_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFram
     return df[existing].copy()
 
 
+def ensure_commander_card_metadata(df: pd.DataFrame, cache_path: Path) -> pd.DataFrame:
+    """Upgrade restored legacy data from cached Scryfall objects, without requests.
+
+    Older processed snapshots retain full Scryfall responses but only export the
+    first image of each card. Recover all faces once per commander at export time.
+    When the cache is missing/incomplete, leave the legacy image fields available
+    for the frontend's fallback instead of claiming the preview is complete.
+    """
+    if "commander_slug" not in df.columns:
+        return df
+    cache = load_cache(cache_path)
+
+    cards_by_name = {}
+    cards_by_image = {}
+    for cached in cache.values():
+        if not isinstance(cached, dict):
+            continue
+        cached_cards = cached.get("data", []) if cached.get("object") == "list" else [cached]
+        for card in cached_cards:
+            if not isinstance(card, dict) or not card.get("name"):
+                continue
+            cards_by_name.setdefault(str(card["name"]).casefold(), card)
+            for face in card.get("card_faces") or []:
+                if isinstance(face, dict) and face.get("name"):
+                    cards_by_name.setdefault(str(face["name"]).casefold(), card)
+            image_url = get_card_image_url(card)
+            if image_url:
+                cards_by_image[image_url] = card
+
+    unique_rows = df.drop_duplicates(subset=["commander_slug"]).to_dict(orient="records")
+    standalone_colors = {}
+    for row in unique_rows:
+        candidates = split_commander_name_candidates(str(row.get("commander_name") or ""))
+        matched_names = normalize_list_value(row.get("scryfall_card_names"))
+        is_single = len(candidates) == 1 or matched_names == [candidates[0]]
+        if is_single and isinstance(row.get("color_identity"), list):
+            for name in [candidates[0], *matched_names]:
+                standalone_colors[str(name).casefold()] = row["color_identity"]
+
+    cards_by_slug = {}
+    colors_by_slug = {}
+    for row in unique_rows:
+        candidates = split_commander_name_candidates(str(row.get("commander_name") or ""))
+        matched_names = normalize_list_value(row.get("scryfall_card_names"))
+        # A full exact name may be a single double-faced card. Otherwise resolve
+        # every display-name member, even when the old enrichment found only one.
+        full_card = cache.get(make_cache_key(candidates[0], "exact"))
+        full_card = full_card or cards_by_name.get(candidates[0].casefold())
+        is_pair = len(candidates) > 1 and not full_card and matched_names != [candidates[0]]
+        names = candidates[1:] if is_pair else matched_names or candidates[:1]
+        images = normalize_list_value(row.get("partner_card_image_urls"))
+        if not images and has_value(row.get("card_image_url")):
+            images = [row["card_image_url"]]
+        cards = []
+        identities = []
+        for name in names:
+            # Only align legacy images against their own matched names: a partial
+            # pair may contain an image for its second member but not its first.
+            index = matched_names.index(name) if name in matched_names else len(images)
+            card = cards_by_image.get(images[index]) if index < len(images) else None
+            card = card or cache.get(make_cache_key(str(name), "exact"))
+            card = card or cache.get(make_cache_key(str(name), "fuzzy"))
+            card = card or cards_by_name.get(str(name).casefold())
+            colors = card.get("color_identity") if isinstance(card, dict) else None
+            identities.append(colors if isinstance(colors, list) else standalone_colors.get(str(name).casefold()))
+            if not isinstance(card, dict):
+                cards.append(None)
+                continue
+            # Two face names can refer to the same physical double-faced card.
+            if not any(existing and existing.get("name") == card.get("name") for existing in cards):
+                cards.append(card)
+        if is_pair and all(isinstance(colors, list) for colors in identities):
+            colors_by_slug[row["commander_slug"]] = ordered_color_identity(
+                [color for colors in identities for color in colors]
+            )
+        if not normalize_list_value(row.get("commander_cards")):
+            if cards and all(cards):
+                meld_results = {}
+                for card in cards:
+                    meld_part = get_meld_result_part(card)
+                    if meld_part:
+                        result = cache.get(make_uri_cache_key(meld_part["uri"]))
+                        if not isinstance(result, dict):
+                            result = cards_by_name.get(str(meld_part.get("name")).casefold())
+                        if result:
+                            meld_results[meld_part["uri"]] = result
+                previews = build_commander_cards(cards, meld_results=meld_results)
+                if previews:
+                    cards_by_slug[row["commander_slug"]] = previews
+
+    if not cards_by_slug and not colors_by_slug:
+        return df
+    df = df.copy()
+    for column, values_by_slug in [("commander_cards", cards_by_slug), ("color_identity", colors_by_slug)]:
+        if values_by_slug:
+            existing = df[column] if column in df else [None] * len(df)
+            df[column] = [
+                values_by_slug.get(slug, value)
+                for slug, value in zip(df["commander_slug"], existing)
+            ]
+    return df
+
+
 def sort_for_leaderboard(df: pd.DataFrame) -> pd.DataFrame:
     sort_columns = []
     ascending = []
@@ -436,6 +550,7 @@ def build_commander_index(df: pd.DataFrame) -> pd.DataFrame:
         "total_decks",
         "card_image_url",
         "partner_card_image_urls",
+        "commander_cards",
         "scryfall_uri",
         "partner_scryfall_uris",
         "scryfall_card_names",
@@ -520,6 +635,7 @@ def build_set_commander_row(
         "trend_status": row.get("trend_status") or row.get("snapshot_status"),
         "card_image_url": row.get("card_image_url"),
         "partner_card_image_urls": row.get("partner_card_image_urls"),
+        "commander_cards": row.get("commander_cards"),
         "scryfall_uri": row.get("scryfall_uri"),
         "partner_scryfall_uris": row.get("partner_scryfall_uris"),
         "scryfall_card_names": row.get("scryfall_card_names"),
@@ -691,6 +807,7 @@ def build_theme_bracket_commander_row(
         "total_decks": theme_row.get("total_decks"),
         "card_image_url": theme_row.get("card_image_url"),
         "partner_card_image_urls": theme_row.get("partner_card_image_urls"),
+        "commander_cards": theme_row.get("commander_cards"),
         "scryfall_uri": theme_row.get("scryfall_uri"),
         "partner_scryfall_uris": theme_row.get("partner_scryfall_uris"),
         "scryfall_card_names": theme_row.get("scryfall_card_names"),
@@ -791,6 +908,12 @@ def export_theme_report(
             "commander_name",
             "total_decks",
             "color_identity",
+            "commander_cards",
+            "card_image_url",
+            "partner_card_image_urls",
+            "scryfall_uri",
+            "partner_scryfall_uris",
+            "scryfall_card_names",
             "tag_slug",
             "tag_name",
             "z",
@@ -843,6 +966,12 @@ def export_theme_report(
                 "commander_name": row.get("commander_name"),
                 "total_decks": row.get("total_decks"),
                 "color_identity": row.get("color_identity"),
+                "commander_cards": row.get("commander_cards"),
+                "card_image_url": row.get("card_image_url"),
+                "partner_card_image_urls": row.get("partner_card_image_urls"),
+                "scryfall_uri": row.get("scryfall_uri"),
+                "partner_scryfall_uris": row.get("partner_scryfall_uris"),
+                "scryfall_card_names": row.get("scryfall_card_names"),
                 "bracket_tag_rows": build_theme_bracket_signal_rows(commander_rows),
             }
         )
@@ -899,6 +1028,12 @@ def export_quirky_builds_report(
                 "commander_name",
                 "total_decks",
                 "color_identity",
+                "commander_cards",
+                "card_image_url",
+                "partner_card_image_urls",
+                "scryfall_uri",
+                "partner_scryfall_uris",
+                "scryfall_card_names",
                 "tag_slug",
                 "tag_name",
                 "z",
@@ -944,6 +1079,12 @@ def export_quirky_builds_report(
                 "commander_name": row.get("commander_name"),
                 "total_decks": row.get("total_decks"),
                 "color_identity": row.get("color_identity"),
+                "commander_cards": row.get("commander_cards"),
+                "card_image_url": row.get("card_image_url"),
+                "partner_card_image_urls": row.get("partner_card_image_urls"),
+                "scryfall_uri": row.get("scryfall_uri"),
+                "partner_scryfall_uris": row.get("partner_scryfall_uris"),
+                "scryfall_card_names": row.get("scryfall_card_names"),
                 "bracket_tag_rows": build_theme_bracket_signal_rows(commander_rows),
             })
 
@@ -1090,6 +1231,7 @@ def export_full_site_data(
     affinity_path = processed_dir / "affinity_rows_with_trends.json"
     df = read_json_records(affinity_path)
     df = normalize_columns(df)
+    df = ensure_commander_card_metadata(df, processed_dir / "scryfall_lookup_cache.json")
     df = ensure_origin_set_metadata(df)
 
     tag_summary_path = processed_dir / "tag_summary.json"

@@ -56,6 +56,8 @@ export default function DataTable({
 
     onSortingChange: setSorting,
     onGlobalFilterChange: setGlobalFilter,
+    // A missing value in the first row must not disable a column's search.
+    getColumnCanGlobalFilter: (column) => !!column.accessorFn,
 
     /*
       Row models are the processing steps TanStack uses.

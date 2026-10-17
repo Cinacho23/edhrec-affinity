@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { asNumber, compareValues, passesMin, passesMax, sortRows } from "./tableUtils.js";
+import { asNumber, compareValues, passesMin, passesMax, sortRows, toggleSortDirection } from "./tableUtils.js";
 
 test("unavailable numeric values follow scored rows in both sort directions", () => {
   const missing = [null, undefined, "", " ", NaN, Infinity, -Infinity, "invalid", "Infinity"];
@@ -52,4 +52,47 @@ test("sorting leaves source rows intact and preserves tied numeric order", () =>
   const rows = [{ id: "first", z: 2 }, { id: "second", z: "2" }, { id: "third", z: 1 }];
   assert.deepEqual(sortRows(rows, "z", "asc").map((row) => row.id), ["third", "first", "second"]);
   assert.deepEqual(rows.map((row) => row.id), ["first", "second", "third"]);
+});
+
+test("colour sorting follows the pie across all 32 identities, in either direction", () => {
+  const expected = [
+    "C", "W", "U", "B", "R", "G",
+    "WU", "UB", "BR", "RG", "GW", "WB", "UR", "BG", "RW", "GU",
+    "WUB", "UBR", "BRG", "RGW", "GWU", "WBG", "URW", "BGU", "RWB", "GUR",
+    "WUBR", "UBRG", "BRGW", "RGWU", "GWUB", "WUBRG",
+  ];
+  const rows = [...expected].reverse().map((id) => ({
+    id,
+    color_identity: id === "C" ? [] : id.split("").reverse(),
+  }));
+  const original = structuredClone(rows);
+
+  assert.deepEqual(sortRows(rows, "color_identity", "asc").map((row) => row.id), expected);
+  assert.deepEqual(sortRows(rows, "color_identity", "desc").map((row) => row.id), [...expected].reverse());
+  assert.deepEqual(rows, original, "sorting must not mutate rows or their colour arrays");
+});
+
+test("colourless comes first ascending, unknown colours stay last, and equal identities keep row order", () => {
+  const rows = [
+    { id: "unknown", color_identity: null },
+    { id: "azorius-first", color_identity: "UW" },
+    { id: "red", color_identity: ["R"] },
+    { id: "colourless", color_identity: [] },
+    { id: "azorius-second", color_identity: ["U", "W", "U"] },
+    { id: "blank", color_identity: "" },
+    { id: "invalid", color_identity: "unknown" },
+  ];
+  assert.deepEqual(sortRows(rows, "color_identity", "asc").map((row) => row.id), [
+    "colourless", "red", "azorius-first", "azorius-second", "unknown", "blank", "invalid",
+  ]);
+  assert.deepEqual(sortRows(rows, "color_identity", "desc").map((row) => row.id), [
+    "azorius-first", "azorius-second", "red", "colourless", "unknown", "blank", "invalid",
+  ]);
+});
+
+test("the first Colors click starts with colourless and repeated clicks reverse the pie", () => {
+  assert.equal(toggleSortDirection("z", "color_identity", "desc"), "asc");
+  assert.equal(toggleSortDirection("color_identity", "color_identity", "asc"), "desc");
+  assert.equal(toggleSortDirection("color_identity", "color_identity", "desc"), "asc");
+  assert.equal(toggleSortDirection("color_identity", "z", "asc"), "desc");
 });

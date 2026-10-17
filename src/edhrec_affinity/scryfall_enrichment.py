@@ -357,9 +357,8 @@ def find_cards_for_commander(
 
     Strategy:
       1. Try exact match on the full cleaned name.
-      2. If the name looks paired, try exact match on each part.
-      3. If no exact match works, try fuzzy match on the full cleaned name.
-      4. If still no match and the name is paired, try fuzzy match on each part.
+      2. If the name looks paired, resolve every part (exact, then fuzzy).
+      3. For a single commander, try fuzzy match on the full cleaned name.
 
     Returns:
       (cards, match_strategy)
@@ -380,8 +379,11 @@ def find_cards_for_commander(
     if exact_full:
         return [exact_full], "exact_full_name"
 
-    # 2. Exact part-name matches for paired commanders.
-    exact_part_cards: list[dict[str, Any]] = []
+    # A partially successful pair must not discard its other commander/background.
+    # Resolve each part before returning, and do not fuzzy-match the whole pair:
+    # that can silently resolve to just one of its cards.
+    part_cards: list[dict[str, Any]] = []
+    used_fuzzy = False
 
     for part_name in part_names:
         card = fetch_scryfall_named(
@@ -392,11 +394,22 @@ def find_cards_for_commander(
             cache=cache,
         )
 
-        if card:
-            exact_part_cards.append(card)
+        if not card:
+            card = fetch_scryfall_named(
+                client,
+                part_name,
+                search_mode="fuzzy",
+                delay_seconds=delay_seconds,
+                cache=cache,
+            )
+            used_fuzzy = used_fuzzy or bool(card)
 
-    if exact_part_cards:
-        return exact_part_cards, "exact_split_parts"
+        if card:
+            part_cards.append(card)
+
+    if part_names:
+        strategy = "fuzzy_split_parts" if used_fuzzy else "exact_split_parts"
+        return part_cards, strategy if part_cards else "not_found"
 
     # 3. Fuzzy full-name match.
     fuzzy_full = fetch_scryfall_named(
@@ -409,24 +422,6 @@ def find_cards_for_commander(
 
     if fuzzy_full:
         return [fuzzy_full], "fuzzy_full_name"
-
-    # 4. Fuzzy part-name matches.
-    fuzzy_part_cards: list[dict[str, Any]] = []
-
-    for part_name in part_names:
-        card = fetch_scryfall_named(
-            client,
-            part_name,
-            search_mode="fuzzy",
-            delay_seconds=delay_seconds,
-            cache=cache,
-        )
-
-        if card:
-            fuzzy_part_cards.append(card)
-
-    if fuzzy_part_cards:
-        return fuzzy_part_cards, "fuzzy_split_parts"
 
     return [], "not_found"
 
@@ -442,44 +437,84 @@ def ordered_color_identity(colors: list[str]) -> list[str]:
     return [color for color in COLOR_ORDER if color in color_set]
 
 
-def get_card_image_url(card: dict[str, Any]) -> str | None:
+def get_card_faces(card: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return every printed image, preserving front/back order for double faces.
+
+    Split and adventure cards use a single top-level image containing both parts.
+    Double-faced cards instead supply a separate image on each card_faces entry.
     """
-    Extract a useful card image URL from a Scryfall card object.
-
-    Normal cards usually have:
-      card["image_uris"]["normal"]
-
-    Multi-face cards may instead have:
-      card["card_faces"][0]["image_uris"]["normal"]
-    """
-    image_uris = card.get("image_uris")
-
-    if isinstance(image_uris, dict):
-        return (
-            image_uris.get("normal")
-            or image_uris.get("large")
-            or image_uris.get("small")
-            or image_uris.get("png")
+    def image_url(value: dict[str, Any]) -> str | None:
+        image_uris = value.get("image_uris")
+        if not isinstance(image_uris, dict):
+            return None
+        return next(
+            (image_uris[size] for size in ("normal", "large", "small", "png")
+             if image_uris.get(size)),
+            None,
         )
 
-    card_faces = card.get("card_faces")
+    combined_image = image_url(card)
+    if combined_image:
+        return [{"name": card.get("name"), "image_url": combined_image}]
 
-    if isinstance(card_faces, list):
-        for face in card_faces:
-            if not isinstance(face, dict):
-                continue
+    faces = []
+    for face in card.get("card_faces") or []:
+        if not isinstance(face, dict):
+            continue
+        url = image_url(face)
+        if url:
+            faces.append({"name": face.get("name") or card.get("name"), "image_url": url})
+    return faces
 
-            face_image_uris = face.get("image_uris")
 
-            if isinstance(face_image_uris, dict):
-                return (
-                    face_image_uris.get("normal")
-                    or face_image_uris.get("large")
-                    or face_image_uris.get("small")
-                    or face_image_uris.get("png")
-                )
+def get_card_image_url(card: dict[str, Any]) -> str | None:
+    """Keep the first printed image available to legacy website consumers."""
+    faces = get_card_faces(card)
+    return faces[0]["image_url"] if faces else None
 
-    return None
+
+def get_meld_result_part(card: dict[str, Any]) -> dict[str, Any] | None:
+    """Find a meld commander's reverse side, excluding the other meld ingredient."""
+    if card.get("layout") != "meld":
+        return None
+    return next(
+        (
+            part for part in card.get("all_parts") or []
+            if isinstance(part, dict)
+            and part.get("component") == "meld_result"
+            and part.get("uri")
+            and part.get("name") != card.get("name")
+        ),
+        None,
+    )
+
+
+def build_commander_cards(
+    cards: list[dict[str, Any]],
+    *,
+    meld_results: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Group each commander/background with all faces, including its meld result.
+
+    Leave structured previews empty if a required meld back is unavailable, so
+    legacy front images can still display while the frontend retries the lookup.
+    """
+    previews = []
+    for card in cards:
+        faces = get_card_faces(card)
+        meld_part = get_meld_result_part(card)
+        if meld_part:
+            result = (meld_results or {}).get(meld_part["uri"])
+            result_faces = get_card_faces(result) if result else []
+            if not result_faces:
+                return []
+            faces.extend(result_faces)
+        previews.append({
+            "name": card.get("name"),
+            "scryfall_uri": card.get("scryfall_uri"),
+            "faces": faces,
+        })
+    return previews
 
 
 def get_origin_set_info(card: dict[str, Any]) -> dict[str, Any] | None:
@@ -526,6 +561,7 @@ def build_metadata_row(
     *,
     match_strategy: str,
     origin_cards: list[dict[str, Any]] | None = None,
+    meld_results: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Convert one or more Scryfall card objects into one commander metadata row.
@@ -579,6 +615,7 @@ def build_metadata_row(
         "color_identity": ordered_color_identity(colors),
         "card_image_url": image_urls[0] if image_urls else None,
         "partner_card_image_urls": image_urls,
+        "commander_cards": build_commander_cards(cards, meld_results=meld_results),
         "scryfall_uri": scryfall_uris[0] if scryfall_uris else None,
         "partner_scryfall_uris": scryfall_uris,
         "origin_set_code": primary_origin_set.get("set_code")
@@ -708,6 +745,20 @@ def enrich_commanders_with_scryfall(
                 cache=cache,
             )
 
+            meld_results = {}
+            for card in cards:
+                meld_part = get_meld_result_part(card)
+                if not meld_part:
+                    continue
+                result = fetch_scryfall_uri(
+                    client,
+                    meld_part["uri"],
+                    delay_seconds=delay_seconds,
+                    cache=cache,
+                )
+                if result:
+                    meld_results[meld_part["uri"]] = result
+
             origin_cards = [
                 find_origin_card(
                     client,
@@ -724,6 +775,7 @@ def enrich_commanders_with_scryfall(
                 cards,
                 match_strategy=match_strategy,
                 origin_cards=origin_cards,
+                meld_results=meld_results,
             )
 
             metadata_rows.append(metadata_row)
@@ -780,6 +832,7 @@ def merge_metadata_into_rows(
                 "color_identity": metadata.get("color_identity"),
                 "card_image_url": metadata.get("card_image_url"),
                 "partner_card_image_urls": metadata.get("partner_card_image_urls"),
+                "commander_cards": metadata.get("commander_cards"),
                 "scryfall_uri": metadata.get("scryfall_uri"),
                 "partner_scryfall_uris": metadata.get("partner_scryfall_uris"),
                 "scryfall_card_names": metadata.get("scryfall_card_names"),
