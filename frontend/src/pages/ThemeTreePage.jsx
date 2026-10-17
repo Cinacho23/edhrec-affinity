@@ -6,15 +6,14 @@ import { themeTreeDataLoader } from "../lib/themeTreeData";
 import {
   THEME_TREE_MIN_TAG_DECKS,
   THEME_TREE_MIN_TOTAL_DECKS,
-  buildThemeTreeNodes,
   combineThemeTreeSubsets,
-  getThemeTreeChildren,
-  rankThemeTreeNodes,
+  getThemeTreeSubsetCount,
   themeSubsetId,
 } from "../lib/themeTreeUtils";
 import "./ThemeTreePage.css";
 
 const EMPTY_ROWS = new Map();
+const EMPTY_GRAPH = { nodes: [], edges: [], rootId: null };
 const NODE_WIDTH = 246;
 const NODE_HEIGHT = 142;
 const ROW_GAP = 76;
@@ -47,7 +46,7 @@ function layoutGraph(nodes) {
 }
 
 function clampZoom(value) {
-  return Math.max(0.0001, Math.min(2, value));
+  return Math.max(Number.EPSILON, Math.min(2, value));
 }
 
 function TreeCanvas({ nodes, edges, selectedIds, onSelect, loading, focusRequest }) {
@@ -138,7 +137,7 @@ function TreeCanvas({ nodes, edges, selectedIds, onSelect, loading, focusRequest
         <span>Full combination above · single themes below</span>
         <div className="theme-tree-zoom">
           <button type="button" onClick={() => zoom(1 / 1.3)} aria-label="Zoom out">−</button>
-          <output aria-label="Zoom level">{view.scale < 0.01 ? (view.scale * 100).toFixed(2) : Math.round(view.scale * 100)}%</output>
+          <output aria-label="Zoom level">{view.scale < 0.01 ? (view.scale * 100).toPrecision(2) : Math.round(view.scale * 100)}%</output>
           <button type="button" onClick={() => zoom(1.3)} aria-label="Zoom in">+</button>
           <button type="button" onClick={() => setCamera(null)}>Fit graph</button>
           <button type="button" onClick={() => setCamera({ scale: 1, x: (size.width - layout.width) / 2, y: 28 })}>Reset view</button>
@@ -207,10 +206,10 @@ export default function ThemeTreePage() {
   const [index, setIndex] = useState({ tags: [], loading: true, error: null });
   const [selectedSlugs, setSelectedSlugs] = useState([]);
   const [query, setQuery] = useState("");
-  const [expandedSubsets, setExpandedSubsets] = useState([]);
   const [selectedIds, setSelectedIds] = useState([]);
   const [focusRequest, setFocusRequest] = useState(null);
   const [result, setResult] = useState({ key: null, rows: EMPTY_ROWS, error: null });
+  const [computed, setComputed] = useState({ key: null, graph: null, error: null });
   const [attempt, setAttempt] = useState(0);
   const [addToNode, setAddToNode] = useState("");
   const initialized = useRef(false);
@@ -244,13 +243,39 @@ export default function ThemeTreePage() {
     return () => { current = false; };
   }, [selectedTags, dataKey]);
 
-  const loading = selectedTags.length > 0 && result.key !== dataKey;
-  const error = index.error || (result.key === dataKey ? result.error : null);
-  const graph = useMemo(() => buildThemeTreeNodes(selectedTags, expandedSubsets), [selectedTags, expandedSubsets]);
-  const nodes = useMemo(() => result.key === dataKey && !result.error
-    ? rankThemeTreeNodes(graph.nodes, result.rows)
-    : graph.nodes.map((node) => ({ ...node, winner: null, qualifyingCommanderCount: 0 })),
-  [graph.nodes, result, dataKey]);
+  useEffect(() => {
+    if (selectedTags.length === 0 || result.key !== dataKey || result.error) return;
+    let current = true;
+    let worker;
+    try {
+      worker = new Worker(new URL("../lib/themeTreeWorker.js", import.meta.url), { type: "module" });
+      worker.onmessage = ({ data }) => {
+        if (current) setComputed({ key: dataKey, graph: data.graph || null, error: data.error || null });
+        worker.terminate();
+      };
+      worker.onerror = (event) => {
+        event.preventDefault();
+        if (current) setComputed({ key: dataKey, graph: null, error: event.message || "Could not generate the complete graph." });
+        worker.terminate();
+      };
+      worker.postMessage({ tags: selectedTags, rowsByTag: result.rows });
+    } catch (error) {
+      // Worker setup and structured-clone failures are asynchronous UI errors.
+      queueMicrotask(() => {
+        if (current) setComputed({ key: dataKey, graph: null, error: error.message });
+      });
+      worker?.terminate();
+    }
+    return () => { current = false; worker?.terminate(); };
+  }, [selectedTags, result, dataKey]);
+
+  const loadingData = selectedTags.length > 0 && result.key !== dataKey;
+  const error = index.error || (result.key === dataKey ? result.error : null) || (computed.key === dataKey ? computed.error : null);
+  const buildingGraph = selectedTags.length > 0 && !loadingData && !error && computed.key !== dataKey;
+  const loading = loadingData || buildingGraph;
+  const graph = !loading && !error && computed.key === dataKey ? computed.graph || EMPTY_GRAPH : EMPTY_GRAPH;
+  const nodes = graph.nodes;
+  const totalPossibleNodes = getThemeTreeSubsetCount(selectedTags.length);
   const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
   const activeNode = nodeById.get(selectedIds.at(-1)) || nodeById.get(graph.rootId);
   const searchMatches = index.tags.filter((tag) => !selectedSlugs.includes(tag.tag_slug) && `${tag.tag_name} ${tag.tag_slug}`.toLowerCase().includes(query.trim().toLowerCase())).slice(0, 12);
@@ -259,8 +284,6 @@ export default function ThemeTreePage() {
 
   function changeThemes(slugs) {
     setSelectedSlugs(slugs);
-    const retained = new Set(slugs);
-    setExpandedSubsets((previous) => previous.filter((subset) => subset.every((slug) => retained.has(slug))));
     setSelectedIds([]);
     setFocusRequest(null);
     setAddToNode("");
@@ -271,10 +294,9 @@ export default function ThemeTreePage() {
     setQuery("");
   }
 
-  function showSubsets(subsets, focus = subsets[0]) {
-    setExpandedSubsets((previous) => [...previous, ...subsets]);
-    if (focus?.length) {
-      const id = themeSubsetId(focus);
+  function focusCombination(slugs) {
+    if (slugs?.length) {
+      const id = themeSubsetId(slugs);
       setSelectedIds([id]);
       setFocusRequest({ id, token: Date.now() });
       setAddToNode("");
@@ -310,15 +332,16 @@ export default function ThemeTreePage() {
       </div>}
       <div role="status" aria-live="polite">
         {index.loading && <p className="muted">Loading available themes…</p>}
-        {loading && <p className="muted">Loading commander scores for {selectedTags.length} themes…</p>}
-        {error && <p className="error-message">Could not load theme data: {error} <button type="button" onClick={() => setAttempt((value) => value + 1)}>Retry</button></p>}
+        {loadingData && <p className="muted">Loading commander scores for {selectedTags.length} themes…</p>}
+        {buildingGraph && <p className="muted">Generating all {BigInt(totalPossibleNodes).toLocaleString("en-US")} combinations… You can change themes while this runs.</p>}
+        {error && <p className="error-message">Could not load the complete theme graph: {error} <button type="button" onClick={() => setAttempt((value) => value + 1)}>Retry</button></p>}
       </div>
     </section>
 
     {selectedTags.length > 0 && <>
       <div className="theme-tree-summary">
-        <div><strong>{formatNumber(nodes.length)} visible nodes</strong><span> of {BigInt(graph.totalPossibleNodes).toLocaleString("en-US")} possible combinations</span></div>
-        <p>{graph.fullyExpanded ? "Every nonempty combination is shown." : "Combinations grow exponentially. Expand nodes, add or remove themes, or combine two nodes to explore. Edges may skip combinations that have not been expanded."} Empty combinations stay visible.</p>
+        <div><strong>{formatNumber(nodes.length)} visible nodes</strong><span> of {BigInt(totalPossibleNodes).toLocaleString("en-US")} combinations</span></div>
+        <p>Every nonempty combination is included automatically, including empty results. There is no theme cutoff. Each added theme roughly doubles the graph, so large selections take more time and memory.</p>
       </div>
       <div className="theme-tree-workspace">
         <TreeCanvas key={selectionKey} nodes={nodes} edges={graph.edges} selectedIds={selectedIds} onSelect={selectNode} loading={loading || Boolean(error)} focusRequest={focusRequest} />
@@ -335,16 +358,15 @@ export default function ThemeTreePage() {
             {!loading && !error && <p className="muted">{formatNumber(activeNode.qualifyingCommanderCount)} commanders have at least {THEME_TREE_MIN_TOTAL_DECKS} total decks, with at least {THEME_TREE_MIN_TAG_DECKS} decks and z &gt; 1 in every theme in this node.</p>}
             <div className="theme-tree-detail__actions">
               <button type="button" onClick={() => setFocusRequest({ id: activeNode.id, token: Date.now() })}>Focus this node</button>
-              {activeNode.tagSlugs.length > 1 && <button type="button" onClick={() => showSubsets(getThemeTreeChildren(activeNode), activeNode.tagSlugs)}>Expand immediate subsets</button>}
             </div>
             <section className="theme-tree-combine">
               <h3>Combine two nodes</h3>
-              <p className="muted">Select two nodes in the graph to form their combined themes.</p>
-              <button type="button" disabled={pair.length !== 2} onClick={() => { const union = combineThemeTreeSubsets(pair[0], pair[1]); showSubsets([union]); }}>Combine selected ({pair.length}/2)</button>
+              <p className="muted">Select two nodes to focus their combined themes.</p>
+              <button type="button" disabled={pair.length !== 2} onClick={() => focusCombination(combineThemeTreeSubsets(pair[0], pair[1]))}>Combine selected ({pair.length}/2)</button>
             </section>
             {activeNode.tagSlugs.length > 1 && <section className="theme-tree-edit-node">
               <h3>Explore without a theme</h3>
-              <div className="theme-tree-subset-buttons">{activeNode.tags.map((tag) => <button type="button" key={tag.tag_slug} onClick={() => showSubsets([activeNode.tagSlugs.filter((slug) => slug !== tag.tag_slug)])}>− {tag.tag_name || tag.tag_slug}</button>)}</div>
+              <div className="theme-tree-subset-buttons">{activeNode.tags.map((tag) => <button type="button" key={tag.tag_slug} onClick={() => focusCombination(activeNode.tagSlugs.filter((slug) => slug !== tag.tag_slug))}>− {tag.tag_name || tag.tag_slug}</button>)}</div>
             </section>}
             {themesToAdd.length > 0 && <section className="theme-tree-edit-node">
               <h3>Add to this combination</h3>
@@ -353,7 +375,7 @@ export default function ThemeTreePage() {
                 <option value="">Choose a theme</option>
                 {themesToAdd.map((tag) => <option key={tag.tag_slug} value={tag.tag_slug}>{tag.tag_name || tag.tag_slug}</option>)}
               </select>
-              <button type="button" disabled={!themesToAdd.some((tag) => tag.tag_slug === addToNode)} onClick={() => showSubsets([[...activeNode.tagSlugs, addToNode]])}>Show combination</button>
+              <button type="button" disabled={!themesToAdd.some((tag) => tag.tag_slug === addToNode)} onClick={() => focusCombination([...activeNode.tagSlugs, addToNode])}>Show combination</button>
             </section>}
           </>}
         </aside>
