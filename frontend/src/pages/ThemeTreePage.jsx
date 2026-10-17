@@ -2,6 +2,7 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { formatDecimal, formatNumber } from "../lib/formatters";
+import { readSessionObject, writeSessionValue } from "../lib/persistentState";
 import { themeTreeDataLoader } from "../lib/themeTreeData";
 import {
   THEME_TREE_MIN_TAG_DECKS,
@@ -14,11 +15,45 @@ import "./ThemeTreePage.css";
 
 const EMPTY_ROWS = new Map();
 const EMPTY_GRAPH = { nodes: [], edges: [], rootId: null };
+const SETTINGS_STORAGE_KEY = "edhrec-affinity:theme-tree:settings";
+const CAMERA_STORAGE_KEY = "edhrec-affinity:theme-tree:camera";
 const NODE_WIDTH = 246;
 const NODE_HEIGHT = 142;
 const ROW_GAP = 76;
 const COLUMN_GAP = 28;
 const PADDING = 42;
+
+function readTreeSettings() {
+  const stored = readSessionObject(SETTINGS_STORAGE_KEY, {});
+  const selectedSlugs = Array.isArray(stored.selectedSlugs)
+    ? [...new Set(stored.selectedSlugs.filter((slug) => typeof slug === "string" && slug !== ""))]
+    : null;
+  const selectedIds = Array.isArray(stored.selectedIds) ? stored.selectedIds.flatMap((id) => {
+    try {
+      const slugs = JSON.parse(id);
+      return Array.isArray(slugs) && slugs.length && slugs.every((slug) => selectedSlugs?.includes(slug))
+        ? [themeSubsetId(slugs)] : [];
+    } catch {
+      return [];
+    }
+  }).slice(-2) : [];
+  return {
+    selectedSlugs,
+    selectedIds: [...new Set(selectedIds)],
+    query: typeof stored.query === "string" ? stored.query : "",
+    showEmptyNodes: typeof stored.showEmptyNodes === "boolean" ? stored.showEmptyNodes : true,
+    addToNode: selectedSlugs?.includes(stored.addToNode) ? stored.addToNode : "",
+  };
+}
+
+function readTreeCamera(viewKey) {
+  const stored = readSessionObject(CAMERA_STORAGE_KEY, {});
+  const camera = stored.camera;
+  return stored.viewKey === viewKey && camera &&
+    Number.isFinite(camera.x) && Number.isFinite(camera.y) &&
+    Number.isFinite(camera.scale) && camera.scale >= Number.EPSILON && camera.scale <= 2
+    ? camera : null;
+}
 
 function layoutGraph(nodes) {
   const levels = new Map();
@@ -49,12 +84,12 @@ function clampZoom(value) {
   return Math.max(Number.EPSILON, Math.min(2, value));
 }
 
-function TreeCanvas({ nodes, edges, selectedIds, onSelect, loading, focusRequest }) {
+function TreeCanvas({ nodes, edges, selectedIds, onSelect, loading, focusRequest, viewKey }) {
   const viewportRef = useRef(null);
   const dragRef = useRef(null);
   const arrowId = useId().replaceAll(":", "");
   const [size, setSize] = useState({ width: 800, height: 640 });
-  const [camera, setCamera] = useState(null);
+  const [camera, setCamera] = useState(() => readTreeCamera(viewKey));
   const [dragging, setDragging] = useState(false);
   const layout = useMemo(() => layoutGraph(nodes), [nodes]);
   const fitScale = clampZoom(Math.min((size.width - 32) / layout.width, (size.height - 32) / layout.height, 1));
@@ -67,6 +102,10 @@ function TreeCanvas({ nodes, edges, selectedIds, onSelect, loading, focusRequest
   const viewRef = useRef(view);
 
   useEffect(() => { viewRef.current = view; }, [view]);
+
+  useEffect(() => {
+    if (!loading) writeSessionValue(CAMERA_STORAGE_KEY, { viewKey, camera });
+  }, [viewKey, camera, loading]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -203,21 +242,23 @@ function TreeCanvas({ nodes, edges, selectedIds, onSelect, loading, focusRequest
 }
 
 export default function ThemeTreePage() {
+  const [restoredSettings] = useState(readTreeSettings);
   const [index, setIndex] = useState({ tags: [], loading: true, error: null });
-  const [selectedSlugs, setSelectedSlugs] = useState([]);
-  const [query, setQuery] = useState("");
-  const [showEmptyNodes, setShowEmptyNodes] = useState(true);
-  const [selectedIds, setSelectedIds] = useState([]);
+  const [selectedSlugs, setSelectedSlugs] = useState(restoredSettings.selectedSlugs || []);
+  const [query, setQuery] = useState(restoredSettings.query);
+  const [showEmptyNodes, setShowEmptyNodes] = useState(restoredSettings.showEmptyNodes);
+  const [selectedIds, setSelectedIds] = useState(restoredSettings.selectedIds);
   const [focusRequest, setFocusRequest] = useState(null);
   const [result, setResult] = useState({ key: null, rows: EMPTY_ROWS, error: null });
   const [computed, setComputed] = useState({ key: null, graph: null, error: null });
   const [attempt, setAttempt] = useState(0);
-  const [addToNode, setAddToNode] = useState("");
-  const initialized = useRef(false);
+  const [addToNode, setAddToNode] = useState(restoredSettings.addToNode);
+  const initialized = useRef(restoredSettings.selectedSlugs !== null);
   const searchId = useId();
   const tagBySlug = useMemo(() => new Map(index.tags.map((tag) => [tag.tag_slug, tag])), [index.tags]);
   const selectedTags = useMemo(() => selectedSlugs.map((slug) => tagBySlug.get(slug)).filter(Boolean), [selectedSlugs, tagBySlug]);
   const selectionKey = JSON.stringify(selectedSlugs);
+  const viewKey = `${selectionKey}:${showEmptyNodes}`;
   const dataKey = `${selectionKey}:${attempt}`;
 
   useEffect(() => {
@@ -229,10 +270,21 @@ export default function ThemeTreePage() {
         initialized.current = true;
         const preferred = ["elves", "goodstuff", "wolves"].map((name) => tags.find((tag) => String(tag.tag_slug).replace(/[-_\s]/g, "").toLowerCase() === name));
         setSelectedSlugs((preferred.every(Boolean) ? preferred : tags.slice(0, 3)).map((tag) => tag.tag_slug));
+      } else {
+        const availableSlugs = new Set(tags.map((tag) => tag.tag_slug));
+        setSelectedSlugs((currentSlugs) => currentSlugs.every((slug) => availableSlugs.has(slug))
+          ? currentSlugs : currentSlugs.filter((slug) => availableSlugs.has(slug)));
       }
     }, (error) => { if (current) setIndex({ tags: [], loading: false, error: error.message }); });
     return () => { current = false; };
   }, [attempt]);
+
+  useEffect(() => {
+    // Wait for the index so a loading render cannot overwrite a saved selection
+    // with the initial defaults. An intentionally empty selection is saved too.
+    if (index.loading || index.error) return;
+    writeSessionValue(SETTINGS_STORAGE_KEY, { selectedSlugs, query, showEmptyNodes, selectedIds, addToNode });
+  }, [index.loading, index.error, selectedSlugs, query, showEmptyNodes, selectedIds, addToNode]);
 
   useEffect(() => {
     if (selectedTags.length === 0) return;
@@ -361,7 +413,7 @@ export default function ThemeTreePage() {
       </div>
       {!loading && !error && !showEmptyNodes && nodes.length === 0 && <p role="status">No combinations have a qualifying commander. Turn on “Show empty nodes” to see all combinations.</p>}
       <div className="theme-tree-workspace">
-        <TreeCanvas key={`${selectionKey}:${showEmptyNodes}`} nodes={nodes} edges={edges} selectedIds={selectedIds} onSelect={selectNode} loading={loading || Boolean(error)} focusRequest={focusRequest} />
+        <TreeCanvas key={viewKey} viewKey={viewKey} nodes={nodes} edges={edges} selectedIds={selectedIds} onSelect={selectNode} loading={loading || Boolean(error)} focusRequest={focusRequest} />
         <aside className="theme-tree-detail panel" aria-label="Selected combination">
           <div className="theme-tree-detail__heading"><p className="eyebrow">{!activeNode ? "No visible combination" : !selectedIds.length && activeNode.id === graph.rootId ? "Full combination" : "Selected combination"}</p><span className="theme-tree-count">{activeNode?.tagSlugs.length || 0} themes</span></div>
           {activeNode && <>

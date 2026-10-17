@@ -29,10 +29,33 @@ import {
 } from "../lib/themeReportUtils";
 
 const FILTER_STORAGE_KEY = "edhrec-affinity:theme-report:filters";
+const VIEW_STORAGE_KEY = "edhrec-affinity:theme-report:view";
 const PAGE_SIZE = 100;
+const SORT_KEYS = new Set([
+  "", "theme_tag_name", "commander_name", "color_identity", "cumulative_z", "bracket_rank",
+  "theme_affinity_pct", "theme_affinity_adjusted_pct", "theme_build_rarity", "theme_affinity_z",
+  "theme_rank_within_tag_by_z", "theme_tag_decks", "total_decks", "decision_tag_name",
+]);
+
+function readSavedView() {
+  const stored = readSessionObject(VIEW_STORAGE_KEY, {});
+  const cumulativeQuery = typeof stored.cumulativeQuery === "string" ? stored.cumulativeQuery : "";
+  const defaultSortKey = cumulativeQuery.trim() ? "cumulative_z" : "";
+  const validSortKey = SORT_KEYS.has(stored.sort?.key)
+    && (stored.sort.key !== "cumulative_z" || cumulativeQuery.trim());
+  return {
+    cumulativeQuery,
+    sort: {
+      key: validSortKey ? stored.sort.key : defaultSortKey,
+      direction: validSortKey && stored.sort.direction === "asc" ? "asc" : "desc",
+    },
+    page: Number.isSafeInteger(stored.page) && stored.page > 0 ? stored.page : 1,
+  };
+}
 
 export default function ThemeReportPage() {
-  const cumulative = useCumulativeTags();
+  const [savedView] = useState(readSavedView);
+  const cumulative = useCumulativeTags(savedView.cumulativeQuery);
   const { filterRows: filterCumulativeRows, active: cumulativeActive } = cumulative;
   const loaderRef = useRef(null);
   const [filters, setFilters] = useState(() => {
@@ -44,8 +67,8 @@ export default function ThemeReportPage() {
         : [],
     };
   });
-  const [sort, setSort] = useState({ key: "", direction: "desc" });
-  const [page, setPage] = useState(1);
+  const [sort, setSort] = useState(savedView.sort);
+  const [page, setPage] = useState(savedView.page);
   const [retry, setRetry] = useState(0);
   const [data, setData] = useState({ themes: [], rows: [] });
   const [state, setState] = useState({ loading: true, loaded: 0, total: 0, error: null });
@@ -107,6 +130,11 @@ export default function ThemeReportPage() {
   useEffect(() => {
     writeSessionValue(FILTER_STORAGE_KEY, filters);
   }, [filters]);
+
+  useEffect(() => {
+    // Keep the requested page while report rows and cumulative scores load.
+    writeSessionValue(VIEW_STORAGE_KEY, { sort, page, cumulativeQuery: cumulative.query });
+  }, [sort, page, cumulative.query]);
 
   const rankedRows = useMemo(
     () => buildThemeReportRows(filterCumulativeRows(data.rows), {
