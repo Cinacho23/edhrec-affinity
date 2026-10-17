@@ -14,7 +14,7 @@ function tag(tag_slug) {
 }
 
 function row(commander_slug, tag_slug, z, extra = {}) {
-  return { commander_slug, commander_name: commander_slug, total_decks: 200, tag_slug, z, ...extra };
+  return { commander_slug, commander_name: commander_slug, total_decks: 200, tag_decks: 5, tag_slug, z, ...extra };
 }
 
 function assertReducedAndConnected(graph) {
@@ -140,6 +140,62 @@ test("empty combinations remain visible and missing, invalid, or legacy scores n
   assert.throws(() => rankThemeTreeNodes(graph.nodes, new Map()), /Missing complete tag data/);
 });
 
+test("leaves and combinations require at least 200 total decks and 5 tag decks, including numeric strings", () => {
+  const graph = buildThemeTreeNodes([tag("elves"), tag("wolves")]);
+  const rowsByTag = new Map(["elves", "wolves"].map((slug) => [slug, [
+    row("too-few-total", slug, 100, { total_decks: 199 }),
+    row("too-few-tag", slug, 100, { tag_decks: 4 }),
+    row("exact-minimum", slug, 2),
+    row("above-minimum", slug, 3, { total_decks: 201, tag_decks: 6 }),
+    row("numeric-strings", slug, 4, { total_decks: "200", tag_decks: "5" }),
+  ]]));
+  const ranked = rankThemeTreeNodes(graph.nodes, rowsByTag);
+  for (const node of ranked) {
+    assert.equal(node.qualifyingCommanderCount, 3);
+    assert.equal(node.winner.commander_slug, "numeric-strings");
+    assert.equal(node.winner.cumulative_z, 4 * node.tagSlugs.length);
+  }
+});
+
+test("every constituent theme must meet the tag deck minimum and empty combinations remain visible", () => {
+  const graph = buildThemeTreeNodes([tag("elves"), tag("wolves")]);
+  const rowsByTag = new Map([
+    ["elves", [row("one-low-tag", "elves", 100), row("eligible", "elves", 2)]],
+    ["wolves", [row("one-low-tag", "wolves", 100, { tag_decks: 4 }), row("eligible", "wolves", 3)]],
+  ]);
+  const ranked = rankThemeTreeNodes(graph.nodes, rowsByTag);
+  const root = ranked.find((node) => node.id === graph.rootId);
+  assert.equal(root.winner.commander_slug, "eligible");
+  assert.equal(root.winner.cumulative_z, 5);
+  assert.equal(root.qualifyingCommanderCount, 1);
+  assert.equal(ranked.find((node) => node.id === themeSubsetId(["elves"])).qualifyingCommanderCount, 2);
+  assert.equal(ranked.find((node) => node.id === themeSubsetId(["wolves"])).qualifyingCommanderCount, 1);
+
+  rowsByTag.set("wolves", rowsByTag.get("wolves").filter((value) => value.commander_slug !== "eligible"));
+  const emptyRanked = rankThemeTreeNodes(graph.nodes, rowsByTag);
+  assert.equal(emptyRanked.length, graph.nodes.length);
+  assert.equal(emptyRanked.find((node) => node.id === graph.rootId).winner, null);
+  assert.equal(emptyRanked.find((node) => node.id === graph.rootId).qualifyingCommanderCount, 0);
+});
+
+test("missing, invalid, and nonfinite deck counts cannot qualify or replace a valid row", () => {
+  const graph = buildThemeTreeNodes([tag("elves"), tag("wolves")]);
+  const invalidCounts = [null, undefined, "", " ", false, true, "invalid", NaN, Infinity, -Infinity, "Infinity"];
+  const rowsByTag = new Map(["elves", "wolves"].map((slug) => {
+    const rows = ["total_decks", "tag_decks"].flatMap((field) => [
+      ...invalidCounts.map((value, index) => row(`${field}-${index}`, slug, 100, { [field]: value })),
+      row("eligible", slug, 100, { [field]: undefined }),
+    ]);
+    rows.push(row("eligible", slug, 2));
+    return [slug, rows];
+  }));
+  for (const node of rankThemeTreeNodes(graph.nodes, rowsByTag)) {
+    assert.equal(node.qualifyingCommanderCount, 1);
+    assert.equal(node.winner.commander_slug, "eligible");
+    assert.equal(node.winner.cumulative_z, 2 * node.tagSlugs.length);
+  }
+});
+
 test("ranking uses unrounded sums, then total decks, name and slug, and deduplicates repeated tag rows", () => {
   const graph = buildThemeTreeNodes([tag("elves"), tag("wolves")]);
   const candidates = [
@@ -147,7 +203,7 @@ test("ranking uses unrounded sums, then total decks, name and slug, and deduplic
     ["beta", "Alpha", 200, 2],
     ["alpha", "Alpha", 200, 2],
     ["more-decks", "More", 300, 2],
-    ["precise", "Precise", 100, 2.0000000001],
+    ["precise", "Precise", 200, 2.0000000001],
   ];
   const rowsByTag = new Map(["elves", "wolves"].map((slug) => [slug, candidates.map(([id, name, decks, z]) =>
     row(id, slug, z, { commander_name: name, total_decks: decks })
