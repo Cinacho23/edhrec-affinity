@@ -34,6 +34,7 @@ def read_json(path: Path):
 def read_theme_rows(path: Path):
     data = read_json(path)
     assert data["qualification_score_field"] == "z"
+    assert data["minimum_z"] == 1
     assert isinstance(data["rows"], list)
     return data["rows"]
 
@@ -58,7 +59,7 @@ def test_upgrade_exports_current_theme_qualification_and_preserves_legacy_histor
     }
     write_json(processed_dir / "affinity_rows_with_trends.json", [
         {**common, "tag_name": "Tokens", "tag_slug": "tokens", "z": 3, "legacy_z": .2},
-        {**common, "tag_name": "Combo", "tag_slug": "combo", "z": 1.05, "legacy_z": -2,
+        {**common, "tag_name": "Combo", "tag_slug": "combo", "z": 1, "legacy_z": -2,
          "tag_decks": 30, "tag_affinity_pct": .03, "tag_affinity_adjusted_pct": .029,
          "tag_affinity_lower_pct": .02, "tag_affinity_upper_pct": .04, "rank_within_tag_by_z": 9},
         {**common, "tag_name": "Snow", "tag_slug": "snow", "z": 1.04, "legacy_z": 5},
@@ -86,17 +87,20 @@ def test_upgrade_exports_current_theme_qualification_and_preserves_legacy_histor
     assert theme_rows[0]["theme_affinity_model_version"] == "beta_binomial_v1"
     assert theme_rows[0]["theme_rank_within_tag_by_z"] == 2
     assert theme_rows[0]["bracket_tag_rows"] == [{
-        "tag_name": "Combo", "tag_slug": "combo", "z": 1.05, "legacy_z": -2,
+        "tag_name": "Combo", "tag_slug": "combo", "z": 1, "legacy_z": -2,
         "tag_decks": 30, "tag_affinity_pct": .03, "tag_affinity_adjusted_pct": .029,
         "tag_affinity_lower_pct": .02, "tag_affinity_upper_pct": .04,
         "affinity_model_status": "fitted", "affinity_model_version": "beta_binomial_v1",
         "rank_within_tag_by_z": 9,
     }]
-    assert read_theme_rows(output_dir / "theme-brackets" / "snow.json") == []
+    snow_rows = read_theme_rows(output_dir / "theme-brackets" / "snow.json")
+    assert len(snow_rows) == 1
+    assert snow_rows[0]["theme_z"] == 1.04
     assert read_theme_rows(output_dir / "theme-brackets" / "lands.json") == []
     report = read_json(output_dir / "theme-report.json")
     token_rows = next(theme for theme in report["themes"] if theme["tag_slug"] == "tokens")["rows"]
     assert report["qualification_score_field"] == "z"
+    assert report["minimum_z"] == 1
     assert token_rows[0]["theme_z"] == 3
     assert token_rows[0]["theme_affinity_z"] == 3
     assert token_rows[0]["theme_legacy_z"] == .2
@@ -244,7 +248,7 @@ def test_export_full_site_data_writes_compact_theme_bracket_files(tmp_path):
                 "total_decks": 300,
                 "tag_decks": 8,
                 "tag_affinity_pct": 0.026,
-                "z": 1.04,
+                "z": 0.99,
             },
             {
                 "commander_name": "Below Threshold",
@@ -269,7 +273,7 @@ def test_export_full_site_data_writes_compact_theme_bracket_files(tmp_path):
         clean_output=True,
     )
 
-    assert manifest["theme_bracket_export"]["minimum_z"] == 1.05
+    assert manifest["theme_bracket_export"]["minimum_z"] == 1
     assert manifest["theme_bracket_export"]["qualification_score_field"] == "z"
 
     theme_index = read_json(output_dir / "theme-brackets" / "index.json")
@@ -280,7 +284,7 @@ def test_export_full_site_data_writes_compact_theme_bracket_files(tmp_path):
         theme for theme in theme_index if theme["tag_slug"] == "combo"
     )
     assert mutate_info["qualified_commander_count"] == 1
-    assert mutate_info["minimum_z"] == 1.05
+    assert mutate_info["minimum_z"] == 1
     assert mutate_info["qualification_rule"] == "theme_z_and_bracket_rules"
     assert mutate_info["qualification_score_field"] == "z"
     assert combo_info["qualified_commander_count"] == 2
@@ -313,7 +317,7 @@ def test_export_full_site_data_writes_compact_theme_bracket_files(tmp_path):
         "theme_count": 2,
         "commander_count": 2,
         "row_count": 3,
-        "minimum_z": 1.05,
+        "minimum_z": 1,
         "qualification_score_field": "z",
     }
     mutate_report = next(theme for theme in report["themes"] if theme["tag_slug"] == "mutate")
@@ -358,16 +362,16 @@ def test_theme_report_matches_theme_brackets_without_deck_minimums(tmp_path):
         "tag_affinity_pct": 0.1,
     }
     rows = [
-        {**tiny_commander, "tag_slug": "artifacts", "tag_name": "Artifacts", "z": 1.05},
-        {**tiny_commander, "tag_slug": "artifacts", "tag_name": "Artifacts", "z": 1.06},
+        {**tiny_commander, "tag_slug": "artifacts", "tag_name": "Artifacts", "z": 1.01},
+        {**tiny_commander, "tag_slug": "artifacts", "tag_name": "Artifacts", "z": 1.04},
         {
             **tiny_commander,
             "commander_slug": "boundary-commander",
             "tag_slug": "artifacts",
             "tag_name": "Artifacts",
-            "z": 1.05,
+            "z": 1,
         },
-        {**tiny_commander, "tag_slug": "snow", "tag_name": "Snow", "z": 1.04},
+        {**tiny_commander, "tag_slug": "snow", "tag_name": "Snow", "z": 0.9999},
     ]
 
     for slug in ["cedh", "aggro", "control", "midrange", "tempo", "combo"]:
@@ -410,7 +414,7 @@ def test_theme_report_matches_theme_brackets_without_deck_minimums(tmp_path):
             assert commander == {key: bracket_row[key] for key in commander}
 
     artifacts = next(theme for theme in report["themes"] if theme["tag_slug"] == "artifacts")
-    assert [row["theme_z"] for row in artifacts["rows"]] == [1.06, 1.05]
+    assert [row["theme_z"] for row in artifacts["rows"]] == [1.04, 1]
     assert all(row["theme_tag_decks"] == 1 for row in artifacts["rows"])
     assert next(theme for theme in report["themes"] if theme["tag_slug"] == "snow")["rows"] == []
 
@@ -422,7 +426,7 @@ def test_theme_report_retains_empty_themes_and_handles_an_empty_dataset(tmp_path
                 "commander_slug": "below-threshold",
                 "tag_slug": "snow",
                 "tag_name": "Snow",
-                "z": 1.04,
+                "z": 0.9999,
             }
         ]
     )
@@ -432,12 +436,13 @@ def test_theme_report_retains_empty_themes_and_handles_an_empty_dataset(tmp_path
         "commanders": [],
         "themes": [{"tag_slug": "snow", "tag_name": "Snow", "rows": []}],
         "qualification_score_field": "z",
+        "minimum_z": 1,
     }
 
     metadata = export_full_site_data_module.export_theme_report(df.iloc[:0], None, tmp_path)
     assert metadata["row_count"] == metadata["commander_count"] == metadata["theme_count"] == 0
     assert read_json(tmp_path / "theme-report.json") == {
-        "commanders": [], "themes": [], "qualification_score_field": "z"
+        "commanders": [], "themes": [], "qualification_score_field": "z", "minimum_z": 1
     }
 
 

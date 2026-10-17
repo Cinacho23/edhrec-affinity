@@ -43,7 +43,7 @@ import pandas as pd
 
 
 LEADERBOARD_PAGE_SIZE = 500
-THEME_BRACKET_MIN_Z = 1.05
+THEME_BRACKET_MIN_Z = 1
 BRACKET_SIGNAL_TAG_SLUGS = {
     "cedh",
     "aggro",
@@ -740,7 +740,11 @@ def export_theme_bracket_files(
             )
 
         filename = f"theme-brackets/{theme_slug}.json"
-        write_json(output_dir / filename, {"qualification_score_field": "z", "rows": rows})
+        write_json(output_dir / filename, {
+            "qualification_score_field": "z",
+            "minimum_z": THEME_BRACKET_MIN_Z,
+            "rows": rows,
+        })
         max_commanders = max(max_commanders, len(rows))
 
         theme_info = dict(tag_info_by_slug.get(theme_slug, {}))
@@ -849,7 +853,12 @@ def export_theme_report(
     filename = "theme-report.json"
     write_json(
         output_dir / filename,
-        {"commanders": commanders, "themes": themes, "qualification_score_field": "z"},
+        {
+            "commanders": commanders,
+            "themes": themes,
+            "qualification_score_field": "z",
+            "minimum_z": THEME_BRACKET_MIN_Z,
+        },
         compact=True,
     )
 

@@ -42,7 +42,7 @@ function signalFiles() {
 }
 
 test("reuses compact index and theme requests without loading legacy data", async () => {
-  const themes = [{ tag_slug: "tokens", tag_name: "Tokens", qualification_score_field: "z" }];
+  const themes = [{ tag_slug: "tokens", tag_name: "Tokens", qualification_score_field: "z", minimum_z: 1 }];
   const rows = [{ commander_slug: "alpha", theme_tag_slug: "tokens", theme_z: 3 }];
   const source = createSource({
     "loadThemeBracketIndex:": themes,
@@ -72,9 +72,9 @@ test("legacy themes share six complete signal files and preserve both eligibilit
     loader.loadRows("mutate", false),
     loader.loadRows("combo", false),
   ]);
-  assert.deepEqual(buildCommanderThemeBracketRows(tokens, "tokens").map((row) => row.bracket_key), ["4"]);
+  assert.deepEqual(buildCommanderThemeBracketRows(tokens, "tokens").map((row) => row.bracket_key), ["4", "2"]);
   assert.deepEqual(buildCommanderThemeBracketRows(mutate, "mutate").map((row) => row.bracket_key), ["4"]);
-  assert.deepEqual(buildCommanderThemeBracketRows(combo, "combo").map((row) => row.bracket_key), ["4", "1/2"]);
+  assert.deepEqual(buildCommanderThemeBracketRows(combo, "combo").map((row) => row.bracket_key), ["4", "2"]);
   assert.equal(source.calls.filter((call) => call === "loadTagDetail:combo").length, 1);
   assert.equal(source.calls.some((call) => call.startsWith("loadCommanderDetail")), false);
   assert.ok(source.maxActive <= 2);
@@ -189,7 +189,7 @@ test("fallback and compact rows retain exact selected-theme and deciding-tag met
     ...signalFiles(),
     "loadTagDetail:tokens": [theme],
     "loadTagDetail:cedh": [decision],
-    "loadThemeBracketIndex:": [{ tag_slug: "tokens", qualification_score_field: "z" }],
+    "loadThemeBracketIndex:": [{ tag_slug: "tokens", qualification_score_field: "z", minimum_z: 1 }],
     "loadThemeBracketDetail:tokens": [compact],
   });
   const loader = createThemeBracketDataLoader({ dataSource: source.dataSource });
@@ -237,7 +237,7 @@ test("unmarked compact collections fall back to complete tags to recover new qua
 test("marked collections with rejected stale details use complete tag data", async () => {
   const source = createSource({
     ...signalFiles(),
-    "loadThemeBracketIndex:": [{ tag_slug: "tokens", qualification_score_field: "z" }],
+    "loadThemeBracketIndex:": [{ tag_slug: "tokens", qualification_score_field: "z", minimum_z: 1 }],
     // The API rejects an old detail array without the qualification marker.
     "loadTagDetail:tokens": [tag("new-qualifier", "tokens", 2)],
   });
@@ -245,4 +245,34 @@ test("marked collections with rejected stale details use complete tag data", asy
   const results = buildCommanderThemeBracketRows(await loader.loadRows("tokens"), "tokens");
   assert.equal(results[0].commander_slug, "new-qualifier");
   assert.equal(source.calls.includes("loadThemeBracketDetail:tokens"), true);
+});
+
+test("old compact thresholds fall back to complete tags including newly eligible scores", async () => {
+  for (const minimum_z of [undefined, 1.05]) {
+    const source = createSource({
+      ...signalFiles(),
+      "loadThemeBracketIndex:": [{ tag_slug: "tokens", qualification_score_field: "z", minimum_z }],
+      "loadTagIndex:": [{ tag_slug: "tokens" }],
+      "loadThemeBracketDetail:tokens": [],
+      "loadTagDetail:tokens": [
+        tag("exact-boundary", "tokens", 1),
+        tag("newly-eligible", "tokens", 1.04),
+        tag("below-boundary", "tokens", 0.99),
+      ],
+    });
+    const loader = createThemeBracketDataLoader({ dataSource: source.dataSource });
+    assert.equal((await loader.loadIndex()).usesThemeBracketFiles, false);
+    const rows = await loader.loadRows("tokens");
+    assert.deepEqual(rows.map((row) => row.commander_slug), ["exact-boundary", "newly-eligible"]);
+    assert.equal(source.calls.includes("loadThemeBracketDetail:tokens"), false);
+  }
+});
+
+test("signal-only compact indexes retain their bracket-rules-only eligibility", async () => {
+  const themes = [{ tag_slug: "combo", qualification_score_field: "z", minimum_z: null,
+    qualification_rule: "bracket_rules_only" }];
+  const source = createSource({ "loadThemeBracketIndex:": themes, "loadThemeBracketDetail:combo": [] });
+  const loader = createThemeBracketDataLoader({ dataSource: source.dataSource });
+  assert.deepEqual(await loader.loadIndex(), { themes, usesThemeBracketFiles: true });
+  assert.deepEqual(await loader.loadRows("combo"), []);
 });

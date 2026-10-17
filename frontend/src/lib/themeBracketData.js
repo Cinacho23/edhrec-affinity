@@ -149,9 +149,12 @@ export function createThemeBracketDataLoader({
       indexPromise = (async () => {
         try {
           const themes = await requestRows("loadThemeBracketIndex");
-          // Earlier collections omitted rows using the legacy score gate and
+          // Earlier collections used legacy scores or a higher minimum and
           // expose stale qualified counts. Recover themes and rows from tags.
-          if (themes.every((theme) => theme.qualification_score_field === "z")) {
+          if (themes.every((theme) =>
+            theme.qualification_score_field === "z" &&
+            (themeUsesBracketRulesOnly(theme.tag_slug) || theme.minimum_z === THEME_BRACKET_MIN_Z)
+          )) {
             return { themes, usesThemeBracketFiles: true };
           }
           return { themes: await requestRows("loadTagIndex"), usesThemeBracketFiles: false };

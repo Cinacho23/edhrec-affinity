@@ -2,6 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import BracketBadge from "../components/BracketBadge";
+import CumulativeTagFilter from "../components/CumulativeTagFilter";
+import { useCumulativeTags } from "../lib/useCumulativeTags";
+import { cumulativeZColumn } from "../lib/cumulativeTagUtils";
 import SimpleTable from "../components/SimpleTable";
 import {
   formatAdjustedAffinity,
@@ -53,21 +56,34 @@ function isAvailableTheme(themeList, themeSlug) {
 export default function ThemeBracketsPage() {
   const { themeSlug: routeThemeSlug = "" } = useParams();
   const navigate = useNavigate();
+  const cumulative = useCumulativeTags();
+  const { filterRows: filterCumulativeRows, active: cumulativeActive } = cumulative;
   const initialRouteThemeRef = useRef(routeThemeSlug.toLowerCase());
   const [dataLoader] = useState(createThemeBracketDataLoader);
   const [themes, setThemes] = useState([]);
   const [selectedTheme, setSelectedTheme] = useState("");
   const [themeRows, setThemeRows] = useState([]);
   const [usesThemeBracketFiles, setUsesThemeBracketFiles] = useState(true);
-  const [filters, setFilters] = useState(() =>
-    readSessionObject(FILTER_STORAGE_KEY, DEFAULT_FILTERS)
-  );
+  const [filters, setFilters] = useState(() => {
+    const stored = readSessionObject(FILTER_STORAGE_KEY, DEFAULT_FILTERS);
+    return {
+      ...stored,
+      bracket: BRACKET_OPTIONS.some((bracket) => bracket.key === stored.bracket)
+        ? stored.bracket
+        : "",
+    };
+  });
   const [sort, setSort] = useState(() => {
     const stored = readSessionObject(SORT_STORAGE_KEY, {
       key: "bracket_rank",
       direction: "desc",
     });
-    return { ...stored, key: stored.key === "theme_z" ? "theme_affinity_z" : stored.key };
+    return {
+      ...stored,
+      key: stored.key === "cumulative_z"
+        ? "bracket_rank"
+        : stored.key === "theme_z" ? "theme_affinity_z" : stored.key,
+    };
   });
   const [state, setState] = useState({
     loadingThemes: true,
@@ -171,7 +187,7 @@ export default function ThemeBracketsPage() {
 
   const eligibleRows = useMemo(
     () =>
-      bracketRows.filter(
+      filterCumulativeRows(bracketRows).filter(
         (row) =>
           rowMatchesText(row, filters.commanderQuery, [
             "commander_name",
@@ -183,6 +199,7 @@ export default function ThemeBracketsPage() {
       ),
     [
       bracketRows,
+      filterCumulativeRows,
       filters.commanderQuery,
       filters.minTotalDecks,
       filters.minThemeDecks,
@@ -228,6 +245,8 @@ export default function ThemeBracketsPage() {
 
   function resetFilters() {
     setFilters({ ...DEFAULT_FILTERS });
+    cumulative.setQuery("");
+    setSort({ key: "bracket_rank", direction: "desc" });
   }
 
   function handleSort(nextKey) {
@@ -248,6 +267,7 @@ export default function ThemeBracketsPage() {
         </Link>
       ),
     },
+    ...(cumulativeActive ? [cumulativeZColumn] : []),
     {
       key: "bracket_rank",
       header: "Bracket",
@@ -355,7 +375,7 @@ export default function ThemeBracketsPage() {
         <h1>Theme Brackets</h1>
         <p>
           For ordinary themes, commanders must have a theme z-score of at least
-          1.05 and satisfy the selected bracket. When the selected theme is
+          1 and satisfy the selected bracket. When the selected theme is
           cEDH or one of the five archetypes, only the bracket rules apply.
           Suggested building brackets give our recommended ceiling from tag
           associations; actual deck strength depends on the build.
@@ -364,9 +384,9 @@ export default function ThemeBracketsPage() {
           Raw and adjusted affinity, the 95% range, z-score, and Rank in Tag
           all describe the selected theme. Rank in Tag compares all reported
           commanders for that theme, across brackets. Bracket Z describes the
-          Deciding Tag. The same numeric eligibility and bracket cutoffs now
-          use upgraded affinity z-scores. “Unadjusted” marks a fallback and —
-          means unavailable.{" "}
+          Deciding Tag. Theme eligibility and bracket cutoffs use upgraded
+          affinity z-scores, with bracket boundaries at 0 and 1. “Unadjusted”
+          marks a fallback and — means unavailable.{" "}
           <Link to="/methodology">How it works</Link>
         </p>
         <p>
@@ -383,22 +403,19 @@ export default function ThemeBracketsPage() {
             <h2 id="theme-rules-title">Two gates, with six exceptions</h2>
           </div>
           <p className="muted">
-            All other themes require theme z ≥ 1.05 plus the bracket rule.
+            All other themes require theme z ≥ 1 plus the bracket rule.
             cEDH, Aggro, Control, Midrange, Tempo, and Combo use only the
             bracket rules below, using Bracket Z. Both scores use the upgraded
             affinity algorithm. cEDH is always evaluated first.
           </p>
         </div>
         <div className="bracket-rule-grid">
-          <div><strong>Theme</strong><span>Theme z ≥ 1.05, plus bracket</span></div>
+          <div><strong>Theme</strong><span>Theme z ≥ 1, plus bracket</span></div>
           <div><strong>6 tags</strong><span>cEDH/archetypes use bracket rules only</span></div>
-          <div><strong>5</strong><span>cEDH ≥ 1.05</span></div>
-          <div><strong>4/5</strong><span>cEDH &gt; 0.95 and &lt; 1.05</span></div>
-          <div><strong>4</strong><span>cEDH from 0.05 to 0.95</span></div>
-          <div><strong>3</strong><span>Any archetype ≥ 1.05</span></div>
-          <div><strong>2/3</strong><span>Any archetype &gt; 0.95 and &lt; 1.05</span></div>
-          <div><strong>2</strong><span>Any archetype from 0.05 to 0.95</span></div>
-          <div><strong>1/2</strong><span>Any archetype &gt; 0 and &lt; 0.05</span></div>
+          <div><strong>5</strong><span>cEDH ≥ 1</span></div>
+          <div><strong>4</strong><span>cEDH &gt; 0 and &lt; 1</span></div>
+          <div><strong>3</strong><span>Any archetype ≥ 1</span></div>
+          <div><strong>2</strong><span>Strongest archetype &gt; 0 and &lt; 1</span></div>
           <div><strong>1</strong><span>No higher threshold met</span></div>
         </div>
       </section>
@@ -411,6 +428,13 @@ export default function ThemeBracketsPage() {
           </div>
           <button type="button" onClick={resetFilters}>Reset filters</button>
         </div>
+        <CumulativeTagFilter
+          filter={cumulative}
+          onChange={(query) => {
+            cumulative.setQuery(query);
+            setSort({ key: query.trim() ? "cumulative_z" : "bracket_rank", direction: "desc" });
+          }}
+        />
         <div className="filter-grid">
           <label>
             Search themes
@@ -491,8 +515,8 @@ export default function ThemeBracketsPage() {
                         ? `${formatNumber(theme.qualified_commander_count)} · bracket rules only`
                         : "Bracket rules only"
                       : theme.qualified_commander_count !== undefined
-                        ? `${formatNumber(theme.qualified_commander_count)} · z ≥ 1.05`
-                        : "Theme z ≥ 1.05, plus bracket"}
+                        ? `${formatNumber(theme.qualified_commander_count)} · z ≥ 1`
+                        : "Theme z ≥ 1, plus bracket"}
                   </small>
                 </button>
               ))

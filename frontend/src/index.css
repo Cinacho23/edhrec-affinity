@@ -656,6 +656,32 @@ button:disabled {
 
 /* Filter panels */
 
+.cumulative-tag-filter {
+  margin: 1.2rem 0;
+}
+
+.cumulative-tag-filter > label {
+  display: block;
+  margin-bottom: 0.6rem;
+  font-weight: 700;
+}
+
+.cumulative-tag-filter__input {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.cumulative-tag-filter__input input {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.cumulative-tag-filter p {
+  margin: 0.65rem 0 0;
+  line-height: 1.5;
+}
+
 .filter-panel {
   margin: 1.2rem 0;
 }
@@ -1139,7 +1165,7 @@ button:disabled {
 
 .bracket-summary-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0.6rem;
   margin-bottom: 1rem;
 }
@@ -1183,12 +1209,6 @@ button:disabled {
   background: rgb(127 29 29 / 0.45);
 }
 
-.bracket-badge--4-5 {
-  color: #fbcfe8;
-  border-color: rgb(244 114 182 / 0.32);
-  background: rgb(131 24 67 / 0.4);
-}
-
 .bracket-badge--4 {
   color: #fed7aa;
   border-color: rgb(251 146 60 / 0.32);
@@ -1201,22 +1221,10 @@ button:disabled {
   background: rgb(113 63 18 / 0.4);
 }
 
-.bracket-badge--2-3 {
-  color: #d9f99d;
-  border-color: rgb(163 230 53 / 0.3);
-  background: rgb(54 83 20 / 0.42);
-}
-
 .bracket-badge--2 {
   color: #bbf7d0;
   border-color: rgb(74 222 128 / 0.28);
   background: rgb(20 83 45 / 0.42);
-}
-
-.bracket-badge--1-2 {
-  color: #a5f3fc;
-  border-color: rgb(34 211 238 / 0.28);
-  background: rgb(22 78 99 / 0.42);
 }
 
 .bracket-badge--1 {

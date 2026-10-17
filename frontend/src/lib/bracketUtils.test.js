@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  BRACKET_OPTIONS,
   buildCommanderBracketRows,
   buildCommanderThemeBracketRows,
   classifyCommanderRows,
@@ -11,11 +12,17 @@ function tag(tag_slug, z, tag_name = tag_slug) {
   return { tag_slug, tag_name, z };
 }
 
-test("classifies exact cEDH boundaries and the 4/5 flux band", () => {
-  assert.equal(classifyCommanderRows([tag("cedh", 1.05, "cEDH")]).bracket_key, "5");
-  assert.equal(classifyCommanderRows([tag("cedh", 1.01, "cEDH")]).bracket_key, "4/5");
-  assert.equal(classifyCommanderRows([tag("cedh", 0.95, "cEDH")]).bracket_key, "4");
-  assert.equal(classifyCommanderRows([tag("cedh", 0.05, "cEDH")]).bracket_key, "4");
+test("exposes only the five whole brackets", () => {
+  assert.deepEqual(BRACKET_OPTIONS.map(({ key }) => key), ["5", "4", "3", "2", "1"]);
+});
+
+test("classifies cEDH scores at zero and one without tolerance bands", () => {
+  for (const [score, expected] of [
+    [-0.05, "1"], [0, "1"], [0.001, "4"], [0.02, "4"], [0.05, "4"],
+    [0.95, "4"], [0.999, "4"], [1, "5"], [1.01, "5"], [1.05, "5"],
+  ]) {
+    assert.equal(classifyCommanderRows([tag("cedh", score, "cEDH")]).bracket_key, expected);
+  }
 });
 
 test("gives a qualifying cEDH score precedence over a stronger archetype", () => {
@@ -30,11 +37,13 @@ test("gives a qualifying cEDH score precedence over a stronger archetype", () =>
   assert.equal(classification.decision_tag_decks, 8);
 });
 
-test("classifies archetype boundaries and both requested flux examples", () => {
-  assert.equal(classifyCommanderRows([tag("control", 1.05, "Control")]).bracket_key, "3");
-  assert.equal(classifyCommanderRows([tag("midrange", 0.98, "Midrange")]).bracket_key, "2/3");
-  assert.equal(classifyCommanderRows([tag("tempo", 0.95, "Tempo")]).bracket_key, "2");
-  assert.equal(classifyCommanderRows([tag("control", 0.02, "Control")]).bracket_key, "1/2");
+test("classifies archetype scores at zero and one without tolerance bands", () => {
+  for (const [score, expected] of [
+    [-0.05, "1"], [0, "1"], [0.001, "2"], [0.02, "2"], [0.05, "2"],
+    [0.95, "2"], [0.999, "2"], [1, "3"], [1.01, "3"], [1.05, "3"],
+  ]) {
+    assert.equal(classifyCommanderRows([tag("control", score, "Control")]).bracket_key, expected);
+  }
 });
 
 test("uses the strongest qualifying archetype and otherwise falls back to Bracket 1", () => {
@@ -47,7 +56,7 @@ test("uses the strongest qualifying archetype and otherwise falls back to Bracke
   assert.equal(strong.bracket_key, "3");
   assert.equal(strong.decision_tag_name, "Combo");
   assert.equal(classifyCommanderRows([tag("control", 0, "Control")]).bracket_key, "1");
-  assert.equal(classifyCommanderRows([tag("cedh", 0.02, "cEDH")]).bracket_key, "1");
+  assert.equal(classifyCommanderRows([tag("cedh", 0.02, "cEDH")]).bracket_key, "4");
   assert.equal(classifyCommanderRows([]).bracket_key, "1");
 });
 
@@ -64,7 +73,7 @@ test("groups tag rows into one result per commander", () => {
   assert.equal(rows.find((row) => row.commander_slug === "beta").bracket_key, "1");
 });
 
-test("requires both the selected theme and a Bracket 3 archetype at 1.05", () => {
+test("requires both the selected theme and a Bracket 3 archetype at 1", () => {
   const rows = buildCommanderThemeBracketRows(
     [
       {
@@ -72,18 +81,18 @@ test("requires both the selected theme and a Bracket 3 archetype at 1.05", () =>
         commander_name: "Qualifies",
         tag_slug: "mutate",
         tag_name: "Mutate",
-        z: 1.05,
+        z: 1,
         tag_decks: 12,
       },
       {
         commander_slug: "qualifies",
         commander_name: "Qualifies",
-        ...tag("combo", 1.05, "Combo"),
+        ...tag("combo", 1, "Combo"),
       },
       {
         commander_slug: "weak-theme",
         commander_name: "Weak Theme",
-        ...tag("mutate", 1.04, "Mutate"),
+        ...tag("mutate", 0.99, "Mutate"),
       },
       {
         commander_slug: "weak-theme",
@@ -98,7 +107,7 @@ test("requires both the selected theme and a Bracket 3 archetype at 1.05", () =>
       {
         commander_slug: "weak-archetype",
         commander_name: "Weak Archetype",
-        ...tag("tempo", 1.04, "Tempo"),
+        ...tag("tempo", 0.99, "Tempo"),
       },
     ],
     "mutate"
@@ -106,9 +115,9 @@ test("requires both the selected theme and a Bracket 3 archetype at 1.05", () =>
 
   assert.equal(rows.length, 2);
   assert.equal(rows.find((row) => row.id === "qualifies").bracket_key, "3");
-  assert.equal(rows.find((row) => row.id === "qualifies").theme_z, 1.05);
+  assert.equal(rows.find((row) => row.id === "qualifies").theme_z, 1);
   assert.equal(rows.find((row) => row.id === "qualifies").theme_tag_decks, 12);
-  assert.equal(rows.find((row) => row.id === "weak-archetype").bracket_key, "2/3");
+  assert.equal(rows.find((row) => row.id === "weak-archetype").bracket_key, "2");
 });
 
 test("classifies compact theme export rows with the shared cEDH precedence", () => {
@@ -137,7 +146,7 @@ test("classifies compact theme export rows with the shared cEDH precedence", () 
   assert.equal("bracket_tag_rows" in rows[0], false);
 });
 
-test("uses bracket rules without a second 1.05 gate for bracket-signal themes", () => {
+test("uses bracket rules without a second 1 gate for bracket-signal themes", () => {
   const aggroRows = buildCommanderThemeBracketRows(
     [
       {
@@ -176,7 +185,7 @@ test("uses bracket rules without a second 1.05 gate for bracket-signal themes", 
 
   assert.deepEqual(
     aggroRows.map((row) => row.bracket_key),
-    ["2", "1/2", "1"]
+    ["2", "2", "1"]
   );
   assert.deepEqual(
     cedhRows.map((row) => row.bracket_key),
@@ -186,7 +195,7 @@ test("uses bracket rules without a second 1.05 gate for bracket-signal themes", 
 
 test("canonical affinity determines every bracket boundary even with divergent legacy scores", () => {
   for (const slug of ["cedh", "combo"]) {
-    for (const score of [null, -2, 0, 0.02, 0.05, 0.95, 0.98, 1.05, 2]) {
+    for (const score of [null, -2, 0, 0.02, 0.05, 0.95, 0.98, 1, 1.05, 2]) {
       const oldRow = { ...tag(slug, score), tag_decks: 17 };
       const upgraded = { ...oldRow, legacy_z: 9 };
       const { decision_legacy_z: history, ...newClassification } = classifyCommanderRows([upgraded]);

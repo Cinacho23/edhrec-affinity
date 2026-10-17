@@ -1,3 +1,5 @@
+import { THEME_BRACKET_MIN_Z } from "./bracketUtils.js";
+
 const BASE_URL = import.meta.env?.BASE_URL || "/";
 
 function getBasePath() {
@@ -99,11 +101,15 @@ export async function loadThemeBracketDetail(themeSlug) {
   const filename = safeJsonFilename(themeSlug);
   const theme = await fetchJson(`theme-brackets/${filename}.json`);
 
-  // Validate even empty files: a legacy-gated compact list can omit newly
+  // Validate even empty files: a previously gated compact list can omit newly
   // eligible commanders despite a current index. The loader uses complete
   // tag data when an outdated compact file is rejected.
-  if (theme?.qualification_score_field !== "z" || !Array.isArray(theme.rows)) {
-    throw new Error("The compact theme uses an outdated qualification score or invalid rows.");
+  if (
+    theme?.qualification_score_field !== "z" ||
+    theme.minimum_z !== THEME_BRACKET_MIN_Z ||
+    !Array.isArray(theme.rows)
+  ) {
+    throw new Error("The compact theme uses an outdated qualification score or threshold, or invalid rows.");
   }
 
   return theme.rows;
@@ -112,10 +118,13 @@ export async function loadThemeBracketDetail(themeSlug) {
 export async function loadThemeReport() {
   const report = await fetchJson("theme-report.json");
 
-  // Older compact reports omitted rows using legacy scores. The report page
-  // falls back to complete tag data when these rows cannot be recovered here.
-  if (report?.qualification_score_field !== "z") {
-    throw new Error("The compact theme report uses an outdated qualification score.");
+  // Older reports omitted rows using legacy scores or a higher threshold.
+  // The report page falls back to complete tag data to recover those rows.
+  if (
+    report?.qualification_score_field !== "z" ||
+    report.minimum_z !== THEME_BRACKET_MIN_Z
+  ) {
+    throw new Error("The compact theme report uses an outdated qualification score or threshold.");
   }
 
   return report;

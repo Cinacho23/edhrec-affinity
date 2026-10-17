@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
+import CumulativeTagFilter from "../components/CumulativeTagFilter";
 import SimpleTable from "../components/SimpleTable";
+import { cumulativeZColumn } from "../lib/cumulativeTagUtils";
+import { useCumulativeTags } from "../lib/useCumulativeTags";
 import {
   formatAdjustedAffinity,
   formatAffinityInterval,
@@ -68,6 +71,8 @@ function getSelectedOriginSet(row, setCode) {
 }
 
 export default function SetExplorerPage() {
+  const cumulative = useCumulativeTags();
+  const { filterRows: filterCumulativeRows, active: cumulativeActive } = cumulative;
   const commanderDetailCacheRef = useRef(new Map());
   const [sets, setSets] = useState([]);
   const [commanders, setCommanders] = useState([]);
@@ -78,12 +83,13 @@ export default function SetExplorerPage() {
   const [filters, setFilters] = useState(() =>
     readSessionObject(FILTER_STORAGE_KEY, DEFAULT_FILTERS)
   );
-  const [sort, setSort] = useState(() =>
-    readSessionObject(SORT_STORAGE_KEY, {
+  const [sort, setSort] = useState(() => {
+    const stored = readSessionObject(SORT_STORAGE_KEY, {
       key: "z",
       direction: "desc",
-    })
-  );
+    });
+    return stored.key === "cumulative_z" ? { key: "z", direction: "desc" } : stored;
+  });
   const [usesExportedSetFiles, setUsesExportedSetFiles] = useState(true);
   const [state, setState] = useState({
     loadingSets: true,
@@ -265,7 +271,7 @@ export default function SetExplorerPage() {
   }, [sets, filters.setQuery]);
 
   const filteredRows = useMemo(() => {
-    const filtered = rows.filter((row) => {
+    const filtered = filterCumulativeRows(rows).filter((row) => {
       return (
         rowMatchesText(row, filters.commanderQuery, [
           "commander_name",
@@ -291,6 +297,7 @@ export default function SetExplorerPage() {
     filters.minZ,
     filters.maxZ,
     sort,
+    filterCumulativeRows,
   ]);
 
   function updateFilter(key, value) {
@@ -302,6 +309,8 @@ export default function SetExplorerPage() {
 
   function resetFilters() {
     setFilters({ ...DEFAULT_FILTERS });
+    cumulative.setQuery("");
+    setSort({ key: "z", direction: "desc" });
   }
 
   function handleSort(nextKey) {
@@ -322,6 +331,7 @@ export default function SetExplorerPage() {
         </Link>
       ),
     },
+    ...(cumulativeActive ? [cumulativeZColumn] : []),
     {
       key: "color_identity",
       header: "Colors",
@@ -518,6 +528,14 @@ export default function SetExplorerPage() {
           </label>
         </div>
       </section>
+
+      <CumulativeTagFilter
+        filter={cumulative}
+        onChange={(query) => {
+          cumulative.setQuery(query);
+          setSort({ key: query.trim() ? "cumulative_z" : "z", direction: "desc" });
+        }}
+      />
 
       <section className="set-layout">
         <aside className="set-list-panel">

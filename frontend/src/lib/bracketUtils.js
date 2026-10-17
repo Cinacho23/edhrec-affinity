@@ -8,7 +8,7 @@ export const ARCHETYPE_TAG_SLUGS = new Set([
   "combo",
 ]);
 
-export const THEME_BRACKET_MIN_Z = 1.05;
+export const THEME_BRACKET_MIN_Z = 1;
 
 export function themeUsesBracketRulesOnly(themeSlug) {
   const normalizedThemeSlug = normalizeTagSlug({ tag_slug: themeSlug });
@@ -21,12 +21,9 @@ export function themeUsesBracketRulesOnly(themeSlug) {
 
 export const BRACKET_OPTIONS = [
   { key: "5", label: "Bracket 5", rank: 5 },
-  { key: "4/5", label: "Bracket 4/5", rank: 4.5 },
   { key: "4", label: "Bracket 4", rank: 4 },
   { key: "3", label: "Bracket 3", rank: 3 },
-  { key: "2/3", label: "Bracket 2/3", rank: 2.5 },
   { key: "2", label: "Bracket 2", rank: 2 },
-  { key: "1/2", label: "Bracket 1/2", rank: 1.5 },
   { key: "1", label: "Bracket 1", rank: 1 },
 ];
 
@@ -113,67 +110,42 @@ function createClassification(key, scoredRow, reason) {
  *
  * cEDH is evaluated before the five archetype tags, so a qualifying cEDH
  * score always wins even when an archetype score would otherwise be Bracket 3.
- * The open intervals from 0.95 to 1.05 are the upper in-flux bands. A small
- * positive archetype score below 0.05 is the Bracket 1/2 in-flux band.
+ * Zero belongs to the lower bracket; one belongs to the higher bracket.
  */
 export function classifyCommanderRows(rows) {
   const cedh = getHighestScoredRow(rows, new Set([CEDH_TAG_SLUG]));
 
-  if (cedh?.score >= 1.05) {
+  if (cedh?.score >= 1) {
     return createClassification(
       "5",
       cedh,
-      "cEDH z-score is at least 1.05."
+      "cEDH z-score is at least 1."
     );
   }
 
-  if (cedh?.score > 0.95) {
-    return createClassification(
-      "4/5",
-      cedh,
-      "cEDH z-score is between 0.95 and 1.05."
-    );
-  }
-
-  if (cedh?.score >= 0.05) {
+  if (cedh?.score > 0) {
     return createClassification(
       "4",
       cedh,
-      "cEDH z-score is from 0.05 through 0.95."
+      "cEDH z-score is above 0 and below 1."
     );
   }
 
   const archetype = getHighestScoredRow(rows, ARCHETYPE_TAG_SLUGS);
 
-  if (archetype?.score >= 1.05) {
+  if (archetype?.score >= 1) {
     return createClassification(
       "3",
       archetype,
-      `${archetype.row.tag_name} z-score is at least 1.05.`
-    );
-  }
-
-  if (archetype?.score > 0.95) {
-    return createClassification(
-      "2/3",
-      archetype,
-      `${archetype.row.tag_name} z-score is between 0.95 and 1.05.`
-    );
-  }
-
-  if (archetype?.score >= 0.05) {
-    return createClassification(
-      "2",
-      archetype,
-      `${archetype.row.tag_name} z-score is from 0.05 through 0.95.`
+      `${archetype.row.tag_name} z-score is at least 1.`
     );
   }
 
   if (archetype?.score > 0) {
     return createClassification(
-      "1/2",
+      "2",
       archetype,
-      `${archetype.row.tag_name} z-score is positive but below 0.05.`
+      `${archetype.row.tag_name} z-score is above 0 and below 1.`
     );
   }
 

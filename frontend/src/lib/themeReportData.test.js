@@ -54,7 +54,7 @@ test("compact report hydration preserves Theme Brackets classifications and meta
     ...row,
     id: JSON.stringify([row.theme_tag_slug, row.id]),
   })));
-  assert.deepEqual(compactResults.map((row) => row.bracket_key), ["4", "4/5", "2/3", "1/2", "3", "1"]);
+  assert.deepEqual(compactResults.map((row) => row.bracket_key), ["4", "5", "3", "2", "3", "1"]);
   assert.equal(compactResults.find((row) => row.commander_slug === "tied-signals").decision_tag_name, "Tempo");
   assert.equal(JSON.stringify(data), snapshot);
 });
@@ -64,8 +64,8 @@ test("compact ordinary themes keep their threshold while signal themes allow low
   const data = {
     commanders: [commander("shared", [signal("cedh", 0.4, "cEDH")])],
     themes: [
-      { tag_slug: "tokens", tag_name: "Tokens", rows: [themeRow("shared", 1.04)] },
-      { tag_slug: "artifacts", tag_name: "Artifacts", rows: [themeRow("shared", 1.05)] },
+      { tag_slug: "tokens", tag_name: "Tokens", rows: [themeRow("shared", 0.99)] },
+      { tag_slug: "artifacts", tag_name: "Artifacts", rows: [themeRow("shared", 1)] },
       ...signalSlugs.map((tag_slug) => ({ tag_slug, rows: [themeRow("shared", 0.02)] })),
     ],
   };

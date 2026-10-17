@@ -2,8 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import SimpleTable from "../components/SimpleTable";
+import CumulativeTagFilter from "../components/CumulativeTagFilter";
 import TrendBadge from "../components/TrendBadge";
 import { loadLeaderboardIndex, loadLeaderboardPage } from "../lib/api";
+import { cumulativeZColumn } from "../lib/cumulativeTagUtils";
+import { useCumulativeTags } from "../lib/useCumulativeTags";
 import {
   formatAdjustedAffinity,
   formatAffinityInterval,
@@ -48,6 +51,8 @@ const FILTER_STORAGE_KEY = "edhrec-affinity:leaderboard:filters";
 const PAGE_STORAGE_KEY = "edhrec-affinity:leaderboard:page";
 
 export default function GlobalLeaderboardPage() {
+  const cumulative = useCumulativeTags();
+  const { filterRows: filterCumulativeRows, active: cumulativeActive } = cumulative;
   const [index, setIndex] = useState(null);
   const [rows, setRows] = useState([]);
   const [pageNumber, setPageNumber] = useState(() => {
@@ -115,7 +120,7 @@ export default function GlobalLeaderboardPage() {
   }, [index, currentPageNumber]);
 
   const filteredRows = useMemo(() => {
-    const filtered = rows.filter((row) => {
+    const filtered = filterCumulativeRows(rows).filter((row) => {
       return (
         rowMatchesText(row, filters.query, [
           "commander_name",
@@ -133,7 +138,7 @@ export default function GlobalLeaderboardPage() {
     });
 
     return sortRows(filtered, sortKey, sortDirection);
-  }, [rows, filters, sortKey, sortDirection]);
+  }, [rows, filters, sortKey, sortDirection, filterCumulativeRows]);
 
   function updateFilter(key, value) {
     setFilters((current) => ({
@@ -144,6 +149,9 @@ export default function GlobalLeaderboardPage() {
 
   function resetFilters() {
     setFilters({ ...DEFAULT_FILTERS });
+    cumulative.setQuery("");
+    setSortKey("z");
+    setSortDirection("desc");
   }
 
   function handleSort(nextKey) {
@@ -154,6 +162,7 @@ export default function GlobalLeaderboardPage() {
   }
 
   const columns = [
+    ...(cumulativeActive ? [cumulativeZColumn] : []),
     {
       key: "commander_name",
       header: "Commander",
@@ -338,6 +347,12 @@ export default function GlobalLeaderboardPage() {
           </button>
         </div>
       </section>
+
+      <CumulativeTagFilter filter={cumulative} onChange={(value) => {
+        cumulative.setQuery(value);
+        setSortKey(value.trim() ? "cumulative_z" : "z");
+        setSortDirection("desc");
+      }} />
 
       <section className="filter-panel">
         <div className="filter-panel-header">

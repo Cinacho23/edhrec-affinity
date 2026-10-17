@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import BracketBadge from "../components/BracketBadge";
+import CumulativeTagFilter from "../components/CumulativeTagFilter";
 import SimpleTable from "../components/SimpleTable";
 import {
   formatAdjustedAffinity,
@@ -12,11 +13,13 @@ import {
 } from "../lib/affinityDisplay";
 import { loadThemeReport } from "../lib/api";
 import { BRACKET_OPTIONS } from "../lib/bracketUtils";
+import { cumulativeZColumn } from "../lib/cumulativeTagUtils";
 import { formatDecimal, formatNumber, formatRank } from "../lib/formatters";
 import { readSessionObject, writeSessionValue } from "../lib/persistentState";
 import { rowMatchesText, sortRows, toggleSortDirection } from "../lib/tableUtils";
 import { createThemeBracketDataLoader, mapWithConcurrency } from "../lib/themeBracketData";
 import { expandThemeReport } from "../lib/themeReportData";
+import { useCumulativeTags } from "../lib/useCumulativeTags";
 import {
   DEFAULT_THEME_REPORT_FILTERS,
   buildThemeReportRows,
@@ -27,6 +30,8 @@ const FILTER_STORAGE_KEY = "edhrec-affinity:theme-report:filters";
 const PAGE_SIZE = 100;
 
 export default function ThemeReportPage() {
+  const cumulative = useCumulativeTags();
+  const { filterRows: filterCumulativeRows, active: cumulativeActive } = cumulative;
   const loaderRef = useRef(null);
   const [filters, setFilters] = useState(() => {
     const stored = readSessionObject(FILTER_STORAGE_KEY, DEFAULT_THEME_REPORT_FILTERS);
@@ -102,8 +107,11 @@ export default function ThemeReportPage() {
   }, [filters]);
 
   const rankedRows = useMemo(
-    () => buildThemeReportRows(data.rows, filters),
-    [data.rows, filters]
+    () => buildThemeReportRows(filterCumulativeRows(data.rows), {
+      ...filters,
+      rankBy: cumulativeActive ? "cumulative_z" : "theme_z",
+    }),
+    [data.rows, filters, filterCumulativeRows, cumulativeActive]
   );
   const sortedRows = useMemo(
     () => sortRows(rankedRows, sort.key, sort.direction),
@@ -135,6 +143,7 @@ export default function ThemeReportPage() {
   }
 
   function resetFilters() {
+    cumulative.setQuery("");
     setFilters({ ...DEFAULT_THEME_REPORT_FILTERS, brackets: [] });
     setSort({ key: "", direction: "desc" });
     setPage(1);
@@ -161,6 +170,7 @@ export default function ThemeReportPage() {
       key: "commander_name", header: "Commander", sortable: true,
       render: (row) => <Link className="table-commander-link" to={`/commanders/${row.commander_slug}`}>{row.commander_name}</Link>,
     },
+    ...(cumulativeActive ? [cumulativeZColumn] : []),
     {
       key: "bracket_rank", header: "Bracket", sortable: true,
       render: (row) => <span title={row.bracket_reason}><BracketBadge bracketKey={row.bracket_key} label={row.bracket_label} /></span>,
@@ -219,10 +229,10 @@ export default function ThemeReportPage() {
         </p>
         <p className="muted">
           Uses the <Link className="table-commander-link" to="/theme-brackets">Theme Brackets rules</Link>:
-          ordinary themes require theme z ≥ 1.05; cEDH, Aggro, Control, Midrange, Tempo,
+          ordinary themes require theme z ≥ 1; cEDH, Aggro, Control, Midrange, Tempo,
           and Combo use bracket rules only. cEDH takes precedence when assigning brackets.
           Theme eligibility, bracket suggestions, and rankings use the upgraded
-          affinity score with the same numeric cutoffs.
+          affinity score, with bracket boundaries at 0 and 1.
         </p>
         <p>
           Raw and adjusted affinity, the 95% range, z-score, and Rank in Tag
@@ -240,6 +250,12 @@ export default function ThemeReportPage() {
           commander; it does not measure how well the build works.
         </p>
       </div>
+
+      <CumulativeTagFilter filter={cumulative} onChange={(query) => {
+        cumulative.setQuery(query);
+        setSort({ key: query.trim() ? "cumulative_z" : "", direction: "desc" });
+        setPage(1);
+      }} />
 
       <section className="filter-panel" aria-labelledby="report-filters-title">
         <div className="filter-panel-header">
@@ -323,17 +339,22 @@ export default function ThemeReportPage() {
           <section className="data-table-section" aria-labelledby="theme-report-results-title">
             <div className="table-toolbar">
               <div>
-                <p className="eyebrow">Ranked by theme z-score</p>
+                <p className="eyebrow">Ranked by {cumulativeActive ? "cumulative z-score" : "theme z-score"}</p>
                 <h2 id="theme-report-results-title">{perBracket ? "Leaders by theme and bracket" : "Leaders by theme"}</h2>
                 <p className="table-count" role="status">
                   {formatNumber(rankedRows.length)} results across {formatNumber(representedThemes.size)} of {formatNumber(matchingThemes.length)} matching themes
                 </p>
               </div>
-              {sort.key && <button type="button" onClick={() => { setSort({ key: "", direction: "desc" }); setPage(1); }}>Restore theme order</button>}
+              {(sort.key !== (cumulativeActive ? "cumulative_z" : "") || sort.direction !== "desc") && (
+                <button type="button" onClick={() => {
+                  setSort({ key: cumulativeActive ? "cumulative_z" : "", direction: "desc" });
+                  setPage(1);
+                }}>Restore {cumulativeActive ? "cumulative" : "theme"} order</button>
+              )}
             </div>
             <p className="muted theme-report-note">
-              Ranks use the highest theme Z within each {perBracket ? "theme and bracket" : "theme"}.
-              Ties use theme decks, then total decks, then commander name.
+              Ranks use the highest {cumulativeActive ? "cumulative Z" : "theme Z"} within each {perBracket ? "theme and bracket" : "theme"}.
+              Ties use {cumulativeActive ? "theme Z, then " : ""}theme decks, then total decks, then commander name.
               Only commanders with a numeric theme z-score can be ranked.
             </p>
             <SimpleTable columns={columns} rows={pageRows} sortKey={sort.key} sortDirection={sort.direction}

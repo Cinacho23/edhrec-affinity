@@ -1,5 +1,5 @@
 export default function BracketBadge({ bracketKey, label }) {
-  const classSuffix = String(bracketKey || "1").replace("/", "-");
+  const classSuffix = String(bracketKey || "1");
 
   return (
     <span className={`bracket-badge bracket-badge--${classSuffix}`}>

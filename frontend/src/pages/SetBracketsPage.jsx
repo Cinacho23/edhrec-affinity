@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import BracketBadge from "../components/BracketBadge";
+import CumulativeTagFilter from "../components/CumulativeTagFilter";
+import { useCumulativeTags } from "../lib/useCumulativeTags";
+import { cumulativeZColumn } from "../lib/cumulativeTagUtils";
 import SimpleTable from "../components/SimpleTable";
 import {
   formatAdjustedAffinity,
@@ -71,21 +74,34 @@ function getSelectedOriginSet(row, setCode) {
 export default function SetBracketsPage() {
   const { setCode: routeSetCode = "" } = useParams();
   const navigate = useNavigate();
+  const cumulative = useCumulativeTags();
+  const { filterRows: filterCumulativeRows, active: cumulativeActive } = cumulative;
   const initialRouteSetCodeRef = useRef(routeSetCode.toLowerCase());
   const commanderDetailCacheRef = useRef(new Map());
   const [sets, setSets] = useState([]);
   const [commanders, setCommanders] = useState([]);
   const [selectedSet, setSelectedSet] = useState("");
   const [tagRows, setTagRows] = useState([]);
-  const [filters, setFilters] = useState(() =>
-    readSessionObject(FILTER_STORAGE_KEY, DEFAULT_FILTERS)
-  );
+  const [filters, setFilters] = useState(() => {
+    const stored = readSessionObject(FILTER_STORAGE_KEY, DEFAULT_FILTERS);
+    return {
+      ...stored,
+      bracket: BRACKET_OPTIONS.some((bracket) => bracket.key === stored.bracket)
+        ? stored.bracket
+        : "",
+    };
+  });
   const [sort, setSort] = useState(() => {
     const stored = readSessionObject(SORT_STORAGE_KEY, {
       key: "bracket_rank",
       direction: "desc",
     });
-    return { ...stored, key: stored.key === "decision_z" ? "decision_affinity_z" : stored.key };
+    return {
+      ...stored,
+      key: stored.key === "cumulative_z"
+        ? "bracket_rank"
+        : stored.key === "decision_z" ? "decision_affinity_z" : stored.key,
+    };
   });
   const [usesExportedSetFiles, setUsesExportedSetFiles] = useState(true);
   const [state, setState] = useState({
@@ -258,7 +274,7 @@ export default function SetBracketsPage() {
 
   const eligibleRows = useMemo(
     () =>
-      bracketRows.filter(
+      filterCumulativeRows(bracketRows).filter(
         (row) =>
           rowMatchesText(row, filters.commanderQuery, [
             "commander_name",
@@ -270,6 +286,7 @@ export default function SetBracketsPage() {
       ),
     [
       bracketRows,
+      filterCumulativeRows,
       filters.commanderQuery,
       filters.minTotalDecks,
       filters.minTagDecks,
@@ -315,6 +332,8 @@ export default function SetBracketsPage() {
 
   function resetFilters() {
     setFilters({ ...DEFAULT_FILTERS });
+    cumulative.setQuery("");
+    setSort({ key: "bracket_rank", direction: "desc" });
   }
 
   function handleSort(nextKey) {
@@ -335,6 +354,7 @@ export default function SetBracketsPage() {
         </Link>
       ),
     },
+    ...(cumulativeActive ? [cumulativeZColumn] : []),
     {
       key: "bracket_rank",
       header: "Bracket",
@@ -435,14 +455,13 @@ export default function SetBracketsPage() {
         <p>
           Choose a Magic set to see suggested building brackets for its
           commanders. These labels give our recommended ceiling from observed
-          tag associations; actual deck strength depends on the build. In-flux
-          labels identify commanders whose Bracket Z sits between thresholds.
+          tag associations; actual deck strength depends on the build.
         </p>
         <p>
           Raw and adjusted affinity, the 95% range, Bracket Z, and Rank in Tag
           all describe the Deciding Tag. Rank in Tag compares all reported
-          commanders for that tag, across sets and brackets. The same numeric
-          bracket cutoffs now use the upgraded affinity z-score. “Unadjusted”
+          commanders for that tag, across sets and brackets. Bracket cutoffs at
+          0 and 1 use the upgraded affinity z-score. “Unadjusted”
           marks a fallback and — means
           unavailable. <Link to="/methodology">How it works</Link>
         </p>
@@ -466,13 +485,10 @@ export default function SetBracketsPage() {
           </p>
         </div>
         <div className="bracket-rule-grid">
-          <div><strong>5</strong><span>cEDH ≥ 1.05</span></div>
-          <div><strong>4/5</strong><span>cEDH &gt; 0.95 and &lt; 1.05</span></div>
-          <div><strong>4</strong><span>cEDH from 0.05 to 0.95</span></div>
-          <div><strong>3</strong><span>Any archetype ≥ 1.05</span></div>
-          <div><strong>2/3</strong><span>Any archetype &gt; 0.95 and &lt; 1.05</span></div>
-          <div><strong>2</strong><span>Any archetype from 0.05 to 0.95</span></div>
-          <div><strong>1/2</strong><span>Any archetype &gt; 0 and &lt; 0.05</span></div>
+          <div><strong>5</strong><span>cEDH ≥ 1</span></div>
+          <div><strong>4</strong><span>cEDH &gt; 0 and &lt; 1</span></div>
+          <div><strong>3</strong><span>Any archetype ≥ 1</span></div>
+          <div><strong>2</strong><span>Strongest archetype &gt; 0 and &lt; 1</span></div>
           <div><strong>1</strong><span>No higher threshold met</span></div>
         </div>
       </section>
@@ -485,6 +501,13 @@ export default function SetBracketsPage() {
           </div>
           <button type="button" onClick={resetFilters}>Reset filters</button>
         </div>
+        <CumulativeTagFilter
+          filter={cumulative}
+          onChange={(query) => {
+            cumulative.setQuery(query);
+            setSort({ key: query.trim() ? "cumulative_z" : "bracket_rank", direction: "desc" });
+          }}
+        />
         <div className="filter-grid">
           <label>
             Search sets
