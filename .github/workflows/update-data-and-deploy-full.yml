@@ -13,7 +13,7 @@ permissions:
   actions: read
 
 concurrency:
-  # Share the collector lock with manual cohorts so their cumulative artifacts
+  # Share the collector lock with catalog runs so their cumulative artifacts
   # cannot diverge and lose commanders collected by the other workflow.
   group: commander-build-style-samples
   cancel-in-progress: false
@@ -189,7 +189,14 @@ jobs:
         with:
           destination: ${{ env.PROCESSED_DIR }}/build-styles
 
-      - name: Extend build-style coverage with a bounded cohort
+      - name: Restore shared card rules cache
+        uses: actions/cache@v4
+        with:
+          path: data/raw/build-style-card-metadata.json
+          key: build-style-cards-${{ env.SNAPSHOT_DATE }}-${{ github.run_id }}
+          restore-keys: build-style-cards-
+
+      - name: Continue build-style catalog coverage
         id: build_styles
         continue-on-error: true
         shell: bash
@@ -199,17 +206,19 @@ jobs:
             --commander-index "${PROCESSED_DIR}/affinity_rows_with_trends.json" \
             --output-dir "${PROCESSED_DIR}/build-styles" \
             --snapshot-date "${SNAPSHOT_DATE}" \
-            --max-commanders 5 --sample-decks 60 --max-components 8
+            --max-commanders 0 --sample-decks 60 --max-components 8 \
+            --min-total-decks 0 --max-runtime-seconds 900 --request-delay 1 --prune-completed-cache
 
       - name: Report build-style collection failure
         if: steps.build_styles.outcome == 'failure'
-        run: echo "::warning::Build-style collection stopped or failed; retained previous samples. See build_style_batch.json in the processed-data artifact."
+        run: echo "::warning::Build-style collection stopped or failed; retained completed samples and the retry checkpoint. See build_style_batch.json in the processed-data artifact."
 
       - name: Upload cumulative build-style samples
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-styles-${{ env.SNAPSHOT_DATE }}-${{ github.run_id }}
-          path: ${{ env.PROCESSED_DIR }}/build-styles/*.json
+          path: ${{ env.PROCESSED_DIR }}/build-styles/
           if-no-files-found: warn
           retention-days: 90
 

@@ -13,13 +13,13 @@ function reportDate(value) {
 }
 
 export default function BuildDiscoveryPage() {
-  const [state, setState] = useState({ loading: true, commanders: [], error: null });
+  const [state, setState] = useState({ loading: true, commanders: [], index: null, error: null });
   const [query, setQuery] = useState("");
   useEffect(() => {
     const controller = new AbortController();
     let active = true;
     loadBuildStyleIndex({ signal: controller.signal }).then(
-      (index) => { if (active) setState({ loading: false, commanders: index.commanders, error: null }); },
+      (index) => { if (active) setState({ loading: false, commanders: index.commanders, index, error: null }); },
       (error) => { if (active && error.name !== "AbortError") setState({ loading: false, commanders: [], error: error.message }); }
     );
     return () => { active = false; controller.abort(); };
@@ -31,6 +31,10 @@ export default function BuildDiscoveryPage() {
       .toSorted((left, right) => String(left.commander_name || left.commander_slug).localeCompare(String(right.commander_name || right.commander_slug)));
   }, [state.commanders, query]);
 
+  const totalCatalog = Number.isInteger(state.index?.total_catalog) && state.index.total_catalog >= state.commanders.length
+    ? state.index.total_catalog : null;
+  const pending = totalCatalog === null ? null : totalCatalog - state.commanders.length;
+
   return <section className="page build-discovery-page">
     <div className="page-header">
       <p className="eyebrow">Exploratory analysis</p>
@@ -41,7 +45,12 @@ export default function BuildDiscoveryPage() {
     <div className="panel build-discovery-coverage">
       <h2>Available commander reports</h2>
       <p>Each report covers sampled decks for one commander. The package count adapts to the evidence, and a package can suggest one or several themes. These reports describe a sample rather than every EDHREC deck.</p>
-      {!state.loading && !state.error ? <strong>{formatNumber(state.commanders.length)} {state.commanders.length === 1 ? "commander report available" : "commander reports available"}</strong> : null}
+      {!state.loading && !state.error ? <>
+        <strong>{totalCatalog === null
+          ? `${formatNumber(state.commanders.length)} ${state.commanders.length === 1 ? "commander report available" : "commander reports available"}`
+          : `${formatNumber(state.commanders.length)} of ${formatNumber(totalCatalog)} commanders analyzed`}</strong>
+        {pending !== null ? <p className="build-discovery-coverage__pending">{formatNumber(pending)} {pending === 1 ? "commander remains" : "commanders remain"} pending in this dataset. Analyzed commanders stay listed when there is insufficient data to fit packages.</p> : null}
+      </> : null}
     </div>
 
     {state.loading ? <p className="muted" role="status">Loading available build reports…</p> : state.error ? <div className="panel"><p className="error-message">Could not load build discovery: {state.error}</p></div> : state.commanders.length ? <>
@@ -57,7 +66,9 @@ export default function BuildDiscoveryPage() {
           <div><strong>{formatNumber(commander.profile_count)}</strong><span>tag profiles</span></div>
           <div><strong>{formatNumber(commander.unique_decks)}</strong><span>sampled decks</span></div>
         </div>
-        {commander.status !== "fitted" ? <p className="muted">Tag profile comparisons available; deck evidence is insufficient to fit packages.</p> : null}
+        {commander.status !== "fitted" ? <p className="muted">{commander.profile_count > 0
+          ? "Tag profile comparisons available; deck evidence is insufficient to fit packages."
+          : "Insufficient data for tag comparisons or packages."}</p> : null}
         <div className="build-discovery-card__footer"><span>Analyzed {reportDate(commander.generated_at)}</span><Link to={`/commanders/${encodeURIComponent(commander.commander_slug)}`}>Explore report →</Link></div>
       </article>)}</div>
       {!visible.length ? <p className="muted">No available reports match this search.</p> : null}

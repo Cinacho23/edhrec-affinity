@@ -3,20 +3,161 @@ import { useEffect, useState } from "react";
 import { loadCommanderBuildStyles } from "../lib/api";
 import {
   formatBuildPoints,
+  formatBuildLift,
   formatBuildShare,
+  generatedDeckFilename,
   getBuildModel,
   getBuildModelOptions,
   getComparableProfilePairs,
   getDeckMixtureRows,
+  getExternalDeckRating,
+  getGeneratedDeckGroups,
   getSupportedThemes,
+  isBuildMetadataFresh,
   safeExternalUrl,
+  splitPrimerCardReferences,
 } from "../lib/buildStyleUtils";
 import { formatDecimal, formatNumber } from "../lib/formatters";
+import CommanderName from "./CommanderName";
 import "./CommanderBuildStyles.css";
 
 function SourceLink({ url, children }) {
   const href = safeExternalUrl(url);
   return href ? <a href={href} target="_blank" rel="noreferrer">{children} ↗</a> : null;
+}
+
+function DeckCardName({ name }) {
+  return <CommanderName commander={{ commander_name: name, commander_cards: [{ name }] }} linked={false} className="build-card-name" />;
+}
+
+function downloadDeckText(text, name, extension) {
+  const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = generatedDeckFilename(name, extension);
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+const VALIDATION_LABELS = {
+  card_count: "100 cards", commander_identity: "Correct commander", color_identity: "Color identity",
+  singleton: "Singleton", commander_legality: "Commander legality", sampled_pool: "Sampled card pool",
+  metadata_complete: "Card metadata", metadata_fresh: "Recent card rules cache",
+};
+
+function checkedDate(value) {
+  const date = value ? new Date(value) : null;
+  return date && Number.isFinite(date.getTime())
+    ? date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "America/Toronto" })
+    : "Date unavailable";
+}
+
+function ExternalDeckRating({ rating }) {
+  const result = getExternalDeckRating(rating);
+  if (!result) return <p className="build-note"><strong>External rating: unverified.</strong> Use the EDHPowerLevel link to assess this exact card list.</p>;
+  const stale = result.status === "stale";
+  return <div className="build-external-rating" data-status={result.status}>
+    <p><strong>EDHPowerLevel result{stale ? " · stale" : " · verified for this card list"}</strong><span>Checked {checkedDate(result.checked_at)}</span></p>
+    <div className="build-generated-deck__metrics">
+      <span><strong>{formatDecimal(result.playability_pct, 1)}%</strong> playability</span>
+      {Number.isFinite(result.bracket) ? <span><strong>{result.bracket}</strong> external bracket</span> : null}
+      {result.power_level !== undefined && result.power_level !== null ? <span><strong>{String(result.power_level)}</strong> external power</span> : null}
+    </div>
+    <p className="build-note">{stale
+      ? `This older observation was ${result.inTargetRange ? "within" : "outside"} the 72.5–77.5% playability target. Recheck before treating it as current.`
+      : `72.5–77.5% playability target ${result.targetMet ? "met" : "not met"}.`} External bracket and power are separate from the site’s source-informed bracket estimate.</p>
+    {result.source_url ? <p className="build-source-links"><SourceLink url={result.source_url}>Open rated card list</SourceLink></p> : null}
+  </div>;
+}
+
+function GeneratedPackageDeck({ deck, packageNumber }) {
+  const [expanded, setExpanded] = useState(false);
+  const [copyStatus, setCopyStatus] = useState("");
+  if (!deck || deck.status !== "generated") {
+    return <div className="build-generated-unavailable"><strong>Generated deck unavailable</strong><p className="muted">{deck?.reason || "This report predates generated package decks. A refreshed analysis can add one when enough verified card data is available."}</p></div>;
+  }
+  const groups = getGeneratedDeckGroups(deck);
+  const stats = deck.statistics || {};
+  const validation = deck.validation || {};
+  const bracket = validation.bracket || {};
+  const externalRating = getExternalDeckRating(validation.external_rating);
+  const metadata = validation.metadata || {};
+  const metadataFresh = isBuildMetadataFresh(metadata);
+  const highestLift = stats.highest_average_lift;
+  const exportText = typeof deck.export_text === "string" ? deck.export_text : "";
+  const primer = typeof deck.primer === "string" ? deck.primer : "";
+  async function copyText(text, label) {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+      setCopyStatus(`${label} copied.`);
+    } catch {
+      setCopyStatus(`Clipboard unavailable. Download the ${label.toLowerCase()} or select its text below.`);
+    }
+  }
+  return <details className="build-generated-deck" onToggle={(event) => setExpanded(event.currentTarget.open)}>
+    <summary><span>Generated {formatNumber(deck.card_count)}-card deck</span><span className="build-generated-deck__summary-note">Cards, tagged export & primer</span></summary>
+    {expanded ? <div className="build-generated-deck__content">
+      <h5>{deck.name || `Package ${packageNumber} deck`}</h5>
+      <p className="build-note">A suggested deck assembled from the sampled card pool for this package. Card names support hover and keyboard previews.</p>
+      <div className="build-generated-deck__metrics">
+        <span><strong>{formatNumber(deck.card_count)}</strong> cards including commanders</span>
+        {Number.isFinite(stats.land_count) ? <span><strong>{formatNumber(stats.land_count)}</strong> lands</span> : null}
+        {Number.isFinite(stats.swaps) ? <span><strong>{formatNumber(stats.swaps)}</strong> consensus swaps</span> : null}
+        {Array.isArray(stats.land_adjustments) && stats.land_adjustments.length ? <span><strong>{formatNumber(stats.land_adjustments.length)}</strong> land adjustments</span> : null}
+        {externalRating?.status === "verified" && Number.isFinite(externalRating.bracket)
+          ? <span><strong>{externalRating.bracket}</strong> external bracket</span>
+          : Number.isFinite(bracket.recommended) ? <span><strong>{bracket.recommended}</strong> estimated bracket</span> : null}
+      </div>
+      {!metadataFresh ? <p className="build-generated-deck__review-note">Current card-rule freshness has not been verified. Refresh card metadata before relying on current legality.</p> : null}
+      <div className="build-generated-deck__actions">
+        {exportText ? <><button type="button" onClick={() => copyText(exportText, "Tagged deck")}>Copy for Moxfield</button><button type="button" onClick={() => downloadDeckText(exportText, deck.name, "txt")}>Download deck .txt</button></> : null}
+        {primer ? <button type="button" onClick={() => copyText(primer, "Primer")}>Copy primer</button> : null}
+      </div>
+      {validation.external_url ? <p className="build-source-links"><SourceLink url={validation.external_url}>Check on EDHPowerLevel</SourceLink></p> : null}
+      <ExternalDeckRating rating={validation.external_rating} />
+      <p className="build-generated-deck__copy-status" role="status" aria-live="polite">{copyStatus}</p>
+      <p className="build-note">Paste the tagged card list into Moxfield’s text import. Commander markers and tags are included. Cards can carry several functional and package theme tags.</p>
+      <div className="build-generated-deck__card-list" tabIndex="0" role="region" aria-label={`Package ${packageNumber} generated deck cards`}>
+        {groups.map((group) => <section className="build-generated-deck__role" key={group.name}>
+          <h6>{group.name} <span>{formatNumber(group.count)}</span></h6>
+          <table><thead><tr><th scope="col">Card</th><th scope="col">Tags</th><th scope="col">Avg. inclusion</th><th scope="col">Avg. lift</th></tr></thead>
+            <tbody>{group.cards.map((card) => <tr key={card.name}>
+              <th scope="row"><span className="build-generated-deck__quantity">{card.quantity}</span> <DeckCardName name={card.name} /></th>
+              <td><div className="build-generated-deck__card-tags">{card.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></td>
+              <td>{formatBuildShare(card.average_inclusion)}</td><td>{formatBuildLift(card.average_lift)}</td>
+            </tr>)}</tbody>
+          </table>
+        </section>)}
+      </div>
+      {stats.metric_note ? <p className="build-note">{stats.metric_note}</p> : null}
+      <details className="build-evidence build-generated-deck__validation"><summary>Deck checks and selection</summary>
+        <p className="muted">{validation.valid === true ? "The generated deck passed the structure checks recorded at generation." : "Review the recorded checks before using this deck."}</p>
+        {validation.checks ? <ul className="build-generated-deck__checks">{Object.entries(validation.checks).map(([key, recorded]) => {
+          const passed = recorded === true && (key !== "metadata_fresh" || metadataFresh);
+          return <li key={key} data-passed={passed}><span>{passed ? "✓" : "—"}</span> {VALIDATION_LABELS[key] || key.replaceAll("_", " ")}</li>;
+        })}</ul> : null}
+        {metadata.checked_at || metadata.oldest_checked_at ? <p className="build-note">Rules-cache check recorded {checkedDate(metadata.checked_at)}. Oldest card record: {checkedDate(metadata.oldest_checked_at)}.{metadata.stale_cached ? ` ${formatNumber(metadata.stale_cached)} cached ${metadata.stale_cached === 1 ? "entry needed" : "entries needed"} a freshness check at generation.` : ""}</p> : null}
+        {(validation.errors || []).length ? <ul>{validation.errors.map((error, index) => <li key={index}>{error}</li>)}</ul> : null}
+        {Number.isFinite(bracket.recommended) ? <>
+          <p className="build-note"><strong>Estimated bracket {bracket.recommended}{Number.isFinite(bracket.target) ? ` · source target ${bracket.target}` : ""}.</strong> Based on {bracket.source === "membership_weighted_median" ? "brackets reported for the package’s sampled decks" : "the available sample"} and recorded card constraints.</p>
+          {Number.isFinite(bracket.game_changer_count) ? <p className="build-note">{formatNumber(bracket.game_changer_count)} Game Changers{Number.isFinite(bracket.game_changer_limit) ? ` · bracket limit ${bracket.game_changer_limit}` : ""}.</p> : null}
+          {(bracket.notes || []).map((note, index) => <p className="build-note" key={index}>{note}</p>)}
+        </> : bracket.reason ? <p className="build-note">{bracket.reason}</p> : null}
+        {stats.selection_reason ? <p className="build-note"><strong>Candidate selection:</strong> {stats.selection_reason}</p> : null}
+        {stats.method ? <p className="build-note">{stats.method}</p> : null}
+        {Number.isFinite(highestLift?.lift) ? <p className="build-note">Highest card average lift: <DeckCardName name={highestLift.name} /> · {formatBuildLift(highestLift.lift)}.</p>
+          : Number.isFinite(highestLift) ? <p className="build-note">Highest card average lift: {formatBuildLift(highestLift)}.</p> : null}
+        {stats.profile_names?.length ? <p className="build-note">Metric profiles: {stats.profile_names.join(", ")}.</p> : null}
+        {stats.anchor_source_url ? <p className="build-source-links"><SourceLink url={stats.anchor_source_url}>Sampled starting deck</SourceLink></p> : null}
+      </details>
+      {primer ? <details className="build-evidence build-generated-deck__primer" open><summary>Package primer</summary><div className="build-generated-deck__primer-text">{splitPrimerCardReferences(primer).map((part, index) => part.type === "card"
+        ? <span key={index}>[[<DeckCardName name={part.text} />]]</span> : <span key={index}>{part.text}</span>)}</div><button type="button" onClick={() => downloadDeckText(primer, `${deck.name || "generated-deck"}-primer`, "md")}>Download primer .md</button></details> : null}
+      {exportText ? <details className="build-evidence"><summary>Tagged import text</summary><textarea className="build-generated-deck__export" aria-label={`Package ${packageNumber} tagged import text`} readOnly value={exportText} spellCheck={false} /></details> : null}
+    </div> : null}
+  </details>;
 }
 
 function PackageCard({ pkg, index, decks }) {
@@ -39,6 +180,7 @@ function PackageCard({ pkg, index, decks }) {
           </span>
         )) : <span className="muted">No supported theme label</span>}
       </div>
+      <GeneratedPackageDeck key={pkg.generated_deck?.name || pkg.id} deck={pkg.generated_deck} packageNumber={index + 1} />
       <details className="build-evidence" open>
         <summary>Distinctive cards</summary>
         <div className="build-table-scroll" tabIndex="0" role="region" aria-label={`Package ${index + 1} card evidence`}>

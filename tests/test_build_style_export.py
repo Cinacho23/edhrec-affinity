@@ -48,7 +48,9 @@ def test_missing_samples_export_explicit_empty_coverage(tmp_path):
     )
     index = json.loads((tmp_path / "site/build-styles/index.json").read_text())
     assert result["commander_count"] == 0
-    assert index == {"schema_version": 1, "coverage": "sampled_commanders", "total_available": 0, "commanders": []}
+    assert index == {"schema_version": 1, "coverage": "sampled_commanders", "total_available": 0,
+                     "total_catalog": 1, "total_pending": 1, "total_fitted": 0,
+                     "total_insufficient": 0, "commanders": []}
 
 
 @pytest.mark.parametrize("packages", [1, 3, 7])
@@ -66,6 +68,22 @@ def test_export_counts_flexible_packages_and_filters_other_commanders(tmp_path, 
     assert index["commanders"][0]["file"] == "build-styles/commander-a.json"
     assert not (site / "build-styles/not-sampled.json").exists()
     assert not (site / "build-styles/removed-commander.json").exists()
+
+
+def test_empty_insufficient_report_is_counted_without_inventing_packages(tmp_path):
+    processed, site = tmp_path / "processed", tmp_path / "site"
+    insufficient = report(packages=0)
+    insufficient["profiles"]["profiles"] = []
+    insufficient["deck_analysis"].update(unique_decks=2, reason="Need at least 8 unique usable decks")
+    write_json(processed / "build-styles/commander-a.json", insufficient)
+    exporter.export_build_style_files(
+        pd.DataFrame({"commander_slug": ["commander-a", "pending", "pending"]}), processed, site,
+        seed_dir=tmp_path / "missing-seeds",
+    )
+    index = json.loads((site / "build-styles/index.json").read_text())
+    assert (index["total_catalog"], index["total_pending"], index["total_insufficient"], index["total_fitted"]) == (2, 1, 1, 0)
+    assert index["commanders"][0]["package_count"] == 0
+    assert not (site / "build-styles/pending.json").exists()
 
 
 def test_malformed_samples_do_not_prevent_other_exports(tmp_path):
@@ -146,6 +164,8 @@ def test_batch_prioritizes_unsampled_before_refresh_and_obeys_hard_limit(tmp_pat
     write_json(args.output_dir / "commander-a.json", report(date="2026-01-01T00:00:00+00:00"))
     assert [row["commander_slug"] for row in batch.select_commanders(args)] == ["commander-b"]
     write_json(args.output_dir / "commander-b.json", report("commander-b", date="2026-10-18T00:00:00+00:00"))
+    assert [row["commander_slug"] for row in batch.select_commanders(args)] == ["commander-c"]
+    write_json(args.output_dir / "commander-c.json", report("commander-c", date="2026-10-18T00:00:00+00:00"))
     assert [row["commander_slug"] for row in batch.select_commanders(args)] == ["commander-a"]
 
 
@@ -154,7 +174,7 @@ def test_batch_supports_explicit_small_commander_and_offline_dry_run(tmp_path):
     summary = batch.run_batch(args, runner=lambda _: pytest.fail("Dry run must not collect"))
     assert summary["selected"] == ["commander-c"]
     assert summary["max_preview_attempts"] == 20
-    assert summary["max_page_requests"] == 34
+    assert summary["max_page_requests"] == 39
     with pytest.raises(ValueError, match="not in the index"):
         batch.select_commanders(batch_args(tmp_path, "--commanders", "unknown"))
 
@@ -193,3 +213,132 @@ def test_access_block_stops_entire_batch_and_retains_previous_fit(tmp_path):
     assert summary["blocked"]
     assert calls == ["commander-a"]
     assert json.loads((args.output_dir / "commander-a.json").read_text()) == old
+    # The next scheduled job honors the shared cooldown without making requests.
+    subsequent = batch.run_batch(args, runner=lambda _: pytest.fail("Cooldown must stop collection"))
+    assert subsequent["blocked"]
+    assert subsequent["blocked_until"]
+
+
+def test_default_queue_includes_entire_catalog_without_deck_count_threshold(tmp_path):
+    args = batch_args(tmp_path, "--dry-run")
+    write_json(args.commander_index, [
+        {"commander_slug": f"commander-{i}", "total_decks": i} for i in range(100)
+    ])
+    summary = batch.run_batch(args, runner=lambda _: pytest.fail("Dry run must not collect"))
+    assert len(summary["selected"]) == summary["catalog_size"] == 100
+    assert "commander-0" in summary["selected"]
+    assert args.max_commanders == args.min_total_decks == 0
+
+
+def test_deadline_saves_finished_work_and_next_run_continues(tmp_path):
+    args = batch_args(tmp_path, "--max-runtime-seconds", "60")
+    ticks = iter([0, 0, 61])
+    summary = batch.run_batch(
+        args, runner=lambda parsed: report(parsed.commander, date="2026-10-19T00:00:00+00:00"),
+        monotonic=lambda: next(ticks),
+    )
+    assert summary["time_budget_reached"]
+    assert summary["completed"] == ["commander-a"]
+    assert summary["remaining_in_batch"] == 2
+    assert batch.read_checkpoint(args)["commanders"]["commander-a"]["status"] == "fitted"
+    assert batch.select_commanders(args)[0]["commander_slug"] == "commander-b"
+    assert json.loads((args.output_dir.parent / "build_style_batch.json").read_text()) == summary
+
+
+def test_insufficient_evidence_is_saved_and_not_repeated_each_hour(tmp_path):
+    args = batch_args(tmp_path, "--max-commanders", "1")
+
+    def runner(parsed):
+        value = report(parsed.commander, date="2026-10-19T00:00:00+00:00", packages=0)
+        value["profiles"]["profiles"] = []
+        return value
+
+    assert batch.run_batch(args, runner=runner)["completed"] == ["commander-a"]
+    assert batch.read_checkpoint(args)["commanders"]["commander-a"]["status"] == "insufficient_data"
+    assert batch.select_commanders(args)[0]["commander_slug"] == "commander-b"
+
+
+def test_failures_do_not_starve_other_commanders_and_retry_later(tmp_path):
+    args = batch_args(tmp_path)
+    calls = []
+
+    def runner(parsed):
+        calls.append(parsed.commander)
+        if parsed.commander == "commander-a":
+            raise ValueError("No usable base profile")
+        return report(parsed.commander, date="2026-10-19T00:00:00+00:00")
+
+    summary = batch.run_batch(args, runner=runner)
+    assert calls == ["commander-a", "commander-b", "commander-c"]
+    assert len(summary["failures"]) == 1
+    assert not batch.select_commanders(args)
+    state = batch.read_checkpoint(args)
+    state["commanders"]["commander-a"]["retry_after"] = "2000-01-01T00:00:00+00:00"
+    batch.atomic_json(batch.checkpoint_path(args), state)
+    assert batch.select_commanders(args)[0]["commander_slug"] == "commander-a"
+
+
+def test_interrupted_run_retains_checkpoint_and_resumes_raw_snapshot(tmp_path):
+    args = batch_args(tmp_path, "--max-commanders", "1")
+
+    def interrupt(_):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        batch.run_batch(args, runner=interrupt)
+    assert batch.read_checkpoint(args)["commanders"]["commander-a"]["status"] == "running"
+    args.snapshot_date = "2026-10-20"
+    caches = []
+
+    def resume(parsed):
+        caches.append(parsed.cache_dir)
+        return report(parsed.commander, date="2026-10-20T00:00:00+00:00")
+
+    batch.run_batch(args, runner=resume)
+    assert caches == [args.cache_root / "2026-10-19/commander-a"]
+
+
+def test_partial_deck_generation_retries_without_refetching_completed_raw_pages(tmp_path):
+    args = batch_args(tmp_path, "--max-commanders", "1")
+
+    def partial(parsed):
+        return {**report(parsed.commander, date="2026-10-19T00:00:00+00:00"),
+                "prototype_version": 3, "deck_generation": {"status": "partial"}}
+
+    batch.run_batch(args, runner=partial)
+    assert batch.select_commanders(args)[0]["commander_slug"] == "commander-b"
+    state = batch.read_checkpoint(args)
+    state["commanders"]["commander-a"]["retry_after"] = "2000-01-01T00:00:00+00:00"
+    batch.atomic_json(batch.checkpoint_path(args), state)
+    args.snapshot_date = "2026-10-20"
+    caches = []
+
+    def complete(parsed):
+        caches.append(parsed.cache_dir)
+        return {**report(parsed.commander, date="2026-10-20T00:00:00+00:00"),
+                "prototype_version": 3, "deck_generation": {"status": "complete"}}
+
+    batch.run_batch(args, runner=complete)
+    assert caches == [args.cache_root / "2026-10-19/commander-a"]
+
+
+def test_ci_cache_pruning_keeps_durable_reports_and_partial_retry_data(tmp_path):
+    args = batch_args(tmp_path, "--max-commanders", "1", "--prune-completed-cache")
+    raw = args.cache_root / args.snapshot_date / "commander-a"
+    write_json(raw / "base.json", {"sample": "cached"})
+    batch.run_batch(args, runner=lambda parsed: report(parsed.commander, date="2026-10-19T00:00:00+00:00"))
+    assert not raw.exists()
+    assert (args.output_dir / "commander-a.json").exists()
+    assert batch.read_checkpoint(args)["commanders"]["commander-a"]["status"] == "fitted"
+    args.refresh = True
+    write_json(raw / "base.json", {"sample": "cached"})
+    batch.run_batch(args, runner=lambda parsed: {
+        **report(parsed.commander, date="2026-10-19T00:00:00+00:00"), "deck_generation": {"status": "partial"}})
+    assert raw.exists()
+
+
+def test_old_package_only_reports_receive_native_deck_upgrade(tmp_path):
+    args = batch_args(tmp_path)
+    write_json(args.output_dir / "commander-a.json", {
+        **report(date="2026-10-19T00:00:00+00:00"), "prototype_version": 2})
+    assert batch.select_commanders(args)[0]["commander_slug"] == "commander-a"

@@ -2,6 +2,7 @@
 .build-discovery-coverage { margin-bottom: 1rem; }
 .build-discovery-coverage p { color: var(--muted); max-width: 880px; line-height: 1.6; }
 .build-discovery-coverage > strong { color: var(--accent); font-size: .9rem; }
+.build-discovery-coverage .build-discovery-coverage__pending { margin-bottom: 0; font-size: .85rem; }
 .build-discovery-search { margin-bottom: 1rem; }
 .build-discovery-search input { margin-top: .6rem; }
 .build-discovery-search p { margin-bottom: 0; font-size: .82rem; }

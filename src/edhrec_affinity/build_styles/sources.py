@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import time
@@ -122,10 +123,11 @@ def extract_preview_data(html: str) -> dict[str, Any]:
     return data
 
 
-def parse_profile(payload: dict, slug: str, name: str) -> dict:
+def parse_profile(payload: dict, slug: str, name: str, *, allow_empty: bool = False) -> dict:
     """Keep observed, mature nonland card rates; omitted cards remain unknown."""
     count = extract_page_deck_count(payload)
     cards: dict[str, dict] = {}
+    ranking_cards: dict[str, dict] = {}
     ignored = Counter()
     allowed = {
         "topcards", "highliftcards", "highsynergycards", "creatures", "instants",
@@ -142,8 +144,6 @@ def parse_profile(payload: dict, slug: str, name: str) -> dict:
     }
     for group in cardlists:
         category = group.get("tag")
-        if category not in allowed:
-            continue
         for card in group.get("cardviews", []):
             numerator = card.get("num_decks")
             denominator = card.get("potential_decks")
@@ -153,22 +153,32 @@ def parse_profile(payload: dict, slug: str, name: str) -> dict:
             if not 0 <= numerator <= denominator or denominator <= 0 or denominator > count:
                 ignored["invalid_counts"] += 1
                 continue
+            key = card_key(card["name"])
+            lift = card.get("lift")
+            measurement = {
+                "name": card["name"], "rate": numerator / denominator,
+                "count": int(numerator), "denominator": int(denominator),
+                "lift": lift if isinstance(lift, (int, float)) and math.isfinite(lift) and lift >= 0 else None,
+            }
+            # Deck rankings use the page's actual observations, including lands
+            # and recent cards. The mature-card restriction below remains only
+            # for statistical profile comparisons.
+            ranking_cards[key] = measurement
+            if category not in allowed:
+                continue
             # Recent cards can have a smaller eligible-deck window. Do not compare
             # that rate against an older card's full-history denominator.
             if denominator < 0.9 * count:
                 ignored["short_exposure_window"] += 1
                 continue
-            key = card_key(card["name"])
             if key in land_keys:
                 continue
-            cards[key] = {
-                "name": card["name"], "rate": numerator / denominator,
-                "count": int(numerator), "denominator": int(denominator),
-            }
-    if not cards:
+            cards[key] = measurement
+    if not cards and not allow_empty:
         raise ValueError(f"{slug}: no usable nonland cards; check the page schema")
     return {"tag_slug": slug, "tag_name": name, "deck_count": count,
-            "cards": cards, "land_keys": sorted(land_keys), "ignored": dict(ignored)}
+            "cards": cards, "ranking_cards": ranking_cards,
+            "land_keys": sorted(land_keys), "ignored": dict(ignored)}
 
 
 def _quantity(value: Any) -> int:

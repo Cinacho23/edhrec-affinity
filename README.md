@@ -15,7 +15,7 @@ This project is not trying to reproduce EDHREC. Its purpose is to add an origina
 - Commander search
 - Cumulative tag filters across commander list pages: every selected tag must have z > 1, with matching commanders sorted by their summed z-scores
 - Commander detail pages with a minimum of 5 tagged decks per displayed tag
-- Build discovery on sampled commander pages: automatic 1–N card packages, supported alternative counts, overlapping theme suggestions, tag-profile evidence and source decklists
+- Build discovery with a resumable collection queue for every indexed commander: automatic 1–N card packages when supported, overlapping theme suggestions, tag-profile evidence and source decklists
 - Global commander-tag leaderboard
 - Tag explorer
 - Set-based commander brackets
@@ -53,6 +53,15 @@ GitHub Actions scheduled workflow
 
 The [build-discovery documentation](docs/build_style_prototype.md) explains the
 website feature, automatic package-count selection, local analysis and static
-data generation. Real seed samples cover Ghave, Hapatra and Jasmine; weekly
-bounded batches extend coverage. Source deck tags are optional. Public EDHREC
-previews supply cardlists without direct requests to Moxfield or Archidekt.
+data generation. Real seed samples cover Ghave, Hapatra and Jasmine. An hourly
+workflow continues through the full commander catalog, preserving completed
+reports and collection checkpoints between runs. There is no commander-count
+cap or minimum popularity gate; a time budget keeps each run bounded. Low-data
+commanders can return profiles or an insufficient-data result instead of card
+packages. Source deck tags are optional. Public EDHREC previews supply cardlists
+without direct requests to Moxfield or Archidekt.
+
+Every supported package can generate a native 100-card deck using learned card
+preferences and the sampled card pool, with functional tags, a primer, Moxfield
+text export and per-card inclusion/lift averages. Bracket estimates and recorded
+external ratings are shown separately from card legality checks.

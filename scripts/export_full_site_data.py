@@ -1259,8 +1259,9 @@ def read_build_style_reports(directory: Path) -> dict[str, dict[str, Any]]:
             if any(not isinstance(package, dict) or "id" not in package or not isinstance(package.get("top_cards"), list)
                    for package in analysis["packages"]):
                 raise ValueError("invalid package entry")
-            if not report["profiles"]["profiles"] and not analysis["packages"]:
-                raise ValueError("report contains no usable analysis")
+            # An attempted commander can legitimately have too little data for
+            # either comparison. Preserve that outcome so catalog coverage does
+            # not confuse an insufficient sample with an unprocessed commander.
             reports[slug] = report
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
             print(f"Skipping invalid build-style report {path}: {error}")
@@ -1306,8 +1307,13 @@ def export_build_style_files(
             "package_count": len(analysis["packages"]),
             "unique_decks": analysis["unique_decks"], "status": analysis["status"],
         })
-    index = {"schema_version": 1, "coverage": "sampled_commanders", "total_available": len(entries),
-             "commanders": entries}
+    index = {
+        "schema_version": 1, "coverage": "sampled_commanders", "total_available": len(entries),
+        "total_catalog": len(known_slugs), "total_pending": len(known_slugs) - len(entries),
+        "total_fitted": sum(entry["status"] == "fitted" for entry in entries),
+        "total_insufficient": sum(entry["status"] == "insufficient_data" for entry in entries),
+        "commanders": entries,
+    }
     write_json(output_dir / "build-styles/index.json", index)
     return {"index_file": "build-styles/index.json", "file_pattern": "build-styles/<commander_slug>.json",
             "commander_count": len(entries), "coverage": "sampled_commanders"}

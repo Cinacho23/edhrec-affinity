@@ -25,7 +25,9 @@ def run(args: argparse.Namespace) -> dict:
         card = payload["container"]["json_dict"]["card"]
         if card.get("url") and card["url"] != f"/commanders/{slug}":
             raise ValueError("The cache contains a different commander; select a separate cache directory")
-        base = parse_profile(payload, "all", "All builds")
+        # A valid commander page can contain no mature card measurements. Deck
+        # analysis can still proceed, or record an honest insufficient sample.
+        base = parse_profile(payload, "all", "All builds", allow_empty=True)
         base["commander_names"] = card.get("names") or [card["name"]]
         tags = sorted((tag for tag in payload["panels"]["taglinks"]
                        if tag["count"] >= args.min_tag_decks), key=lambda tag: (-tag["count"], tag["slug"]))
@@ -59,7 +61,9 @@ def run(args: argparse.Namespace) -> dict:
                     attempted += 1
                     try:
                         data = cache.get(f"previews/{identifier}.html", f"https://edhrec.com/deckpreview/{identifier}", html=True)
-                        decks.append(parse_preview(data, identifier))
+                        deck = parse_preview(data, identifier)
+                        deck["source_bracket"] = row.get("bracket")
+                        decks.append(deck)
                     except (FileNotFoundError, ValueError, KeyError, TypeError, httpx.HTTPError, SourceBlocked) as error:
                         failures.append({"deck": identifier, "error": str(error)})
                         if cache.blocked:
@@ -74,22 +78,84 @@ def run(args: argparse.Namespace) -> dict:
             imported_count = len(imported)
             decks.extend(imported)
             failures.extend(import_failures)
+        analysis = analyze_decks(decks, base, profiles, components=args.components,
+                                 max_components=args.max_components,
+                                 seed=args.seed, min_cards=args.min_deck_cards,
+                                 min_support=args.min_card_support,
+                                 membership_threshold=args.membership)
+        deck_generation = {"version": 1, "status": "insufficient_data", "metadata": {}, "ranking_pages": []}
+        if analysis["status"] == "fitted":
+            from .card_metadata import load_card_metadata
+            from .deckbuilding import generate_package_decks
+            from .external_validation import attach_external_validation
+
+            # Bracket pages contribute only to deck ranking, never NMF fitting or
+            # theme discovery. The unfiltered commander page is not a ranking page.
+            bracket_paths = {1: "exhibition", 2: "core", 3: "upgraded", 4: "optimized", 5: "cedh"}
+            brackets = {deck.get("source_bracket") for deck in decks
+                        if type(deck.get("source_bracket")) is int and deck["source_bracket"] in bracket_paths}
+            brackets.add(3)  # Explicit default guidance for samples with no reported bracket.
+            ranking_profiles = list(profiles)
+            for bracket in sorted(brackets):
+                path = bracket_paths[bracket]
+                try:
+                    page = cache.get(f"bracket-{bracket}.json", f"{url}/{path}.json")
+                    profile = parse_profile(page, f"bracket-{bracket}", f"Bracket {bracket}", allow_empty=True)
+                    profile.update(bracket=bracket, source_url=f"https://edhrec.com/commanders/{slug}/{path}")
+                    ranking_profiles.append(profile)
+                except (FileNotFoundError, ValueError, KeyError, httpx.HTTPError, SourceBlocked) as error:
+                    failures.append({"ranking_bracket": bracket, "error": str(error)})
+                    if cache.blocked:
+                        break
+            names = [*base["commander_names"], *[card["name"] for deck in decks for card in deck["cards"]]]
+            metadata, metadata_summary = load_card_metadata(names, args.card_metadata_cache, fetch=args.fetch)
+            generate_package_decks(analysis, decks, base, ranking_profiles, metadata, prefer_playability=True)
+            packages = [*analysis["packages"], *[pkg for model in analysis.get("alternative_models", []) for pkg in model["packages"]]]
+            processed_decks = set()
+            for package in packages:
+                generated = package.get("generated_deck", {})
+                if generated.get("status") != "generated" or id(generated) in processed_decks:
+                    continue
+                processed_decks.add(id(generated))
+                validation = generated["validation"]
+                validation["metadata"] = {key: metadata_summary.get(key) for key in
+                                          ("checked_at", "oldest_checked_at", "stale_cached", "cache_max_age_days")}
+                validation["checks"]["metadata_fresh"] = not bool(metadata_summary.get("stale_cached"))
+                if metadata_summary.get("stale_cached"):
+                    validation["valid"] = False
+                    validation.setdefault("errors", []).append("Some card rules use an older cache; refresh metadata before relying on current legality.")
+                rating = attach_external_validation(generated)
+                if rating.get("status") in {"verified", "stale"}:
+                    generated["primer"] += (
+                        f"\n\nExternal observation\nEDHPowerLevel measured {rating['playability_pct']:.1f}% playability "
+                        f"and bracket {rating['bracket']} on {rating['checked_at']}. "
+                        "This observation belongs to this exact card list; it is separate from the source-based bracket estimate.\n"
+                    )
+            generation_status = "complete"
+            if any(pkg.get("generated_deck", {}).get("status") != "generated" for pkg in packages):
+                generation_status = "partial" if metadata_summary.get("missing") or metadata_summary.get("stale_cached") else "unavailable"
+            elif metadata_summary.get("stale_cached"):
+                generation_status = "partial"
+            deck_generation.update(
+                status=generation_status,
+                metadata=metadata_summary,
+                ranking_pages=[{"tag_slug": p["tag_slug"], "tag_name": p["tag_name"],
+                                "source_url": p.get("source_url", f"https://edhrec.com/commanders/{slug}/{p['tag_slug']}")}
+                               for p in ranking_profiles],
+            )
         report = {
-            "schema_version": 1, "prototype_version": 2,
+            "schema_version": 1, "prototype_version": 3,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "commander_name": card["name"], "commander_slug": slug,
             "total_edhrec_decks": base["deck_count"],
-            "collection": {"network_enabled": args.fetch, "blocked": cache.blocked,
+            "collection": {"network_enabled": args.fetch,
+                           "blocked": cache.blocked or bool(deck_generation.get("metadata", {}).get("blocked")),
                            "sampling": "Seeded simple random sample of unique EDHREC deck-index IDs",
                            "seed": args.seed, "frame_decks": frame_count, "previews_attempted": attempted,
                            "previews_loaded": len(decks) - imported_count, "local_imports": imported_count,
                            "failures": failures, "provenance": cache.provenance},
             "profiles": compare_profiles(base, profiles, threshold=args.similarity),
-            "deck_analysis": analyze_decks(decks, base, profiles, components=args.components,
-                                          max_components=args.max_components,
-                                          seed=args.seed, min_cards=args.min_deck_cards,
-                                          min_support=args.min_card_support,
-                                          membership_threshold=args.membership),
+            "deck_analysis": analysis, "deck_generation": deck_generation,
             "limits": [
                 "Tag profile similarity does not measure shared decks or imply compatible strategies.",
                 "EDHREC card lists are truncated: omitted cards are unknown, never observed zeros.",
@@ -101,6 +167,9 @@ def run(args: argparse.Namespace) -> dict:
                 "Sample composition, budget, bracket and deck age may explain packages alongside strategy.",
                 "Imported text may contain unrecognized nonbasic lands unless EDHREC lists them as lands.",
                 "Results describe the successfully loaded sample, not every deck on EDHREC or its source sites.",
+                "Generated decks use NMF-weighted sample consensus and rule-based structural constraints; functional buckets are Oracle-text heuristics, not learned labels.",
+                "Deck ranking averages only selected theme/bracket observations, with missing cards contributing zero as requested. Unlisted cards are still unknown observations in the statistical profile model.",
+                "Generated deck bracket guidance is an estimate; combo speed and external EDHPowerLevel playability are not certified by structural legality checks.",
             ],
         }
     finally:
@@ -132,6 +201,8 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--commander", required=True, help="EDHREC commander slug")
     cli.add_argument("--fetch", action="store_true", help="Collect missing public EDHREC pages; default is cache only")
     cli.add_argument("--cache-dir", type=Path)
+    cli.add_argument("--card-metadata-cache", type=Path, default=Path("data/raw/build-style-card-metadata.json"),
+                     help="Shared Scryfall metadata cache for generated package decks")
     cli.add_argument("--output-dir", type=Path, default=Path("data/prototypes/build-styles"))
     cli.add_argument("--no-html", action="store_true", help="Write JSON only for static-site data generation")
     cli.add_argument("--deck-import", type=Path, help="Folder of local .txt or .json exports; source tags not required")
