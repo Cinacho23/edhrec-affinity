@@ -20,9 +20,13 @@ export function safeJsonFilename(value) {
     .replace(/^-|-$/g, "") || "unknown";
 }
 
-async function fetchJson(relativePath) {
+async function fetchJson(relativePath, { optional = false, signal } = {}) {
   const url = joinDataPath(relativePath);
-  const response = await fetch(url);
+  const response = await fetch(url, signal ? { signal } : undefined);
+
+  if (optional && response.status === 404) {
+    return null;
+  }
 
   if (!response.ok) {
     throw new Error(`Failed to load ${url}. HTTP ${response.status}`);
@@ -32,6 +36,8 @@ async function fetchJson(relativePath) {
   const cleanText = text.trimStart();
 
   if (cleanText.startsWith("<")) {
+    // Static hosts commonly serve the app shell for an absent optional file.
+    if (optional) return null;
     throw new Error(
       `Expected JSON at ${url}, but received HTML. Local data is probably missing. Run npm run data:download from the frontend folder.`
     );
@@ -73,6 +79,37 @@ export async function loadCommanderIndex() {
 export async function loadCommanderDetail(commanderSlug) {
   const filename = safeJsonFilename(commanderSlug);
   return fetchJson(`commanders/${filename}.json`);
+}
+
+export async function loadCommanderBuildStyles(commanderSlug, { signal } = {}) {
+  const filename = safeJsonFilename(commanderSlug);
+  const report = await fetchJson(`build-styles/${filename}.json`, { optional: true, signal });
+  if (report === null) return null;
+  if (
+    typeof report !== "object" ||
+    safeJsonFilename(report.commander_slug) !== filename ||
+    !Array.isArray(report.profiles?.profiles) ||
+    !report.deck_analysis ||
+    !Array.isArray(report.deck_analysis.packages)
+  ) {
+    throw new Error("The build discovery report is invalid or belongs to another commander.");
+  }
+  return report;
+}
+
+export async function loadBuildStyleIndex({ signal } = {}) {
+  const index = await fetchJson("build-styles/index.json", { optional: true, signal });
+  if (index === null) {
+    return { schema_version: 1, coverage: "sampled_commanders", total_available: 0, commanders: [] };
+  }
+  if (
+    index?.schema_version !== 1 ||
+    !Array.isArray(index.commanders) ||
+    index.commanders.some((commander) => !commander || typeof commander.commander_slug !== "string" || !commander.commander_slug.trim())
+  ) {
+    throw new Error("The build discovery coverage index is invalid.");
+  }
+  return index;
 }
 
 export async function loadTagIndex() {

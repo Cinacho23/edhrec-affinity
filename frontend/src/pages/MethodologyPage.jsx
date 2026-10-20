@@ -316,6 +316,38 @@ z = (adjusted affinity − μ) / σ`}</code></pre>
           alongside decklists and gameplay context.
         </p>
       </section>
+
+      <section className="method-section">
+        <h2>12. Discovering different builds</h2>
+
+        <p>
+          Commander pages with collected build data offer two additional views.
+          Tag profiles compare cards used more often in a tagged build than in
+          that commander’s overall decks. Similar profiles suggest related card
+          choices; they do not establish that the same decks carry those tags.
+        </p>
+        <p>
+          Individual deck packages are learned from sampled cardlists without
+          using the decks’ tags. A deck can combine several packages, and a
+          package can have one, many, or no suggested theme labels. These labels
+          come from similarity to EDHREC tag profiles after fitting.
+        </p>
+        <p>
+          Auto compares package counts starting at one, within a limit supported
+          by the sample. It favors a simpler count with consistent card packages,
+          enough supporting decks, and good reconstruction of held-out decklists.
+          You can inspect supported alternative counts using the package selector.
+          This is an exploratory heuristic, rather than proof of a commander’s
+          true number of strategies.
+        </p>
+        <p>
+          The displayed mixture weights, theme suggestions and captured card
+          signal are descriptive model scores. They are not probabilities,
+          confidence levels, or estimates of a build’s share of all decks.
+          Coverage and collection dates are shown for each commander; commanders
+          without a collected sample keep their existing tag table.
+        </p>
+      </section>
     </div>
   );
 }

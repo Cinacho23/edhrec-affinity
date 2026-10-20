@@ -1,0 +1,32 @@
+name: Restore commander build-style samples
+description: Restore the newest cumulative successful build-style artifact when available
+inputs:
+  destination:
+    description: Directory receiving per-commander JSON reports
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        BUILD_STYLE_DESTINATION: ${{ inputs.destination }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${BUILD_STYLE_DESTINATION}"
+        BUILD_STYLE_DEFAULT_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+        while IFS=$'\t' read -r run_id artifact_name; do
+          IFS=$'\t' read -r conclusion source_branch < <(
+            gh run view "${run_id}" --json conclusion,headBranch --jq '[.conclusion, .headBranch] | @tsv'
+          )
+          if [[ "${conclusion}" != "success" || "${source_branch}" != "${BUILD_STYLE_DEFAULT_BRANCH}" ]]; then
+            continue
+          fi
+          gh run download "${run_id}" --name "${artifact_name}" --dir "${BUILD_STYLE_DESTINATION}"
+          echo "Restored ${artifact_name} from run ${run_id}."
+          exit 0
+        done < <(
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts | sort_by(.created_at) | reverse | .[] | select(.expired == false) | select(.name | startswith("build-styles-")) | [.workflow_run.id, .name] | @tsv'
+        )
+        echo "No build-style artifact yet; tracked seed samples remain available."
