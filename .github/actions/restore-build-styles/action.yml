@@ -1,8 +1,8 @@
 name: Restore commander build-style samples
-description: Restore the newest cumulative successful build-style artifact when available
+description: Restore the newest cumulative successful build-style artifact, including collection checkpoints
 inputs:
   destination:
-    description: Directory receiving per-commander JSON reports
+    description: Directory receiving per-commander reports and the _collection checkpoint directory
     required: true
 runs:
   using: composite

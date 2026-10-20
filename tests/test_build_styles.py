@@ -58,8 +58,8 @@ def test_tag_can_belong_to_two_groups_without_merging_unrelated_endpoints():
 
 def test_profile_uses_actual_card_denominators_and_excludes_lands_and_new_card_windows():
     cards = [
-        {"name": "Engine", "num_decks": 45, "potential_decks": 90},
-        {"name": "Recent", "num_decks": 20, "potential_decks": 20},
+        {"name": "Engine", "num_decks": 45, "potential_decks": 90, "lift": 3.9},
+        {"name": "Recent", "num_decks": 20, "potential_decks": 20, "lift": 4.2},
         {"name": "Land", "num_decks": 70, "potential_decks": 100},
         {"name": "Invalid", "num_decks": 101, "potential_decks": 100},
     ]
@@ -72,6 +72,9 @@ def test_profile_uses_actual_card_denominators_and_excludes_lands_and_new_card_w
     assert parsed["cards"]["engine"]["rate"] == .5
     assert parsed["ignored"]["short_exposure_window"] == 1
     assert parsed["ignored"]["invalid_counts"] == 1
+    assert parsed["ranking_cards"]["recent"]["rate"] == 1
+    assert parsed["ranking_cards"]["recent"]["lift"] == 4.2
+    assert parsed["cards"]["engine"]["lift"] == 3.9
 
 
 def test_public_preview_reads_cards_without_requiring_tags():
@@ -201,7 +204,8 @@ def test_report_embedding_does_not_allow_source_text_to_end_script(tmp_path):
     assert "<script>alert(1)" not in text
 
 
-def test_offline_cli_writes_an_honest_report_with_insufficient_deck_data(tmp_path):
+@pytest.mark.parametrize("empty_page", [False, True])
+def test_offline_cli_writes_an_honest_report_with_insufficient_deck_data(tmp_path, empty_page):
     cache = tmp_path / "cache"
     cache.mkdir()
     payload = {"container": {"json_dict": {
@@ -210,6 +214,9 @@ def test_offline_cli_writes_an_honest_report_with_insufficient_deck_data(tmp_pat
             {"name": "Engine", "num_decks": 40, "potential_decks": 100},
         ]}],
     }}, "panels": {"taglinks": []}}
+    if empty_page:
+        payload["container"]["json_dict"]["card"]["num_decks"] = 0
+        payload["container"]["json_dict"]["cardlists"] = []
     (cache / "base.json").write_text(json.dumps(payload))
     output = tmp_path / "report"
     args = parser().parse_args(["--commander", "ghave", "--sample-decks", "0",
