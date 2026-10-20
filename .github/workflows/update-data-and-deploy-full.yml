@@ -13,7 +13,9 @@ permissions:
   actions: read
 
 concurrency:
-  group: update-full-sharded-data-and-pages
+  # Share the collector lock with manual cohorts so their cumulative artifacts
+  # cannot diverge and lose commanders collected by the other workflow.
+  group: commander-build-style-samples
   cancel-in-progress: false
 
 env:
@@ -50,7 +52,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m pip install -e ".[dev,prototype]"
 
       - name: Run Python tests
         shell: bash
@@ -181,6 +183,35 @@ jobs:
             --processed-dir "${PROCESSED_DIR}" \
             --merge-website-files \
             --website-files affinity_rows_with_trends.json
+
+      - name: Restore accumulated build-style samples
+        uses: ./.github/actions/restore-build-styles
+        with:
+          destination: ${{ env.PROCESSED_DIR }}/build-styles
+
+      - name: Extend build-style coverage with a bounded cohort
+        id: build_styles
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 scripts/build_site_build_styles.py \
+            --fetch \
+            --commander-index "${PROCESSED_DIR}/affinity_rows_with_trends.json" \
+            --output-dir "${PROCESSED_DIR}/build-styles" \
+            --snapshot-date "${SNAPSHOT_DATE}" \
+            --max-commanders 5 --sample-decks 60 --max-components 8
+
+      - name: Report build-style collection failure
+        if: steps.build_styles.outcome == 'failure'
+        run: echo "::warning::Build-style collection stopped or failed; retained previous samples. See build_style_batch.json in the processed-data artifact."
+
+      - name: Upload cumulative build-style samples
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-styles-${{ env.SNAPSHOT_DATE }}-${{ github.run_id }}
+          path: ${{ env.PROCESSED_DIR }}/build-styles/*.json
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Export full sharded frontend data
         shell: bash

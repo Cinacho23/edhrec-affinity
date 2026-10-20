@@ -4,6 +4,7 @@ import Layout from "./components/Layout";
 import HomePage from "./pages/HomePage";
 import CommanderSearchPage from "./pages/CommanderSearchPage";
 import CommanderDetailPage from "./pages/CommanderDetailPage";
+import BuildDiscoveryPage from "./pages/BuildDiscoveryPage";
 import GlobalLeaderboardPage from "./pages/GlobalLeaderboardPage";
 import TagExplorerPage from "./pages/TagExplorerPage";
 import SetExplorerPage from "./pages/SetExplorerPage";
@@ -22,6 +23,7 @@ export default function App() {
         <Route path="/" element={<HomePage />} />
         <Route path="/commanders" element={<CommanderSearchPage />} />
         <Route path="/commanders/:commanderSlug" element={<CommanderDetailPage />} />
+        <Route path="/build-discovery" element={<BuildDiscoveryPage />} />
         <Route path="/leaderboard" element={<GlobalLeaderboardPage />} />
         <Route path="/tags" element={<TagExplorerPage />} />
         <Route path="/sets" element={<SetExplorerPage />} />

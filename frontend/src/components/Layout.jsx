@@ -25,6 +25,7 @@ export default function Layout() {
               Home
             </NavLink>
             <NavLink to="/commanders">Commanders</NavLink>
+            <NavLink to="/build-discovery">Build Discovery</NavLink>
             <NavLink to="/leaderboard">Leaderboard</NavLink>
             <NavLink to="/tags">Tag Explorer</NavLink>
             <NavLink to="/sets">Sets</NavLink>

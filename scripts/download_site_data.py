@@ -108,6 +108,20 @@ def build_download_list(base_url: str, output_dir: Path) -> list[str]:
         if report_file:
             paths.add(report_file)
 
+    # Older deployments do not have build samples. Only request the index when
+    # advertised, and follow its actual files rather than every commander slug.
+    build_style_index_file = manifest.get("build_style_export", {}).get("index_file")
+    if build_style_index_file:
+        build_style_index = fetch_json(base_url, build_style_index_file)
+        write_json(output_dir, build_style_index_file, build_style_index)
+        if isinstance(build_style_index, dict):
+            for entry in build_style_index.get("commanders", []):
+                if isinstance(entry, dict) and entry.get("commander_slug"):
+                    filename = entry.get("file") or f"build-styles/{safe_json_filename(entry['commander_slug'])}.json"
+                    if not re.fullmatch(r"build-styles/[a-z0-9_-]+\.json", filename):
+                        raise RuntimeError("Build-style index contains an invalid report path")
+                    paths.add(filename)
+
     leaderboard_index = fetch_json(base_url, "leaderboard/index.json")
     write_json(output_dir, "leaderboard/index.json", leaderboard_index)
 

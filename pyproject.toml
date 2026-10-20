@@ -47,6 +47,9 @@ dependencies = [
 dev = [
     "pytest",
 ]
+prototype = [
+    "scikit-learn>=1.4",
+]
 
 # Tell setuptools to look for packages inside the src/ folder.
 #

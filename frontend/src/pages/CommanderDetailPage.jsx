@@ -4,6 +4,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import CommanderImageGallery from "../components/CommanderImageGallery";
 import CommanderName from "../components/CommanderName";
 import CommanderColors from "../components/CommanderColors";
+import CommanderBuildStyles from "../components/CommanderBuildStyles";
 import SimpleTable from "../components/SimpleTable";
 import { loadCommanderDetail } from "../lib/api";
 import {
@@ -31,20 +32,23 @@ export default function CommanderDetailPage() {
   const [rows, setRows] = useState([]);
   const [minBuildRarity, setMinBuildRarity] = useState("");
   const [sort, setSort] = useState({ key: "z", direction: "desc" });
-  const [state, setState] = useState({ loading: true, error: null });
+  const [state, setState] = useState({ loading: true, error: null, slug: null });
 
   useEffect(() => {
+    let active = true;
     async function loadData() {
       try {
         const data = await loadCommanderDetail(commanderSlug);
+        if (!active) return;
         setRows(Array.isArray(data) ? data : []);
-        setState({ loading: false, error: null });
+        setState({ loading: false, error: null, slug: commanderSlug });
       } catch (error) {
-        setState({ loading: false, error: error.message });
+        if (active) setState({ loading: false, error: error.message, slug: commanderSlug });
       }
     }
 
     loadData();
+    return () => { active = false; };
   }, [commanderSlug]);
 
   const commander = rows[0];
@@ -129,7 +133,7 @@ export default function CommanderDetailPage() {
     },
   ];
 
-  if (state.loading) {
+  if (state.loading || state.slug !== commanderSlug) {
     return <p className="muted">Loading commander detail…</p>;
   }
 
@@ -207,6 +211,8 @@ export default function CommanderDetailPage() {
           ) : null}
         </div>
       </section>
+
+      <CommanderBuildStyles key={commanderSlug} commanderSlug={commanderSlug} />
 
       <section className="data-table-section">
         <div className="table-toolbar">

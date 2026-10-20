@@ -23,3 +23,6 @@ data/raw/
 data/raw/
 data/processed/
 frontend/public/data/latest/
+
+# Local build-style experiments, reports and imported deck exports.
+data/prototypes/

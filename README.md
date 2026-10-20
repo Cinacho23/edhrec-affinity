@@ -15,6 +15,7 @@ This project is not trying to reproduce EDHREC. Its purpose is to add an origina
 - Commander search
 - Cumulative tag filters across commander list pages: every selected tag must have z > 1, with matching commanders sorted by their summed z-scores
 - Commander detail pages with a minimum of 5 tagged decks per displayed tag
+- Build discovery on sampled commander pages: automatic 1–N card packages, supported alternative counts, overlapping theme suggestions, tag-profile evidence and source decklists
 - Global commander-tag leaderboard
 - Tag explorer
 - Set-based commander brackets
@@ -46,3 +47,12 @@ GitHub Actions scheduled workflow
   -> copy latest JSON files into frontend
   -> build React/Vite site
   -> deploy static site to GitHub Pages
+```
+
+## Build discovery
+
+The [build-discovery documentation](docs/build_style_prototype.md) explains the
+website feature, automatic package-count selection, local analysis and static
+data generation. Real seed samples cover Ghave, Hapatra and Jasmine; weekly
+bounded batches extend coverage. Source deck tags are optional. Public EDHREC
+previews supply cardlists without direct requests to Moxfield or Archidekt.

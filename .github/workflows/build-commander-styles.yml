@@ -1,0 +1,118 @@
+name: Update commander build styles
+
+on:
+  workflow_dispatch:
+    inputs:
+      commanders:
+        description: "Optional space-separated indexed commander slugs; blank continues the unsampled cohort"
+        type: string
+        default: ""
+      max_commanders:
+        description: "Hard batch limit (1–20); collection is sequential and cached"
+        type: number
+        default: 5
+      sample_decks:
+        description: "Maximum deck previews per commander (0–200)"
+        type: number
+        default: 60
+      max_components:
+        description: "Automatic package-count search ceiling (1–32)"
+        type: number
+        default: 8
+      refresh:
+        description: "Resample selected commanders that already have fitted reports"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: commander-build-style-samples
+  cancel-in-progress: false
+
+env:
+  STYLES_DIR: data/build-style-artifact/build-styles
+
+jobs:
+  build:
+    name: Collect bounded samples and learn build packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install analysis dependencies
+        run: python -m pip install -e ".[prototype]"
+
+      - name: Compute sample date
+        shell: bash
+        run: echo "SAMPLE_DATE=$(TZ=America/Toronto date +%F)" >> "$GITHUB_ENV"
+
+      - name: Restore same-day raw request cache
+        uses: actions/cache@v4
+        with:
+          path: data/raw/build-styles/${{ env.SAMPLE_DATE }}
+          key: build-style-raw-${{ env.SAMPLE_DATE }}-${{ github.run_id }}
+          restore-keys: build-style-raw-${{ env.SAMPLE_DATE }}-
+
+      - name: Restore accumulated build-style samples
+        uses: ./.github/actions/restore-build-styles
+        with:
+          destination: ${{ env.STYLES_DIR }}
+
+      - name: Get current commander index
+        shell: bash
+        run: |
+          mkdir -p data/build-style-artifact
+          curl --fail --silent --show-error --retry 2 \
+            https://cinacho23.github.io/edhrec-affinity/data/latest/commanders/index.json \
+            --output data/build-style-artifact/commander_index.json
+
+      - name: Generate a bounded cohort
+        shell: bash
+        env:
+          COMMANDER_SLUGS: ${{ inputs.commanders }}
+          MAX_COMMANDERS: ${{ inputs.max_commanders }}
+          SAMPLE_DECKS: ${{ inputs.sample_decks }}
+          MAX_COMPONENTS: ${{ inputs.max_components }}
+          REFRESH_REPORTS: ${{ inputs.refresh }}
+        run: |
+          set -euo pipefail
+          args=(--fetch --commander-index data/build-style-artifact/commander_index.json
+                --output-dir "${STYLES_DIR}" --snapshot-date "${SAMPLE_DATE}"
+                --max-commanders "${MAX_COMMANDERS}" --sample-decks "${SAMPLE_DECKS}"
+                --max-components "${MAX_COMPONENTS}")
+          if [[ -n "${COMMANDER_SLUGS}" ]]; then
+            read -r -a commander_args <<< "${COMMANDER_SLUGS}"
+            args+=(--commanders "${commander_args[@]}")
+          fi
+          if [[ "${REFRESH_REPORTS}" == "true" ]]; then
+            args+=(--refresh)
+          fi
+          python scripts/build_site_build_styles.py "${args[@]}"
+
+      - name: Upload cumulative build-style samples
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-styles-${{ env.SAMPLE_DATE }}-${{ github.run_id }}
+          path: ${{ env.STYLES_DIR }}/*.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Upload collection summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-style-summary-${{ github.run_id }}
+          path: data/build-style-artifact/build_style_batch.json
+          if-no-files-found: ignore
+          retention-days: 30
