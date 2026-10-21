@@ -45,6 +45,7 @@ export default function BuildDiscoveryPage() {
     <div className="panel build-discovery-coverage">
       <h2>Available commander reports</h2>
       <p>Each report covers sampled decks for one commander. The package count adapts to the evidence, and a package can suggest one or several themes. These reports describe a sample rather than every EDHREC deck.</p>
+      <p>The scheduled collector gradually adds reports and expands deck coverage. A package describes a recurring card pattern across decks; the generated deck under it is one 100-card example of that pattern. Changing the package count fits a different model.</p>
       {!state.loading && !state.error ? <>
         <strong>{totalCatalog === null
           ? `${formatNumber(state.commanders.length)} ${state.commanders.length === 1 ? "commander report available" : "commander reports available"}`

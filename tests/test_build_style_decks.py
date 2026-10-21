@@ -130,12 +130,14 @@ def test_package_defining_cards_are_not_replaced_by_generic_high_frequency_cards
     assert "Consensus Card" not in names
 
 
-def test_export_preserves_multiple_tags_and_full_name_primer_references():
+def test_export_assigns_one_primary_tag_and_preserves_full_name_primer_references():
     data = fixture()
     data[4]["consensus card"]["oracle_text"] = "{T}: Add {G}. Whenever a Plant enters, draw a card."
     data[4]["weak card"]["oracle_text"] = "{T}: Add {G}. Whenever a Plant enters, draw a card."
     result = generate(data)
-    assert "1 Consensus Card #Ramp #Card Advantage #Plants" in result["export_text"]
+    assert "1 Consensus Card #Ramp\n" in result["export_text"]
+    assert all(len(card["tags"]) == 1 for card in result["cards"])
+    assert all(line.count("#") == 1 for line in result["export_text"].splitlines())
     assert "1 Commander *CMDR* #Commander" in result["export_text"]
     assert "//" not in result["export_text"]
     assert "[[Consensus Card]]" in result["primer"] and "[[Commander]]" in result["primer"]

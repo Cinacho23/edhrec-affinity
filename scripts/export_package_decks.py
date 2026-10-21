@@ -10,6 +10,9 @@ from pathlib import Path
 
 
 def export_decks(report: dict, output: Path) -> list[dict]:
+    from edhrec_affinity.build_styles.deck_tags import normalize_report_deck_tags
+
+    normalize_report_deck_tags(report)
     analysis = report["deck_analysis"]
     models = [("auto", analysis["packages"]),
               *[(f"{model['components']}-packages", model["packages"])

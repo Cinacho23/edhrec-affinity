@@ -342,3 +342,48 @@ def test_old_package_only_reports_receive_native_deck_upgrade(tmp_path):
     write_json(args.output_dir / "commander-a.json", {
         **report(date="2026-10-19T00:00:00+00:00"), "prototype_version": 2})
     assert batch.select_commanders(args)[0]["commander_slug"] == "commander-a"
+
+
+def test_capped_reports_expand_without_waiting_for_refresh_but_complete_report_supersedes_seed(tmp_path):
+    args = batch_args(tmp_path)
+    capped = {**report(date="2026-10-19T00:00:00+00:00"), "prototype_version": 3,
+              "collection": {"frame_decks": 500, "previews_attempted": 60}}
+    write_json(args.seed_dir / "commander-a.json", capped)
+    assert batch.select_commanders(args)[0]["commander_slug"] == "commander-a"
+    complete = {**capped, "collection": {"frame_decks": 500, "previews_attempted": 500, "complete": True}}
+    write_json(args.output_dir / "commander-a.json", complete)
+    assert batch.select_commanders(args)[0]["commander_slug"] == "commander-b"
+
+
+def test_partial_collection_retains_durable_state_and_rotates_with_new_coverage(tmp_path):
+    args = batch_args(tmp_path, "--max-commanders", "1", "--prune-completed-cache")
+    def partial(parsed):
+        assert parsed.sample_decks is None
+        assert parsed.max_preview_seconds == 300
+        assert parsed.collection_state.parent == args.output_dir / "_collection/previews"
+        parsed.collection_state.parent.mkdir(parents=True, exist_ok=True)
+        parsed.collection_state.write_bytes(b"durable-parsed-decks")
+        return {**report(parsed.commander, date="2026-10-19T00:00:00+00:00"),
+                "collection": {"complete": False, "frame_decks": 500, "previews_attempted": 200}}
+    batch.run_batch(args, runner=partial)
+    assert batch.read_checkpoint(args)["commanders"]["commander-a"]["status"] == "collecting"
+    assert (args.output_dir / "_collection/previews/commander-a.json.gz").exists()
+    args.max_commanders = 0
+    queue = [row["commander_slug"] for row in batch.select_commanders(args)]
+    assert "commander-a" in queue and "commander-b" in queue
+
+
+def test_export_converts_existing_decks_to_one_tag_without_changing_cards_or_rating(tmp_path):
+    source = report()
+    deck = {"status": "generated", "commanders": [{"name": "Commander"}], "cards": [
+        {"name": "Commander", "quantity": 1, "primary_role": "Commander", "tags": ["Commander", "Tokens"]},
+        {"name": "Hybrid", "quantity": 1, "primary_role": "Ramp", "tags": ["Ramp", "Removal", "Tokens"]},
+    ], "validation": {"external_rating": {"deck_sha256": "same-card-list"}}, "export_text": "old multi-tag export"}
+    source["deck_analysis"]["packages"][0]["generated_deck"] = deck
+    write_json(tmp_path / "processed/build-styles/commander-a.json", source)
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"]}),
+                                     tmp_path / "processed", tmp_path / "site", seed_dir=tmp_path / "none")
+    saved = json.loads((tmp_path / "site/build-styles/commander-a.json").read_text())["deck_analysis"]["packages"][0]["generated_deck"]
+    assert [card["tags"] for card in saved["cards"]] == [["Commander"], ["Ramp"]]
+    assert saved["validation"] == deck["validation"]
+    assert saved["export_text"] == "1 Commander *CMDR* #Commander\n1 Hybrid #Ramp\n"

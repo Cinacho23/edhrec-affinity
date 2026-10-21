@@ -1276,6 +1276,7 @@ def export_build_style_files(
     seed_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Publish only actual, dated samples; no synthetic entries for unsampled commanders."""
+    from edhrec_affinity.build_styles.deck_tags import normalize_report_deck_tags
     seed_dir = seed_dir if seed_dir is not None else Path(__file__).resolve().parents[1] / "data/build-styles"
     reports = read_build_style_reports(seed_dir)
     for incoming in (previous_reports or {}, read_build_style_reports(processed_dir / "build-styles")):
@@ -1298,6 +1299,7 @@ def export_build_style_files(
         if slug not in known_slugs:
             continue
         filename = f"build-styles/{slug}.json"
+        normalize_report_deck_tags(report)
         write_json(output_dir / filename, report, compact=True)
         analysis = report["deck_analysis"]
         entries.append({

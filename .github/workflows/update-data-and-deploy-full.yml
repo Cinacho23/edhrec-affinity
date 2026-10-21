@@ -206,7 +206,7 @@ jobs:
             --commander-index "${PROCESSED_DIR}/affinity_rows_with_trends.json" \
             --output-dir "${PROCESSED_DIR}/build-styles" \
             --snapshot-date "${SNAPSHOT_DATE}" \
-            --max-commanders 0 --sample-decks 60 --max-components 8 \
+            --max-commanders 0 --sample-decks all --max-components 8 \
             --min-total-decks 0 --max-runtime-seconds 900 --request-delay 1 --prune-completed-cache
 
       - name: Report build-style collection failure

@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 import warnings
 
 import numpy as np
+from scipy import sparse
 
 from .sources import card_key
 
@@ -181,21 +182,20 @@ def _evaluate_components(matrix, components: int, seed: int, membership_threshol
     rng = np.random.default_rng(seed)
     subsample, validation, validation_converged = [], [], []
     for offset in range(3):
-        indexes = rng.choice(len(matrix), max(components + 1, math.floor(0.8 * len(matrix))), replace=False)
-        held_out = np.ones(len(matrix), dtype=bool)
+        indexes = rng.choice(matrix.shape[0], max(components + 1, math.floor(0.8 * matrix.shape[0])), replace=False)
+        held_out = np.ones(matrix.shape[0], dtype=bool)
         held_out[indexes] = False
         candidate, _, fit_converged = _fit_nmf(matrix[indexes], components, seed + 100 + offset)
         # NMF.transform changes only held-out deck weights, keeping card packages fixed.
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter("always")
             held_weights = candidate.transform(matrix[held_out])
-        residual = matrix[held_out] - held_weights @ candidate.components_
-        validation.append(float(np.square(residual).sum() / max(np.square(matrix[held_out]).sum(), 1e-12)))
+        validation.append(_reconstruction_ratio(matrix[held_out], held_weights, candidate.components_))
         validation_converged.append(fit_converged and not captured)
         subsample.append(_aligned_similarity(model.components_, candidate.components_))
     minimum_count = int((memberships >= membership_threshold).sum(axis=0).min())
     minimum_effective = float(memberships.sum(axis=0).min())
-    minimum_required = max(3, math.ceil(0.05 * len(matrix)))
+    minimum_required = max(3, math.ceil(0.05 * matrix.shape[0]))
     seed_consistency = float(np.mean(stability))
     subsample_consistency = float(np.mean(subsample))
     supported = minimum_count >= minimum_required and minimum_effective >= minimum_required
@@ -211,7 +211,7 @@ def _evaluate_components(matrix, components: int, seed: int, membership_threshol
     error = float(np.mean(validation))
     # Explicit conservative heuristic: one deck-equivalent per extra component.
     # This is not AIC, a calibrated probability, or proof of an optimal K.
-    penalty = (components - 1) / len(matrix)
+    penalty = (components - 1) / matrix.shape[0]
     diagnostic = {
         "components": components, "validation_error": error,
         "validation_error_std": float(np.std(validation, ddof=1)),
@@ -226,6 +226,16 @@ def _evaluate_components(matrix, components: int, seed: int, membership_threshol
     }
     return {"model": model, "weights": weights, "memberships": memberships,
             "converged": converged, "diagnostic": diagnostic}
+
+
+def _reconstruction_ratio(matrix, weights, components) -> float:
+    if not sparse.issparse(matrix):
+        return float(np.square(matrix - weights @ components).sum() / max(np.square(matrix).sum(), 1e-12))
+    # ||X-WH||² without materializing a dense decks × cards prediction.
+    norm = float(matrix.multiply(matrix).sum())
+    prediction_norm = float(np.sum((weights.T @ weights) * (components @ components.T)))
+    cross = float(np.sum((matrix @ components.T) * weights))
+    return max(0.0, norm + prediction_norm - 2 * cross) / max(norm, 1e-12)
 
 
 def _package_summary(fit: dict, kept: list[dict], vocabulary: list[str], presence,
@@ -333,8 +343,16 @@ def analyze_decks(decks: list[dict], base: dict, profiles: list[dict], *, compon
         result["reason"] = "Too few recurring cards after support and staple filters"
         selection["reason"] = result["reason"]
         return result
-    presence = np.array([[key in cards for key in vocabulary] for cards in card_sets], dtype=float)
-    informative = presence.sum(axis=1) > 0
+    use_sparse = len(kept) > 1000
+    if use_sparse:
+        columns = {key: index for index, key in enumerate(vocabulary)}
+        positions = [(row, columns[key]) for row, cards in enumerate(card_sets) for key in cards if key in columns]
+        row_indexes, column_indexes = zip(*positions)
+        presence = sparse.csr_matrix((np.ones(len(positions)), (row_indexes, column_indexes)),
+                                     shape=(len(kept), len(vocabulary)))
+    else:
+        presence = np.array([[key in cards for key in vocabulary] for cards in card_sets], dtype=float)
+    informative = np.asarray(presence.sum(axis=1)).ravel() > 0
     for deck in np.array(kept, dtype=object)[~informative]:
         result["rejected"].append({"id": deck["id"], "reason": "No informative cards after feature filtering"})
     kept = [deck for deck, use in zip(kept, informative) if use]
@@ -346,20 +364,34 @@ def analyze_decks(decks: list[dict], base: dict, profiles: list[dict], *, compon
         selection["reason"] = result["reason"]
         return result
     idf = (np.ones(len(vocabulary)) if feature_mode == "shared_cards_fallback" else
-           np.log((1 + len(kept)) / (1 + presence.sum(axis=0))))
-    matrix = presence * idf
+           np.log((1 + len(kept)) / (1 + np.asarray(presence.sum(axis=0)).ravel())))
+    matrix = presence.multiply(idf).tocsr() if use_sparse else presence * idf
+    if use_sparse:
+        matrix.eliminate_zeros()
     # Columns can become universal after rejecting featureless decks. Retain a
     # single shared package if IDF then removes the entire remaining signal.
-    if not matrix.any() and (components is None or components == 1):
+    if (not matrix.nnz if use_sparse else not matrix.any()) and (components is None or components == 1):
         idf = np.ones(len(vocabulary))
         matrix = presence.copy()
         feature_mode = "shared_cards_fallback"
-    matrix /= np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
-    rank = int(np.linalg.matrix_rank(matrix))
+    if use_sparse:
+        from sklearn.utils.extmath import randomized_svd
+
+        norm = np.sqrt(np.asarray(matrix.multiply(matrix).sum(axis=1)).ravel())
+        matrix = matrix.multiply((1 / np.maximum(norm, 1e-12))[:, None]).tocsr()
+        # Only determine rank up to the candidate ceiling, not a full costly SVD.
+        ceiling = min(max_components if components is None else components, *matrix.shape)
+        _, values, _ = randomized_svd(matrix, n_components=ceiling, random_state=seed)
+        rank = int((values > max(matrix.shape) * np.finfo(float).eps * values[0]).sum())
+    else:
+        matrix /= np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
+        rank = int(np.linalg.matrix_rank(matrix))
     supported_max = min(max_components, len(kept) // 4, len(vocabulary), rank)
     selection["max_components"] = supported_max
     selection["data_limits"] = {"usable_decks": len(kept), "features": len(vocabulary),
-                                "matrix_rank": rank, "minimum_decks_per_candidate_component": 4}
+                                "matrix_rank": None if use_sparse else rank,
+                                "rank_at_least": rank, "sparse_matrix": use_sparse,
+                                "minimum_decks_per_candidate_component": 4}
     if rank < (components or 1):
         result["reason"] = "Too few independent card signals for the requested package count"
         selection["reason"] = result["reason"]
@@ -394,7 +426,8 @@ def analyze_decks(decks: list[dict], base: dict, profiles: list[dict], *, compon
                  for count, fit in fits.items() if fit["diagnostic"]["eligible"] or count == chosen}
     selected = summaries[chosen]
     memberships = fits[chosen]["memberships"]
-    near_duplicates = sum(len(a & b) / len(a | b) >= 0.9 for a, b in combinations(card_sets, 2) if a | b)
+    near_duplicates = (sum(len(a & b) / len(a | b) >= 0.9 for a, b in combinations(card_sets, 2) if a | b)
+                       if not use_sparse else None)
     labeled = [deck for deck in kept if deck.get("tags")]
     tag_pairs = Counter(pair for deck in labeled for pair in combinations(sorted(set(deck["tags"])), 2))
     result.update({
@@ -407,6 +440,7 @@ def analyze_decks(decks: list[dict], base: dict, profiles: list[dict], *, compon
                                 "note": "All profiles above both heuristic similarity floors; no fixed tag count or calibrated tag confidence."},
         "consistency_note": "Matched component cosine across four initializations and three 80% training subsets; not a confidence probability.",
         "near_duplicate_pairs": near_duplicates, "decks_with_source_tags": len(labeled),
+        "near_duplicate_note": "Pairwise near-copy diagnostic omitted for large collections; exact copies are still removed" if use_sparse else "All pairs checked",
         "observed_tag_pairs": [{"tags": list(pair), "count": count} for pair, count in tag_pairs.most_common(15)],
         "source_hosts": dict(Counter(urlsplit(deck.get("source_url", "")).hostname or "local export" for deck in kept)),
         "decks": [{"id": deck["id"], "source_url": deck.get("source_url", ""),

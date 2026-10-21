@@ -634,12 +634,7 @@ def _generate_one(package, model_decks, source_decks, base, profiles, metadata, 
     rows = []
     for key, quantity in counts.items():
         card = metadata[key]
-        tags = ["Commander"] if key in commander_keys else list(functional_tags(card))
-        for profile in profiles:
-            if profile.get("tag_slug") in suggested and _profile_value(profile, key, metadata) > _profile_value(base, key, metadata):
-                name = profile.get("tag_name", profile["tag_slug"])
-                if name not in tags:
-                    tags.append(name)
+        tags = ["Commander" if key in commander_keys else functional_tags(card)[0]]
         rows.append({"name": card["name"], "quantity": quantity, "tags": tags, "primary_role": tags[0],
                      **metrics[key], "member_inclusion": support.get(key, 0)})
     rows.sort(key=lambda row: (ROLES.index(row["primary_role"]), card_key(row["name"])))

@@ -36,7 +36,7 @@ All eligible alternatives are stored in `deck_analysis.alternative_models`, with
 
 ## Real launch samples
 
-Tracked reports in `data/build-styles/` provide real starting data for Ghave, Hapatra and Jasmine. Each uses up to 12 tag profiles and 60 randomly sampled deck previews. The number 60 is the configured sample size, not EDHREC’s retrieval limit.
+Tracked reports in `data/build-styles/` provide real starting data for Ghave, Hapatra and Jasmine. These initial snapshots use up to 12 tag profiles and 60 randomly sampled deck previews. That was the original configured sample size, not EDHREC’s retrieval limit; the collector now defaults to the full available index.
 
 The Ghave sample contains 60 unique decks originating from 30 Moxfield and 30 Archidekt lists. Only six had tags reported by EDHREC, but all 60 could be analyzed from their cards. Automatic selection suggests two packages; supported alternative counts include one, three, four, five and seven. The two-package fit captures about 17% of the weighted card signal. Its broad themes include Combo/Aristocrats and Saprolings/Fungi, with multiple suggested labels per package.
 
@@ -59,7 +59,11 @@ This writes a self-contained `index.html` and `report.json`. The HTML can be ope
 
 Omit `--fetch` for cache-only analysis. Existing pages are reused even with `--fetch`; choose a new cache directory for a fresh snapshot. Per-commander caches default to `data/raw/build-style-prototype/<slug>/`.
 
-The collector attempts at most `--sample-decks` previews (default 60, CLI guardrail 200), after sampling IDs before examining cardlists or tags. Profiles use the most numerous reported tags with at least 25 decks by default, without a z-score gate. Use `--tags`, `--min-tag-decks` and `--max-tags` to adjust the profile cohort.
+The collector defaults to `--sample-decks all`, with no preview-count ceiling. A nonnegative count remains available for experiments; `0` uses imports only. IDs are shuffled before examining cardlists or tags. Batch jobs collect for up to five minutes per commander before analyzing all lists collected so far, saving compressed parsed lists and a frozen index in `_collection/previews/`. Later jobs resume rather than starting over. Reports expose the index size, cumulative attempts, loaded lists and completion status. All available index IDs does not guarantee every source-site deck is accessible or usable. Profiles use the most numerous reported tags with at least 25 decks by default, without a z-score gate. Use `--tags`, `--min-tag-decks` and `--max-tags` to adjust the profile cohort.
+
+A package is a recurring card pattern across collected decks, and one deck can mix several patterns. Each selectable count is fitted separately: package numbers do not identify the same strategy across models. Each package gets its own generated 100-card example. Published card rows and Moxfield exports have exactly one primary category tag; internal role checks can still recognize multiple functions.
+
+Collections above 1,000 usable lists use sparse card matrices and a rank probe up to the model-count ceiling. All usable decks still enter model fitting. The optional quadratic near-copy diagnostic is omitted at that size (reported as unavailable); exact-copy filtering remains active. This avoids dense full-rank decompositions and pairwise comparisons growing with the uncapped index.
 
 ## Data access and quality
 
@@ -193,7 +197,7 @@ Collect a targeted cohort:
   --max-commanders 2 --sample-decks 100 --max-components 10
 ```
 
-Batch caches are dated. Interrupted, blocked and partial attempts resume their previous raw snapshot; successful reports are skipped until due for refresh. Partial deck generation retries after a day. CI uses `--prune-completed-cache` after durable report/checkpoint writes, retaining unfinished snapshots while keeping the catalog backfill from accumulating all raw HTML. Local caches remain unless that flag is supplied. The default 60 deck previews is adjustable up to 200, not an EDHREC limit.
+Batch caches are dated. Interrupted, blocked and partial attempts resume their previous snapshot. Existing limited reports are eligible for expansion immediately; new commanders and expansions alternate, and unfinished collections rotate between runs. Completed snapshots are skipped until due for refresh. Partial deck generation retries after a day. CI uses `--prune-completed-cache` after durable writes: parsed previews and source hashes remain in the cumulative artifact while their raw HTML is discarded; fully completed snapshots are removed. Local caches remain unless that flag is supplied. Requests remain sequential with at least one second between starts, and access challenges stop collection rather than being bypassed. Removing the count ceiling increases total backfill work; time slices bound preview collection, not the eventual dataset size or model runtime.
 
 ## Local deck imports
 

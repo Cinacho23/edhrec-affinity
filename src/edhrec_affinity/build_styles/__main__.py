@@ -6,12 +6,13 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-import random
+import math
 
 import httpx
 
 from .analysis import analyze_decks, compare_profiles
-from .sources import Cache, SourceBlocked, checked_identifier, import_decks, parse_preview, parse_profile
+from .collection import collect_previews, parse_sample_decks
+from .sources import Cache, SourceBlocked, checked_identifier, import_decks, parse_profile
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -48,28 +49,18 @@ def run(args: argparse.Namespace) -> dict:
                 failures.append({"tag": tag_slug, "error": str(error)})
                 if cache.blocked:
                     break
-        decks, frame_count, attempted = [], None, 0
-        if args.sample_decks and not cache.blocked:
+        decks = []
+        collection = {"frame_decks": None, "previews_attempted": 0, "previews_loaded": 0,
+                      "sample_limit": args.sample_decks, "target_mode": "all" if args.sample_decks is None else "sample",
+                      "complete": args.sample_decks == 0}
+        if args.sample_decks != 0 and not cache.blocked:
             try:
-                table = cache.get("decks.json", f"https://json.edhrec.com/pages/decks/{slug}.json")["table"]
-                # Sampling occurs before inspecting card lists or deck tags.
-                rows = {row["urlhash"]: row for row in table}
-                frame_count = len(rows)
-                sample = random.Random(args.seed).sample(list(rows.values()), min(args.sample_decks, len(rows)))
-                for row in sample:
-                    identifier = checked_identifier(row["urlhash"], deck=True)
-                    attempted += 1
-                    try:
-                        data = cache.get(f"previews/{identifier}.html", f"https://edhrec.com/deckpreview/{identifier}", html=True)
-                        deck = parse_preview(data, identifier)
-                        deck["source_bracket"] = row.get("bracket")
-                        decks.append(deck)
-                    except (FileNotFoundError, ValueError, KeyError, TypeError, httpx.HTTPError, SourceBlocked) as error:
-                        failures.append({"deck": identifier, "error": str(error)})
-                        if cache.blocked:
-                            break
-                    if args.fetch and attempted % 10 == 0:
-                        print(f"Read {attempted}/{len(sample)} sampled deck previews", flush=True)
+                decks, collection = collect_previews(
+                    cache, slug, limit=args.sample_decks, seed=args.seed,
+                    progress_path=args.collection_state or root / "collection.json.gz",
+                    max_seconds=args.max_preview_seconds,
+                )
+                failures.extend(collection.pop("failures"))
             except (FileNotFoundError, KeyError, ValueError, httpx.HTTPError, SourceBlocked) as error:
                 failures.append({"deck_index": slug, "error": str(error)})
         imported_count = 0
@@ -148,11 +139,11 @@ def run(args: argparse.Namespace) -> dict:
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "commander_name": card["name"], "commander_slug": slug,
             "total_edhrec_decks": base["deck_count"],
-            "collection": {"network_enabled": args.fetch,
+            "collection": {**collection, "network_enabled": args.fetch,
                            "blocked": cache.blocked or bool(deck_generation.get("metadata", {}).get("blocked")),
-                           "sampling": "Seeded simple random sample of unique EDHREC deck-index IDs",
-                           "seed": args.seed, "frame_decks": frame_count, "previews_attempted": attempted,
-                           "previews_loaded": len(decks) - imported_count, "local_imports": imported_count,
+                           "sampling": ("All unique IDs in the available EDHREC deck index, collected in seeded order across resumable runs"
+                                        if args.sample_decks is None else "Seeded random sample of unique EDHREC deck-index IDs"),
+                           "seed": args.seed, "local_imports": imported_count,
                            "failures": failures, "provenance": cache.provenance},
             "profiles": compare_profiles(base, profiles, threshold=args.similarity),
             "deck_analysis": analysis, "deck_generation": deck_generation,
@@ -209,7 +200,11 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--min-tag-decks", type=int, default=25)
     cli.add_argument("--max-tags", type=int, default=12)
     cli.add_argument("--tags", nargs="+", help="Optional explicit tag slugs, still subject to the deck minimum")
-    cli.add_argument("--sample-decks", type=int, default=60, help="At most this many previews attempted; 0 uses imports only")
+    cli.add_argument("--sample-decks", type=parse_sample_decks, default=None,
+                     help="all (default) enumerates the available index; optional count; 0 uses imports only")
+    cli.add_argument("--collection-state", type=Path, help="Durable compressed preview checkpoint; defaults inside cache-dir")
+    cli.add_argument("--max-preview-seconds", type=float, default=0,
+                     help="Pause preview collection after this many seconds, resuming next run; 0 disables the time slice")
     cli.add_argument("--components", type=parse_components, default=None,
                      help="auto (default) selects a supported package count; or specify a positive integer")
     cli.add_argument("--max-components", type=int, default=8,
@@ -226,8 +221,10 @@ def parser() -> argparse.ArgumentParser:
 def main() -> None:
     cli = parser()
     args = cli.parse_args()
-    if not 1 <= args.max_tags <= 16 or not 0 <= args.sample_decks <= 200:
-        cli.error("--max-tags must be 1–16 and --sample-decks must be 0–200 for this pilot")
+    if not 1 <= args.max_tags <= 16:
+        cli.error("--max-tags must be 1–16")
+    if not math.isfinite(args.max_preview_seconds) or args.max_preview_seconds < 0:
+        cli.error("--max-preview-seconds must be finite and nonnegative")
     if (not 1 <= args.max_components <= 32 or
         args.components is not None and not 1 <= args.components <= 32 or
         args.min_tag_decks < 1 or args.min_card_support < 2):
