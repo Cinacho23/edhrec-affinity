@@ -21,6 +21,8 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from edhrec_affinity.build_styles.collection import parse_sample_decks
+
 
 def read_index(path: Path) -> list[dict]:
     rows = json.loads(path.read_text(encoding="utf-8"))
@@ -94,6 +96,29 @@ def future_date(value: str | None) -> bool:
     return datetime.fromisoformat(value) > datetime.now(timezone.utc)
 
 
+def needs_more_previews(path: Path, slug: str, limit: int | None) -> bool:
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+        collection = report.get("collection", {})
+        frame = collection.get("frame_decks")
+        if report.get("commander_slug") != slug or not isinstance(frame, int):
+            return False
+        target = frame if limit is None else min(frame, limit)
+        return collection.get("previews_attempted", 0) < target or collection.get("complete") is False
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def preview_expansion_needed(args: argparse.Namespace, slug: str) -> bool:
+    # The cumulative artifact supersedes the seed; an old seed must never cause
+    # a completed larger collection to be scheduled again on every run.
+    for directory in [args.output_dir, args.seed_dir]:
+        path = directory / f"{slug}.json"
+        if sample_date(path, slug) is not None:
+            return needs_more_previews(path, slug, args.sample_decks)
+    return False
+
+
 def select_commanders(args: argparse.Namespace) -> list[dict]:
     rows = read_index(args.commander_index)
     requested = set(args.commanders or [])
@@ -101,7 +126,7 @@ def select_commanders(args: argparse.Namespace) -> list[dict]:
     if requested - known:
         raise ValueError(f"Commanders not in the index: {', '.join(sorted(requested - known))}")
     state = read_checkpoint(args)
-    selected, refreshable = [], []
+    selected, expanding, refreshable = [], [], []
     snapshot = datetime.strptime(args.snapshot_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     for row in sorted(rows, key=lambda row: (-float(row.get("total_decks") or 0), row["commander_slug"])):
         slug = row["commander_slug"]
@@ -112,6 +137,9 @@ def select_commanders(args: argparse.Namespace) -> list[dict]:
         attempt = state["commanders"].get(slug, {})
         if not args.refresh and future_date(attempt.get("retry_after")):
             continue
+        if not args.refresh and (attempt.get("status") == "collecting" or preview_expansion_needed(args, slug)):
+            expanding.append(row)
+            continue
         existing_dates = [date for directory in [args.output_dir, args.seed_dir]
                           if (date := sample_date(directory / f"{slug}.json", slug)) is not None]
         if not args.refresh and existing_dates:
@@ -120,7 +148,17 @@ def select_commanders(args: argparse.Namespace) -> list[dict]:
                 refreshable.append((most_recent, row))
             continue
         selected.append(row)
-    # Grow coverage before refreshing dated samples; zero means the whole queue.
+    # Alternate new coverage and expansion; rotate unfinished commanders so one
+    # very large index cannot monopolize every scheduled run.
+    expanding.sort(key=lambda row: (state["commanders"].get(row["commander_slug"], {}).get("attempted_at", ""),
+                                   -float(row.get("total_decks") or 0), row["commander_slug"]))
+    queue = []
+    for index in range(max(len(selected), len(expanding))):
+        if index < len(expanding):
+            queue.append(expanding[index])
+        if index < len(selected):
+            queue.append(selected[index])
+    selected = queue
     selected.extend(row for _, row in sorted(refreshable, key=lambda item: (item[0], item[1]["commander_slug"])))
     return selected[:args.max_commanders] if args.max_commanders else selected
 
@@ -134,8 +172,8 @@ def run_batch(args: argparse.Namespace, *, runner: Callable | None = None, monot
     selected = select_commanders(args)
     summary = {
         "snapshot_date": args.snapshot_date, "selected": [row["commander_slug"] for row in selected],
-        "max_preview_attempts": len(selected) * args.sample_decks,
-        "max_page_requests": len(selected) * (7 + args.max_tags + args.sample_decks),
+        "max_preview_attempts": None if args.sample_decks is None else len(selected) * args.sample_decks,
+        "max_page_requests": None if args.sample_decks is None else len(selected) * (7 + args.max_tags + args.sample_decks),
         "catalog_size": len(read_index(args.commander_index)),
         "completed": [], "failures": [], "blocked": False, "dry_run": args.dry_run,
         "time_budget_seconds": args.max_runtime_seconds, "time_budget_reached": False,
@@ -151,17 +189,18 @@ def run_batch(args: argparse.Namespace, *, runner: Callable | None = None, monot
     runner = runner or run
     atomic_json(summary_path, summary)
     for row in selected:
-        if args.max_runtime_seconds and monotonic() - started >= args.max_runtime_seconds:
+        elapsed = monotonic() - started
+        if args.max_runtime_seconds and elapsed >= args.max_runtime_seconds:
             summary["time_budget_reached"] = True
             break
         slug = row["commander_slug"]
-        print(f"Building {slug} (at most {args.sample_decks} deck previews)", flush=True)
+        print(f"Building {slug} ({'all available' if args.sample_decks is None else args.sample_decks} deck previews)", flush=True)
         previous_attempt = state["commanders"].get(slug, {})
         # An interrupted commander resumes the same raw snapshot. A later retry
         # after an actual failure starts a new snapshot to allow fresh evidence.
         cache_snapshot = (previous_attempt.get("cache_snapshot", args.snapshot_date)
                           if not args.refresh and previous_attempt.get("status") in
-                          {"running", "blocked", "failed", "generation_partial"} else args.snapshot_date)
+                          {"running", "blocked", "failed", "generation_partial", "collecting"} else args.snapshot_date)
         if datetime.strptime(cache_snapshot, "%Y-%m-%d").date().isoformat() != cache_snapshot:
             raise ValueError("Invalid cache snapshot in collection checkpoint")
         state["commanders"][slug] = {
@@ -169,9 +208,17 @@ def run_batch(args: argparse.Namespace, *, runner: Callable | None = None, monot
             "cache_snapshot": cache_snapshot,
         }
         atomic_json(checkpoint_path(args), state)
+        preview_state = args.output_dir / "_collection" / "previews" / f"{slug}.json.gz"
+        if args.refresh or (previous_attempt.get("cache_snapshot") not in {None, cache_snapshot}
+                            and previous_attempt.get("status") not in
+                            {"running", "blocked", "failed", "generation_partial", "collecting"}):
+            preview_state.unlink(missing_ok=True)
         argv = ["--commander", slug, "--components", "auto", "--max-components", str(args.max_components),
                 "--max-tags", str(args.max_tags), "--min-tag-decks", str(args.min_tag_decks),
-                "--sample-decks", str(args.sample_decks), "--seed", str(args.seed),
+                "--sample-decks", "all" if args.sample_decks is None else str(args.sample_decks), "--seed", str(args.seed),
+                "--collection-state", str(preview_state),
+                "--max-preview-seconds", str(min(args.max_preview_seconds, max(1, args.max_runtime_seconds - elapsed))
+                                            if args.max_runtime_seconds else args.max_preview_seconds),
                 "--request-delay", str(args.request_delay), "--no-html",
                 "--cache-dir", str(args.cache_root / cache_snapshot / slug),
                 "--output-dir", str(args.cache_root / cache_snapshot / slug / "analysis")]
@@ -187,12 +234,14 @@ def run_batch(args: argparse.Namespace, *, runner: Callable | None = None, monot
             if analysis.get("status") not in {"fitted", "insufficient_data"}:
                 raise ValueError("Report has no recognized deck analysis status")
             destination = args.output_dir / f"{slug}.json"
+            collecting = report.get("collection", {}).get("complete") is False
             # Keep a previous successful fit if a later sample is too small.
             if analysis.get("status") != "fitted" and has_completed_report(destination, slug):
                 state["commanders"][slug].update(
-                    status="insufficient_data", retained_previous_fit=True,
-                    retry_after=(datetime.now(timezone.utc) + timedelta(days=args.refresh_after_days)).isoformat(),
+                    status="collecting" if collecting else "insufficient_data", retained_previous_fit=True,
                 )
+                if not collecting:
+                    state["commanders"][slug]["retry_after"] = (datetime.now(timezone.utc) + timedelta(days=args.refresh_after_days)).isoformat()
                 summary["completed"].append(slug)
                 continue
             # Local cache paths are machine specific; URLs and collection dates
@@ -201,7 +250,9 @@ def run_batch(args: argparse.Namespace, *, runner: Callable | None = None, monot
                 provenance.pop("cache_file", None)
             atomic_json(destination, report)
             state["commanders"][slug].update(status=analysis["status"])
-            if report.get("deck_generation", {}).get("status") == "partial":
+            if collecting:
+                state["commanders"][slug].update(status="collecting", analysis_status=analysis["status"])
+            elif report.get("deck_generation", {}).get("status") == "partial":
                 state["commanders"][slug].update(
                     status="generation_partial", analysis_status=analysis["status"],
                     retry_after=(datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
@@ -222,13 +273,20 @@ def run_batch(args: argparse.Namespace, *, runner: Callable | None = None, monot
         finally:
             atomic_json(checkpoint_path(args), state)
             atomic_json(summary_path, summary)
+            # Parsed lists and source hashes are durable in the artifact. Avoid
+            # retaining gigabytes of preview HTML during an uncapped backfill.
+            if args.prune_completed_cache and slug in summary["completed"]:
+                previews = args.cache_root / cache_snapshot / slug / "previews"
+                if previews.is_dir() and not previews.is_symlink():
+                    shutil.rmtree(previews)
             # CI retains completed reports and their source provenance as the
             # durable artifact; raw HTML is needed only while an attempt resumes.
             if (args.prune_completed_cache and slug in summary["completed"]
-                    and state["commanders"][slug]["status"] != "generation_partial"):
+                    and state["commanders"][slug]["status"] not in {"generation_partial", "collecting"}):
                 raw = args.cache_root / cache_snapshot / slug
                 if raw.is_dir() and not raw.is_symlink():
                     shutil.rmtree(raw)
+                (args.output_dir / "_collection" / "previews" / f"{slug}.json.gz").unlink(missing_ok=True)
     summary["remaining_in_batch"] = len(selected) - len(summary["completed"]) - len(summary["failures"])
     atomic_json(summary_path, summary)
     return summary
@@ -244,7 +302,10 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--max-runtime-seconds", type=float, default=2700,
                      help="Stop before starting another commander after this budget; 0 disables the budget (default 2700)")
     cli.add_argument("--min-total-decks", type=int, default=0, help="Optional filter; all indexed commanders are eligible by default")
-    cli.add_argument("--sample-decks", type=int, default=60, help="Maximum attempted previews per commander, 0–200")
+    cli.add_argument("--sample-decks", type=parse_sample_decks, default=None,
+                     help="all (default) collects the available index; optional nonnegative count, with no count ceiling")
+    cli.add_argument("--max-preview-seconds", type=float, default=300,
+                     help="Preview collection time slice per commander (default 300 seconds); progress resumes next run")
     cli.add_argument("--max-tags", type=int, default=12)
     cli.add_argument("--min-tag-decks", type=int, default=25)
     cli.add_argument("--max-components", type=int, default=8, help="Automatic package-count search: 1 through this ceiling")
@@ -266,11 +327,12 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     cli = parser()
     args = cli.parse_args()
-    if args.max_commanders < 0 or not 0 <= args.sample_decks <= 200 or not 1 <= args.max_tags <= 16:
-        cli.error("Use a nonnegative commander count, 0–200 deck previews, and 1–16 tag profiles")
+    if args.max_commanders < 0 or not 1 <= args.max_tags <= 16:
+        cli.error("Use a nonnegative commander count and 1–16 tag profiles")
     if (not 1 <= args.max_components <= 32 or args.min_tag_decks < 1 or args.min_total_decks < 0
             or not math.isfinite(args.request_delay) or args.request_delay < 1 or args.refresh_after_days < 1
-            or not math.isfinite(args.max_runtime_seconds) or args.max_runtime_seconds < 0):
+            or not math.isfinite(args.max_runtime_seconds) or args.max_runtime_seconds < 0
+            or not math.isfinite(args.max_preview_seconds) or args.max_preview_seconds <= 0):
         cli.error("Invalid package ceiling, deck minimum, or request delay (minimum one second)")
     try:
         if datetime.strptime(args.snapshot_date, "%Y-%m-%d").date().isoformat() != args.snapshot_date:

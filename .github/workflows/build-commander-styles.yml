@@ -15,9 +15,9 @@ on:
         type: number
         default: 0
       sample_decks:
-        description: "Maximum deck previews per commander (0–200)"
-        type: number
-        default: 60
+        description: "Deck previews per commander: all (default), or an optional count; 0 skips previews"
+        type: string
+        default: "all"
       max_components:
         description: "Automatic package-count search ceiling (1–32)"
         type: number
@@ -94,7 +94,7 @@ jobs:
         env:
           COMMANDER_SLUGS: ${{ inputs.commanders }}
           MAX_COMMANDERS: ${{ inputs.max_commanders || 0 }}
-          SAMPLE_DECKS: ${{ github.event_name == 'schedule' && 60 || inputs.sample_decks }}
+          SAMPLE_DECKS: ${{ github.event_name == 'schedule' && 'all' || inputs.sample_decks }}
           MAX_COMPONENTS: ${{ inputs.max_components || 8 }}
           REFRESH_REPORTS: ${{ inputs.refresh }}
         run: |

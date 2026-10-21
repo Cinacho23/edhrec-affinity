@@ -106,7 +106,7 @@ export function getGeneratedDeckGroups(deck) {
     if (!groups.has(role)) groups.set(role, { name: role, count: 0, cards: [] });
     const group = groups.get(role);
     group.count += card.quantity;
-    group.cards.push({ ...card, tags });
+    group.cards.push({ ...card, tags: [role] });
   }
   const order = (role) => {
     const index = DECK_ROLE_ORDER.findIndex((known) => known.toLowerCase() === role.toLowerCase());
@@ -115,6 +115,12 @@ export function getGeneratedDeckGroups(deck) {
   return [...groups.values()].map((group) => ({
     ...group, cards: group.cards.toSorted((left, right) => left.name.localeCompare(right.name)),
   })).sort((left, right) => order(left.name) - order(right.name) || left.name.localeCompare(right.name));
+}
+
+export function getGeneratedDeckExport(deck) {
+  return getGeneratedDeckGroups(deck).flatMap((group) => group.cards.map((card) =>
+    `${card.quantity} ${card.name}${group.name === "Commander" ? " *CMDR*" : ""} #${group.name.replaceAll("#", "").replaceAll("\n", " ")}`,
+  )).join("\n") + (deck?.cards?.length ? "\n" : "");
 }
 
 export function splitPrimerCardReferences(primer) {

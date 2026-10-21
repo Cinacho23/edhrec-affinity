@@ -11,6 +11,7 @@ import {
   getComparableProfilePairs,
   getDeckMixtureRows,
   getExternalDeckRating,
+  getGeneratedDeckExport,
   getGeneratedDeckGroups,
   getSupportedThemes,
   isBuildMetadataFresh,
@@ -86,7 +87,7 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
   const metadata = validation.metadata || {};
   const metadataFresh = isBuildMetadataFresh(metadata);
   const highestLift = stats.highest_average_lift;
-  const exportText = typeof deck.export_text === "string" ? deck.export_text : "";
+  const exportText = getGeneratedDeckExport(deck);
   const primer = typeof deck.primer === "string" ? deck.primer : "";
   async function copyText(text, label) {
     try {
@@ -119,7 +120,7 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
       {validation.external_url ? <p className="build-source-links"><SourceLink url={validation.external_url}>Check on EDHPowerLevel</SourceLink></p> : null}
       <ExternalDeckRating rating={validation.external_rating} />
       <p className="build-generated-deck__copy-status" role="status" aria-live="polite">{copyStatus}</p>
-      <p className="build-note">Paste the tagged card list into Moxfield’s text import. Commander markers and tags are included. Cards can carry several functional and package theme tags.</p>
+      <p className="build-note">Paste the tagged card list into Moxfield’s text import. Each card has one primary category tag, matching its group below. Commander markers are included.</p>
       <div className="build-generated-deck__card-list" tabIndex="0" role="region" aria-label={`Package ${packageNumber} generated deck cards`}>
         {groups.map((group) => <section className="build-generated-deck__role" key={group.name}>
           <h6>{group.name} <span>{formatNumber(group.count)}</span></h6>
@@ -249,6 +250,7 @@ function DeckPackages({ analysis }) {
           {options.map((count) => <option key={count} value={count}>{count} {count === 1 ? "package" : "packages"}</option>)}
         </select></label> : null}
       </div>
+      <p className="build-note">A package is a group of cards that tend to appear together. Auto suggests a supported, simpler count. Each numbered choice fits a separate model: changing the count can regroup cards and change the theme labels. Package numbers do not identify the same strategy across models. More packages give finer detail, not necessarily a better explanation.</p>
       <div className="build-selection-note">
         <strong>{selection?.mode === "automatic" ? `Auto suggests ${analysis.package_count ?? analysis.packages.length} ${(analysis.package_count ?? analysis.packages.length) === 1 ? "package" : "packages"}` : `${packages.length} ${packages.length === 1 ? "package" : "packages"} in this analysis`}</strong>
         {selection?.reason ? <span>{selection.reason}</span> : <span>The package count depends on the available deck data.</span>}
@@ -297,6 +299,7 @@ function BuildReport({ report }) {
     <div className="build-heading"><div><p className="eyebrow">Build discovery <span className="build-pilot">Exploratory</span></p><h2 id="build-discovery-heading">How this commander gets built</h2></div>{report.generated_at ? <span className="muted">Updated {new Date(report.generated_at).toLocaleDateString("en-US", { timeZone: "America/Toronto" })}</span> : null}</div>
     <p className="build-intro">Themes can overlap or describe different builds. Explore related tag profiles and the recurring card packages found in individual decks.</p>
     <p className="build-coverage">Coverage: {formatNumber(report.profiles.profiles.length)} tag profiles and {formatNumber(analyzed)} unique sampled decks from {formatNumber(report.total_edhrec_decks)} decks listed by EDHREC. This sample is not every deck and does not establish how common a style is.</p>
+    {report.collection?.target_mode === "all" ? <p className="build-note">{formatNumber(report.collection.previews_attempted)} of {formatNumber(report.collection.frame_decks)} available deck previews attempted. {report.collection.complete ? "This index snapshot is complete; unavailable or unusable lists can still be excluded." : "Collection is in progress and resumes across scheduled runs. Packages currently use the successfully collected lists."}</p> : null}
     <div className="build-view-switch" role="group" aria-label="Build discovery views"><button type="button" aria-pressed={view === "decks"} onClick={() => setView("decks")}>Individual deck packages</button><button type="button" aria-pressed={view === "profiles"} onClick={() => setView("profiles")}>Tag profile similarities</button></div>
     {view === "decks" ? <DeckPackages analysis={report.deck_analysis} /> : <TagProfiles profiles={report.profiles} />}
     <details className="build-evidence build-method-note"><summary>Data and interpretation</summary><p>{report.collection?.sampling || "Card profiles and deck previews collected from EDHREC."}</p><p>Deck tags are optional metadata. The package model uses cards, so untagged decks and decks with one or many tags can all contribute. Suggested themes describe a package’s similarity to tag profiles; they are not confirmed labels on every member deck.</p><ul>{(report.limits || []).map((limit) => <li key={limit}>{limit}</li>)}</ul></details>

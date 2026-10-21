@@ -3,7 +3,7 @@ import test from "node:test";
 
 import {
   formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildModel, getBuildModelOptions, getComparableProfilePairs,
-  getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckGroups, getSupportedThemes, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
+  getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckExport, getGeneratedDeckGroups, getSupportedThemes, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
 } from "./buildStyleUtils.js";
 
 test("models keep any number of packages and match alternative weights by deck ID", () => {
@@ -78,7 +78,7 @@ test("shares distinguish missing evidence from a measured zero; external links d
   assert.equal(safeExternalUrl("https://edhrec.com/deckpreview/abc"), "https://edhrec.com/deckpreview/abc");
 });
 
-test("generated deck grouping counts each card once while retaining multiple role and theme tags", () => {
+test("legacy decks display and export one primary category per card", () => {
   const deck = { commanders: [{ name: "Commander A", quantity: 1 }], cards: [
     { name: "Hybrid spell", quantity: 1, primary_role: "Card Draw", tags: ["Card Draw", "Tokens", "+1/+1 Counters"] },
     { name: "Forest", quantity: 35, tags: ["Lands"] },
@@ -91,7 +91,12 @@ test("generated deck grouping counts each card once while retaining multiple rol
     ["Commander", 1], ["Lands", 35], ["Card Draw", 1], ["Other Spells", 1],
   ]);
   assert.deepEqual(groups.find((group) => group.name === "Card Draw").cards[0].tags,
-    ["Card Draw", "Tokens", "+1/+1 Counters"]);
+    ["Card Draw"]);
+  const exported = getGeneratedDeckExport(deck);
+  assert.ok(exported.includes("1 Hybrid spell #Card Draw\n"));
+  assert.ok(exported.includes("1 Commander A *CMDR* #Commander\n"));
+  assert.ok(exported.trim().split("\n").every((line) => line.split("#").length === 2));
+  assert.deepEqual(deck.cards[0].tags, ["Card Draw", "Tokens", "+1/+1 Counters"]);
   assert.equal(groups.reduce((total, group) => total + group.count, 0), 38);
   assert.equal(deck.cards[0].name, "Hybrid spell");
   assert.deepEqual(getGeneratedDeckGroups(null), []);

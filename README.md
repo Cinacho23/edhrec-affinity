@@ -55,13 +55,14 @@ The [build-discovery documentation](docs/build_style_prototype.md) explains the
 website feature, automatic package-count selection, local analysis and static
 data generation. Real seed samples cover Ghave, Hapatra and Jasmine. An hourly
 workflow continues through the full commander catalog, preserving completed
-reports and collection checkpoints between runs. There is no commander-count
-cap or minimum popularity gate; a time budget keeps each run bounded. Low-data
+reports and collection checkpoints between runs. Collection defaults to every
+available deck-index ID, with no commander or preview count cap. Time slices let
+unfinished commanders resume across runs. There is no minimum popularity gate. Low-data
 commanders can return profiles or an insufficient-data result instead of card
 packages. Source deck tags are optional. Public EDHREC previews supply cardlists
 without direct requests to Moxfield or Archidekt.
 
 Every supported package can generate a native 100-card deck using learned card
-preferences and the sampled card pool, with functional tags, a primer, Moxfield
-text export and per-card inclusion/lift averages. Bracket estimates and recorded
+preferences and the sampled card pool, with one primary category tag per card,
+a primer, Moxfield text export and per-card inclusion/lift averages. Bracket estimates and recorded
 external ratings are shown separately from card legality checks.
