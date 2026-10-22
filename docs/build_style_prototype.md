@@ -167,37 +167,40 @@ Per-commander reports are exported to `data/latest/build-styles/<slug>.json`. Th
 
 The exporter validates finite JSON and report identities, merges tracked seeds with previously successful and current processed reports, prefers newer successful samples, and filters commanders absent from the current dataset. Clean exports preserve those samples. The local site-data downloader follows the advertised availability index.
 
-The catalog is the current commander index: 6,750 entries in the October 2026 local snapshot. Every indexed commander is eligible by default, with no minimum total-deck gate. The three tracked seed reports are starting data, not a coverage limit. Collection prioritizes unsampled commanders before samples older than 90 days. A commander with few usable previews may have profile evidence or an insufficient-data result; eligibility does not guarantee that machine learning can identify meaningful packages.
+The catalog is the current commander index: 6,750 entries in the October 2026 snapshot. Every commander and every available deck-index ID is eligible, with no minimum popularity gate or eventual preview-count ceiling. Low-data commanders can honestly return insufficient evidence for packages.
 
-The **Update commander build styles** workflow continues the queue hourly at minute 17. It processes sequentially until its 45-minute time budget, checking the budget before starting another commander. The normal weekly data workflow also continues the same queue with a 15-minute budget. `--max-commanders 0` means no commander-count cap; a positive value is an optional per-run limit. A targeted manual workflow run can name specific indexed commanders.
+The **Update commander build styles** workflow uses `--pipeline`: rolling four-hour batches overlap six commander collectors, up to sixteen preview workers each, and two independent model processes. All source workers share one adaptive request budget. The default ceiling is 40 starts per second, ramping from two; it is not multiplied by the worker count. Network errors reduce the rate; 401/403/429 stop every worker, with server Retry-After preserved across jobs. The repository owner confirmed permission for automated EDHREC collection on October 21, 2026. No alternate route is used to evade access restrictions.
 
-The collectors share a concurrency group, preserve cumulative reports and `build-styles/_collection/state.json` between runs, and checkpoint after each commander. The checkpoint records successful attempts, insufficient-data results and retry delays. Source blocks impose a 24-hour pause across runs; other errors wait seven days before retrying. Each hourly artifact contains the entire cumulative directory, including the checkpoint, and is retained for seven days. Weekly artifacts remain available for 90 days. Restore accepts artifacts only from successful runs on the default branch; collector failures are reported without discarding completed work or the pause state.
+A shared transport discovers the site's public Next.js build version once, requests compact public deck JSON, and refreshes discovery after a deployment invalidates it. Access blocks never cause a fallback around the block. Compared with one observed 362 KB HTML response, its JSON payload was 33 KB; this is an observation about that payload, not a promised network speedup.
 
-A successful collection workflow triggers frontend deployment on main. These workflows must be deployed to the repository before scheduled collection can run. Full coverage takes sustained collection: at the defaults, one commander can require up to 79 EDHREC page requests including bracket profiles, plus shared batched card metadata, so thousands of commanders require many hours of paced requests. The website only displays evidence actually collected; it never invents a package report for an uncollected commander.
+The objective is full collection within 96 hours, followed by daily index verification. Initial backfill starts its clock when the pipeline first runs. A later weekly snapshot date from `site_manifest.json` starts the next cycle at that dataset's Toronto calendar date. Capacity summaries distinguish the configured ceiling, measured completed HTTP requests, optimistic request-only lower bounds, projected completion, pending analysis, unavailable previews and an overdue target. Setting a ceiling never marks the deadline met.
 
-Inspect a batch without network collection:
+EDHREC's FAQ explains that edited decks receive a new database entry and the old one is removed: https://edhrec.com/faq . The rolling collector reconciles added/removed IDs and changed row fingerprints, immediately downloads new/changed versions, and verifies unchanged versions against a recent index. Original deck download timestamps remain separate from index verification timestamps. Dataset/ranking/card-rule hashes skip model fitting only when its real inputs and model settings are unchanged. This is freshness relative to EDHREC; its own upstream ingestion delay remains outside this project's control.
 
-```sh
-.venv/bin/python scripts/build_site_build_styles.py --dry-run
-```
+Parsed lists, source hashes, small page caches and pending analysis inputs remain in `build-styles/_collection/` across jobs, including completed datasets needed for incremental refresh. Bulky per-preview responses are discarded only after their parsed data is durably saved. Model workers consume saved evidence and make no EDHREC or Scryfall requests. One shared Scryfall repository loads its cache once and coalesces concurrent card lookups; pipeline metadata has a three-day cache policy.
 
-Continue the complete pending catalog, stopping before starting another commander after 45 minutes:
+After a durable artifact upload, an unrestricted run self-dispatches its successor only while actionable work remains and progress was made. The hourly schedule is a recovery trigger, not the normal source of continuity. The Monday workflow restores reports and triggers collection after publishing the new weekly dataset; it no longer competes to write the collection checkpoint. Frontend deployment is skipped when a batch changed no published reports. Restore validates cumulative artifacts and can recover usable checkpoints from completed interrupted runs on the default branch. Checkpoint artifacts are retained two days; summaries seven days. A failed upload prevents automatic continuation.
 
-```sh
-.venv/bin/python scripts/build_site_build_styles.py --fetch \
-  --max-commanders 0 --max-runtime-seconds 2700
-```
+Full-dataset storage and runner capacity must support the workload. The collector pauses before consuming its configured free-disk reserve; it does not provision paid storage or claim GitHub artifact quotas can hold every future dataset. A source limit, insufficient storage, runner gaps, unavailable lists or slow analysis can miss the four-day objective and must remain visible as such. The complete 6,750-commander deadline has not been validated by a production backfill.
 
-Collect a targeted cohort:
+Inspect the current catalog and request-only capacity without fetching data:
 
 ```sh
-.venv/bin/python scripts/build_site_build_styles.py --fetch \
-  --commander-index frontend/public/data/latest/commanders/index.json \
-  --commanders ghave-guru-of-spores hapatra-vizier-of-poisons \
-  --max-commanders 2 --sample-decks 100 --max-components 10
+.venv/bin/python scripts/build_site_build_styles.py --pipeline --dry-run
 ```
 
-Batch caches are dated. Interrupted, blocked and partial attempts resume their previous snapshot. Existing limited reports are eligible for expansion immediately; new commanders and expansions alternate, and unfinished collections rotate between runs. Completed snapshots are skipped until due for refresh. Partial deck generation retries after a day. CI uses `--prune-completed-cache` after durable writes: parsed previews and source hashes remain in the cumulative artifact while their raw HTML is discarded; fully completed snapshots are removed. Local caches remain unless that flag is supplied. Requests remain sequential with at least one second between starts, and access challenges stop collection rather than being bypassed. Removing the count ceiling increases total backfill work; time slices bound preview collection, not the eventual dataset size or model runtime.
+Run the rolling full collector under the existing source-access permission:
+
+```sh
+.venv/bin/python scripts/build_site_build_styles.py --pipeline --fetch \
+  --workers 6 --preview-workers 16 --analysis-workers 2 \
+  --requests-per-second 40 --sample-decks all \
+  --target-completion-hours 96 --source-max-age-hours 72 \
+  --index-max-age-hours 24 --refresh-after-days 3 \
+  --max-runtime-seconds 14400 --prune-completed-cache
+```
+
+`--max-commanders`, `--commanders`, and a numeric `--sample-decks` remain optional bounded experiments. A finite sample cannot satisfy full-index coverage, and bounded/manual refresh runs do not self-dispatch indefinitely. Without `--pipeline`, the older sequential batch mode remains available for local experiments; its dated cache/refresh behavior is separate from the production rolling pipeline.
 
 ## Local deck imports
 

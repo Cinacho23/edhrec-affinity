@@ -86,6 +86,47 @@ def test_empty_insufficient_report_is_counted_without_inventing_packages(tmp_pat
     assert not (site / "build-styles/pending.json").exists()
 
 
+def test_export_preserves_source_age_and_partial_coverage_without_using_analysis_date(tmp_path):
+    processed, site = tmp_path / "processed", tmp_path / "site"
+    source = report(date="2026-10-21T12:00:00+00:00")
+    evidence = {"target_hours": 96, "max_age_hours": 72,
+                "oldest_source_at": "2026-10-01T12:00:00+00:00",
+                "newest_source_at": "2026-10-20T12:00:00+00:00",
+                "dated_previews": 60, "undated_previews": 0, "observed_previews": 60, "stale_previews": 20,
+                "index_source_at": "2026-10-20T12:00:00+00:00", "index_stale": False,
+                "source_complete": False}
+    source["collection"].update(target_mode="all", complete=False, frame_decks=1000,
+                                previews_attempted=60, previews_loaded=60, freshness=evidence)
+    write_json(processed / "build-styles/commander-a.json", source)
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"]}), processed, site,
+                                     seed_dir=tmp_path / "missing-seeds")
+    index = json.loads((site / "build-styles/index.json").read_text())
+    entry = index["commanders"][0]
+    assert entry["generated_at"] == "2026-10-21T12:00:00+00:00"
+    assert entry["collection"]["freshness"] == evidence
+    assert entry["collection"]["previews_attempted"] == 60
+    assert "provenance" not in entry["collection"]
+    from datetime import datetime, timezone
+    summary = exporter.summarize_build_style_freshness(index["commanders"], datetime(2026, 10, 21, 12, tzinfo=timezone.utc))
+    assert (summary["target_met"], summary["partial"], summary["overdue"], summary["unknown"]) == (0, 1, 1, 0)
+
+
+def test_freshness_summary_counts_full_current_sources_and_unknown_legacy_reports():
+    from datetime import datetime, timezone
+    evidence = {"oldest_source_at": "2026-10-20T12:00:00Z", "newest_source_at": "2026-10-20T13:00:00Z",
+                "dated_previews": 98, "undated_previews": 0, "observed_previews": 98, "stale_previews": 0,
+                "index_source_at": "2026-10-20T14:00:00Z", "index_stale": False}
+    full = {"collection": {"target_mode": "all", "complete": True, "frame_decks": 100,
+                            "previews_attempted": 100, "unavailable_previews": 0, "freshness": evidence}}
+    legacy = {"generated_at": "2026-10-21T12:00:00Z"}
+    summary = exporter.summarize_build_style_freshness([full, legacy], datetime(2026, 10, 21, 12, tzinfo=timezone.utc))
+    assert (summary["target_met"], summary["partial"], summary["overdue"], summary["unknown"]) == (1, 1, 0, 1)
+    evidence.update(basis="current_index_versions", oldest_verified_at="2026-10-20T14:00:00Z",
+                    newest_verified_at="2026-10-20T14:00:00Z", oldest_source_at="2026-08-01T00:00:00Z")
+    summary = exporter.summarize_build_style_freshness([full], datetime(2026, 10, 21, 12, tzinfo=timezone.utc))
+    assert (summary["target_met"], summary["overdue"]) == (1, 0)
+
+
 def test_malformed_samples_do_not_prevent_other_exports(tmp_path):
     samples = tmp_path / "samples"
     write_json(samples / "commander-a.json", report())

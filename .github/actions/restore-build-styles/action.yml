@@ -1,32 +1,88 @@
 name: Restore commander build-style samples
-description: Restore the newest cumulative successful build-style artifact, including collection checkpoints
+description: Restore a durable cumulative build-style artifact, including collection checkpoints
 inputs:
   destination:
     description: Directory receiving per-commander reports and the _collection checkpoint directory
     required: true
+  run-id:
+    description: Prefer this completed run, falling back to the newest usable default-branch checkpoint
+    required: false
+    default: ""
+outputs:
+  restored:
+    description: Whether a usable artifact was restored
+    value: ${{ steps.restore.outputs.restored }}
+  run-id:
+    description: Workflow run containing the restored artifact
+    value: ${{ steps.restore.outputs.run_id }}
 runs:
   using: composite
   steps:
-    - shell: bash
+    - id: restore
+      shell: bash
       env:
         BUILD_STYLE_DESTINATION: ${{ inputs.destination }}
+        BUILD_STYLE_PREFERRED_RUN: ${{ inputs.run-id }}
         GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
         mkdir -p "${BUILD_STYLE_DESTINATION}"
         BUILD_STYLE_DEFAULT_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+        candidates="$(mktemp "${RUNNER_TEMP}/build-style-artifacts.XXXXXX")"
+        if [[ -n "${BUILD_STYLE_PREFERRED_RUN}" ]]; then
+          [[ "${BUILD_STYLE_PREFERRED_RUN}" =~ ^[0-9]+$ ]] || { echo "Invalid preferred run id" >&2; exit 1; }
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_STYLE_PREFERRED_RUN}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired == false) | select(.name | startswith("build-styles-")) | [.workflow_run.id, .name] | @tsv' \
+            >> "${candidates}" || echo "::warning::Preferred artifact unavailable; trying earlier checkpoints."
+        fi
+        gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+          --jq '[.[].artifacts[]] | sort_by(.created_at) | reverse | .[] | select(.expired == false) | select(.name | startswith("build-styles-")) | [.workflow_run.id, .name] | @tsv' \
+          >> "${candidates}"
         while IFS=$'\t' read -r run_id artifact_name; do
-          IFS=$'\t' read -r conclusion source_branch < <(
-            gh run view "${run_id}" --json conclusion,headBranch --jq '[.conclusion, .headBranch] | @tsv'
+          IFS=$'\t' read -r status source_branch source_event < <(
+            gh run view "${run_id}" --json status,headBranch,event --jq '[.status, .headBranch, .event] | @tsv'
           )
-          if [[ "${conclusion}" != "success" || "${source_branch}" != "${BUILD_STYLE_DEFAULT_BRANCH}" ]]; then
+          if [[ "${status}" != "completed" || "${source_branch}" != "${BUILD_STYLE_DEFAULT_BRANCH}" || "${source_event}" == pull_request* ]]; then
             continue
           fi
-          gh run download "${run_id}" --name "${artifact_name}" --dir "${BUILD_STYLE_DESTINATION}"
+          staging="$(mktemp -d "${RUNNER_TEMP}/build-style-restore.XXXXXX")"
+          if ! gh run download "${run_id}" --name "${artifact_name}" --dir "${staging}"; then
+            echo "::warning::Could not download ${artifact_name}; trying an earlier checkpoint."
+            rm -rf "${staging}"
+            continue
+          fi
+          # A failed or cancelled run can still have uploaded a complete,
+          # atomic checkpoint. Do not discard its progress or access cooldown.
+          if ! python - "${staging}" <<'PY'
+        import json
+        from pathlib import Path
+        import sys
+
+        root = Path(sys.argv[1])
+        state_path = root / "_collection/state.json"
+        state = json.loads(state_path.read_text()) if state_path.exists() else None
+        reports = list(root.glob("*.json"))
+        if state is not None and (not isinstance(state, dict) or state.get("schema_version") != 1
+                                  or not isinstance(state.get("commanders"), dict)):
+            raise SystemExit("Invalid collection checkpoint")
+        if not reports and state is None:
+            raise SystemExit("Artifact contains no reports or collection checkpoint")
+        for path in reports:
+            value = json.loads(path.read_text())
+            if value.get("commander_slug") != path.stem:
+                raise SystemExit(f"Report identity mismatch: {path.name}")
+        PY
+          then
+            echo "::warning::Ignoring unusable ${artifact_name}; trying an earlier checkpoint."
+            rm -rf "${staging}"
+            continue
+          fi
+          cp -a "${staging}/." "${BUILD_STYLE_DESTINATION}/"
+          rm -rf "${staging}"
           echo "Restored ${artifact_name} from run ${run_id}."
+          echo "restored=true" >> "${GITHUB_OUTPUT}"
+          echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
           exit 0
-        done < <(
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-            --jq '.artifacts | sort_by(.created_at) | reverse | .[] | select(.expired == false) | select(.name | startswith("build-styles-")) | [.workflow_run.id, .name] | @tsv'
-        )
+        done < <(awk '!seen[$0]++' "${candidates}")
+        echo "restored=false" >> "${GITHUB_OUTPUT}"
         echo "No build-style artifact yet; tracked seed samples remain available."

@@ -14,6 +14,8 @@
 .build-discovery-card__stats > div { display: grid; gap: .35rem; }
 .build-discovery-card__stats strong { color: var(--accent); font-size: 1.45rem; }
 .build-discovery-card__stats span { color: var(--muted); font-size: .75rem; }
+.build-discovery-card__sources { display: grid; gap: .4rem; margin-bottom: 1rem; font-size: .78rem; line-height: 1.5; color: var(--muted); }
+.build-discovery-card__sources strong { color: var(--muted-strong); }
 .build-discovery-card__footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .75rem; align-items: center; margin-top: auto; padding-top: 1rem; border-top: 1px solid var(--border-soft); font-size: .75rem; color: var(--muted); }
 .build-discovery-card__footer a, .build-discovery-all-commanders { color: var(--accent); font-weight: 700; }
 .build-discovery-card__footer a:hover, .build-discovery-all-commanders:hover { text-decoration: underline; }

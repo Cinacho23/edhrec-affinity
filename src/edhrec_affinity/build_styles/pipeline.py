@@ -1,0 +1,356 @@
+"""Rolling full-catalog collection with independent network and model workers.
+
+The 96-hour window is a measured objective, never a claim that a configured
+request ceiling establishes source capacity or guarantees completion.
+"""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from datetime import datetime, timedelta, timezone
+import gzip
+import hashlib
+import json
+import multiprocessing
+from pathlib import Path
+import shutil
+import threading
+import time
+from zoneinfo import ZoneInfo
+
+import httpx
+
+from .capacity import plan_capacity
+from .sources import PreviewTransport, RequestLimiter, SourceBlocked, source_time
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")), encoding="utf-8")
+    temporary.replace(path)
+
+
+def save_evidence(path: Path, evidence: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    with gzip.open(temporary, "wt", encoding="utf-8", compresslevel=1) as handle:
+        json.dump(evidence, handle, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    temporary.replace(path)
+
+
+def evidence_version(evidence: dict, options: argparse.Namespace | None = None) -> str:
+    # Observation times change during revalidation even when the input does not.
+    # Include actual card rules and ranking measurements, not their check times.
+    metadata = {key: {field: value for field, value in card.items() if field not in {"checked_at", "_build_cache"}}
+                for key, card in evidence.get("metadata", {}).items()}
+    contents = {"deck_dataset_sha256": evidence["collection"].get("dataset_sha256"),
+                "base": evidence["base"], "profiles": evidence["ranking_profiles"], "metadata": metadata,
+                "model_version": 4, "options": {key: getattr(options, key, None) for key in
+                    ("seed", "components", "max_components", "min_deck_cards", "min_card_support", "membership", "similarity")}}
+    return hashlib.sha256(json.dumps(contents, sort_keys=True, ensure_ascii=False, allow_nan=False,
+                                    separators=(",", ":")).encode()).hexdigest()
+
+
+def published_collection(evidence: dict) -> dict:
+    return {**evidence["collection"], "failures": evidence.get("failures", []),
+            "provenance": [{key: value for key, value in item.items() if key != "cache_file"}
+                           for item in evidence.get("provenance", [])]}
+
+
+def refresh_unchanged_report_metadata(report: dict, metadata_summary: dict) -> None:
+    """Refresh observations of unchanged rules without inventing a new rating."""
+    if not metadata_summary.get("checked_at"):
+        return
+    analysis = report.get("deck_analysis", {})
+    packages = [*analysis.get("packages", []),
+                *[package for model in analysis.get("alternative_models", []) for package in model.get("packages", [])]]
+    stale_error = "Some card rules use an older cache; refresh metadata before relying on current legality."
+    for package in packages:
+        generated = package.get("generated_deck", {})
+        if generated.get("status") != "generated":
+            continue
+        validation = generated.setdefault("validation", {})
+        validation["metadata"] = {key: metadata_summary.get(key) for key in
+                                  ("checked_at", "oldest_checked_at", "stale_cached", "cache_max_age_days")}
+        validation.setdefault("checks", {})["metadata_fresh"] = not bool(metadata_summary.get("stale_cached"))
+        if validation["checks"]["metadata_fresh"]:
+            validation["errors"] = [error for error in validation.get("errors", []) if error != stale_error]
+            validation["valid"] = not validation["errors"] and all(validation["checks"].values())
+    if report.get("deck_generation"):
+        report["deck_generation"]["metadata"] = metadata_summary
+
+
+def analyze_saved_evidence(path: Path, options: dict) -> dict:
+    """Spawn-safe worker: reads a durable input and never fetches source data."""
+    from threadpoolctl import threadpool_limits
+    from .__main__ import analyze_evidence
+
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        evidence = json.load(handle)
+    with threadpool_limits(limits=1):
+        report = analyze_evidence(argparse.Namespace(**options), evidence)
+    return {"slug": report["commander_slug"], "report": str(Path(options["output_dir"]) / "report.json"),
+            "status": report["deck_analysis"]["status"], "version": evidence["analysis_version"]}
+
+
+def collection_options(args, slug: str, remaining_seconds: float):
+    from .__main__ import parser
+
+    options = parser().parse_args(["--commander", slug, "--no-html"])
+    options.cache_dir = args.output_dir / "_collection" / "sources" / slug
+    options.collection_state = args.output_dir / "_collection" / "previews" / f"{slug}.json.gz"
+    options.output_dir = args.output_dir / "_collection" / "analyzed" / slug
+    options.card_metadata_cache = args.card_metadata_cache
+    options.fetch, options.sample_decks, options.seed = args.fetch, args.sample_decks, args.seed
+    options.max_components, options.max_tags, options.min_tag_decks = args.max_components, args.max_tags, args.min_tag_decks
+    options.request_delay, options.preview_workers = args.request_delay, args.preview_workers
+    options.source_max_age_hours, options.index_max_age_hours = args.source_max_age_hours, args.index_max_age_hours
+    options.target_completion_hours = args.target_completion_hours
+    options.trust_index_versions, options.defer_partial_analysis = True, True
+    options.max_preview_seconds = min(args.max_preview_seconds, max(1, remaining_seconds))
+    return options
+
+
+def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monotonic=time.monotonic,
+                 analysis_executor_factory=None, now=None) -> dict:
+    from .__main__ import collect_evidence
+    from .card_metadata import MetadataRepository
+
+    now = now or (lambda: datetime.now(timezone.utc))
+    started, observed_at = monotonic(), now()
+    root = args.output_dir / "_collection"
+    root.mkdir(parents=True, exist_ok=True)
+    state_path, summary_path = root / "state.json", args.output_dir.parent / "build_style_batch.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {"schema_version": 1, "commanders": {}}
+    if state.get("schema_version") != 1 or not isinstance(state.get("commanders"), dict):
+        raise ValueError("Invalid collection checkpoint")
+    requested = set(args.commanders or [])
+    known = {row["commander_slug"] for row in rows}
+    if requested - known:
+        raise ValueError("Requested commanders not found in catalog")
+    rows = [row for row in rows if (not requested or row["commander_slug"] in requested)
+            and (bool(requested) or float(row.get("total_decks") or 0) >= args.min_total_decks)]
+    rows_by_slug = {row["commander_slug"]: row for row in rows}
+    cycle = state.setdefault("pipeline", {"version": 1, "cycle_started_at": observed_at.isoformat()})
+    cycle_start = source_time(cycle.get("cycle_started_at")) or observed_at
+    upstream_date = getattr(args, "upstream_snapshot_date", None)
+    if upstream_date and cycle.get("upstream_snapshot_date") not in {None, upstream_date}:
+        cycle_start = datetime.strptime(upstream_date, "%Y-%m-%d").replace(tzinfo=ZoneInfo("America/Toronto")).astimezone(timezone.utc)
+        cycle["cycle_started_at"] = cycle_start.isoformat()
+    if upstream_date:
+        cycle["upstream_snapshot_date"] = upstream_date
+    cycle_complete = all(state["commanders"].get(slug, {}).get("status") in {"fitted", "insufficient_data"}
+                         and state["commanders"][slug].get("coverage_complete")
+                         and not state["commanders"][slug].get("unavailable_previews")
+                         and (verified := source_time(state["commanders"][slug].get("verified_at"))) is not None
+                         and -300 <= (observed_at - verified).total_seconds() < args.target_completion_hours * 3600
+                         and (args.output_dir / f"{slug}.json").exists() for slug in rows_by_slug)
+    if cycle_complete and (observed_at - cycle_start).total_seconds() >= args.refresh_after_days * 86400:
+        cycle_start = observed_at
+        cycle["cycle_started_at"] = observed_at.isoformat()
+    summary = {"snapshot_date": args.snapshot_date, "pipeline_version": 1, "catalog_size": len(rows),
+               "cycle_started_at": cycle_start.isoformat(), "target_completion_hours": args.target_completion_hours,
+               "completed": [], "collected": [], "failures": [], "blocked": False,
+               "dry_run": args.dry_run, "publish_needed": False, "continuation_needed": False,
+               "no_progress": True, "time_budget_reached": False, "new_previews_attempted": 0,
+               "time_budget_seconds": args.max_runtime_seconds, "max_preview_attempts": None,
+               "request_ceiling_per_second": args.requests_per_second}
+
+    def eligible(slug):
+        record = state["commanders"].get(slug, {})
+        retry = source_time(record.get("retry_after"))
+        if retry and retry > now() and not args.refresh:
+            return False
+        verified = source_time(record.get("verified_at"))
+        return (args.refresh or record.get("status") not in {"fitted", "insufficient_data"}
+                or not record.get("coverage_complete") or verified is None
+                or not (args.output_dir / f"{slug}.json").exists()
+                or (verified - now()).total_seconds() > 300
+                or (now() - verified).total_seconds() >= min(args.refresh_after_days * 86400, args.index_max_age_hours * 3600))
+
+    queue = sorted((slug for slug in rows_by_slug if eligible(slug)), key=lambda slug: (
+        state["commanders"].get(slug, {}).get("attempted_at", ""),
+        float(rows_by_slug[slug].get("total_decks") or 0), slug))
+    if args.max_commanders:
+        queue = queue[:args.max_commanders]
+    summary["selected"] = list(queue)
+
+    def checkpoint():
+        elapsed = max(0.0, monotonic() - started)
+        remaining = sum(max(0, int(record.get("frame_decks", rows_by_slug[slug].get("total_decks") or 0))
+                            - (int(record.get("current_previews", 0)) if source_time(record.get("verified_at"))
+                               and (now() - source_time(record["verified_at"])).total_seconds() < args.target_completion_hours * 3600 else 0))
+                        for slug in rows_by_slug for record in [state["commanders"].get(slug, {})])
+        preview_rate = summary["new_previews_attempted"] / elapsed if elapsed > 0 and summary["new_previews_attempted"] else None
+        # ``limiter`` lives in the enclosing run after initialization; before
+        # then (including dry runs) no throughput measurement exists.
+        measured_limiter = limiter_holder[0]
+        stats = measured_limiter.stats if measured_limiter is not None else None
+        rate = stats.get("successful_responses", 0) / elapsed if stats and elapsed > 0 and stats.get("successful_responses") else None
+        summary["preview_processing_rate"] = preview_rate
+        overhead = 19 * sum(not source_time(state["commanders"].get(slug, {}).get("last_collection_at"))
+                            or (now() - source_time(state["commanders"][slug]["last_collection_at"])).total_seconds()
+                            >= args.index_max_age_hours * 3600 for slug in rows_by_slug)
+        summary["capacity"] = plan_capacity(rows, target_hours=args.target_completion_hours,
+            max_requests_per_second=args.requests_per_second, observed_requests_per_second=rate,
+            elapsed_seconds=max(0, (now() - cycle_start).total_seconds()), remaining_previews=remaining,
+            remaining_overhead_requests=overhead, now=now())
+        summary["capacity"]["unavailable_previews"] = sum(state["commanders"].get(slug, {}).get("unavailable_previews", 0)
+                                                         for slug in rows_by_slug)
+        summary["capacity"]["analysis_pending"] = sum(state["commanders"].get(slug, {}).get("status") == "analysis_pending"
+                                                      for slug in rows_by_slug)
+        summary["remaining_in_batch"] = sum(eligible(slug) for slug in rows_by_slug)
+        summary["deadline_target_met"] = (remaining == 0 and summary["remaining_in_batch"] == 0
+                                           and not summary["capacity"]["unavailable_previews"])
+        summary["capacity"]["disk_free_bytes"] = shutil.disk_usage(root).free
+        summary["elapsed_seconds"] = round(elapsed, 3)
+        if not args.dry_run:
+            atomic_json(state_path, state)
+            atomic_json(summary_path, summary)
+
+    limiter_holder = [None]
+    checkpoint()
+    cooldown = source_time(state.get("blocked_until"))
+    if cooldown and cooldown > now():
+        summary.update(blocked=True, blocked_until=state["blocked_until"])
+        checkpoint()
+        return summary
+    if args.dry_run:
+        return summary
+    limiter = RequestLimiter(max_rate=args.requests_per_second, start_rate=min(2, args.requests_per_second), ramp_after=100)
+    limiter_holder[0] = limiter
+    transport, metadata_lock = PreviewTransport(), threading.Lock()
+    repository = MetadataRepository(args.card_metadata_cache, max_age_days=args.source_max_age_hours / 24)
+    collector, analyzer = collector or collect_evidence, analyzer or analyze_saved_evidence
+    analysis_executor_factory = analysis_executor_factory or (lambda: ProcessPoolExecutor(
+        max_workers=args.analysis_workers, mp_context=multiprocessing.get_context("spawn")))
+    network_jobs, model_jobs = {}, {}
+    analysis_queue = []
+    for slug in queue[:]:
+        record = state["commanders"].get(slug, {})
+        evidence_path = root / "evidence" / f"{slug}.json.gz"
+        if record.get("status") == "analysis_pending" and evidence_path.exists():
+            analysis_queue.append((slug, evidence_path, collection_options(args, slug, args.max_preview_seconds)))
+            queue.remove(slug)
+    visits, visited_count = {}, 0
+    with ThreadPoolExecutor(max_workers=args.workers) as network_pool, analysis_executor_factory() as model_pool:
+        try:
+            while queue or network_jobs or analysis_queue or model_jobs:
+                elapsed = monotonic() - started
+                remaining_time = args.max_runtime_seconds - elapsed if args.max_runtime_seconds else float("inf")
+                accepting = remaining_time > 0 and not summary["blocked"]
+                if accepting and shutil.disk_usage(root).free < args.min_free_disk_gb * 1024 ** 3:
+                    summary["resource_limit"] = "Insufficient local disk for another durable collection checkpoint"
+                    accepting = False
+                if remaining_time <= 0:
+                    summary["time_budget_reached"] = True
+                while accepting and queue and len(network_jobs) < args.workers:
+                    slug = queue.pop(0)
+                    if args.max_commanders and visited_count >= args.max_commanders and slug not in visits:
+                        continue
+                    if slug not in visits:
+                        visited_count += 1
+                    visits[slug] = visits.get(slug, 0) + 1
+                    options = collection_options(args, slug, remaining_time)
+                    state["commanders"].setdefault(slug, {}).update(
+                        status="collecting", attempted_at=now().isoformat(), cache_snapshot="rolling")
+                    future = network_pool.submit(collector, options, limiter=limiter, preview_transport=transport,
+                                                 metadata_lock=metadata_lock, metadata_provider=repository)
+                    network_jobs[future] = (slug, options)
+                while analysis_queue and len(model_jobs) < args.analysis_workers:
+                    slug, evidence_path, options = analysis_queue.pop(0)
+                    model_jobs[model_pool.submit(analyzer, evidence_path, vars(options))] = (slug, evidence_path)
+                futures = [*network_jobs, *model_jobs]
+                if not futures:
+                    break
+                done, _ = wait(futures, timeout=1, return_when=FIRST_COMPLETED)
+                for future in done:
+                    slug, context = (network_jobs.pop(future) if future in network_jobs else model_jobs.pop(future))
+                    is_collection = isinstance(context, argparse.Namespace)
+                    record = state["commanders"][slug]
+                    try:
+                        result = future.result()
+                        if is_collection:
+                            collection = result["collection"]
+                            if result.get("blocked") or limiter.blocked:
+                                raise SourceBlocked("Source access restriction or rate limit; shared workers stopped")
+                            new_attempts = int(collection.get("new_previews_attempted", 0))
+                            summary["new_previews_attempted"] += new_attempts
+                            summary["collected"].append(slug)
+                            record.update(frame_decks=collection.get("frame_decks") or 0,
+                                current_previews=collection.get("fresh_previews", collection.get("previews_loaded", 0)),
+                                unavailable_previews=collection.get("unavailable_previews", 0),
+                                coverage_complete=collection.get("complete") is True and collection.get("target_mode") == "all",
+                                last_collection_at=now().isoformat())
+                            freshness = collection.get("freshness", {})
+                            record["verified_at"] = (freshness.get("oldest_verified_at") or freshness.get("oldest_source_at")
+                                                     or (freshness.get("index_source_at") if collection.get("complete") else None))
+                            if new_attempts or collection.get("reconciliation", {}).get("refreshed_index"):
+                                summary["no_progress"] = False
+                            destination = args.output_dir / f"{slug}.json"
+                            if collection.get("complete"):
+                                version = evidence_version(result, context)
+                                collection.update(analysis_current=True, analysis_dataset_sha256=collection.get("dataset_sha256"))
+                                result["analysis_version"] = version
+                                if record.get("analysis_version") == version and destination.exists():
+                                    report = json.loads(destination.read_text())
+                                    report["collection"] = {**report.get("collection", {}), **published_collection(result)}
+                                    refresh_unchanged_report_metadata(report, result.get("metadata_summary", {}))
+                                    atomic_json(destination, report)
+                                    record["status"] = report["deck_analysis"]["status"]
+                                    summary["completed"].append(slug)
+                                    summary.update(publish_needed=True, no_progress=False)
+                                else:
+                                    evidence_path = root / "evidence" / f"{slug}.json.gz"
+                                    save_evidence(evidence_path, result)
+                                    record["status"] = "analysis_pending"
+                                    analysis_queue.append((slug, evidence_path, context))
+                            else:
+                                if destination.exists():
+                                    report = json.loads(destination.read_text())
+                                    report["collection"].update(published_collection(result), analysis_current=False)
+                                    atomic_json(destination, report)
+                                    summary["publish_needed"] = True
+                                if new_attempts:
+                                    queue.append(slug)  # Continue full coverage, never a sample-count ceiling.
+                                else:
+                                    record.update(status="failed", retry_after=(now() + timedelta(minutes=30)).isoformat())
+                            if args.prune_completed_cache:
+                                previews = context.cache_dir / "previews"
+                                if previews.is_dir() and not previews.is_symlink():
+                                    shutil.rmtree(previews)
+                        else:
+                            report = json.loads(Path(result["report"]).read_text())
+                            for item in report.get("collection", {}).get("provenance", []):
+                                item.pop("cache_file", None)
+                            atomic_json(args.output_dir / f"{slug}.json", report)
+                            record.update(status=result["status"], analysis_version=result["version"], analyzed_at=now().isoformat())
+                            summary["completed"].append(slug)
+                            summary.update(publish_needed=True, no_progress=False)
+                            context.unlink(missing_ok=True)
+                            shutil.rmtree(root / "analyzed" / slug, ignore_errors=True)
+                    except SourceBlocked as error:
+                        summary["blocked"] = True
+                        limiter.block(str(error))
+                        cooldown_seconds = max(3600, limiter.stats.get("retry_after_seconds", 0))
+                        state["blocked_until"] = (now() + timedelta(seconds=cooldown_seconds)).isoformat()
+                        record.update(status="blocked", retry_after=state["blocked_until"])
+                        summary["failures"].append({"commander_slug": slug, "error": str(error)})
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError, httpx.HTTPError) as error:
+                        record.update(status="analysis_pending" if not is_collection else "failed",
+                                      retry_after=(now() + timedelta(minutes=30)).isoformat())
+                        summary["failures"].append({"commander_slug": slug, "error": str(error)})
+                    checkpoint()
+                if not accepting and not network_jobs and not model_jobs and not analysis_queue:
+                    break
+        finally:
+            checkpoint()
+    summary["continuation_needed"] = (not summary["blocked"] and not summary["no_progress"]
+                                      and not summary.get("resource_limit") and summary["remaining_in_batch"] > 0
+                                      and args.sample_decks is None and not args.max_commanders
+                                      and not args.commanders and not args.refresh)
+    summary["measured_request_rate"] = limiter.stats if hasattr(limiter, "stats") else None
+    checkpoint()
+    return summary

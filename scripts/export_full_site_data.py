@@ -36,7 +36,7 @@ import json
 import math
 import re
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1302,13 +1302,29 @@ def export_build_style_files(
         normalize_report_deck_tags(report)
         write_json(output_dir / filename, report, compact=True)
         analysis = report["deck_analysis"]
-        entries.append({
+        entry = {
             "commander_slug": slug, "commander_name": report["commander_name"],
             "file": filename, "generated_at": report["generated_at"],
             "profile_count": len(report["profiles"]["profiles"]),
             "package_count": len(analysis["packages"]),
             "unique_decks": analysis["unique_decks"], "status": analysis["status"],
-        })
+        }
+        collection = report.get("collection", {})
+        if isinstance(collection, dict):
+            # Keep source observations distinct from generated_at. The catalog
+            # can show partial coverage and age without fetching every report.
+            summary = {key: collection[key] for key in (
+                "target_mode", "complete", "frame_decks", "previews_attempted", "previews_loaded", "analysis_current", "unavailable_previews",
+            ) if key in collection}
+            if isinstance(collection.get("freshness"), dict):
+                summary["freshness"] = {key: value for key, value in collection["freshness"].items()
+                    if key in {"target_hours", "max_age_hours", "oldest_source_at", "newest_source_at",
+                               "stale_previews", "dated_previews", "undated_previews", "observed_previews",
+                               "index_source_at", "index_stale", "source_complete", "basis", "oldest_verified_at",
+                               "newest_verified_at", "source_dated_previews", "source_undated_previews", "unchanged_verified"}}
+            if summary:
+                entry["collection"] = summary
+        entries.append(entry)
     index = {
         "schema_version": 1, "coverage": "sampled_commanders", "total_available": len(entries),
         "total_catalog": len(known_slugs), "total_pending": len(known_slugs) - len(entries),
@@ -1316,9 +1332,58 @@ def export_build_style_files(
         "total_insufficient": sum(entry["status"] == "insufficient_data" for entry in entries),
         "commanders": entries,
     }
+    if any("freshness" in entry.get("collection", {}) for entry in entries):
+        index["freshness"] = summarize_build_style_freshness(entries)
     write_json(output_dir / "build-styles/index.json", index)
     return {"index_file": "build-styles/index.json", "file_pattern": "build-styles/<commander_slug>.json",
             "commander_count": len(entries), "coverage": "sampled_commanders"}
+
+
+def summarize_build_style_freshness(entries: list[dict[str, Any]], now: datetime | None = None) -> dict[str, Any]:
+    """Export a dated summary; clients recompute age as the static site gets older.
+
+    Partial, overdue and unknown counts can overlap. A recent analysis timestamp
+    does not establish source freshness or full-index coverage.
+    """
+    now = now or datetime.now(timezone.utc)
+    result = {"target_hours": 96, "evaluated_at": now.isoformat(), "target_met": 0,
+              "partial": 0, "overdue": 0, "unknown": 0}
+
+    def age_hours(value):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return None
+            age = (now - parsed).total_seconds() / 3600
+            return age if age >= -5 / 60 else None
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    for entry in entries:
+        collection = entry.get("collection", {})
+        evidence = collection.get("freshness", {})
+        frame, attempted = collection.get("frame_decks"), collection.get("previews_attempted")
+        complete = collection.get("target_mode") == "all" and collection.get("complete") is True \
+            and type(frame) is int and type(attempted) is int and frame >= 0 and attempted == frame
+        result["partial"] += not complete
+        fields = ("oldest_verified_at", "newest_verified_at") if evidence.get("basis") == "current_index_versions" \
+            else ("oldest_source_at", "newest_source_at")
+        oldest, newest = (age_hours(evidence.get(field)) for field in fields)
+        dated, undated, observed, stale = (evidence.get(key) for key in (
+            "dated_previews", "undated_previews", "observed_previews", "stale_previews"))
+        counts_known = all(type(value) is int and value >= 0 for value in (dated, undated, observed, stale))
+        known = counts_known and observed > 0 and dated > 0 and dated + undated == observed \
+            and stale <= observed and oldest is not None and newest is not None and oldest >= newest
+        empty = frame == 0 and observed == 0 and undated == 0 and stale == 0
+        unknown = not empty and (not known or undated > 0)
+        result["unknown"] += unknown
+        result["overdue"] += oldest is not None and oldest >= 96
+        index_age = age_hours(evidence.get("index_source_at"))
+        result["target_met"] += complete and collection.get("analysis_current") is not False \
+            and collection.get("unavailable_previews") == 0 \
+            and (empty or known and undated == 0 and stale == 0 and oldest < 96) \
+            and index_age is not None and index_age < 96 and evidence.get("index_stale") is False
+    return result
 
 
 def export_full_site_data(

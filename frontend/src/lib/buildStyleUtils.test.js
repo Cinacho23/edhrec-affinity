@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildModel, getBuildModelOptions, getComparableProfilePairs,
-  getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckExport, getGeneratedDeckGroups, getSupportedThemes, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
+  formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildCollectionProgress, getBuildModel, getBuildModelOptions, getBuildSourceFreshness, getComparableProfilePairs,
+  getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckExport, getGeneratedDeckGroups, getPackageBracketLabel, getSupportedThemes, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
 } from "./buildStyleUtils.js";
 
 test("models keep any number of packages and match alternative weights by deck ID", () => {
@@ -157,4 +157,82 @@ test("generated deck groups preserve the generator's functional role order", () 
   const roles = ["Commander", "Lands", "Fast Mana", "Ramp", "Card Advantage", "Wipe", "Removal", "Tutor", "Recursion", "Protection", "Leftover"];
   const cards = roles.toReversed().map((primary_role) => ({ name: `${primary_role} card`, quantity: 1, primary_role, tags: [primary_role, "Theme A"] }));
   assert.deepEqual(getGeneratedDeckGroups({ cards }).map((group) => group.name), roles);
+});
+
+function sourceCollection(overrides = {}) {
+  return { target_mode: "all", complete: true, frame_decks: 100, previews_attempted: 100, unavailable_previews: 0,
+    freshness: { target_hours: 96, oldest_source_at: "2026-10-20T12:00:00Z", newest_source_at: "2026-10-20T13:00:00Z",
+      dated_previews: 98, undated_previews: 0, observed_previews: 98, stale_previews: 0,
+      index_source_at: "2026-10-20T14:00:00Z", index_stale: false, source_complete: true, ...overrides } };
+}
+
+test("source age uses actual source observations and expires even when the analysis is rebuilt", () => {
+  const now = Date.parse("2026-10-21T12:00:00Z");
+  assert.equal(getBuildSourceFreshness({ generated_at: "2026-10-21T12:00:00Z" }, now).status, "unknown");
+  assert.equal(getBuildSourceFreshness(sourceCollection(), now).status, "fresh");
+  const fourDaysLater = Date.parse("2026-10-24T12:00:00Z");
+  assert.equal(getBuildSourceFreshness(sourceCollection(), fourDaysLater).status, "mixed");
+  assert.equal(getBuildSourceFreshness(sourceCollection(), fourDaysLater + 3600 * 1000).status, "stale");
+  assert.equal(getBuildCollectionProgress(sourceCollection(), fourDaysLater).targetMet, false);
+});
+
+test("full-index freshness requires coverage plus current deck and index checks", () => {
+  const now = Date.parse("2026-10-21T12:00:00Z");
+  assert.equal(getBuildCollectionProgress(sourceCollection(), now).targetMet, true);
+  const partial = { ...sourceCollection(), complete: false, previews_attempted: 30 };
+  assert.equal(getBuildSourceFreshness(partial, now).status, "fresh");
+  assert.equal(getBuildCollectionProgress(partial, now).targetMet, false);
+  assert.equal(getBuildCollectionProgress(partial, now).label, "Partial index coverage");
+  assert.equal(getBuildCollectionProgress({ ...sourceCollection(), target_mode: "sample" }, now).targetMet, false);
+  assert.equal(getBuildCollectionProgress({ ...sourceCollection(), analysis_current: false }, now).targetMet, false);
+  assert.equal(getBuildCollectionProgress({ ...sourceCollection(), unavailable_previews: 2 }, now).targetMet, false);
+  assert.equal(getBuildCollectionProgress(sourceCollection({ index_source_at: "2026-10-01T00:00:00Z" }), now).targetMet, false);
+  assert.equal(getBuildCollectionProgress(sourceCollection({ index_stale: true }), now).targetMet, false);
+  assert.equal(getBuildCollectionProgress(sourceCollection({ index_source_at: null }), now).targetMet, false);
+  assert.equal(getBuildCollectionProgress({ ...sourceCollection({ observed_previews: 0, dated_previews: 0,
+    oldest_source_at: null, newest_source_at: null }), frame_decks: 0, previews_attempted: 0 }, now).targetMet, true);
+});
+
+test("undated, changed and invalid preview checks cannot claim verified freshness", () => {
+  const now = Date.parse("2026-10-21T12:00:00Z");
+  const undated = sourceCollection({ dated_previews: 97, undated_previews: 1, stale_previews: 1 });
+  assert.equal(getBuildSourceFreshness(undated, now).status, "mixed");
+  assert.equal(getBuildCollectionProgress(undated, now).targetMet, false);
+  assert.equal(getBuildSourceFreshness(sourceCollection({ stale_previews: 1 }), now).status, "mixed");
+  for (const overrides of [{ oldest_source_at: null }, { newest_source_at: "invalid" },
+    { oldest_source_at: "2026-10-25T12:00:00Z" }, { oldest_source_at: "2026-10-20T15:00:00Z" },
+    { observed_previews: 100 }, { dated_previews: null }]) {
+    assert.equal(getBuildSourceFreshness(sourceCollection(overrides), now).status, "unknown");
+    assert.equal(getBuildCollectionProgress(sourceCollection(overrides), now).targetMet, false);
+  }
+  assert.equal(getBuildCollectionProgress({ ...sourceCollection(), previews_attempted: 101 }, now).known, false);
+});
+
+test("version verification can retain cached lists without changing their actual download dates", () => {
+  const now = Date.parse("2026-10-21T12:00:00Z");
+  const collection = sourceCollection({ basis: "current_index_versions",
+    oldest_source_at: "2026-09-01T12:00:00Z", newest_source_at: "2026-09-30T12:00:00Z",
+    oldest_verified_at: "2026-10-20T12:00:00Z", newest_verified_at: "2026-10-20T14:00:00Z",
+    unchanged_verified: 98 });
+  const freshness = getBuildSourceFreshness(collection, now);
+  assert.equal(freshness.status, "fresh");
+  assert.equal(freshness.label, "Collected deck versions verified within 4 days");
+  assert.equal(freshness.oldestSourceAt, "2026-09-01T12:00:00Z");
+  assert.equal(getBuildCollectionProgress(collection, now).targetMet, true);
+  assert.equal(getBuildSourceFreshness({ ...collection, freshness: { ...collection.freshness, basis: undefined } }, now).status, "stale");
+  assert.equal(getBuildSourceFreshness({ ...collection, freshness: { ...collection.freshness, oldest_verified_at: null } }, now).status, "unknown");
+  assert.equal(getBuildCollectionProgress(collection, now + 96 * 3600 * 1000).targetMet, false);
+});
+
+test("package headings prefer a current external bracket and identify fallback estimates", () => {
+  const now = Date.parse("2026-10-21T12:00:00Z");
+  const deck = { status: "generated", validation: { bracket: { recommended: 3 },
+    external_rating: { status: "verified", checked_at: "2026-10-20T12:00:00Z", playability_pct: 74.5, bracket: 5 } } };
+  assert.equal(getPackageBracketLabel(deck, now), "Bracket 5 · EDHPowerLevel");
+  assert.equal(getPackageBracketLabel(deck, now + 7 * 24 * 3600 * 1000), "Estimated bracket 3");
+  assert.equal(getPackageBracketLabel({ ...deck, validation: { ...deck.validation,
+    external_rating: { ...deck.validation.external_rating, status: "stale" } } }, now), "Estimated bracket 3");
+  assert.equal(getPackageBracketLabel({ ...deck, status: "unavailable" }, now), null);
+  assert.equal(getPackageBracketLabel({ status: "generated", validation: {} }, now), null);
+  assert.equal(getPackageBracketLabel({ status: "generated", validation: { bracket: { recommended: 9 } } }, now), null);
 });

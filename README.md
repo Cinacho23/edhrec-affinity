@@ -53,14 +53,25 @@ GitHub Actions scheduled workflow
 
 The [build-discovery documentation](docs/build_style_prototype.md) explains the
 website feature, automatic package-count selection, local analysis and static
-data generation. Real seed samples cover Ghave, Hapatra and Jasmine. An hourly
-workflow continues through the full commander catalog, preserving completed
-reports and collection checkpoints between runs. Collection defaults to every
+data generation. Real seed samples cover Ghave, Hapatra and Jasmine. Rolling
+four-hour jobs continue through the full commander catalog, preserving completed
+reports and collection checkpoints between runs, with an hourly recovery schedule.
+Collection targets every
 available deck-index ID, with no commander or preview count cap. Time slices let
 unfinished commanders resume across runs. There is no minimum popularity gate. Low-data
 commanders can return profiles or an insufficient-data result instead of card
 packages. Source deck tags are optional. Public EDHREC previews supply cardlists
 without direct requests to Moxfield or Archidekt.
+
+The complete-deck refresh objective is 96 hours. Downloads and model processes
+run independently, using compact public JSON previews and one adaptive shared
+request ceiling. The configured ceiling is not a guarantee of sustained speed:
+collection summaries measure throughput and expose missed projections. Daily
+deck-index checks add changed/new versions and remove deleted entries while
+preserving unchanged lists and their original download dates. The site separately
+shows index verification, deck coverage, pending analysis, and unknown/stale data.
+Full automated collection relies on the repository owner's stated permission
+from EDHREC; access restrictions and server cooldowns stop all source workers.
 
 Every supported package can generate a native 100-card deck using learned card
 preferences and the sampled card pool, with one primary category tag per card,

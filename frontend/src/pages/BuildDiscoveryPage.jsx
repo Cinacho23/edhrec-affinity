@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { loadBuildStyleIndex } from "../lib/api";
+import { getBuildCollectionProgress, getBuildSourceFreshness } from "../lib/buildStyleUtils";
 import { formatNumber } from "../lib/formatters";
 import "./BuildDiscoveryPage.css";
 
@@ -34,6 +35,11 @@ export default function BuildDiscoveryPage() {
   const totalCatalog = Number.isInteger(state.index?.total_catalog) && state.index.total_catalog >= state.commanders.length
     ? state.index.total_catalog : null;
   const pending = totalCatalog === null ? null : totalCatalog - state.commanders.length;
+  const freshnessCounts = state.commanders.reduce((counts, commander) => {
+    counts[getBuildSourceFreshness(commander.collection).status] += 1;
+    if (getBuildCollectionProgress(commander.collection).targetMet) counts.targetMet += 1;
+    return counts;
+  }, { fresh: 0, mixed: 0, stale: 0, unknown: 0, targetMet: 0 });
 
   return <section className="page build-discovery-page">
     <div className="page-header">
@@ -45,12 +51,14 @@ export default function BuildDiscoveryPage() {
     <div className="panel build-discovery-coverage">
       <h2>Available commander reports</h2>
       <p>Each report covers sampled decks for one commander. The package count adapts to the evidence, and a package can suggest one or several themes. These reports describe a sample rather than every EDHREC deck.</p>
-      <p>The scheduled collector gradually adds reports and expands deck coverage. A package describes a recurring card pattern across decks; the generated deck under it is one 100-card example of that pattern. Changing the package count fits a different model.</p>
+      <p>The four-day freshness target applies to checking every available deck preview for each commander. A first analysis can appear while that collection is still in progress. Source-check age and full-index progress are shown separately; a newly built report alone does not meet the target.</p>
+      <p>A package describes a recurring card pattern across decks; the generated deck under it is one 100-card example of that pattern. Changing the package count fits a different model.</p>
       {!state.loading && !state.error ? <>
         <strong>{totalCatalog === null
           ? `${formatNumber(state.commanders.length)} ${state.commanders.length === 1 ? "commander report available" : "commander reports available"}`
           : `${formatNumber(state.commanders.length)} of ${formatNumber(totalCatalog)} commanders analyzed`}</strong>
         {pending !== null ? <p className="build-discovery-coverage__pending">{formatNumber(pending)} {pending === 1 ? "commander remains" : "commanders remain"} pending in this dataset. Analyzed commanders stay listed when there is insufficient data to fit packages.</p> : null}
+        <p className="build-discovery-coverage__freshness">{formatNumber(freshnessCounts.targetMet)}{totalCatalog !== null ? ` of ${formatNumber(totalCatalog)}` : ""} commanders currently meet the full-index four-day freshness target. {formatNumber(freshnessCounts.unknown)} published reports have unknown source age; {formatNumber(freshnessCounts.mixed + freshnessCounts.stale)} contain source checks needing refresh. Collected-source freshness alone does not mean full index coverage.</p>
       </> : null}
     </div>
 
@@ -60,18 +68,30 @@ export default function BuildDiscoveryPage() {
         <input id="build-discovery-search" type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search commander name…" />
         <p className="muted" aria-live="polite">{formatNumber(visible.length)} of {formatNumber(state.commanders.length)} reports</p>
       </div>
-      <div className="build-discovery-grid">{visible.map((commander) => <article className="panel build-discovery-card" key={commander.commander_slug}>
+      <div className="build-discovery-grid">{visible.map((commander) => {
+        const freshness = getBuildSourceFreshness(commander.collection);
+        const progress = getBuildCollectionProgress(commander.collection);
+        return <article className="panel build-discovery-card" key={commander.commander_slug}>
         <h2><Link to={`/commanders/${encodeURIComponent(commander.commander_slug)}`}>{commander.commander_name || commander.commander_slug}</Link></h2>
         <div className="build-discovery-card__stats">
           <div><strong>{formatNumber(commander.package_count)}</strong><span>{commander.package_count === 1 ? "suggested package" : "suggested packages"}</span></div>
           <div><strong>{formatNumber(commander.profile_count)}</strong><span>tag profiles</span></div>
-          <div><strong>{formatNumber(commander.unique_decks)}</strong><span>sampled decks</span></div>
+          <div><strong>{formatNumber(commander.unique_decks)}</strong><span>analyzed decks</span></div>
         </div>
         {commander.status !== "fitted" ? <p className="muted">{commander.profile_count > 0
           ? "Tag profile comparisons available; deck evidence is insufficient to fit packages."
           : "Insufficient data for tag comparisons or packages."}</p> : null}
-        <div className="build-discovery-card__footer"><span>Analyzed {reportDate(commander.generated_at)}</span><Link to={`/commanders/${encodeURIComponent(commander.commander_slug)}`}>Explore report →</Link></div>
-      </article>)}</div>
+        <div className="build-discovery-card__sources">
+          <strong>{progress.targetMet ? "Full index meets four-day target" : progress.label}</strong>
+          {!progress.analysisCurrent ? <span>Analysis awaiting the current deck collection</span> : null}
+          {progress.known ? <span>{formatNumber(progress.attempted)} / {formatNumber(progress.frame)} previews attempted</span> : null}
+          {progress.unavailable > 0 ? <span>{formatNumber(progress.unavailable)} previews unavailable or unreadable</span> : null}
+          <span>{freshness.label}{freshness.versionsVerified && freshness.oldestVerifiedAt
+            ? ` · oldest verification ${reportDate(freshness.oldestVerifiedAt)}`
+            : freshness.oldestSourceAt ? ` · oldest download ${reportDate(freshness.oldestSourceAt)}` : ""}</span>
+        </div>
+        <div className="build-discovery-card__footer"><span>Analysis built {reportDate(commander.generated_at)}</span><Link to={`/commanders/${encodeURIComponent(commander.commander_slug)}`}>Explore report →</Link></div>
+      </article>; })}</div>
       {!visible.length ? <p className="muted">No available reports match this search.</p> : null}
     </> : <div className="panel"><p className="muted">No build discovery reports are available in this dataset yet.</p><Link className="build-discovery-all-commanders" to="/commanders">Browse all commanders →</Link></div>}
   </section>;
