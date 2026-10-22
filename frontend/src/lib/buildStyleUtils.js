@@ -77,6 +77,71 @@ const DECK_ROLE_ORDER = [
 const BUILD_EVIDENCE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const BUILD_EVIDENCE_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
 
+const BUILD_SOURCE_TARGET_HOURS = 96;
+
+function observedTimestamp(value, now) {
+  const timestamp = typeof value === "string" ? Date.parse(value) : NaN;
+  return Number.isFinite(timestamp) && timestamp <= now + BUILD_EVIDENCE_FUTURE_TOLERANCE_MS ? timestamp : NaN;
+}
+
+export function getBuildSourceFreshness(collection, now = Date.now()) {
+  const evidence = collection?.freshness;
+  const targetHours = BUILD_SOURCE_TARGET_HOURS;
+  const targetAge = targetHours * 60 * 60 * 1000;
+  const sourceOldest = observedTimestamp(evidence?.oldest_source_at, now);
+  const sourceNewest = observedTimestamp(evidence?.newest_source_at, now);
+  const versionsVerified = evidence?.basis === "current_index_versions";
+  const oldest = versionsVerified ? observedTimestamp(evidence?.oldest_verified_at, now) : sourceOldest;
+  const newest = versionsVerified ? observedTimestamp(evidence?.newest_verified_at, now) : sourceNewest;
+  const dated = evidence?.dated_previews;
+  const undated = evidence?.undated_previews;
+  const observed = evidence?.observed_previews;
+  const stale = evidence?.stale_previews;
+  const countsKnown = [dated, undated, observed, stale].every((value) => Number.isInteger(value) && value >= 0)
+    && dated + undated === observed && stale <= observed;
+  const result = { status: "unknown", label: "Collected source age unknown", targetHours, versionsVerified,
+    oldestSourceAt: Number.isFinite(sourceOldest) ? evidence.oldest_source_at : null,
+    newestSourceAt: Number.isFinite(sourceNewest) ? evidence.newest_source_at : null,
+    oldestVerifiedAt: versionsVerified && Number.isFinite(oldest) ? evidence.oldest_verified_at : null,
+    newestVerifiedAt: versionsVerified && Number.isFinite(newest) ? evidence.newest_verified_at : null };
+  if (collection?.frame_decks === 0 && collection.complete === true && evidence?.observed_previews === 0) {
+    return { ...result, status: "fresh", label: "No deck previews listed" };
+  }
+  if (!Number.isFinite(now) || !countsKnown || !observed || !dated || !Number.isFinite(oldest)
+      || !Number.isFinite(newest) || oldest > newest) return result;
+  if (now - newest >= targetAge && undated === 0) {
+    return { ...result, status: "stale", label: versionsVerified ? "Collected verification checks exceed 4 days" : "Collected sources exceed 4 days" };
+  }
+  if (now - oldest >= targetAge || undated > 0) {
+    return { ...result, status: "mixed", label: versionsVerified ? "Mixed or incomplete verification ages" : "Mixed or incomplete source ages" };
+  }
+  if (stale > 0) {
+    return { ...result, status: "mixed", label: versionsVerified ? "Collected deck versions need verification" : "Collected sources need a refresh" };
+  }
+  return { ...result, status: "fresh", label: versionsVerified ? "Collected deck versions verified within 4 days" : "Collected sources checked within 4 days" };
+}
+
+export function getBuildCollectionProgress(collection, now = Date.now()) {
+  const frame = collection?.frame_decks;
+  const attempted = collection?.previews_attempted;
+  const known = Number.isInteger(frame) && frame >= 0 && Number.isInteger(attempted) && attempted >= 0 && attempted <= frame;
+  const complete = known && collection?.target_mode === "all" && collection.complete === true && attempted >= frame;
+  const freshness = getBuildSourceFreshness(collection, now);
+  const indexAt = observedTimestamp(collection?.freshness?.index_source_at, now);
+  const indexFresh = Number.isFinite(indexAt) && now - indexAt < freshness.targetHours * 60 * 60 * 1000
+    && collection?.freshness?.index_stale === false;
+  const analysisCurrent = collection?.analysis_current !== false;
+  const unavailable = Number.isInteger(collection?.unavailable_previews) && collection.unavailable_previews >= 0
+    ? collection.unavailable_previews : null;
+  return {
+    known, frame, attempted, complete, indexFresh, analysisCurrent, unavailable,
+    indexSourceAt: Number.isFinite(indexAt) ? collection.freshness.index_source_at : null,
+    targetMet: complete && freshness.status === "fresh" && indexFresh && analysisCurrent && unavailable === 0,
+    label: complete ? "Full index checked" : known && attempted === frame && collection?.target_mode === "all"
+      ? "Full index awaiting refresh" : known ? "Partial index coverage" : "Index coverage unknown",
+  };
+}
+
 export function getExternalDeckRating(rating, now = Date.now()) {
   if (!rating || !["verified", "stale"].includes(rating.status)
       || !Number.isFinite(rating.playability_pct) || rating.playability_pct < 0 || rating.playability_pct > 100) return null;
@@ -85,6 +150,15 @@ export function getExternalDeckRating(rating, now = Date.now()) {
   const status = rating.status === "stale" || now - checkedAt >= BUILD_EVIDENCE_MAX_AGE_MS ? "stale" : "verified";
   const inTargetRange = rating.playability_pct >= 72.5 && rating.playability_pct <= 77.5;
   return { ...rating, status, inTargetRange, targetMet: status === "verified" && inTargetRange };
+}
+
+export function getPackageBracketLabel(deck, now = Date.now()) {
+  if (deck?.status !== "generated") return null;
+  const validBracket = (value) => Number.isInteger(value) && value >= 1 && value <= 5;
+  const external = getExternalDeckRating(deck.validation?.external_rating, now);
+  if (external?.status === "verified" && validBracket(external.bracket)) return `Bracket ${external.bracket} · EDHPowerLevel`;
+  const estimated = deck.validation?.bracket?.recommended ?? deck.statistics?.recommended_bracket;
+  return validBracket(estimated) ? `Estimated bracket ${estimated}` : null;
 }
 
 export function isBuildMetadataFresh(metadata, now = Date.now()) {

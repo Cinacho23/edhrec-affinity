@@ -2,8 +2,12 @@ name: Update commander build styles
 
 on:
   schedule:
-    # Continue the catalog queue hourly; requests remain sequential.
+    # Watchdog only: successful batches dispatch their own continuation.
     - cron: "17 * * * *"
+  workflow_run:
+    workflows: ["Update full sharded data and deploy site"]
+    branches: [main]
+    types: [completed]
   workflow_dispatch:
     inputs:
       commanders:
@@ -29,7 +33,9 @@ on:
 
 permissions:
   contents: read
-  actions: read
+  # workflow_dispatch is explicitly supported with GITHUB_TOKEN. No PAT or
+  # workflow_run recursion is needed for consecutive collection batches.
+  actions: write
 
 concurrency:
   group: commander-build-style-samples
@@ -37,12 +43,18 @@ concurrency:
 
 env:
   STYLES_DIR: data/build-style-artifact/build-styles
+  # One adaptive limiter applies across all collection workers. This is its
+  # ceiling, not its startup rate; source blocks stop the entire batch.
+  REQUESTS_PER_SECOND: ${{ vars.BUILD_STYLE_REQUESTS_PER_SECOND || '40' }}
 
 jobs:
   build:
     name: Continue catalog collection and learn build packages
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Leave time after the four-hour collection window to drain analysis and
+    # durably upload the checkpoint before dispatching the following batch.
+    timeout-minutes: 330
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -60,13 +72,6 @@ jobs:
         shell: bash
         run: echo "SAMPLE_DATE=$(TZ=America/Toronto date +%F)" >> "$GITHUB_ENV"
 
-      - name: Restore raw request cache for interrupted samples
-        uses: actions/cache@v4
-        with:
-          path: data/raw/build-styles
-          key: build-style-raw-${{ env.SAMPLE_DATE }}-${{ github.run_id }}
-          restore-keys: build-style-raw-
-
       - name: Restore accumulated build-style samples
         uses: ./.github/actions/restore-build-styles
         with:
@@ -79,13 +84,42 @@ jobs:
           key: build-style-cards-${{ env.SAMPLE_DATE }}-${{ github.run_id }}
           restore-keys: build-style-cards-
 
-      - name: Get current commander index
+      - name: Get current commander index and weekly dataset date
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p data/build-style-artifact
           curl --fail --silent --show-error --retry 2 \
             https://cinacho23.github.io/edhrec-affinity/data/latest/commanders/index.json \
             --output data/build-style-artifact/commander_index.json
+          if curl --fail --silent --show-error --retry 2 \
+            https://cinacho23.github.io/edhrec-affinity/data/latest/site_manifest.json \
+            --output data/build-style-artifact/site_manifest.json; then
+            python - <<'PY'
+          from datetime import date
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+
+          try:
+              manifest = json.loads(Path("data/build-style-artifact/site_manifest.json").read_text())
+              processed_dir = manifest.get("processed_dir") if isinstance(manifest, dict) else None
+              if not isinstance(processed_dir, str):
+                  raise ValueError("Missing processed snapshot directory")
+              snapshot = PurePosixPath(processed_dir).name
+              if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", snapshot):
+                  raise ValueError("Unrecognized processed snapshot date")
+              date.fromisoformat(snapshot)
+              with open(os.environ["GITHUB_ENV"], "a") as output:
+                  output.write(f"DATASET_DATE={snapshot}\n")
+              print(f"Using upstream weekly snapshot {snapshot}.")
+          except (OSError, ValueError, TypeError):
+              print("::warning::No valid upstream snapshot date; preserving the current collection cycle.")
+          PY
+          else
+            echo "::warning::Upstream manifest unavailable; preserving the current collection cycle."
+          fi
 
       - name: Continue the resumable catalog queue
         id: collect_styles
@@ -94,7 +128,7 @@ jobs:
         env:
           COMMANDER_SLUGS: ${{ inputs.commanders }}
           MAX_COMMANDERS: ${{ inputs.max_commanders || 0 }}
-          SAMPLE_DECKS: ${{ github.event_name == 'schedule' && 'all' || inputs.sample_decks }}
+          SAMPLE_DECKS: ${{ inputs.sample_decks || 'all' }}
           MAX_COMPONENTS: ${{ inputs.max_components || 8 }}
           REFRESH_REPORTS: ${{ inputs.refresh }}
         run: |
@@ -103,7 +137,13 @@ jobs:
                 --output-dir "${STYLES_DIR}" --snapshot-date "${SAMPLE_DATE}"
                 --max-commanders "${MAX_COMMANDERS}" --sample-decks "${SAMPLE_DECKS}"
                 --max-components "${MAX_COMPONENTS}" --min-total-decks 0
-                --max-runtime-seconds 2700 --request-delay 1 --prune-completed-cache)
+                --max-runtime-seconds 14400 --pipeline --workers 6 --preview-workers 16 --analysis-workers 2
+                --requests-per-second "${REQUESTS_PER_SECOND}"
+                --source-max-age-hours 72 --refresh-after-days 3
+                --target-completion-hours 96 --prune-completed-cache)
+          if [[ -n "${DATASET_DATE:-}" ]]; then
+            args+=(--upstream-snapshot-date "${DATASET_DATE}")
+          fi
           if [[ -n "${COMMANDER_SLUGS}" ]]; then
             read -r -a commander_args <<< "${COMMANDER_SLUGS}"
             args+=(--commanders "${commander_args[@]}")
@@ -118,13 +158,14 @@ jobs:
         run: echo "::warning::Collection stopped or failed. Completed reports and the retry checkpoint are retained; inspect the collection summary."
 
       - name: Upload cumulative build-style samples
+        id: checkpoint
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-styles-${{ env.SAMPLE_DATE }}-${{ github.run_id }}
           path: ${{ env.STYLES_DIR }}/
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 2
 
       - name: Upload collection summary
         if: always()
@@ -134,3 +175,47 @@ jobs:
           path: data/build-style-artifact/build_style_batch.json
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Decide whether collection can continue immediately
+        id: continuation
+        if: success() && steps.checkpoint.outcome == 'success' && steps.collect_styles.outcome == 'success'
+        shell: bash
+        env:
+          TARGETED_COMMANDERS: ${{ inputs.commanders }}
+          MAX_COMMANDERS: ${{ inputs.max_commanders || 0 }}
+          SAMPLE_DECKS: ${{ inputs.sample_decks || 'all' }}
+          REFRESH_REPORTS: ${{ inputs.refresh }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("data/build-style-artifact/build_style_batch.json")
+          summary = json.loads(path.read_text()) if path.exists() else {}
+          # Explicitly bounded/manual refresh runs stay bounded. An access
+          # cooldown or a batch with no forward progress waits for the watchdog.
+          should_continue = (
+              summary.get("continuation_needed") is True
+              and not summary.get("blocked")
+              and not summary.get("no_progress")
+              and not os.environ.get("TARGETED_COMMANDERS", "").strip()
+              and os.environ.get("MAX_COMMANDERS", "0") == "0"
+              and os.environ.get("SAMPLE_DECKS", "all") == "all"
+              and os.environ.get("REFRESH_REPORTS", "false") != "true"
+              and os.environ["GITHUB_REF_NAME"] == os.environ["DEFAULT_BRANCH"]
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"needed={str(should_continue).lower()}\n")
+          if not should_continue:
+              print("No immediate continuation: work is current, bounded, paused, or made no progress.")
+          PY
+
+      - name: Continue from the uploaded checkpoint
+        if: steps.continuation.outputs.needed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: gh workflow run build-commander-styles.yml --ref "${DEFAULT_BRANCH}"

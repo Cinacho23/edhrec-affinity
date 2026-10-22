@@ -8,11 +8,13 @@ or caches negative lookups. Source: https://scryfall.com/docs/api/cards/collecti
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import copy
 import json
 import math
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 from typing import Any, Iterable
 
@@ -46,11 +48,11 @@ def _timestamp(value: Any) -> str:
     return value
 
 
-def _stale(card: dict[str, Any], now: datetime) -> bool:
+def _stale(card: dict[str, Any], now: datetime, max_age_days: float = CACHE_MAX_AGE_DAYS) -> bool:
     checked = datetime.fromisoformat(card["checked_at"].replace("Z", "+00:00"))
     age_seconds = (now - checked).total_seconds()
     # A future timestamp cannot establish freshness either.
-    return age_seconds < 0 or age_seconds >= CACHE_MAX_AGE_DAYS * 86400
+    return age_seconds < 0 or age_seconds >= max_age_days * 86400
 
 
 def _strict_json(text: str) -> Any:
@@ -242,17 +244,7 @@ def _collection_cards(
     return cards, missing, failures
 
 
-def load_card_metadata(
-    names: Iterable[str], cache_path: Path | str = DEFAULT_CACHE_PATH, *, fetch: bool = False,
-) -> tuple[dict[str, dict], dict[str, Any]]:
-    """Resolve exact names with a shared cache and serialized 75-card requests.
-
-    Returns canonical keys plus safe front-face aliases for the requested cards.
-    ``summary.missing`` always lists unresolved input names; a failed request
-    leaves successful prior batches and cached cards usable. Online collection
-    refreshes cards at least seven days old. Offline and unsuccessful refreshes
-    retain dated metadata, with stale names disclosed in the summary.
-    """
+def _requested_names(names: Iterable[str]) -> dict[str, str]:
     if isinstance(names, (str, bytes)):
         raise ValueError("Card names must be an iterable of names")
     requested = {}
@@ -260,76 +252,142 @@ def load_card_metadata(
         if not isinstance(name, str) or not name.strip():
             raise ValueError("Card names must be nonempty strings")
         requested.setdefault(card_key(name), name.strip())
-    path = Path(cache_path)
-    summary: dict[str, Any] = {
-        "source_url": COLLECTION_URL, "checked_at": _now(), "network_enabled": fetch,
-        "requested": len(requested), "cached": 0, "fetched": 0, "requests": 0,
-        "resolved": 0, "missing": [], "not_found": [], "failures": [], "blocked": False,
-        "cache_max_age_days": CACHE_MAX_AGE_DAYS, "stale_cached": 0,
-        "stale_names": [], "oldest_checked_at": None,
-    }
-    cards: dict[str, dict] = {}
-    try:
-        cards = _read_cache(path)
-    except FileNotFoundError:
-        pass
-    except (ValueError, OSError, TypeError) as error:
-        summary["cache_error"] = str(error)
-    index = _index(cards)
-    now = datetime.now(timezone.utc)
-    pending = [name for key, name in requested.items()
-               if key not in index or _stale(index[key], now)]
-    refreshed_keys: set[str] = set()
-    if fetch and pending:
-        with httpx.Client(headers={"User-Agent": DEFAULT_USER_AGENT,
-                                   "Accept": "application/json"}, timeout=30,
-                          follow_redirects=False) as client:
-            for start in range(0, len(pending), COLLECTION_BATCH_SIZE):
-                # A previous batch can resolve an alias in a subsequent batch.
-                index = _index(cards)
-                batch_now = datetime.now(timezone.utc)
-                batch = [name for name in pending[start:start + COLLECTION_BATCH_SIZE]
-                         if card_key(name) not in index or _stale(index[card_key(name)], batch_now)]
-                if not batch:
-                    continue
-                # Delay every request, including the first in a commander run,
-                # so callers sharing this cache also stay paced across runs.
-                time.sleep(REQUEST_DELAY_SECONDS)
-                summary["requests"] += 1
-                try:
-                    response = client.post(COLLECTION_URL,
-                                           json={"identifiers": [{"name": _identifier_name(name)} for name in batch]})
-                    if response.status_code in {401, 403, 429}:
-                        summary["blocked"] = True
-                        summary["failures"].append({"names": batch, "status_code": response.status_code,
-                                                    "error": "Access or rate limit response; collection stopped without retry"})
+    return requested
+
+
+class MetadataRepository:
+    """Resolve many commander pools using one thread-safe in-memory cache.
+
+    The cache is parsed and indexed once. Concurrent callers share exact
+    matches and one serialized Scryfall request stream, including its pacing
+    and access-stop state. Returned records are independent of the repository
+    so deck analysis cannot contaminate another commander's metadata.
+    """
+
+    def __init__(self, cache_path: Path | str = DEFAULT_CACHE_PATH, *, max_age_days: float = 3):
+        if (isinstance(max_age_days, bool) or not isinstance(max_age_days, (int, float))
+                or not math.isfinite(max_age_days) or max_age_days <= 0):
+            raise ValueError("Metadata maximum age must be a positive finite number of days")
+        self.cache_path = Path(cache_path)
+        self.max_age_days = max_age_days
+        self._lock = threading.RLock()
+        self._loaded = False
+        self._cards: dict[str, dict] = {}
+        self._lookup: dict[str, dict] = {}
+        self._cache_error: str | None = None
+        self._blocked_status: int | None = None
+
+    @property
+    def blocked(self) -> bool:
+        with self._lock:
+            return self._blocked_status is not None
+
+    def _read_once(self) -> None:
+        if self._loaded:
+            return
+        try:
+            self._cards = _read_cache(self.cache_path)
+        except FileNotFoundError:
+            pass
+        except (ValueError, OSError, TypeError) as error:
+            self._cache_error = str(error)
+        self._lookup = _index(self._cards)
+        self._loaded = True
+
+    def load(self, names: Iterable[str], *, fetch: bool = False) -> tuple[dict[str, dict], dict[str, Any]]:
+        requested = _requested_names(names)
+        with self._lock:
+            self._read_once()
+            return self._load(requested, fetch=fetch)
+
+    def _load(self, requested: dict[str, str], *, fetch: bool) -> tuple[dict[str, dict], dict[str, Any]]:
+        summary: dict[str, Any] = {
+            "source_url": COLLECTION_URL, "checked_at": _now(), "network_enabled": fetch,
+            "requested": len(requested), "cached": 0, "fetched": 0, "requests": 0,
+            "resolved": 0, "missing": [], "not_found": [], "failures": [], "blocked": self.blocked,
+            "cache_max_age_days": self.max_age_days, "stale_cached": 0,
+            "stale_names": [], "oldest_checked_at": None,
+        }
+        if self._cache_error is not None:
+            summary["cache_error"] = self._cache_error
+        now = datetime.now(timezone.utc)
+        pending = [name for key, name in requested.items()
+                   if key not in self._lookup or _stale(self._lookup[key], now, self.max_age_days)]
+        refreshed_keys: set[str] = set()
+        if fetch and pending and self.blocked:
+            summary["failures"].append({
+                "names": pending, "status_code": self._blocked_status,
+                "error": "Repository paused after an access or rate limit response; no request was retried",
+            })
+        elif fetch and pending:
+            with httpx.Client(headers={"User-Agent": DEFAULT_USER_AGENT,
+                                       "Accept": "application/json"}, timeout=30,
+                              follow_redirects=False) as client:
+                for start in range(0, len(pending), COLLECTION_BATCH_SIZE):
+                    # A previous batch can resolve an alias in a subsequent batch.
+                    batch_now = datetime.now(timezone.utc)
+                    batch = [name for name in pending[start:start + COLLECTION_BATCH_SIZE]
+                             if card_key(name) not in self._lookup
+                             or _stale(self._lookup[card_key(name)], batch_now, self.max_age_days)]
+                    if not batch:
+                        continue
+                    # The lock keeps this delay global across repository users,
+                    # including the first request of the following commander.
+                    time.sleep(REQUEST_DELAY_SECONDS)
+                    summary["requests"] += 1
+                    try:
+                        response = client.post(COLLECTION_URL,
+                                               json={"identifiers": [{"name": _identifier_name(name)} for name in batch]})
+                        if response.status_code in {401, 403, 429}:
+                            self._blocked_status = response.status_code
+                            summary["blocked"] = True
+                            summary["failures"].append({"names": batch, "status_code": response.status_code,
+                                                        "error": "Access or rate limit response; collection stopped without retry"})
+                            break
+                        response.raise_for_status()
+                        fresh, missing, rejected = _collection_cards(_strict_json(response.text), batch, _now())
+                        if fresh:
+                            self._cards.update(fresh)
+                            self._lookup = _index(self._cards)
+                            # Preserve completed batches if a later request fails.
+                            _write_cache(self.cache_path, self._cards)
+                            self._cache_error = None
+                            refreshed_keys.update(key for key in _index(fresh) if key in requested)
+                        summary["not_found"].extend(missing)
+                        summary["failures"].extend(rejected)
+                    except (httpx.HTTPError, ValueError, OSError, TypeError) as error:
+                        summary["failures"].append({"names": batch, "error": str(error)})
                         break
-                    response.raise_for_status()
-                    fresh, missing, rejected = _collection_cards(_strict_json(response.text), batch, _now())
-                    cards.update(fresh)
-                    # Save each completed batch so an interrupted catalog run resumes.
-                    if fresh:
-                        _write_cache(path, cards)
-                        refreshed_keys.update(key for key in _index(fresh) if key in requested)
-                    summary["not_found"].extend(missing)
-                    # A new layout or one invalid card must not discard the
-                    # other exact matches or prevent later batches resolving.
-                    summary["failures"].extend(rejected)
-                except (httpx.HTTPError, ValueError, OSError, TypeError) as error:
-                    summary["failures"].append({"names": batch, "error": str(error)})
-                    break
-    index = _index(cards)
-    resolved_cards = {card_key(index[key]["name"]) for key in requested if key in index}
-    result = {key: card for key, card in index.items() if card_key(card["name"]) in resolved_cards}
-    summary["resolved"] = sum(key in result for key in requested)
-    summary["fetched"] = sum(key in result for key in refreshed_keys)
-    summary["cached"] = summary["resolved"] - summary["fetched"]
-    summary["missing"] = [name for key, name in requested.items() if key not in result]
-    final_now = datetime.now(timezone.utc)
-    summary["stale_names"] = [name for key, name in requested.items()
-                              if key in result and _stale(result[key], final_now)]
-    summary["stale_cached"] = len(summary["stale_names"])
-    checked_dates = [card["checked_at"] for card in result.values()]
-    if checked_dates:
-        summary["oldest_checked_at"] = min(checked_dates, key=lambda value: datetime.fromisoformat(value.replace("Z", "+00:00")))
-    return result, summary
+        # Resolve just this pool, without scanning the complete shared cache
+        # again for every commander. Preserve safe full/front-name aliases.
+        result = {}
+        for key in requested:
+            card = self._lookup.get(key)
+            if card is not None:
+                for alias in _aliases(card):
+                    if self._lookup.get(alias) is card:
+                        result[alias] = card
+        summary["resolved"] = sum(key in result for key in requested)
+        summary["fetched"] = sum(key in result for key in refreshed_keys)
+        summary["cached"] = summary["resolved"] - summary["fetched"]
+        summary["missing"] = [name for key, name in requested.items() if key not in result]
+        final_now = datetime.now(timezone.utc)
+        summary["stale_names"] = [name for key, name in requested.items()
+                                  if key in result and _stale(result[key], final_now, self.max_age_days)]
+        summary["stale_cached"] = len(summary["stale_names"])
+        checked_dates = [card["checked_at"] for card in result.values()]
+        if checked_dates:
+            summary["oldest_checked_at"] = min(checked_dates, key=lambda value: datetime.fromisoformat(value.replace("Z", "+00:00")))
+        return copy.deepcopy(result), summary
+
+
+def load_card_metadata(
+    names: Iterable[str], cache_path: Path | str = DEFAULT_CACHE_PATH, *, fetch: bool = False,
+) -> tuple[dict[str, dict], dict[str, Any]]:
+    """Resolve one pool with the legacy seven-day freshness policy.
+
+    For catalog collection, reuse a ``MetadataRepository`` across commanders.
+    Offline lookups and failed refreshes retain their original dated metadata;
+    unresolved and stale input names remain explicit in the summary.
+    """
+    return MetadataRepository(cache_path, max_age_days=CACHE_MAX_AGE_DAYS).load(names, fetch=fetch)

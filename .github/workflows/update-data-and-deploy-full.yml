@@ -13,9 +13,9 @@ permissions:
   actions: read
 
 concurrency:
-  # Share the collector lock with catalog runs so their cumulative artifacts
-  # cannot diverge and lose commanders collected by the other workflow.
-  group: commander-build-style-samples
+  # The weekly pipeline only reads build-style checkpoints. The rolling
+  # collector is their sole writer and need not block fresh affinity data.
+  group: weekly-full-data
   cancel-in-progress: false
 
 env:
@@ -189,39 +189,6 @@ jobs:
         with:
           destination: ${{ env.PROCESSED_DIR }}/build-styles
 
-      - name: Restore shared card rules cache
-        uses: actions/cache@v4
-        with:
-          path: data/raw/build-style-card-metadata.json
-          key: build-style-cards-${{ env.SNAPSHOT_DATE }}-${{ github.run_id }}
-          restore-keys: build-style-cards-
-
-      - name: Continue build-style catalog coverage
-        id: build_styles
-        continue-on-error: true
-        shell: bash
-        run: |
-          python3 scripts/build_site_build_styles.py \
-            --fetch \
-            --commander-index "${PROCESSED_DIR}/affinity_rows_with_trends.json" \
-            --output-dir "${PROCESSED_DIR}/build-styles" \
-            --snapshot-date "${SNAPSHOT_DATE}" \
-            --max-commanders 0 --sample-decks all --max-components 8 \
-            --min-total-decks 0 --max-runtime-seconds 900 --request-delay 1 --prune-completed-cache
-
-      - name: Report build-style collection failure
-        if: steps.build_styles.outcome == 'failure'
-        run: echo "::warning::Build-style collection stopped or failed; retained completed samples and the retry checkpoint. See build_style_batch.json in the processed-data artifact."
-
-      - name: Upload cumulative build-style samples
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-styles-${{ env.SNAPSHOT_DATE }}-${{ github.run_id }}
-          path: ${{ env.PROCESSED_DIR }}/build-styles/
-          if-no-files-found: warn
-          retention-days: 90
-
       - name: Export full sharded frontend data
         shell: bash
         run: |
@@ -271,6 +238,9 @@ jobs:
     name: Deploy to GitHub Pages
     needs: build
     runs-on: ubuntu-latest
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
 
     environment:
       name: github-pages

@@ -27,9 +27,47 @@ env:
   RESTORED_PROCESSED_DIR: "data/processed/restored"
 
 jobs:
+  changes:
+    name: Check whether collected reports changed
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.changes.outputs.publish }}
+    steps:
+      - name: Inspect collection summary
+        id: changes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" != workflow_run ]]; then
+            echo "publish=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          summary_dir="$(mktemp -d "${RUNNER_TEMP}/build-style-summary.XXXXXX")"
+          gh run download "${SOURCE_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name "build-style-summary-${SOURCE_RUN_ID}" --dir "${summary_dir}"
+          python - "${summary_dir}/build_style_batch.json" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          summary = json.loads(Path(sys.argv[1]).read_text())
+          # Older uploaded summaries predate the explicit change indicator.
+          publish = summary.get("publish_needed", bool(summary.get("completed"))) is True
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"publish={str(publish).lower()}\n")
+          print("Reports changed; publishing." if publish else "No changed reports; keeping the current deployment.")
+          PY
+
   build:
     name: Build frontend
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    needs: changes
+    if: needs.changes.outputs.publish == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -110,6 +148,7 @@ jobs:
         uses: ./.github/actions/restore-build-styles
         with:
           destination: ${{ env.RESTORED_PROCESSED_DIR }}/build-styles
+          run-id: ${{ github.event.workflow_run.id }}
 
       - name: Upgrade cached affinity analysis
         shell: bash

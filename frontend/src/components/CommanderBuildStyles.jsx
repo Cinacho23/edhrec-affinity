@@ -6,13 +6,16 @@ import {
   formatBuildLift,
   formatBuildShare,
   generatedDeckFilename,
+  getBuildCollectionProgress,
   getBuildModel,
   getBuildModelOptions,
+  getBuildSourceFreshness,
   getComparableProfilePairs,
   getDeckMixtureRows,
   getExternalDeckRating,
   getGeneratedDeckExport,
   getGeneratedDeckGroups,
+  getPackageBracketLabel,
   getSupportedThemes,
   isBuildMetadataFresh,
   safeExternalUrl,
@@ -163,13 +166,14 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
 
 function PackageCard({ pkg, index, decks }) {
   const themes = getSupportedThemes(pkg);
+  const bracketLabel = getPackageBracketLabel(pkg.generated_deck);
   const representatives = (pkg.representative_deck_ids || []).map(
     (id) => decks.find((deck) => deck.id === id)
   ).filter(Boolean);
   return (
     <article className="build-package">
       <div className="build-package__header">
-        <h4>Package {index + 1}</h4>
+        <div className="build-package__title"><h4>Package {index + 1}</h4>{bracketLabel ? <span className="build-package__bracket">{bracketLabel}</span> : null}</div>
         <span>{formatNumber(pkg.member_count)} sampled decks</span>
       </div>
       <p className="build-small-label">Suggested themes</p>
@@ -182,7 +186,7 @@ function PackageCard({ pkg, index, decks }) {
         )) : <span className="muted">No supported theme label</span>}
       </div>
       <GeneratedPackageDeck key={pkg.generated_deck?.name || pkg.id} deck={pkg.generated_deck} packageNumber={index + 1} />
-      <details className="build-evidence" open>
+      <details className="build-evidence">
         <summary>Distinctive cards</summary>
         <div className="build-table-scroll" tabIndex="0" role="region" aria-label={`Package ${index + 1} card evidence`}>
           <table>
@@ -295,11 +299,24 @@ function TagProfiles({ profiles }) {
 function BuildReport({ report }) {
   const [view, setView] = useState(report.deck_analysis.packages.length ? "decks" : "profiles");
   const analyzed = report.deck_analysis.unique_decks || 0;
+  const freshness = getBuildSourceFreshness(report.collection);
+  const progress = getBuildCollectionProgress(report.collection);
   return <section className="commander-build-styles panel" aria-labelledby="build-discovery-heading">
-    <div className="build-heading"><div><p className="eyebrow">Build discovery <span className="build-pilot">Exploratory</span></p><h2 id="build-discovery-heading">How this commander gets built</h2></div>{report.generated_at ? <span className="muted">Updated {new Date(report.generated_at).toLocaleDateString("en-US", { timeZone: "America/Toronto" })}</span> : null}</div>
+    <div className="build-heading"><div><p className="eyebrow">Build discovery <span className="build-pilot">Exploratory</span></p><h2 id="build-discovery-heading">How this commander gets built</h2></div>{report.generated_at ? <span className="muted">Analysis built {new Date(report.generated_at).toLocaleDateString("en-US", { timeZone: "America/Toronto" })}</span> : null}</div>
     <p className="build-intro">Themes can overlap or describe different builds. Explore related tag profiles and the recurring card packages found in individual decks.</p>
     <p className="build-coverage">Coverage: {formatNumber(report.profiles.profiles.length)} tag profiles and {formatNumber(analyzed)} unique sampled decks from {formatNumber(report.total_edhrec_decks)} decks listed by EDHREC. This sample is not every deck and does not establish how common a style is.</p>
-    {report.collection?.target_mode === "all" ? <p className="build-note">{formatNumber(report.collection.previews_attempted)} of {formatNumber(report.collection.frame_decks)} available deck previews attempted. {report.collection.complete ? "This index snapshot is complete; unavailable or unusable lists can still be excluded." : "Collection is in progress and resumes across scheduled runs. Packages currently use the successfully collected lists."}</p> : null}
+    <div className="build-source-status">
+      <strong>{progress.targetMet ? "Full index meets the four-day freshness target" : progress.label}</strong>
+      {!progress.analysisCurrent ? <p>Analysis awaiting the current deck collection. The packages shown still describe the previously analyzed decklists.</p> : null}
+      {progress.known ? <p>{formatNumber(progress.attempted)} of {formatNumber(progress.frame)} available deck previews attempted. {progress.complete ? "Unavailable or unusable lists can still be excluded from analysis." : "Collection resumes across runs. A completed analysis of the collected decks does not mean the full index has been checked."}</p> : <p>The available index size and collection progress were not recorded for this report.</p>}
+      {progress.unavailable > 0 ? <p>{formatNumber(progress.unavailable)} previews were unavailable or could not be read. The full-deck freshness target remains unmet.</p> : null}
+      <p className={`build-source-status__age build-source-status__age--${freshness.status}`}>{freshness.label}.{freshness.versionsVerified
+        ? (freshness.oldestVerifiedAt ? ` Oldest version verification: ${checkedDate(freshness.oldestVerifiedAt)}.` : " Version-verification dates are unavailable.")
+        : (freshness.oldestSourceAt ? ` Oldest successful preview check: ${checkedDate(freshness.oldestSourceAt)}.` : " This report has no verified source-check dates.")}</p>
+      {freshness.versionsVerified ? <p className="build-note">{freshness.oldestSourceAt ? `Oldest actual decklist download: ${checkedDate(freshness.oldestSourceAt)}.` : "Original decklist-download dates are unavailable."} Current index checks verify unchanged deck IDs; new or changed versions require downloading the decklist.</p> : null}
+      <p className="build-note">{progress.indexSourceAt ? `Deck index checked ${checkedDate(progress.indexSourceAt)}.${progress.indexFresh ? "" : " The index needs a freshness check."}` : "The deck index’s source-check date is unknown."}</p>
+      <p className="build-note">The target is to check the full available index within four days. Check dates record when EDHREC was read; they do not establish when a deck owner last changed a deck. Rebuilding this analysis does not reset source age.</p>
+    </div>
     <div className="build-view-switch" role="group" aria-label="Build discovery views"><button type="button" aria-pressed={view === "decks"} onClick={() => setView("decks")}>Individual deck packages</button><button type="button" aria-pressed={view === "profiles"} onClick={() => setView("profiles")}>Tag profile similarities</button></div>
     {view === "decks" ? <DeckPackages analysis={report.deck_analysis} /> : <TagProfiles profiles={report.profiles} />}
     <details className="build-evidence build-method-note"><summary>Data and interpretation</summary><p>{report.collection?.sampling || "Card profiles and deck previews collected from EDHREC."}</p><p>Deck tags are optional metadata. The package model uses cards, so untagged decks and decks with one or many tags can all contribute. Suggested themes describe a package’s similarity to tag profiles; they are not confirmed labels on every member deck.</p><ul>{(report.limits || []).map((limit) => <li key={limit}>{limit}</li>)}</ul></details>
