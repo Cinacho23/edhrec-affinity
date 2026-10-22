@@ -35,8 +35,10 @@ runs:
             --jq '.artifacts[] | select(.expired == false) | select(.name | startswith("build-styles-")) | [.workflow_run.id, .name] | @tsv' \
             >> "${candidates}" || echo "::warning::Preferred artifact unavailable; trying earlier checkpoints."
         fi
+        # gh cannot combine --slurp with its embedded --jq formatter. Aggregate
+        # pages first, then use standalone jq to sort the complete artifact list.
         gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-          --jq '[.[].artifacts[]] | sort_by(.created_at) | reverse | .[] | select(.expired == false) | select(.name | startswith("build-styles-")) | [.workflow_run.id, .name] | @tsv' \
+          | jq -r '[.[].artifacts[]] | sort_by(.created_at) | reverse | .[] | select(.expired == false) | select(.name | startswith("build-styles-")) | [.workflow_run.id, .name] | @tsv' \
           >> "${candidates}"
         while IFS=$'\t' read -r run_id artifact_name; do
           IFS=$'\t' read -r status source_branch source_event < <(
