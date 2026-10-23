@@ -187,6 +187,8 @@ After a durable artifact upload, an unrestricted run self-dispatches its success
 
 Full-dataset storage and runner capacity must support the workload. The collector pauses before consuming its configured free-disk reserve; it does not provision paid storage or claim GitHub artifact quotas can hold every future dataset. Source limits, insufficient storage, runner gaps, unavailable lists or slow analysis can extend completion and remain visible in progress summaries. A complete eligible-commander production backfill has not yet established sustained end-to-end throughput.
 
+If an interrupted run saves its summary but fails to upload its cumulative checkpoint, automatic dispatch stops. An explicit **Run workflow** request can set `recovery_run_id` to that latest interrupted run. Recovery pins the newest older durable checkpoint and retains the stricter learned request ceiling and applicable cooldowns from both runs. Access restrictions and active cooldowns still prevent collection. The restore is checked again before updating state; unuploaded preview counts and completed reports are never copied. The eligible commander queue is rebuilt using the 200-deck minimum. Checkpoint uploads exclude raw preview responses, model scratch and temporary files that can be removed during cancellation, while retaining parsed decklists and analysis inputs.
+
 An October 22, 2026 local recovery check read the previously failing Timin preview and 126 Ghave decks with no format errors, then stopped on HTTP 429 after about 65 seconds at 1.96 successful requests per second. This confirms format recovery, but does not establish the request rate available to GitHub runners.
 
 Inspect the current catalog and request-only capacity without fetching data:

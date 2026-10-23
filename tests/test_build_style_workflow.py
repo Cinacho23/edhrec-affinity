@@ -1,6 +1,7 @@
 """Regression checks for source-paced collection and honest workflow outcomes."""
 
 import json
+import glob
 import os
 from pathlib import Path
 import shutil
@@ -97,6 +98,41 @@ def test_batch_cli_rejects_a_lower_minimum_before_reading_the_catalog():
                              "--min-total-decks", "0", "--dry-run"], text=True, capture_output=True)
     assert result.returncode == 2
     assert "at least 200" in result.stderr
+
+
+def test_checkpoint_upload_keeps_durable_inputs_and_excludes_mutable_scratch(tmp_path):
+    root = tmp_path / "styles"
+    retained = {"commander-a.json", "_collection/state.json", "_collection/previews/a.json.gz",
+                "_collection/evidence/a.json.gz", "_collection/sources/a/base.json"}
+    scratch = {"_collection/sources/a/previews/deck.rsc", "_collection/sources/a/previews/deck.rsc.meta.json",
+               "_collection/sources/a/previews/nested/deck.json", "_collection/analyzed/a/report.json",
+               "_collection/state.json.tmp", "_collection/evidence/a.tmp"}
+    for relative in retained | scratch:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("test")
+    body = COLLECTOR.read_text().split("      - name: Upload cumulative build-style samples\n", 1)[1]
+    patterns = body.split("          path: |\n", 1)[1].split("          if-no-files-found:", 1)[0]
+    included = set()
+    for pattern in textwrap.dedent(patterns).splitlines():
+        exclude = pattern.startswith("!")
+        pattern = pattern.lstrip("!").replace("${{ env.STYLES_DIR }}", str(root))
+        matches = [Path(path) for path in glob.glob(pattern, recursive=True)]
+        files = {child for path in matches for child in ([path] if path.is_file() else path.rglob("*")) if child.is_file()}
+        included = included - files if exclude else included | files
+    assert {str(path.relative_to(root)) for path in included} == retained
+
+
+def test_explicit_recovery_pins_restore_and_merges_source_controls_before_collection():
+    workflow = COLLECTOR.read_text()
+    assert "      recovery_run_id:" in workflow
+    assert "run-id: ${{ needs.preflight.outputs.restore_run_id }}" in workflow
+    restore = workflow.index("      - name: Restore accumulated build-style samples")
+    merge = workflow.index("      - name: Preserve newer source limits during explicit checkpoint recovery")
+    collect = workflow.index("      - name: Continue the resumable catalog queue")
+    assert restore < merge < collect
+    _, script = step(COLLECTOR, "Preserve newer source limits during explicit checkpoint recovery")
+    assert "recover-control" in script and "--restored-run-id" in script
 
 
 @pytest.mark.parametrize("publish", [True, False])
