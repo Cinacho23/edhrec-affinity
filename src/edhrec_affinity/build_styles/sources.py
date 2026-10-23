@@ -11,6 +11,7 @@ import json
 import math
 from pathlib import Path
 import re
+import sys
 import threading
 import time
 import unicodedata
@@ -36,6 +37,10 @@ class SourceBlocked(RuntimeError):
     """Stop the collection session on an access challenge or rate limit."""
 
 
+class SourceFormatError(ValueError):
+    """A source response could not be read; preserve the item for a later retry."""
+
+
 class RequestLimiter:
     """One request-start budget shared by every collection worker.
 
@@ -46,15 +51,24 @@ class RequestLimiter:
 
     def __init__(self, delay: float = 1.0, *, max_rate: float | None = None,
                  start_rate: float = 2.0, ramp_after: int = 100,
+                 learned_rate: float | None = None,
                  monotonic=time.monotonic, sleep=time.sleep):
         if not math.isfinite(delay) or delay <= 0:
             raise ValueError("Shared request delay must be finite and positive")
         if max_rate is not None and (not math.isfinite(max_rate) or max_rate <= 0):
             raise ValueError("Maximum request rate must be finite and positive")
+        if learned_rate is not None and (isinstance(learned_rate, bool)
+                or not isinstance(learned_rate, (int, float))
+                or not math.isfinite(learned_rate) or learned_rate <= 0):
+            raise ValueError("Learned request rate must be finite and positive")
         if not math.isfinite(start_rate) or start_rate <= 0 or ramp_after < 1:
             raise ValueError("Starting rate and ramp interval must be positive")
-        self.minimum_delay = 1 / max_rate if max_rate is not None else delay
-        self.delay = max(self.minimum_delay, 1 / start_rate) if max_rate is not None else delay
+        self.configured_maximum_rate = max_rate if max_rate is not None else 1 / delay
+        self.learned_rate = min(learned_rate, self.configured_maximum_rate) if learned_rate is not None else None
+        self.minimum_delay = 1 / (self.learned_rate or self.configured_maximum_rate)
+        if not math.isfinite(self.minimum_delay):
+            raise ValueError("Request rate must allow a finite pacing delay")
+        self.delay = max(self.minimum_delay, 1 / start_rate if max_rate is not None else delay)
         self.starting_delay = self.delay
         self.ramp_after = ramp_after
         self._successes = 0
@@ -69,6 +83,8 @@ class RequestLimiter:
         self._failures = 0
         self._deferrals = 0
         self._retry_after_until = 0.0
+        self._throttles = 0
+        self._last_throttle: dict | None = None
 
     @property
     def blocked(self) -> bool:
@@ -82,11 +98,22 @@ class RequestLimiter:
                 "requests_started": self._requests_started, "successful_responses": self._successful_responses,
                 "failures": self._failures + int(self.blocked), "cooldowns": self._deferrals,
                 "maximum_requests_per_second": 1 / self.minimum_delay,
+                "configured_maximum_requests_per_second": self.configured_maximum_rate,
+                "learned_maximum_requests_per_second": self.learned_rate,
                 "current_requests_per_second": 1 / self.delay,
                 "observed_requests_per_second": max(0, self._requests_started - 1) / elapsed if elapsed else 0.0,
                 "retry_after_seconds": max(0.0, self._retry_after_until - self.monotonic()),
                 "elapsed_seconds": elapsed, "blocked": self.blocked,
+                "throttles": self._throttles,
+                "last_throttle": dict(self._last_throttle) if self._last_throttle else None,
             }
+
+    @property
+    def learning_state(self) -> dict:
+        """The learned ceiling can be carried into the next collection job."""
+        with self._lock:
+            return {"learned_rate": self.learned_rate, "throttles": self._throttles,
+                    "last_throttle": dict(self._last_throttle) if self._last_throttle else None}
 
     def wait(self) -> None:
         # Holding the lock while waiting prevents newly arriving workers from
@@ -135,6 +162,32 @@ class RequestLimiter:
             self._deferrals += 1
             self.delay = min(self.starting_delay, self.delay * 2)
             self._next_request = max(self._next_request, self.monotonic() + cooldown)
+
+    def record_throttle(self, *, now: datetime | None = None) -> None:
+        """Learn once from this job's 429; the access stop and cooldown still apply.
+
+        Several requests can already be in flight when the first 429 arrives.
+        Their responses describe the same event, so they must not compound the
+        reduction once per worker. A new job can learn a further lower ceiling.
+        """
+        with self._lock:
+            if self._throttles:
+                return
+            rate_before = 1 / self.delay
+            # The floating-point guard only prevents underflow; there is no
+            # practical fixed floor that could exceed a lower source limit.
+            learned_rate = max(rate_before * .75, min(rate_before, sys.float_info.min))
+            self.learned_rate = min(self.learned_rate or self.configured_maximum_rate, learned_rate)
+            self.minimum_delay = 1 / self.learned_rate
+            self.delay = max(self.delay, self.minimum_delay)
+            self.starting_delay = max(self.starting_delay, self.minimum_delay)
+            self._successes = 0
+            self._throttles = 1
+            self._last_throttle = {
+                "at": (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
+                "rate_before": rate_before, "rate_after": 1 / self.delay,
+            }
+            self._next_request = max(self._next_request, self.monotonic() + self.delay)
 
 
 def source_time(value: Any) -> datetime | None:
@@ -217,7 +270,7 @@ class Cache:
             return self.preview_transport.get(self, identifier, **kwargs)
         return self.get(f"previews/{identifier}.html", f"https://edhrec.com/deckpreview/{identifier}", html=True, **kwargs)
 
-    def get(self, relative: str, url: str, *, html: bool = False,
+    def get(self, relative: str, url: str, *, html: bool = False, rsc: bool = False,
             max_age_seconds: float | None = None, force_refresh: bool = False,
             validate=None) -> Any:
         path = self.root / relative
@@ -248,13 +301,15 @@ class Cache:
                 time.sleep(max(0.0, self.delay - (time.monotonic() - self.last_request)))
             self.last_request = time.monotonic()
             try:
-                response = self.client.get(url)
+                response = self.client.get(url, headers={"RSC": "1"}) if rsc else self.client.get(url)
             except httpx.TransportError:
                 if self.limiter is not None:
                     self.limiter.record_failure()
                 raise
             if response.status_code in {401, 403, 429}:
                 self._block(f"HTTP {response.status_code}: {url}")
+                if response.status_code == 429 and self.limiter is not None:
+                    self.limiter.record_throttle(now=self.now())
                 retry_after = _retry_after_seconds(response.headers.get("Retry-After"), self.now())
                 if retry_after is not None and self.limiter is not None:
                     self.limiter.defer(retry_after)
@@ -263,17 +318,36 @@ class Cache:
                 self.limiter.record_failure()
             response.raise_for_status()
             text = response.text
-            # Validate before caching a possible HTML challenge as a JSON response.
+            # A changed schema is different from an access challenge. Only clear
+            # challenge indicators stop the shared session; unreadable source
+            # data remains retryable without excluding the deck permanently.
+            lower_text = text.lower()
+            challenge = response.headers.get("cf-mitigated", "").lower() == "challenge" or (
+                text.lstrip().startswith("<") and any(marker in lower_text for marker in (
+                    "/cdn-cgi/challenge-platform/", "cf_chl_opt", 'id="challenge-form"',
+                    "id='challenge-form'", "<title>just a moment", "<title>attention required! | cloudflare",
+                ))
+            )
+            if challenge:
+                self._block(f"Access challenge from {url}")
+                raise SourceBlocked(f"Access challenge from {url}; collection stopped")
+            # Validate before caching, so neither a challenge nor an unsupported
+            # response can replace a previously usable observation.
             try:
-                if html:
-                    extract_preview_data(text)
-                elif not isinstance(json.loads(text), dict):
-                    raise ValueError("Expected a JSON object")
+                if rsc:
+                    parsed = extract_preview_stream(text)
+                elif html:
+                    parsed = extract_preview_data(text)
+                else:
+                    parsed = json.loads(text)
+                    if not isinstance(parsed, dict):
+                        raise ValueError("Expected a JSON object")
                 if validate is not None:
-                    validate(json.loads(text))
-            except (ValueError, KeyError) as error:
-                self._block(f"Unexpected response from {url}")
-                raise SourceBlocked(f"Unexpected response from {url}; collection stopped") from error
+                    validate(parsed)
+            except (ValueError, KeyError, TypeError) as error:
+                if self.limiter is not None:
+                    self.limiter.record_failure()
+                raise SourceFormatError(f"Unsupported or invalid response from {url}: {error}") from error
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
             metadata = {
@@ -292,6 +366,8 @@ class Cache:
         with self._provenance_lock:
             self.provenance.append(observation)
             self._observations[url] = observation
+        if rsc:
+            return extract_preview_stream(text)
         return extract_preview_data(text) if html else json.loads(text)
 
 
@@ -300,25 +376,121 @@ class _NextDataParser(HTMLParser):
         super().__init__()
         self.active = False
         self.fragments: list[str] = []
+        self.scripts: list[str] = []
+        self._script: list[str] | None = None
 
     def handle_starttag(self, tag, attrs):
-        if tag == "script" and dict(attrs).get("id") == "__NEXT_DATA__":
-            self.active = True
+        if tag == "script":
+            self.active = dict(attrs).get("id") == "__NEXT_DATA__"
+            self._script = [] if not dict(attrs).get("src") else None
 
     def handle_endtag(self, tag):
         if tag == "script":
+            if self._script is not None:
+                self.scripts.append("".join(self._script))
+                self._script = None
             self.active = False
 
     def handle_data(self, data):
         if self.active:
             self.fragments.append(data)
+        if self._script is not None:
+            self._script.append(data)
+
+
+def _flight_preview_data(stream: str) -> dict[str, Any]:
+    """Read JSON model rows from the public React stream without executing JS."""
+    records = {}
+    for line in stream.splitlines():
+        identifier, separator, value = line.partition(":")
+        if separator and re.fullmatch(r"[0-9a-f]+", identifier):
+            try:
+                records[identifier] = json.loads(value)
+            except ValueError:
+                # Import, resource and text rows are not JSON model records.
+                continue
+
+    def resolve(value):
+        seen = set()
+        while isinstance(value, str) and re.fullmatch(r"\$[0-9a-f]+", value):
+            identifier = value[1:]
+            if identifier in seen or identifier not in records:
+                break
+            seen.add(identifier)
+            value = records[identifier]
+        return value
+
+    # A gallery also has `recs`; require the deckpreview page's decklist to
+    # avoid confusing gallery display cards with counted mainboard entries.
+    pending = list(records.values())
+    while pending:
+        value = pending.pop()
+        if isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, dict):
+            route = resolve(value.get("route"))
+            if isinstance(route, dict) and route.get("section") == "deckpreview":
+                decklist = resolve(value.get("decklist"))
+                if not isinstance(decklist, dict):
+                    raise ValueError("Deck preview is missing its counted decklist")
+                recs = resolve(decklist.get("recs"))
+                categories = resolve(decklist.get("categories", []))
+                if not isinstance(recs, list) or not isinstance(categories, list):
+                    raise ValueError("Deck preview has an invalid decklist")
+                labels = {}
+                for entry in categories:
+                    entry = resolve(entry)
+                    if isinstance(entry, dict):
+                        if not isinstance(entry.get("slug"), str) or not isinstance(entry.get("label"), str):
+                            raise ValueError("Deck preview has an invalid category label")
+                        labels[entry.get("slug")] = entry.get("label")
+                commanders, cards = [], {}
+                for entry in recs:
+                    entry = resolve(entry)
+                    if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                        raise ValueError("Deck preview has an invalid card entry")
+                    name = entry["name"]
+                    # React escapes literal strings beginning with '$'.
+                    name = name[1:] if name.startswith("$$") else name
+                    quantity = _quantity(entry.get("count"))
+                    category = entry.get("category")
+                    role = entry.get("role")
+                    if category == "type-commander" or role in {"commander", "partner"}:
+                        commanders.append(name)
+                    elif role not in {"sideboard", "maybeboard", "considering", "companion"}:
+                        label = labels.get(category) or str(category or "Unknown").removeprefix("type-").title()
+                        if label.casefold() not in {"sideboard", "maybeboard", "considering", "companion"}:
+                            cards.setdefault(label, []).append([name, quantity])
+                if not commanders or not cards:
+                    raise ValueError("Deck preview has no commanders or mainboard cards")
+                return {"deck": {"commander": commanders, "cards": cards},
+                        "tags": resolve(decklist.get("tags", [])), "url": decklist.get("url", ""),
+                        "savedate": decklist.get("savedate"), "urlhash": route.get("deckpreviewSlug")}
+            pending.extend(value.values())
+    raise ValueError("Deck preview has no supported embedded deck data; schema may have changed")
+
+
+def extract_preview_stream(text: str) -> dict[str, Any]:
+    # Some caches/CDNs serve HTML despite the public RSC rendering header.
+    return extract_preview_data(text) if text.lstrip().startswith("<") else _flight_preview_data(text)
 
 
 def extract_preview_data(html: str) -> dict[str, Any]:
     parser = _NextDataParser()
     parser.feed(html)
     if not parser.fragments:
-        raise ValueError("Deck preview has no embedded Next.js data; schema may have changed")
+        fragments = []
+        decoder = json.JSONDecoder()
+        for script in parser.scripts:
+            for match in re.finditer(r"(?:^|;)\s*self\.__next_f\.push\(", script):
+                try:
+                    chunk, _ = decoder.raw_decode(script[match.end():])
+                except ValueError:
+                    continue
+                if (isinstance(chunk, list) and len(chunk) == 2
+                        and chunk[0] == 1 and isinstance(chunk[1], str)):
+                    fragments.append(chunk[1])
+        return _flight_preview_data("".join(fragments))
     payload = json.loads("".join(parser.fragments))
     data = payload["props"]["pageProps"]["data"]
     if not isinstance(data, dict) or not isinstance(data.get("deck"), dict):
@@ -336,11 +508,12 @@ def _compact_preview_data(payload: dict) -> dict:
 
 
 class PreviewTransport:
-    """Reuse the public page's compact Next.js data with a shared build ID.
+    """Reuse the public page's compact data across framework deployments.
 
     The build ID is discovered from the approved public HTML page, never guessed.
-    A deployment-related compact 404 refreshes that page once; an access block
-    propagates immediately without trying another route.
+    Legacy pages expose a shared build ID; newer pages expose a public React
+    stream at the same URL. A compact 404 or changed response rediscovers the
+    format once; an access block propagates without trying another route.
     """
 
     def __init__(self, *, max_build_age_seconds: float = 3600, monotonic=time.monotonic):
@@ -348,6 +521,7 @@ class PreviewTransport:
         self.monotonic = monotonic
         self._lock = threading.Lock()
         self._build_id: str | None = None
+        self._mode: str | None = None
         self._build_checked = 0.0
 
     def _bootstrap(self, cache: Cache, identifier: str, **kwargs) -> dict:
@@ -356,8 +530,9 @@ class PreviewTransport:
         data = cache.get(relative, url, html=True, **{**kwargs, "force_refresh": cache.fetch})
         parser = _NextDataParser()
         parser.feed((cache.root / relative).read_text(encoding="utf-8"))
-        build_id = json.loads("".join(parser.fragments)).get("buildId")
+        build_id = json.loads("".join(parser.fragments)).get("buildId") if parser.fragments else None
         self._build_id = build_id if isinstance(build_id, str) and re.fullmatch(r"[A-Za-z0-9_-]+", build_id) else None
+        self._mode = "compact" if self._build_id else "rsc"
         self._build_checked = self.monotonic()
         return data
 
@@ -366,6 +541,15 @@ class PreviewTransport:
         canonical = f"https://edhrec.com/deckpreview/{identifier}"
         relative = f"previews/{identifier}.json"
         path = cache.root / relative
+        rsc_relative = f"previews/{identifier}.rsc"
+        rsc_path = cache.root / rsc_relative
+        if rsc_path.exists():
+            meta_path = rsc_path.with_suffix(".rsc.meta.json")
+            metadata = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+            limit = kwargs.get("max_age_seconds", cache.max_age_seconds)
+            fresh = limit is None or not source_is_stale(metadata.get("fetched_at"), limit, cache.now())
+            if not cache.fetch or (fresh and not kwargs.get("force_refresh")):
+                return cache.get(rsc_relative, canonical, rsc=True, **kwargs)
         if path.exists():
             meta_path = path.with_suffix(path.suffix + ".meta.json")
             metadata = json.loads(meta_path.read_text()) if meta_path.exists() else {}
@@ -379,23 +563,29 @@ class PreviewTransport:
         if not cache.fetch:
             return cache.get(f"previews/{identifier}.html", canonical, html=True, **kwargs)
         with self._lock:
-            if self._build_id is None or self.monotonic() - self._build_checked >= self.max_build_age_seconds:
+            if self._mode is None or self.monotonic() - self._build_checked >= self.max_build_age_seconds:
                 return self._bootstrap(cache, identifier, **kwargs)
             build_id = self._build_id
+            mode = self._mode
+        if mode == "rsc":
+            return cache.get(rsc_relative, canonical, rsc=True, **kwargs)
         url = f"https://edhrec.com/_next/data/{build_id}/deckpreview/{identifier}.json"
         try:
             payload = cache.get(relative, url, validate=_compact_preview_data, **kwargs)
             cache.alias_observation(canonical, url)
             return _compact_preview_data(payload)
-        except httpx.HTTPStatusError as error:
-            if error.response.status_code != 404:
+        except (httpx.HTTPStatusError, SourceFormatError) as error:
+            if isinstance(error, httpx.HTTPStatusError) and error.response.status_code != 404:
                 raise
             # A successful HTML fallback also supplies this deck's data. Updating
             # the shared build under one lock avoids one refresh per worker.
             with self._lock:
-                if self._build_id is None or self._build_id == build_id:
+                if self._mode == "compact" and self._build_id == build_id:
                     return self._bootstrap(cache, identifier, **kwargs)
                 new_build_id = self._build_id
+                mode = self._mode
+            if mode == "rsc":
+                return cache.get(rsc_relative, canonical, rsc=True, **kwargs)
             new_url = f"https://edhrec.com/_next/data/{new_build_id}/deckpreview/{identifier}.json"
             payload = cache.get(relative, new_url, validate=_compact_preview_data, **kwargs)
             cache.alias_observation(canonical, new_url)

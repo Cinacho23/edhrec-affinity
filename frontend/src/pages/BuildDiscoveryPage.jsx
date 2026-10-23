@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 
 import { loadBuildStyleIndex } from "../lib/api";
 import { getBuildCollectionProgress, getBuildSourceFreshness } from "../lib/buildStyleUtils";
+import { formatCollectionDuration, getBuildCollectorStatus } from "../lib/buildCollectionStatus";
 import { formatNumber } from "../lib/formatters";
 import "./BuildDiscoveryPage.css";
 
@@ -10,6 +11,13 @@ function reportDate(value) {
   const date = new Date(value);
   return value && Number.isFinite(date.getTime())
     ? date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "America/Toronto" })
+    : "Date unavailable";
+}
+
+function collectorDate(value) {
+  const date = new Date(value);
+  return value && Number.isFinite(date.getTime())
+    ? date.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZone: "America/Toronto", timeZoneName: "short" })
     : "Date unavailable";
 }
 
@@ -35,6 +43,7 @@ export default function BuildDiscoveryPage() {
   const totalCatalog = Number.isInteger(state.index?.total_catalog) && state.index.total_catalog >= state.commanders.length
     ? state.index.total_catalog : null;
   const pending = totalCatalog === null ? null : totalCatalog - state.commanders.length;
+  const collector = getBuildCollectorStatus(state.index?.collection_progress);
   const freshnessCounts = state.commanders.reduce((counts, commander) => {
     counts[getBuildSourceFreshness(commander.collection).status] += 1;
     if (getBuildCollectionProgress(commander.collection).targetMet) counts.targetMet += 1;
@@ -51,16 +60,35 @@ export default function BuildDiscoveryPage() {
     <div className="panel build-discovery-coverage">
       <h2>Available commander reports</h2>
       <p>Each report covers sampled decks for one commander. The package count adapts to the evidence, and a package can suggest one or several themes. These reports describe a sample rather than every EDHREC deck.</p>
-      <p>The four-day freshness target applies to checking every available deck preview for each commander. A first analysis can appear while that collection is still in progress. Source-check age and full-index progress are shown separately; a newly built report alone does not meet the target.</p>
+      <p>Collection continues through every available deck preview and adapts its operating rate when EDHREC throttles requests. A first analysis can appear while collection is still in progress. Source-check age and full-index coverage are shown separately.</p>
       <p>A package describes a recurring card pattern across decks; the generated deck under it is one 100-card example of that pattern. Changing the package count fits a different model.</p>
       {!state.loading && !state.error ? <>
         <strong>{totalCatalog === null
           ? `${formatNumber(state.commanders.length)} ${state.commanders.length === 1 ? "commander report available" : "commander reports available"}`
           : `${formatNumber(state.commanders.length)} of ${formatNumber(totalCatalog)} commanders analyzed`}</strong>
         {pending !== null ? <p className="build-discovery-coverage__pending">{formatNumber(pending)} {pending === 1 ? "commander remains" : "commanders remain"} pending in this dataset. Analyzed commanders stay listed when there is insufficient data to fit packages.</p> : null}
-        <p className="build-discovery-coverage__freshness">{formatNumber(freshnessCounts.targetMet)}{totalCatalog !== null ? ` of ${formatNumber(totalCatalog)}` : ""} commanders currently meet the full-index four-day freshness target. {formatNumber(freshnessCounts.unknown)} published reports have unknown source age; {formatNumber(freshnessCounts.mixed + freshnessCounts.stale)} contain source checks needing refresh. Collected-source freshness alone does not mean full index coverage.</p>
+        <p className="build-discovery-coverage__freshness">{formatNumber(freshnessCounts.targetMet)}{totalCatalog !== null ? ` of ${formatNumber(totalCatalog)}` : ""} commanders have full index coverage with recent source checks. {formatNumber(freshnessCounts.unknown)} published reports have unknown source age; {formatNumber(freshnessCounts.mixed + freshnessCounts.stale)} contain source checks needing refresh.</p>
       </> : null}
     </div>
+
+    {!state.loading && !state.error ? <div className="panel build-discovery-collector">
+      <h2>{collector?.label || "Collection progress"}</h2>
+      {collector ? <>
+        <p className="muted">Snapshot {collectorDate(collector.updatedAt)}{collector.stale ? " · awaiting a newer collector checkpoint" : ""}.</p>
+        <div className="build-discovery-collector__stats">
+          <div><strong>{collector.learned ? `${collector.operatingRate.toLocaleString("en-US", { maximumFractionDigits: 3 })} / sec` : "Calibrating"}</strong><span>{collector.learned ? "provisional operating ceiling" : "operating rate"}</span></div>
+          <div><strong>{collector.remaining === null ? "Unknown" : formatNumber(collector.remaining)}</strong><span>estimated requests remaining</span></div>
+          <div><strong>{collector.learned ? formatCollectionDuration(collector.minimumSeconds) : "Awaiting calibration"}</strong><span>minimum time at this ceiling, including cooldown</span></div>
+          <div><strong>{formatCollectionDuration(collector.projectedSeconds)}</strong><span>{collector.paused ? "projection after the recorded pause" : "projection at the observed rate"}</span></div>
+        </div>
+        <p>The provisional operating ceiling is estimated below observed throttling and may adjust again. {collector.configuredRate !== null ? `The configured maximum is ${collector.configuredRate.toLocaleString("en-US")} requests per second; it is not a measured source limit. ` : ""}{collector.observedRate !== null ? `The last batch averaged ${collector.observedRate.toLocaleString("en-US", { maximumFractionDigits: 3 })} successful responses per second. ` : ""}Timing estimates exclude future runner gaps and can grow with retries, analysis, or newly discovered decks.</p>
+        {collector.observedRateAt ? <p>Observed rate measured {collectorDate(collector.observedRateAt)}.</p> : null}
+        {!collector.inventoryComplete ? <p>The deck inventory is still incomplete, so estimates may increase.</p> : null}
+        {collector.blockedUntil ? <p>Requests are paused until at least {collectorDate(collector.blockedUntil)}. Estimates assume collection can resume after this recorded cooldown.</p>
+          : collector.paused ? <p>The latest batch is paused; any additional wait before collection resumes extends these estimates.</p> : null}
+        {collector.projectedFinishAt ? <p>Estimated finish at the last observed rate{collector.paused ? ", assuming requests resume after the recorded pause" : ""}: {collectorDate(collector.projectedFinishAt)}. This is an estimate from the checkpoint above.</p> : null}
+      </> : <p className="muted">The next collector checkpoint will publish its learned operating rate, remaining work, and timing estimates here.</p>}
+    </div> : null}
 
     {state.loading ? <p className="muted" role="status">Loading available build reports…</p> : state.error ? <div className="panel"><p className="error-message">Could not load build discovery: {state.error}</p></div> : state.commanders.length ? <>
       <div className="search-panel build-discovery-search">
@@ -82,7 +110,7 @@ export default function BuildDiscoveryPage() {
           ? "Tag profile comparisons available; deck evidence is insufficient to fit packages."
           : "Insufficient data for tag comparisons or packages."}</p> : null}
         <div className="build-discovery-card__sources">
-          <strong>{progress.targetMet ? "Full index meets four-day target" : progress.label}</strong>
+          <strong>{progress.targetMet ? "Full index checked recently" : progress.label}</strong>
           {!progress.analysisCurrent ? <span>Analysis awaiting the current deck collection</span> : null}
           {progress.known ? <span>{formatNumber(progress.attempted)} / {formatNumber(progress.frame)} previews attempted</span> : null}
           {progress.unavailable > 0 ? <span>{formatNumber(progress.unavailable)} previews unavailable or unreadable</span> : null}

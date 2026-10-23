@@ -36,7 +36,13 @@ def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transpor
         # analysis can still proceed, or record an honest insufficient sample.
         base = parse_profile(payload, "all", "All builds", allow_empty=True)
         base["commander_names"] = card.get("names") or [card["name"]]
-        tags = sorted((tag for tag in payload["panels"]["taglinks"]
+        # Sparse partner pages can omit the tag panel entirely. Their deck
+        # index remains usable even when no tag profiles are available.
+        panels = payload.get("panels", {})
+        taglinks = panels.get("taglinks", []) if isinstance(panels, dict) else None
+        if not isinstance(taglinks, list):
+            raise ValueError("Commander taglinks must be a list when present")
+        tags = sorted((tag for tag in taglinks
                        if tag["count"] >= args.min_tag_decks), key=lambda tag: (-tag["count"], tag["slug"]))
         if args.tags:
             requested = {checked_identifier(tag) for tag in args.tags}
@@ -67,7 +73,8 @@ def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transpor
                     max_seconds=args.max_preview_seconds, preview_workers=args.preview_workers,
                     index_max_age_seconds=args.index_max_age_hours * 3600 if args.index_max_age_hours is not None else None,
                     preview_max_age_seconds=args.source_max_age_hours * 3600 if args.source_max_age_hours is not None else None,
-                    trust_index_versions=args.trust_index_versions, freshness_target_hours=args.target_completion_hours,
+                    trust_index_versions=args.trust_index_versions,
+                    freshness_target_hours=getattr(args, "freshness_target_hours", 96),
                 )
                 failures.extend(collection.pop("failures"))
             except (FileNotFoundError, KeyError, ValueError, httpx.HTTPError, SourceBlocked) as error:
@@ -239,7 +246,9 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--source-max-age-hours", type=float, default=None,
                      help="Refresh source pages and preview observations after this age; default preserves legacy caches")
     cli.add_argument("--index-max-age-hours", type=float, default=None)
-    cli.add_argument("--target-completion-hours", type=float, default=96)
+    cli.add_argument("--freshness-target-hours", "--target-completion-hours", dest="freshness_target_hours",
+                     type=float, default=96,
+                     help="Source verification age threshold; separate from any catalog completion estimate")
     cli.add_argument("--preview-workers", type=int, default=1)
     cli.add_argument("--defer-partial-analysis", action="store_true", help=argparse.SUPPRESS)
     cli.add_argument("--trust-index-versions", action="store_true",
@@ -264,11 +273,11 @@ def main() -> None:
         cli.error("--max-tags must be 1–16")
     if not math.isfinite(args.max_preview_seconds) or args.max_preview_seconds < 0:
         cli.error("--max-preview-seconds must be finite and nonnegative")
-    if (not 1 <= args.preview_workers <= 64 or not math.isfinite(args.target_completion_hours)
-            or args.target_completion_hours <= 0 or any(value is not None and
+    if (not 1 <= args.preview_workers <= 64 or not math.isfinite(args.freshness_target_hours)
+            or args.freshness_target_hours <= 0 or any(value is not None and
                 (not math.isfinite(value) or value <= 0) for value in
                 (args.source_max_age_hours, args.index_max_age_hours))):
-        cli.error("Use 1–64 preview workers and positive finite source-age and completion windows")
+        cli.error("Use 1–64 preview workers and positive finite source-age windows")
     if (not 1 <= args.max_components <= 32 or
         args.components is not None and not 1 <= args.components <= 32 or
         args.min_tag_decks < 1 or args.min_card_support < 2):

@@ -31,15 +31,17 @@ def _count(value, name: str) -> int:
 
 
 def plan_capacity(
-    index_rows: Iterable[Mapping], *, target_hours: float = 96,
+    index_rows: Iterable[Mapping], *, target_hours: float | None = None,
     max_requests_per_second: float = 40,
+    effective_requests_per_second: float | None = None,
     observed_requests_per_second: float | None = None,
+    cooldown_seconds: float = 0,
     elapsed_seconds: float = 0, remaining_previews: int | None = None,
     profile_requests_per_commander: int = 17,
     remaining_overhead_requests: int | None = None,
     now: datetime | None = None,
 ) -> dict:
-    """Estimate a complete-source pass against a deadline, without sampling.
+    """Estimate a complete-source pass at the current source rate ceiling.
 
     ``total_decks`` is summed across distinct commander slugs. This counts deck
     entries, which can overlap between commanders, and is not a proven inventory
@@ -50,9 +52,12 @@ def plan_capacity(
     work can provide remaining previews and overhead. ``observed`` must be real
     completed network requests per wall-clock second, including idle time.
     """
-    target_hours = _number(target_hours, "target_hours", positive=True)
+    target_hours = None if target_hours is None else _number(target_hours, "target_hours", positive=True)
     ceiling = _number(max_requests_per_second, "max_requests_per_second", positive=True)
+    effective_ceiling = ceiling if effective_requests_per_second is None else min(ceiling, _number(
+        effective_requests_per_second, "effective_requests_per_second", positive=True))
     elapsed = _number(elapsed_seconds, "elapsed_seconds")
+    cooldown = _number(cooldown_seconds, "cooldown_seconds")
     observed = None if observed_requests_per_second is None else _number(
         observed_requests_per_second, "observed_requests_per_second")
     profile_requests = _count(profile_requests_per_commander, "profile_requests_per_commander")
@@ -82,18 +87,26 @@ def plan_capacity(
     remaining_overhead = overhead if remaining_overhead_requests is None else _count(
         remaining_overhead_requests, "remaining_overhead_requests")
     requests = previews + remaining_overhead
-    remaining_window = max(0.0, target_hours * 3600 - elapsed)
-    required = requests / remaining_window if remaining_window else (0.0 if not requests else None)
-    preview_rate = previews / remaining_window if remaining_window else (0.0 if not previews else None)
-    minimum_seconds = requests / ceiling
-    measured_seconds = requests / observed if observed else (0.0 if not requests else None)
-    ceiling_sufficient = not requests or (required is not None and ceiling >= required)
-    measured_sufficient = None if observed is None else not requests or (required is not None and observed >= required)
+    remaining_window = None if target_hours is None else max(0.0, target_hours * 3600 - elapsed)
+    required = (None if remaining_window is None else
+                requests / remaining_window if remaining_window else (0.0 if not requests else None))
+    preview_rate = (None if remaining_window is None else
+                    previews / remaining_window if remaining_window else (0.0 if not previews else None))
+    minimum_seconds = requests / effective_ceiling + (cooldown if requests else 0)
+    projection_rate = min(observed, effective_ceiling) if observed else None
+    measured_seconds = 0.0 if not requests else requests / projection_rate + cooldown if projection_rate else None
+    ceiling_sufficient = None if target_hours is None else not requests or (required is not None and ceiling >= required)
+    effective_sufficient = (None if target_hours is None else
+                            not requests or (required is not None and effective_ceiling >= required))
+    measured_sufficient = (None if observed is None or target_hours is None else
+                           not requests or (required is not None and observed >= required))
     if not requests and not unknown_commanders:
         status = "complete"
     elif unknown_commanders:
         status = "inventory_incomplete"
-    elif not ceiling_sufficient or measured_sufficient is False:
+    elif target_hours is None:
+        status = "collecting" if observed else "unmeasured"
+    elif not effective_sufficient or measured_sufficient is False:
         status = "behind_target"
     elif observed is None:
         status = "unmeasured"
@@ -102,7 +115,8 @@ def plan_capacity(
 
     return {
         "schema_version": 1, "objective": "all_available_deck_entries", "evaluated_at": now.isoformat(),
-        "target_hours": target_hours, "deadline_at": (now + timedelta(seconds=target_hours * 3600 - elapsed)).isoformat(),
+        "target_hours": target_hours,
+        "deadline_at": (now + timedelta(seconds=target_hours * 3600 - elapsed)).isoformat() if target_hours is not None else None,
         "commander_count": len(unique_rows), "estimated_catalog_deck_entries": total_entries,
         "inventory_basis": "sum_of_commander_total_decks", "distinct_decks_known": False,
         "inventory_complete": unknown_commanders == 0, "unknown_deck_counts": unknown_commanders,
@@ -110,13 +124,16 @@ def plan_capacity(
         "remaining_previews": previews, "remaining_overhead_requests": remaining_overhead,
         "remaining_requests": requests, "elapsed_seconds": elapsed, "remaining_seconds": remaining_window,
         "minimum_required_preview_rate": preview_rate, "minimum_required_request_rate": required,
-        "configured_requests_per_second": ceiling, "observed_requests_per_second": observed,
+        "configured_requests_per_second": ceiling, "effective_requests_per_second": effective_ceiling,
+        "observed_requests_per_second": observed,
+        "projection_requests_per_second": projection_rate, "cooldown_seconds": cooldown,
         "estimated_minimum_seconds": minimum_seconds,
         "earliest_possible_finish_at": (now + timedelta(seconds=minimum_seconds)).isoformat(),
         "measured_projection_seconds": measured_seconds,
         "projected_finish_at": (now + timedelta(seconds=measured_seconds)).isoformat() if measured_seconds is not None else None,
         "configured_capacity_sufficient": ceiling_sufficient if not unknown_commanders or not ceiling_sufficient else None,
+        "effective_capacity_sufficient": effective_sufficient if not unknown_commanders or not effective_sufficient else None,
         "measured_capacity_sufficient": measured_sufficient if not unknown_commanders or measured_sufficient is False else None,
         "status": status,
-        "estimate_note": "Request-only estimate. Configured throughput is not measured capacity; analysis, latency, retries, runner gaps and source changes can extend completion.",
+        "estimate_note": "Request-only estimate using the current effective ceiling. Configured throughput is not measured capacity; analysis, latency, retries, runner gaps and source changes can extend completion.",
     }

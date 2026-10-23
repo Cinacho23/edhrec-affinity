@@ -1268,6 +1268,53 @@ def read_build_style_reports(directory: Path) -> dict[str, dict[str, Any]]:
     return reports
 
 
+def read_build_collection_progress(directories: list[Path]) -> dict[str, Any] | None:
+    """Publish a compact checkpoint snapshot without exposing the collection state."""
+    candidates = []
+    fields = ("updated_at", "cycle_started_at", "blocked", "blocked_until", "time_budget_reached",
+              "no_progress", "resource_limit")
+    nested_fields = {
+        "capacity": ("evaluated_at", "status", "remaining_requests", "remaining_previews",
+                     "remaining_overhead_requests", "inventory_complete", "distinct_decks_known",
+                     "configured_requests_per_second", "effective_requests_per_second", "rate_limit_learned",
+                     "observed_requests_per_second", "observed_rate_at", "cooldown_seconds", "estimated_minimum_seconds", "earliest_possible_finish_at",
+                     "measured_projection_seconds", "projected_finish_at", "unavailable_previews", "analysis_pending"),
+        "rate_control": ("status", "learned_rate", "throttles", "observed_rate_at", "configured_requests_per_second",
+                         "effective_requests_per_second"),
+        "measured_request_rate": ("successful_responses", "requests_started", "failures", "cooldowns",
+                                  "current_requests_per_second", "observed_requests_per_second", "elapsed_seconds"),
+    }
+    for directory in directories:
+        for path, checkpoint in ((directory / "_collection/state.json", True),
+                                 (directory.parent / "build_style_batch.json", False)):
+            if not path.is_file():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_nonfinite_constant)
+                json.dumps(payload, allow_nan=False)
+                progress = payload.get("progress") if checkpoint else payload
+                if not isinstance(progress, dict) or not isinstance(progress.get("capacity"), dict):
+                    continue
+                updated_at = progress.get("updated_at") or progress["capacity"].get("evaluated_at")
+                updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                if updated.tzinfo is None:
+                    continue
+                public = {key: progress[key] for key in fields if key in progress}
+                public["updated_at"] = updated_at
+                for key, allowed in nested_fields.items():
+                    if isinstance(progress.get(key), dict):
+                        public[key] = {field: progress[key][field] for field in allowed if field in progress[key]}
+                control = progress.get("rate_control")
+                throttle = control.get("last_throttle") if isinstance(control, dict) else None
+                if isinstance(throttle, dict):
+                    public.setdefault("rate_control", {})["last_throttle"] = {
+                        key: throttle[key] for key in ("at", "rate_before", "rate_after") if key in throttle}
+                candidates.append((updated.timestamp(), public))
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+    return max(candidates, key=lambda candidate: candidate[0])[1] if candidates else None
+
+
 def export_build_style_files(
     df: pd.DataFrame,
     processed_dir: Path,
@@ -1334,6 +1381,9 @@ def export_build_style_files(
     }
     if any("freshness" in entry.get("collection", {}) for entry in entries):
         index["freshness"] = summarize_build_style_freshness(entries)
+    progress = read_build_collection_progress([processed_dir / "build-styles", seed_dir])
+    if progress is not None:
+        index["collection_progress"] = progress
     write_json(output_dir / "build-styles/index.json", index)
     return {"index_file": "build-styles/index.json", "file_pattern": "build-styles/<commander_slug>.json",
             "commander_count": len(entries), "coverage": "sampled_commanders"}

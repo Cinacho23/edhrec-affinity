@@ -14,7 +14,7 @@ import time
 
 import httpx
 
-from .sources import SourceBlocked, card_key, checked_identifier, parse_preview, source_is_stale, source_time
+from .sources import SourceBlocked, SourceFormatError, card_key, checked_identifier, parse_preview, source_is_stale, source_time
 
 
 def parse_sample_decks(value: str) -> int | None:
@@ -193,7 +193,8 @@ def collect_previews(cache, slug: str, *, limit: int | None, seed: int, progress
             }
             return identifier, record, None, False
         except (SourceBlocked, httpx.HTTPError, FileNotFoundError, ValueError, KeyError, TypeError) as error:
-            permanent = isinstance(error, (ValueError, KeyError, TypeError)) or (
+            permanent = (isinstance(error, (ValueError, KeyError, TypeError))
+                         and not isinstance(error, SourceFormatError)) or (
                 isinstance(error, httpx.HTTPStatusError) and error.response.status_code in {404, 410})
             record = {"error": str(error), "source_at": now.isoformat(), "row_fingerprint": _row_fingerprint(row)} if permanent else None
             return identifier, record, str(error), not permanent

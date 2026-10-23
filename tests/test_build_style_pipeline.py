@@ -161,6 +161,22 @@ def test_partial_failure_keeps_the_old_model_and_retries_after_backoff(tmp_path)
     assert checkpoint(args)["commanders"]["a"]["coverage_complete"] is True
 
 
+def test_new_preview_progress_publishes_global_status_before_a_model_exists(tmp_path):
+    args = options(tmp_path, target_completion_hours=None)
+    calls = []
+
+    def partial(settings, **_):
+        calls.append(settings.commander)
+        return evidence("a", loaded=1, complete=False, new_attempts=1 if len(calls) == 1 else 0)
+
+    result = execute(args, rows("a"), partial, saved_analyzer([]))
+    assert result["completed"] == []
+    assert not (args.output_dir / "a.json").exists()
+    assert result["publish_needed"] is True
+    assert checkpoint(args)["progress"]["capacity"]["remaining_previews"] == 4
+    assert checkpoint(args)["progress"]["rate_control"]["status"] == "calibrating"
+
+
 def test_analyzer_failure_retains_evidence_for_the_next_attempt(tmp_path):
     args = options(tmp_path)
 
@@ -224,6 +240,81 @@ def test_shared_access_block_stops_new_collection_and_automatic_continuation(tmp
     assert second["blocked"] is True
 
 
+def test_rate_limit_learning_survives_cooldown_and_the_next_collection_batch(tmp_path):
+    args = options(tmp_path)
+
+    def throttled(settings, **dependencies):
+        limiter = dependencies["limiter"]
+        for _ in range(100):
+            limiter.record_success()
+        limiter.record_throttle(now=NOW)
+        limiter.block("HTTP 429 rate limit")
+        raise SourceBlocked("HTTP 429 rate limit")
+
+    first = execute(args, rows("a"), throttled, saved_analyzer([]))
+    learned = checkpoint(args)["source_rate"]
+    assert learned["learned_rate"] == pytest.approx(1.875)
+    assert learned["throttles"] == 1
+    assert learned["last_throttle"]["at"] == NOW.isoformat()
+    assert first["capacity"]["configured_requests_per_second"] == 40
+    assert first["capacity"]["effective_requests_per_second"] == learned["learned_rate"]
+    assert first["publish_needed"] is True
+    assert checkpoint(args)["progress"]["rate_control"]["status"] == "learned_below_observed_throttle"
+
+    def no_collection(*_, **__):
+        pytest.fail("The source cooldown must survive collection restarts")
+
+    cooldown = execute(args, rows("a"), no_collection, saved_analyzer([]), checked=NOW + timedelta(minutes=30))
+    assert cooldown["blocked"] is True
+    assert checkpoint(args)["source_rate"] == learned
+    assert cooldown["capacity"]["effective_requests_per_second"] == learned["learned_rate"]
+    assert cooldown["capacity"]["cooldown_seconds"] == 1800
+    assert cooldown["publish_needed"] is False
+    assert cooldown["capacity"]["observed_requests_per_second"] == learned["observed_requests_per_second"]
+    assert cooldown["capacity"]["observed_rate_at"] == NOW.isoformat()
+    assert cooldown["capacity"]["measured_projection_seconds"] is not None
+    assert checkpoint(args)["progress"]["rate_control"]["observed_rate_at"] == NOW.isoformat()
+
+    resumed_at = NOW + timedelta(minutes=61)
+
+    def resumed(settings, **dependencies):
+        limiter = dependencies["limiter"]
+        for _ in range(3000):
+            limiter.record_success()
+        assert limiter.stats["maximum_requests_per_second"] == learned["learned_rate"]
+        assert limiter.stats["current_requests_per_second"] <= learned["learned_rate"]
+        return evidence(settings.commander, checked=resumed_at)
+
+    resumed_result = execute(args, rows("a"), resumed, saved_analyzer([]), checked=resumed_at)
+    assert resumed_result["completed"] == ["a"]
+    assert resumed_result["cycle_started_at"] == NOW.isoformat()
+    assert {key: checkpoint(args)["source_rate"][key] for key in ("learned_rate", "last_throttle", "throttles")} == {
+        key: learned[key] for key in ("learned_rate", "last_throttle", "throttles")}
+    assert checkpoint(args)["source_rate"]["observed_rate_at"] == resumed_at.isoformat()
+
+
+@pytest.mark.parametrize("invalid", [0, -1, float("inf"), float("nan"), True, "2"])
+def test_invalid_saved_rate_cannot_silently_restore_the_configured_ceiling(tmp_path, invalid):
+    args = options(tmp_path, dry_run=True)
+    state_path = args.output_dir / "_collection/state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"schema_version": 1, "commanders": {},
+                                     "source_rate": {"learned_rate": invalid}}))
+    with pytest.raises(ValueError, match="Learned source rate"):
+        execute(args, rows("a"), lambda *_: None, saved_analyzer([]))
+
+
+@pytest.mark.parametrize("invalid", [0, -1, float("inf"), float("nan"), True, "2"])
+def test_invalid_saved_observed_rate_is_not_used_for_eta(tmp_path, invalid):
+    args = options(tmp_path, dry_run=True)
+    state_path = args.output_dir / "_collection/state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"schema_version": 1, "commanders": {},
+                                     "source_rate": {"observed_requests_per_second": invalid}}))
+    with pytest.raises(ValueError, match="Observed source rate"):
+        execute(args, rows("a"), lambda *_: None, saved_analyzer([]))
+
+
 def test_network_collection_and_analysis_overlap_without_a_sleep(tmp_path):
     args = options(tmp_path)
     second_collection = threading.Event()
@@ -258,6 +349,50 @@ def test_expired_deadline_reports_a_capacity_miss_without_inventing_a_measured_r
     assert result["capacity"]["observed_requests_per_second"] is None
     assert result["capacity"]["projected_finish_at"] is None
     assert result["deadline_target_met"] is False
+
+
+def test_completion_estimates_preserve_fresh_evidence_without_a_deadline(tmp_path):
+    args = options(tmp_path, target_completion_hours=None)
+    observed = (NOW - timedelta(hours=4)).isoformat()
+    record = {"status": "fitted", "coverage_complete": True, "frame_decks": 5,
+              "current_previews": 5, "verified_at": observed, "analyzed_at": observed, "last_collection_at": observed}
+    atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": {"a": record},
+        "pipeline": {"version": 1, "cycle_started_at": (NOW - timedelta(days=2)).isoformat(),
+                     "upstream_snapshot_date": "2026-10-19"}})
+    report_path = args.output_dir / "a.json"
+    atomic_json(report_path, {"commander_slug": "a", "generated_at": observed,
+                             "collection": {"freshness": {"oldest_verified_at": observed}}})
+    previews_path = args.output_dir / "_collection/previews/a.json.gz"
+    save_evidence(previews_path, evidence("a", checked=NOW - timedelta(days=2)))
+    source_path = args.output_dir / "_collection/sources/a/base.json"
+    atomic_json(source_path, {"checked_at": observed, "cards": {}})
+    before = {path: path.read_bytes() for path in (report_path, previews_path, source_path)}
+
+    def no_collection(*_, **__):
+        pytest.fail("Fresh source observations must not be downloaded again")
+
+    result = execute(args, rows("a"), no_collection, saved_analyzer([]))
+    assert result["capacity"]["remaining_seconds"] is None
+    assert result["capacity"]["deadline_at"] is None
+    assert result["deadline_target_met"] is None
+    assert result["capacity"]["status"] == "complete"
+    assert checkpoint(args)["commanders"]["a"] == record
+    assert all(path.read_bytes() == contents for path, contents in before.items())
+
+
+def test_no_completion_deadline_preserves_source_cooldown_and_commander_retry(tmp_path):
+    args = options(tmp_path, target_completion_hours=None)
+    blocked_until = (NOW + timedelta(hours=1)).isoformat()
+    record = {"status": "blocked", "retry_after": blocked_until, "current_previews": 3}
+    atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1,
+        "blocked_until": blocked_until, "commanders": {"a": record},
+        "pipeline": {"version": 1, "cycle_started_at": (NOW - timedelta(days=5)).isoformat()}})
+    result = execute(args, rows("a"), lambda *_: pytest.fail("Collection must respect source cooldown"), saved_analyzer([]))
+    assert result["blocked"] is True
+    assert result["capacity"]["deadline_at"] is None
+    assert result["capacity"]["cooldown_seconds"] == 3600
+    assert checkpoint(args)["blocked_until"] == blocked_until
+    assert checkpoint(args)["commanders"]["a"] == record
 
 
 def test_source_http_failure_is_checkpointed_without_losing_other_commanders(tmp_path):

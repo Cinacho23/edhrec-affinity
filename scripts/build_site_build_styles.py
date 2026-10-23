@@ -321,7 +321,7 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--snapshot-date", default=datetime.now(ZoneInfo("America/Toronto")).date().isoformat(),
                      help="YYYY-MM-DD cache snapshot; reuse the date to resume without refetching")
     cli.add_argument("--fetch", action="store_true", help="Fetch missing public EDHREC pages; otherwise cache only")
-    cli.add_argument("--pipeline", action="store_true", help="Overlap full-catalog collection and model workers with a measured completion target")
+    cli.add_argument("--pipeline", action="store_true", help="Overlap full-catalog collection and model workers with rate-based completion estimates")
     cli.add_argument("--workers", type=int, default=6, help="Concurrent commander collectors sharing one source request budget")
     cli.add_argument("--preview-workers", type=int, default=16, help="Concurrent preview downloads per commander")
     cli.add_argument("--analysis-workers", type=int, default=2, help="Independent CPU model processes")
@@ -329,8 +329,11 @@ def parser() -> argparse.ArgumentParser:
                      help="Shared adaptive request ceiling, not a claimed sustained source capacity")
     cli.add_argument("--source-max-age-hours", type=float, default=72)
     cli.add_argument("--index-max-age-hours", type=float, default=24)
-    cli.add_argument("--target-completion-hours", type=float, default=96)
-    cli.add_argument("--upstream-snapshot-date", help="Weekly dataset YYYY-MM-DD; later snapshots start a new four-day cycle")
+    cli.add_argument("--target-completion-hours", type=float,
+                     help="Optional completion deadline; otherwise report a rate-based ETA without a deadline")
+    cli.add_argument("--freshness-target-hours", type=float, default=96,
+                     help="Source freshness window, independent of the completion estimate (default 96)")
+    cli.add_argument("--upstream-snapshot-date", help="Weekly dataset YYYY-MM-DD; later snapshots start a new collection cycle")
     cli.add_argument("--min-free-disk-gb", type=float, default=2)
     cli.add_argument("--card-metadata-cache", type=Path, default=Path("data/raw/build-style-card-metadata.json"))
     cli.add_argument("--refresh", action="store_true", help="Include commanders already having a fitted report")
@@ -352,7 +355,9 @@ def main() -> int:
         cli.error("Invalid package ceiling, deck minimum, or request delay (minimum one second)")
     if (not 1 <= args.workers <= 32 or not 1 <= args.preview_workers <= 64 or not 1 <= args.analysis_workers <= 16
             or any(not math.isfinite(value) or value <= 0 for value in
-                   (args.requests_per_second, args.source_max_age_hours, args.index_max_age_hours, args.target_completion_hours))
+                   (args.requests_per_second, args.source_max_age_hours, args.index_max_age_hours, args.freshness_target_hours))
+            or (args.target_completion_hours is not None
+                and (not math.isfinite(args.target_completion_hours) or args.target_completion_hours <= 0))
             or not math.isfinite(args.min_free_disk_gb) or args.min_free_disk_gb < 0):
         cli.error("Invalid worker count, source request ceiling, freshness window, or free-disk minimum")
     try:
