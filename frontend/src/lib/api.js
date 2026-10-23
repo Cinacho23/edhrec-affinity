@@ -20,9 +20,9 @@ export function safeJsonFilename(value) {
     .replace(/^-|-$/g, "") || "unknown";
 }
 
-async function fetchJson(relativePath, { optional = false, signal } = {}) {
+async function fetchJson(relativePath, { optional = false, signal, cache } = {}) {
   const url = joinDataPath(relativePath);
-  const response = await fetch(url, signal ? { signal } : undefined);
+  const response = await fetch(url, signal || cache ? { ...(signal ? { signal } : {}), ...(cache ? { cache } : {}) } : undefined);
 
   if (optional && response.status === 404) {
     return null;
@@ -98,7 +98,7 @@ export async function loadCommanderBuildStyles(commanderSlug, { signal } = {}) {
 }
 
 export async function loadBuildStyleIndex({ signal } = {}) {
-  const index = await fetchJson("build-styles/index.json", { optional: true, signal });
+  const index = await fetchJson("build-styles/index.json", { optional: true, signal, cache: "no-cache" });
   if (index === null) {
     return { schema_version: 1, coverage: "sampled_commanders", total_available: 0, commanders: [] };
   }
@@ -110,6 +110,45 @@ export async function loadBuildStyleIndex({ signal } = {}) {
     throw new Error("The build discovery coverage index is invalid.");
   }
   return index;
+}
+
+const BUILD_COLLECTOR_RUNS_URL = "https://api.github.com/repos/Cinacho23/edhrec-affinity/actions/workflows/build-commander-styles.yml/runs?per_page=1&branch=main";
+let buildCollectorRetryAt = 0;
+
+export async function loadBuildCollectorExecution({ signal, now = Date.now() } = {}) {
+  if (now < buildCollectorRetryAt) return null;
+  try {
+    const requestSignal = typeof AbortSignal.any === "function" && typeof AbortSignal.timeout === "function"
+      ? AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(15000)]) : signal;
+    const response = await fetch(BUILD_COLLECTOR_RUNS_URL, {
+      signal: requestSignal, cache: "no-store", credentials: "omit", headers: { Accept: "application/vnd.github+json" },
+    });
+    if (!response.ok) {
+      if ([403, 429].includes(response.status)) {
+        const reset = Number(response.headers?.get("x-ratelimit-reset")) * 1000;
+        const retry = response.headers?.get("retry-after");
+        const retryAt = retry && Number.isFinite(Number(retry)) ? now + Number(retry) * 1000 : Date.parse(retry);
+        buildCollectorRetryAt = Math.max(now + 15 * 60 * 1000,
+          Number.isFinite(reset) ? reset : 0, Number.isFinite(retryAt) ? retryAt : 0);
+      }
+      return null;
+    }
+    const payload = await response.json();
+    const run = Array.isArray(payload?.workflow_runs) ? payload.workflow_runs[0] : null;
+    const timestamp = (value) => typeof value === "string" && Number.isFinite(Date.parse(value))
+      && Date.parse(value) <= now + 5 * 60 * 1000 ? value : null;
+    const createdAt = timestamp(run?.created_at);
+    if (!Number.isSafeInteger(run?.id) || run.id <= 0 || !createdAt || run.head_branch !== "main"
+        || !["in_progress", "queued", "requested", "waiting", "pending", "completed"].includes(run.status)) return null;
+    return {
+      runId: run.id, status: run.status, conclusion: typeof run.conclusion === "string" ? run.conclusion : null,
+      createdAt, startedAt: timestamp(run.run_started_at), updatedAt: timestamp(run.updated_at),
+      checkedAt: new Date(now).toISOString(), url: `https://github.com/Cinacho23/edhrec-affinity/actions/runs/${run.id}`,
+    };
+  } catch (error) {
+    if (error.name === "AbortError") throw error;
+    return null;
+  }
 }
 
 export async function loadTagIndex() {

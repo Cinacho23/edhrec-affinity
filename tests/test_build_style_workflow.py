@@ -47,6 +47,8 @@ def test_scheduled_collection_uses_source_freshness_without_a_completion_deadlin
     assert result.returncode == 0, result.stderr
     args = json.loads(result.stdout)
     assert args[args.index("--freshness-target-hours") + 1] == "96"
+    assert args[args.index("--max-runtime-seconds") + 1] == "1800"
+    assert args[args.index("--min-total-decks") + 1] == "200"
     assert "--target-completion-hours" not in args
     assert "reset_target" not in COLLECTOR.read_text()
 
@@ -56,6 +58,7 @@ def test_failed_collection_fails_workflow_after_uploading_checkpoints():
     result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], text=True, capture_output=True)
     assert result.returncode == 1
     assert "steps.collect_styles.outcome == 'failure'" in body
+    assert "steps.collection_status.outputs.status != 'rate_limit_paused'" in body
     workflow = COLLECTOR.read_text()
     assert workflow.index("      - name: Upload collection summary") < workflow.index(
         "      - name: Fail the run after preserving collection progress")
@@ -75,6 +78,25 @@ def test_pipeline_cli_has_no_default_completion_deadline(tmp_path):
     assert summary["capacity"]["deadline_at"] is None
     assert summary["deadline_target_met"] is None
     assert summary["freshness_target_hours"] == 96
+
+
+def test_watchdog_and_free_cooldown_waiter_are_separate_from_the_collector():
+    watchdog = (ROOT / ".github/workflows/watch-build-styles.yml").read_text()
+    waiter = (ROOT / ".github/workflows/resume-build-styles.yml").read_text()
+    collector = COLLECTOR.read_text()
+    assert 'cron: "7,17,27,37,47,57 * * * *"' in watchdog
+    assert "restore-build-styles" not in watchdog and "pip install" not in watchdog
+    assert "schedule:" not in collector
+    assert "name: build-style-cooldown" in waiter and "deployment: false" in waiter
+    assert "prepare-cooldown" in waiter and " resume " in waiter
+    assert "sleep" not in collector and "sleep" not in waiter
+
+
+def test_batch_cli_rejects_a_lower_minimum_before_reading_the_catalog():
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/build_site_build_styles.py"),
+                             "--min-total-decks", "0", "--dry-run"], text=True, capture_output=True)
+    assert result.returncode == 2
+    assert "at least 200" in result.stderr
 
 
 @pytest.mark.parametrize("publish", [True, False])

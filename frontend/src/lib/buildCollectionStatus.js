@@ -59,7 +59,8 @@ export function getBuildCollectorStatus(progress, now = Date.now()) {
   const observedTimestamp = typeof observedAt === "string" ? Date.parse(observedAt) : NaN;
   return {
     updatedAt: progress.updated_at, stale, paused, complete,
-    label: complete ? "Collection complete" : paused ? "Collection paused" : learned ? "Learned operating ceiling" : "Calibrating request rate",
+    label: complete ? "Last published collection complete" : paused && Number.isFinite(cooldownAt) && cooldownAt > now
+      ? "Last published batch: source cooldown" : paused ? "Last published batch stopped" : "Last published batch",
     learned, operatingRate, configuredRate, observedRate, remaining,
     observedRateAt: Number.isFinite(observedTimestamp) && observedTimestamp <= now + FUTURE_TOLERANCE_MS ? observedAt : null,
     minimumSeconds: learned && (remaining !== 0 || complete) ? nonnegative(capacity.estimated_minimum_seconds) : null,
@@ -70,5 +71,27 @@ export function getBuildCollectorStatus(progress, now = Date.now()) {
     hasRecordedCooldown,
     lastThrottleAt: typeof control?.last_throttle?.at === "string" ? control.last_throttle.at : null,
     inventoryComplete: capacity.inventory_complete === true,
+  };
+}
+
+export function getBuildCollectorExecutionStatus(execution, checkpointAt, now = Date.now()) {
+  const checked = typeof execution?.checkedAt === "string" ? Date.parse(execution.checkedAt) : NaN;
+  const created = typeof execution?.createdAt === "string" ? Date.parse(execution.createdAt) : NaN;
+  const started = typeof execution?.startedAt === "string" ? Date.parse(execution.startedAt) : NaN;
+  const checkpoint = typeof checkpointAt === "string" ? Date.parse(checkpointAt) : NaN;
+  if (!Number.isFinite(now) || !Number.isFinite(checked) || checked > now + FUTURE_TOLERANCE_MS
+      || now - checked >= 5 * 60 * 1000 || !Number.isFinite(created) || created > now + FUTURE_TOLERANCE_MS
+      || !Number.isSafeInteger(execution?.runId) || execution.runId <= 0) return null;
+  const activityAt = Number.isFinite(started) && started <= now + FUTURE_TOLERANCE_MS ? started : created;
+  if (Number.isFinite(checkpoint) && activityAt <= checkpoint) return null;
+  const running = execution.status === "in_progress";
+  const queued = ["queued", "requested", "waiting", "pending"].includes(execution.status);
+  if (!running && !queued && execution.status !== "completed") return null;
+  return {
+    label: running ? "Collector running" : queued ? "Collector queued" : execution.conclusion === "success"
+      ? "Latest collector run finished" : "Latest collector run stopped",
+    running, queued, completed: execution.status === "completed", checkedAt: execution.checkedAt,
+    activityAt: new Date(activityAt).toISOString(),
+    url: `https://github.com/Cinacho23/edhrec-affinity/actions/runs/${execution.runId}`,
   };
 }

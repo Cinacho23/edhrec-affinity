@@ -1,9 +1,6 @@
 name: Update commander build styles
 
 on:
-  schedule:
-    # Watchdog only: successful batches dispatch their own continuation.
-    - cron: "17 * * * *"
   workflow_run:
     workflows: ["Update full sharded data and deploy site"]
     branches: [main]
@@ -48,13 +45,37 @@ env:
   REQUESTS_PER_SECOND: ${{ vars.BUILD_STYLE_REQUESTS_PER_SECOND || '40' }}
 
 jobs:
-  build:
-    name: Continue catalog collection and learn build packages
+  preflight:
+    name: Check collection readiness without restoring decks
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    # Leave time after the four-hour collection window to drain analysis and
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.ready.outputs.run }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Check active collectors and source cooldown
+        id: ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/coordinate_build_styles.py preflight --summary-file data/build-style-artifact/build_style_batch.json
+      - name: Retain a skipped-run summary
+        if: steps.ready.outputs.run == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-style-summary-${{ github.run_id }}
+          path: data/build-style-artifact/build_style_batch.json
+          retention-days: 7
+
+  build:
+    name: Continue catalog collection and learn build packages
+    needs: preflight
+    if: needs.preflight.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    # Leave time after the half-hour collection window to drain analysis and
     # durably upload the checkpoint before dispatching the following batch.
-    timeout-minutes: 330
+    timeout-minutes: 90
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -136,8 +157,8 @@ jobs:
           args=(--fetch --commander-index data/build-style-artifact/commander_index.json
                 --output-dir "${STYLES_DIR}" --snapshot-date "${SAMPLE_DATE}"
                 --max-commanders "${MAX_COMMANDERS}" --sample-decks "${SAMPLE_DECKS}"
-                --max-components "${MAX_COMPONENTS}" --min-total-decks 0
-                --max-runtime-seconds 14400 --pipeline --workers 6 --preview-workers 16 --analysis-workers 2
+                --max-components "${MAX_COMPONENTS}" --min-total-decks 200
+                --max-runtime-seconds 1800 --pipeline --workers 6 --preview-workers 16 --analysis-workers 2
                 --requests-per-second "${REQUESTS_PER_SECOND}"
                 --source-max-age-hours 72 --refresh-after-days 3
                 --freshness-target-hours 96 --prune-completed-cache)
@@ -153,9 +174,9 @@ jobs:
           fi
           python scripts/build_site_build_styles.py "${args[@]}"
 
-      - name: Report paused or failed collection
+      - name: Report the retained collection checkpoint
         if: steps.collect_styles.outcome == 'failure'
-        run: echo "::warning::Collection stopped or failed. Completed reports and the retry checkpoint are retained; inspect the collection summary."
+        run: echo "::notice::Collection stopped; reports and the source cooldown are retained. The outcome check distinguishes a rate-limit pause from a failure."
 
       - name: Upload cumulative build-style samples
         id: checkpoint
@@ -176,6 +197,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Distinguish a rate-limit pause from a failed collector
+        id: collection_status
+        if: always() && steps.checkpoint.outcome == 'success'
+        run: python3 scripts/coordinate_build_styles.py outcome --summary-file data/build-style-artifact/build_style_batch.json
+
       - name: Decide whether collection can continue immediately
         id: continuation
         if: success() && steps.checkpoint.outcome == 'success' && steps.collect_styles.outcome == 'success'
@@ -195,7 +221,8 @@ jobs:
           path = Path("data/build-style-artifact/build_style_batch.json")
           summary = json.loads(path.read_text()) if path.exists() else {}
           # Explicitly bounded/manual refresh runs stay bounded. An access
-          # cooldown or a batch with no forward progress waits for the watchdog.
+          # rate-limit cooldown is resumed separately through a server-side
+          # environment timer. No-progress batches wait for the watchdog.
           should_continue = (
               summary.get("continuation_needed") is True
               and not summary.get("blocked")
@@ -221,7 +248,7 @@ jobs:
         run: gh workflow run build-commander-styles.yml --ref "${DEFAULT_BRANCH}"
 
       - name: Fail the run after preserving collection progress
-        if: always() && steps.collect_styles.outcome == 'failure'
+        if: always() && steps.collect_styles.outcome == 'failure' && steps.collection_status.outputs.status != 'rate_limit_paused'
         run: |
           echo "::error::Collection stopped or failed. Uploaded checkpoints retain progress; inspect the collection summary before retrying."
           exit 1

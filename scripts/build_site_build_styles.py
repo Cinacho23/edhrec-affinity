@@ -22,6 +22,9 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from edhrec_affinity.build_styles.collection import parse_sample_decks
+from edhrec_affinity.build_styles.eligibility import (
+    MIN_COMMANDER_DECKS, commander_is_eligible, valid_deck_count, validate_minimum,
+)
 
 
 def read_index(path: Path) -> list[dict]:
@@ -120,6 +123,7 @@ def preview_expansion_needed(args: argparse.Namespace, slug: str) -> bool:
 
 
 def select_commanders(args: argparse.Namespace) -> list[dict]:
+    minimum = validate_minimum(args.min_total_decks)
     rows = read_index(args.commander_index)
     requested = set(args.commanders or [])
     known = {row["commander_slug"] for row in rows}
@@ -128,11 +132,11 @@ def select_commanders(args: argparse.Namespace) -> list[dict]:
     state = read_checkpoint(args)
     selected, expanding, refreshable = [], [], []
     snapshot = datetime.strptime(args.snapshot_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    for row in sorted(rows, key=lambda row: (-float(row.get("total_decks") or 0), row["commander_slug"])):
+    for row in sorted(rows, key=lambda row: (-(valid_deck_count(row.get("total_decks")) or 0), row["commander_slug"])):
         slug = row["commander_slug"]
         if requested and slug not in requested:
             continue
-        if not requested and float(row.get("total_decks") or 0) < args.min_total_decks:
+        if not commander_is_eligible(row.get("total_decks"), minimum):
             continue
         attempt = state["commanders"].get(slug, {})
         if not args.refresh and future_date(attempt.get("retry_after")):
@@ -218,6 +222,7 @@ def run_batch(args: argparse.Namespace, *, runner: Callable | None = None, monot
                             {"running", "blocked", "failed", "generation_partial", "collecting"}):
             preview_state.unlink(missing_ok=True)
         argv = ["--commander", slug, "--components", "auto", "--max-components", str(args.max_components),
+                "--min-total-decks", str(args.min_total_decks),
                 "--max-tags", str(args.max_tags), "--min-tag-decks", str(args.min_tag_decks),
                 "--sample-decks", "all" if args.sample_decks is None else str(args.sample_decks), "--seed", str(args.seed),
                 "--collection-state", str(preview_state),
@@ -305,7 +310,8 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--max-commanders", type=int, default=0, help="Optional count limit; 0 processes the entire pending catalog (default)")
     cli.add_argument("--max-runtime-seconds", type=float, default=2700,
                      help="Stop before starting another commander after this budget; 0 disables the budget (default 2700)")
-    cli.add_argument("--min-total-decks", type=int, default=0, help="Optional filter; all indexed commanders are eligible by default")
+    cli.add_argument("--min-total-decks", type=int, default=MIN_COMMANDER_DECKS,
+                     help="Minimum commander deck count; at least 200 (default 200)")
     cli.add_argument("--sample-decks", type=parse_sample_decks, default=None,
                      help="all (default) collects the available index; optional nonnegative count, with no count ceiling")
     cli.add_argument("--max-preview-seconds", type=float, default=300,
@@ -346,6 +352,10 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     cli = parser()
     args = cli.parse_args()
+    try:
+        validate_minimum(args.min_total_decks)
+    except ValueError as error:
+        cli.error(str(error))
     if args.max_commanders < 0 or not 1 <= args.max_tags <= 16:
         cli.error("Use a nonnegative commander count and 1–16 tag profiles")
     if (not 1 <= args.max_components <= 32 or args.min_tag_decks < 1 or args.min_total_decks < 0

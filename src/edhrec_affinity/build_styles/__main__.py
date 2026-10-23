@@ -13,11 +13,13 @@ import httpx
 
 from .analysis import analyze_decks, compare_profiles
 from .collection import collect_previews, parse_sample_decks
-from .sources import Cache, RequestLimiter, SourceBlocked, checked_identifier, import_decks, parse_profile
+from .eligibility import MIN_COMMANDER_DECKS, require_eligible_commander, validate_minimum
+from .sources import Cache, CommanderAliasCatalog, RequestLimiter, SourceBlocked, checked_identifier, import_decks, parse_profile
 
 
 def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transport=None, metadata_lock=None,
-                     metadata_provider=None) -> dict:
+                     metadata_provider=None, commander_alias_provider=None) -> dict:
+    minimum = validate_minimum(getattr(args, "min_total_decks", MIN_COMMANDER_DECKS))
     slug = checked_identifier(args.commander)
     root = args.cache_dir or Path("data/raw/build-style-prototype") / slug
     if limiter is None and args.preview_workers > 1:
@@ -32,10 +34,13 @@ def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transpor
         card = payload["container"]["json_dict"]["card"]
         if card.get("url") and card["url"] != f"/commanders/{slug}":
             raise ValueError("The cache contains a different commander; select a separate cache directory")
+        require_eligible_commander(card.get("num_decks", payload.get("num_decks_avg")), minimum)
         # A valid commander page can contain no mature card measurements. Deck
         # analysis can still proceed, or record an honest insufficient sample.
         base = parse_profile(payload, "all", "All builds", allow_empty=True)
         base["commander_names"] = card.get("names") or [card["name"]]
+        aliases = commander_alias_provider or CommanderAliasCatalog(root.parent)
+        base["commander_name_groups"] = aliases.groups(card)
         # Sparse partner pages can omit the tag panel entirely. Their deck
         # index remains usable even when no tag profiles are available.
         panels = payload.get("panels", {})
@@ -122,6 +127,7 @@ def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transpor
 def analyze_evidence(args: argparse.Namespace, evidence: dict) -> dict:
     """CPU work over a saved input; no EDHREC or Scryfall requests in this phase."""
     slug, card, base = evidence["slug"], evidence["card"], evidence["base"]
+    require_eligible_commander(base.get("deck_count"), getattr(args, "min_total_decks", MIN_COMMANDER_DECKS))
     profiles, decks, collection = evidence["profiles"], evidence["decks"], evidence["collection"]
     failures, imported_count = list(evidence["failures"]), evidence["imported_count"]
     ranking_profiles, metadata = evidence["ranking_profiles"], evidence["metadata"]
@@ -235,6 +241,8 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--output-dir", type=Path, default=Path("data/prototypes/build-styles"))
     cli.add_argument("--no-html", action="store_true", help="Write JSON only for static-site data generation")
     cli.add_argument("--deck-import", type=Path, help="Folder of local .txt or .json exports; source tags not required")
+    cli.add_argument("--min-total-decks", type=validate_minimum, default=MIN_COMMANDER_DECKS,
+                     help=f"Minimum EDHREC commander deck count; must be at least {MIN_COMMANDER_DECKS}")
     cli.add_argument("--min-tag-decks", type=int, default=25)
     cli.add_argument("--max-tags", type=int, default=12)
     cli.add_argument("--tags", nargs="+", help="Optional explicit tag slugs, still subject to the deck minimum")

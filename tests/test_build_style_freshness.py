@@ -411,12 +411,66 @@ def test_only_http_429_lowers_the_ceiling_while_both_access_codes_stop_collectio
             cache.get("one.json", "https://json.edhrec.com/one.json")
         assert limiter.learning_state["learned_rate"] == (1.5 if status == 429 else None)
         assert limiter.learning_state["throttles"] == (1 if status == 429 else 0)
+        assert limiter.stats["block_kind"] == ("rate_limit" if status == 429 else "access_restriction")
         assert limiter.stats["retry_after_seconds"] == 7200
         with pytest.raises(SourceBlocked, match="stopped"):
             cache.get("two.json", "https://json.edhrec.com/two.json")
         assert len(calls) == 1
     finally:
         cache.close()
+
+
+@pytest.mark.parametrize("kinds", [
+    ["rate_limit", "access_restriction", "rate_limit", None],
+    ["access_restriction", "rate_limit", None],
+])
+def test_access_restriction_stays_sticky_after_rate_and_generic_stops(kinds):
+    limiter = RequestLimiter()
+    for index, kind in enumerate(kinds):
+        limiter.block(f"stop {index}", kind=kind)
+    assert limiter.blocked
+    assert limiter.stats["block_kind"] == "access_restriction"
+
+
+def test_in_flight_403_after_429_cannot_become_a_rate_limit_auto_resume(tmp_path):
+    limiter, _, _ = fake_limiter()
+    rate_cache = Cache(tmp_path / "rate", fetch=True, limiter=limiter)
+    access_cache = Cache(tmp_path / "access", fetch=True, limiter=limiter)
+    in_flight = threading.Barrier(2)
+    errors = []
+
+    def handler(request):
+        in_flight.wait(timeout=3)
+        if request.url.path == "/rate.json":
+            return httpx.Response(429)
+        assert limiter._blocked_event.wait(timeout=3)  # The 429 was processed first.
+        return httpx.Response(403)
+
+    attach_transport(rate_cache, handler)
+    attach_transport(access_cache, handler)
+
+    def read(cache, name):
+        try:
+            cache.get(name + ".json", "https://json.edhrec.com/" + name + ".json")
+        except SourceBlocked as error:
+            errors.append(str(error))
+
+    workers = [threading.Thread(target=read, args=(rate_cache, "rate")),
+               threading.Thread(target=read, args=(access_cache, "access"))]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+        assert len(errors) == 2
+        assert limiter.stats["throttles"] == 1
+        assert limiter.stats["block_kind"] == "access_restriction"
+        limiter.block("Shared collection stopped")
+        assert limiter.stats["block_kind"] == "access_restriction"
+    finally:
+        rate_cache.close()
+        access_cache.close()
 
 
 def test_access_block_interrupts_a_worker_already_waiting_for_its_request_slot():

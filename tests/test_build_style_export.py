@@ -28,10 +28,10 @@ def write_json(path, value):
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
-def report(slug="commander-a", *, date="2026-10-01T00:00:00+00:00", packages=3):
+def report(slug="commander-a", *, date="2026-10-01T00:00:00+00:00", packages=3, total_decks=200):
     return {
         "schema_version": 1, "commander_slug": slug, "commander_name": slug.title(),
-        "generated_at": date,
+        "generated_at": date, "total_edhrec_decks": total_decks,
         "profiles": {"profiles": [{"tag_slug": "tokens", "tag_name": "Tokens"}]},
         "deck_analysis": {
             "status": "fitted" if packages else "insufficient_data", "unique_decks": 60,
@@ -54,15 +54,15 @@ def current_record(**changes):
 
 def test_missing_samples_export_explicit_empty_coverage(tmp_path):
     result = exporter.export_build_style_files(
-        pd.DataFrame({"commander_slug": ["commander-a"]}), tmp_path / "processed", tmp_path / "site",
+        pd.DataFrame({"commander_slug": ["commander-a"], "total_decks": 200}), tmp_path / "processed", tmp_path / "site",
         seed_dir=tmp_path / "missing-seeds",
     )
     index = json.loads((tmp_path / "site/build-styles/index.json").read_text())
     assert result["commander_count"] == 0
     assert index == {"schema_version": 1, "coverage": "sampled_commanders", "total_available": 0,
-                     "total_catalog": 1, "total_pending": 1, "total_fitted": 0,
+                     "total_catalog": 1, "min_total_decks": 200, "total_pending": 1, "total_fitted": 0,
                      "total_insufficient": 0, "commanders": [], "discovery": {
-                         "policy": "current_collector", "collection_started_after": "2026-10-23T03:13:45Z",
+                         "policy": "current_collector", "min_total_decks": 200, "collection_started_after": "2026-10-23T03:13:45Z",
                          "baseline_run_id": 39893813350, "baseline_previews": 151, "baseline_report_count": 25,
                          "commander_slugs": [], "total_available": 0, "total_hidden": 0}}
 
@@ -75,7 +75,7 @@ def test_discovery_selects_current_reports_before_legacy_merge_and_keeps_archive
     write_json(processed / "build-styles/commander-a.json", approved)
     write_json(processed / "build-styles/_collection/state.json", {"schema_version": 1,
         "commanders": {"commander-a": current_record(status="blocked", collection_dataset_sha256="current-dataset")}})
-    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a", "commander-b", "pending"]}),
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a", "commander-b", "pending"], "total_decks": 200}),
         processed, site, previous_reports={"commander-a": report(date="2026-10-26T00:00:00Z", packages=6)}, seed_dir=seeds)
     index = json.loads((site / "build-styles/index.json").read_text())
     assert index["total_available"] == 2
@@ -97,7 +97,7 @@ def test_discovery_grows_with_future_verified_reports_even_when_model_generation
         write_json(processed / f"build-styles/{slug}.json", current_report(slug))
     state_path = processed / "build-styles/_collection/state.json"
     write_json(state_path, {"schema_version": 1, "commanders": records})
-    frame = pd.DataFrame({"commander_slug": ["commander-a", "commander-b"]})
+    frame = pd.DataFrame({"commander_slug": ["commander-a", "commander-b"], "total_decks": 200})
     exporter.export_build_style_files(frame, processed, site, seed_dir=tmp_path / "none")
     assert json.loads((site / "build-styles/index.json").read_text())["discovery"]["commander_slugs"] == ["commander-a"]
     records["commander-b"] = current_record(last_collection_at="2026-11-01T00:00:00Z", status="failed")
@@ -108,6 +108,48 @@ def test_discovery_grows_with_future_verified_reports_even_when_model_generation
     assert index["discovery"]["total_available"] == 2
     assert index["discovery"]["baseline_report_count"] == 25
     assert all(entry["generated_at"] == "2026-10-01T00:00:00+00:00" for entry in index["commanders"])
+
+
+def test_discovery_starts_empty_for_low_population_reports_and_admits_200_total_decks(tmp_path):
+    processed, site = tmp_path / "processed", tmp_path / "site"
+    populations = {"rare": 6, "boundary-low": 199, "eligible": 200}
+    records = {}
+    for slug, count in populations.items():
+        value = current_report(slug, total_decks=count)
+        value["deck_analysis"]["unique_decks"] = 8
+        write_json(processed / f"build-styles/{slug}.json", value)
+        records[slug] = current_record()
+    write_json(processed / "build-styles/_collection/state.json", {"schema_version": 1, "commanders": records})
+    frame = pd.DataFrame([{"commander_slug": slug, "total_decks": count} for slug, count in populations.items()])
+    exporter.export_build_style_files(frame[frame.commander_slug != "eligible"], processed, site,
+                                     seed_dir=tmp_path / "none")
+    index = json.loads((site / "build-styles/index.json").read_text())
+    assert index["commanders"] == []
+    assert index["discovery"]["commander_slugs"] == []
+    assert index["min_total_decks"] == 200
+    assert (site / "build-styles/rare.json").is_file()
+    exporter.export_build_style_files(frame, processed, site, seed_dir=tmp_path / "none")
+    index = json.loads((site / "build-styles/index.json").read_text())
+    assert index["total_catalog"] == 1
+    assert index["discovery"]["commander_slugs"] == ["eligible"]
+    assert index["commanders"][0]["unique_decks"] == 8
+    assert index["commanders"][0]["total_edhrec_decks"] == 200
+
+
+@pytest.mark.parametrize("catalog_count,current_count", [(199, 500), (None, 500), (500, 199)])
+def test_archived_fit_cannot_override_a_low_or_unknown_population_check(tmp_path, catalog_count, current_count):
+    processed, site, seeds = tmp_path / "processed", tmp_path / "site", tmp_path / "seeds"
+    write_json(seeds / "commander-a.json", report(date="2026-10-25T00:00:00Z", total_decks=500))
+    write_json(processed / "build-styles/commander-a.json", current_report(packages=0, total_decks=current_count))
+    write_json(processed / "build-styles/_collection/state.json", {"schema_version": 1,
+        "commanders": {"commander-a": current_record()}})
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"], "total_decks": catalog_count}),
+                                     processed, site, seed_dir=seeds)
+    index = json.loads((site / "build-styles/index.json").read_text())
+    assert index["commanders"] == []
+    assert index["discovery"]["commander_slugs"] == []
+    archived = json.loads((site / "build-styles/commander-a.json").read_text())
+    assert archived["total_edhrec_decks"] in (None, 199)
 
 
 @pytest.mark.parametrize("record_changes,collection_changes", [
@@ -128,7 +170,7 @@ def test_discovery_hides_unverified_or_partial_reports_without_removing_their_fi
     write_json(processed / "build-styles/commander-a.json", source)
     write_json(processed / "build-styles/_collection/state.json", {"schema_version": 1,
         "commanders": {"commander-a": current_record(**record_changes)}})
-    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"]}), processed, site,
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"], "total_decks": 200}), processed, site,
                                      seed_dir=tmp_path / "none")
     index = json.loads((site / "build-styles/index.json").read_text())
     assert index["total_available"] == 1
@@ -145,7 +187,7 @@ def test_discovery_requires_a_valid_processed_checkpoint_and_does_not_admit_seed
     write_json(processed / "build-styles/commander-b.json", current_report("commander-b"))
     if state is not None:
         write_json(processed / "build-styles/_collection/state.json", state)
-    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a", "commander-b"]}),
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a", "commander-b"], "total_decks": 200}),
                                      processed, site, seed_dir=seeds)
     index = json.loads((site / "build-styles/index.json").read_text())
     assert index["total_available"] == 2
@@ -159,7 +201,7 @@ def test_export_counts_flexible_packages_and_filters_other_commanders(tmp_path, 
     write_json(processed / "build-styles/commander-a.json", report(packages=packages))
     write_json(processed / "build-styles/removed-commander.json", report("removed-commander"))
     result = exporter.export_build_style_files(
-        pd.DataFrame({"commander_slug": ["commander-a", "not-sampled"]}), processed, site,
+        pd.DataFrame({"commander_slug": ["commander-a", "not-sampled"], "total_decks": 200}), processed, site,
         seed_dir=tmp_path / "missing-seeds",
     )
     index = json.loads((site / "build-styles/index.json").read_text())
@@ -177,7 +219,7 @@ def test_empty_insufficient_report_is_counted_without_inventing_packages(tmp_pat
     insufficient["deck_analysis"].update(unique_decks=2, reason="Need at least 8 unique usable decks")
     write_json(processed / "build-styles/commander-a.json", insufficient)
     exporter.export_build_style_files(
-        pd.DataFrame({"commander_slug": ["commander-a", "pending", "pending"]}), processed, site,
+        pd.DataFrame({"commander_slug": ["commander-a", "pending", "pending"], "total_decks": 200}), processed, site,
         seed_dir=tmp_path / "missing-seeds",
     )
     index = json.loads((site / "build-styles/index.json").read_text())
@@ -198,7 +240,7 @@ def test_export_preserves_source_age_and_partial_coverage_without_using_analysis
     source["collection"].update(target_mode="all", complete=False, frame_decks=1000,
                                 previews_attempted=60, previews_loaded=60, freshness=evidence)
     write_json(processed / "build-styles/commander-a.json", source)
-    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"]}), processed, site,
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"], "total_decks": 200}), processed, site,
                                      seed_dir=tmp_path / "missing-seeds")
     index = json.loads((site / "build-styles/index.json").read_text())
     entry = index["commanders"][0]
@@ -231,6 +273,7 @@ def test_export_publishes_compact_checkpoint_rate_and_eta_without_internal_state
     processed, site = tmp_path / "processed", tmp_path / "site"
     progress = {
         "updated_at": "2026-10-23T02:47:17Z", "blocked": True, "blocked_until": "2026-10-23T03:47:17Z",
+        "block_reason": "rate_limit",
         "capacity": {"remaining_requests": 12_000_000, "effective_requests_per_second": 1.5,
                      "configured_requests_per_second": 40, "rate_limit_learned": True,
                      "estimated_minimum_seconds": 8_000_000, "measured_projection_seconds": 9_000_000,
@@ -243,7 +286,7 @@ def test_export_publishes_compact_checkpoint_rate_and_eta_without_internal_state
     }
     write_json(processed / "build-styles/_collection/state.json", {
         "progress": progress, "commanders": {"private-queue-entry": {"cache_file": "/private/state"}}})
-    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"]}), processed, site,
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"], "total_decks": 200}), processed, site,
                                      seed_dir=tmp_path / "missing-seeds")
     index = json.loads((site / "build-styles/index.json").read_text())
     public = index["collection_progress"]
@@ -251,6 +294,7 @@ def test_export_publishes_compact_checkpoint_rate_and_eta_without_internal_state
     assert public["capacity"]["estimated_minimum_seconds"] == 8_000_000
     assert public["rate_control"]["learned_rate"] == 1.5
     assert public["blocked"] is True
+    assert public["block_reason"] == "rate_limit"
     assert "/private" not in json.dumps(public)
     assert "selected" not in public and "commanders" not in public
     assert "raw_response" not in public["rate_control"]["last_throttle"]
@@ -290,7 +334,7 @@ def test_clean_export_keeps_newest_successful_samples_and_publishes_manifest(tmp
     processed, site, seeds = tmp_path / "processed", tmp_path / "site", tmp_path / "seeds"
     write_json(processed / "affinity_rows_with_trends.json", [{
         "commander_slug": "commander-a", "commander_name": "Commander A", "tag_slug": "tokens",
-        "tag_name": "Tokens", "total_decks": 100, "tag_decks": 50, "z": 2,
+        "tag_name": "Tokens", "total_decks": 200, "tag_decks": 50, "z": 2,
     }])
     for name, data in [("analysis_summary", {}), ("trend_summary", {}), ("tag_summary", [])]:
         write_json(processed / f"{name}.json", data)
@@ -309,7 +353,7 @@ def test_clean_export_keeps_newest_successful_samples_and_publishes_manifest(tmp
 def test_seed_fills_first_deployment_and_newer_processed_sample_wins(tmp_path):
     processed, site, seeds = tmp_path / "processed", tmp_path / "site", tmp_path / "seeds"
     write_json(seeds / "commander-a.json", report(packages=1))
-    frame = pd.DataFrame({"commander_slug": ["commander-a"]})
+    frame = pd.DataFrame({"commander_slug": ["commander-a"], "total_decks": 200})
     exporter.export_build_style_files(frame, processed, site, seed_dir=seeds)
     assert json.loads((site / "build-styles/commander-a.json").read_text())["deck_analysis"]["packages"] == [{"id": 0, "top_cards": []}]
     write_json(processed / "build-styles/commander-a.json", report(date="2026-10-15T00:00:00+00:00", packages=4))
@@ -337,8 +381,8 @@ def batch_args(tmp_path, *extra):
     index = tmp_path / "commander_index.json"
     write_json(index, [
         {"commander_slug": "commander-a", "total_decks": 1000},
-        {"commander_slug": "commander-b", "total_decks": 100},
-        {"commander_slug": "commander-c", "total_decks": 10},
+        {"commander_slug": "commander-b", "total_decks": 500},
+        {"commander_slug": "commander-c", "total_decks": 200},
     ])
     return batch.parser().parse_args([
         "--commander-index", str(index), "--output-dir", str(tmp_path / "processed/build-styles"),
@@ -357,7 +401,7 @@ def test_batch_prioritizes_unsampled_before_refresh_and_obeys_hard_limit(tmp_pat
     assert [row["commander_slug"] for row in batch.select_commanders(args)] == ["commander-a"]
 
 
-def test_batch_supports_explicit_small_commander_and_offline_dry_run(tmp_path):
+def test_batch_supports_explicit_eligible_commander_and_offline_dry_run(tmp_path):
     args = batch_args(tmp_path, "--commanders", "commander-c", "--dry-run", "--sample-decks", "20")
     summary = batch.run_batch(args, runner=lambda _: pytest.fail("Dry run must not collect"))
     assert summary["selected"] == ["commander-c"]
@@ -407,15 +451,26 @@ def test_access_block_stops_entire_batch_and_retains_previous_fit(tmp_path):
     assert subsequent["blocked_until"]
 
 
-def test_default_queue_includes_entire_catalog_without_deck_count_threshold(tmp_path):
+def test_default_queue_excludes_commanders_below_two_hundred_decks(tmp_path):
     args = batch_args(tmp_path, "--dry-run")
     write_json(args.commander_index, [
-        {"commander_slug": f"commander-{i}", "total_decks": i} for i in range(100)
+        {"commander_slug": f"commander-{i}", "total_decks": i} for i in range(300)
     ])
     summary = batch.run_batch(args, runner=lambda _: pytest.fail("Dry run must not collect"))
-    assert len(summary["selected"]) == summary["catalog_size"] == 100
-    assert "commander-0" in summary["selected"]
-    assert args.max_commanders == args.min_total_decks == 0
+    assert len(summary["selected"]) == 100
+    assert "commander-199" not in summary["selected"]
+    assert "commander-200" in summary["selected"]
+    assert args.max_commanders == 0 and args.min_total_decks == 200
+
+
+def test_targeted_or_refresh_collection_cannot_bypass_two_hundred_deck_minimum(tmp_path):
+    args = batch_args(tmp_path, "--commanders", "commander-c", "--refresh", "--dry-run")
+    write_json(args.commander_index, [{"commander_slug": "commander-c", "total_decks": 199}])
+    summary = batch.run_batch(args, runner=lambda _: pytest.fail("Below-minimum commander must not be collected"))
+    assert summary["selected"] == []
+    args.min_total_decks = 0
+    with pytest.raises(ValueError, match="at least 200"):
+        batch.select_commanders(args)
 
 
 def test_deadline_saves_finished_work_and_next_run_continues(tmp_path):

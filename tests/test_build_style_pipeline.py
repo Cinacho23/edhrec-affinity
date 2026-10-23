@@ -13,6 +13,7 @@ import pytest
 
 from edhrec_affinity.build_styles.pipeline import atomic_json, evidence_version, run_pipeline, save_evidence
 from edhrec_affinity.build_styles.sources import SourceBlocked
+from edhrec_affinity.build_styles.eligibility import CommanderBelowMinimum
 
 
 NOW = datetime(2026, 10, 21, 12, tzinfo=timezone.utc)
@@ -20,7 +21,7 @@ NOW = datetime(2026, 10, 21, 12, tzinfo=timezone.utc)
 
 def options(tmp_path, **changes):
     defaults = dict(output_dir=tmp_path / "build-styles", snapshot_date="2026-10-21", commanders=None,
-        min_total_decks=0, refresh_after_days=3, refresh=False, max_commanders=0, max_runtime_seconds=30,
+        min_total_decks=200, refresh_after_days=3, refresh=False, max_commanders=0, max_runtime_seconds=30,
         requests_per_second=40, workers=1, analysis_workers=1, preview_workers=1, max_preview_seconds=10,
         card_metadata_cache=tmp_path / "cards.json", fetch=False, sample_decks=None, seed=42,
         max_components=8, max_tags=12, min_tag_decks=25, request_delay=1, source_max_age_hours=72,
@@ -30,13 +31,13 @@ def options(tmp_path, **changes):
 
 
 def rows(*slugs):
-    return [{"commander_slug": slug, "total_decks": 5} for slug in slugs]
+    return [{"commander_slug": slug, "total_decks": 200} for slug in slugs]
 
 
 def evidence(slug, *, frame=5, loaded=5, attempted=None, new_attempts=None, complete=True,
              mode="all", dataset="stable-dataset", checked=NOW):
     attempted = loaded if attempted is None else attempted
-    return {"slug": slug, "card": {"name": slug}, "base": {"commander_names": [slug], "deck_count": frame},
+    return {"slug": slug, "card": {"name": slug}, "base": {"commander_names": [slug], "deck_count": 200},
         "profiles": [], "ranking_profiles": [], "decks": [], "metadata": {}, "metadata_summary": {},
         "failures": [], "imported_count": 0, "blocked": False, "provenance": [],
         "collection": {"target_mode": mode, "frame_decks": frame, "previews_attempted": attempted,
@@ -60,7 +61,7 @@ def saved_analyzer(calls, on_start=None):
             on_start(slug)
         destination = Path(settings["output_dir"]) / "report.json"
         report = {"schema_version": 1, "commander_slug": slug, "commander_name": slug,
-            "generated_at": NOW.isoformat(), "collection": source["collection"],
+            "generated_at": NOW.isoformat(), "total_edhrec_decks": source["base"]["deck_count"], "collection": source["collection"],
             "deck_analysis": {"status": "fitted", "unique_decks": source["collection"]["previews_loaded"],
                 "packages": [{"id": 0, "top_cards": []}]}}
         atomic_json(destination, report)
@@ -97,6 +98,65 @@ def test_complete_collection_is_saved_analyzed_and_published_separately(tmp_path
     assert checkpoint(args)["commanders"]["a"]["collection_dataset_sha256"] == "stable-dataset"
     assert not list((args.output_dir / "_collection/evidence").glob("*.gz"))
     assert json.loads((args.output_dir / "a.json").read_text())["collection"]["analysis_current"] is True
+
+
+def test_pipeline_collects_only_commanders_with_at_least_200_total_decks(tmp_path):
+    args, collected = options(tmp_path), []
+    inventory = [{"commander_slug": slug, "total_decks": count}
+                 for slug, count in [("rare", 6), ("low", 199), ("eligible", 200), ("unknown", None)]]
+
+    def collect(settings, **_):
+        collected.append(settings.commander)
+        assert settings.min_total_decks == 200
+        return evidence(settings.commander)
+
+    result = execute(args, inventory, collect, saved_analyzer([]))
+    assert collected == ["eligible"]
+    assert result["catalog_size"] == 1
+    assert result["min_total_decks"] == 200
+    args.commanders = ["low"]
+    with pytest.raises(ValueError, match="at least 200"):
+        execute(args, inventory, collect, saved_analyzer([]))
+    args.commanders, args.min_total_decks = None, 0
+    with pytest.raises(ValueError, match="at least 200"):
+        execute(args, inventory, collect, saved_analyzer([]))
+
+
+def test_fresh_source_below_minimum_is_skipped_without_analysis_or_repeat_work(tmp_path):
+    args, analyzed = options(tmp_path), []
+    atomic_json(args.output_dir / "a.json", {"total_edhrec_decks": 200, "collection": {},
+        "deck_analysis": {"status": "fitted", "packages": []}})
+
+    def collect(*_, **__):
+        raise CommanderBelowMinimum(199)
+
+    result = execute(args, rows("a"), collect, saved_analyzer(analyzed))
+    assert analyzed == [] and result["failures"] == []
+    assert result["skipped"][0]["total_decks"] == 199
+    assert checkpoint(args)["commanders"]["a"]["status"] == "ineligible"
+    assert result["capacity"]["remaining_previews"] == 0
+    archived = json.loads((args.output_dir / "a.json").read_text())
+    assert archived["total_edhrec_decks"] == 199
+    assert archived["collection"]["analysis_current"] is False
+    retry = execute(args, rows("a"), lambda *_: pytest.fail("Population check must respect its retry interval"),
+                    saved_analyzer(analyzed), checked=NOW + timedelta(hours=1))
+    assert retry["selected"] == []
+
+
+def test_commander_requalifying_with_unchanged_dataset_restores_its_population(tmp_path):
+    args, analyzed = options(tmp_path), []
+    execute(args, rows("a"), lambda settings, **_: evidence("a"), saved_analyzer(analyzed))
+    args.refresh = True
+
+    def below_minimum(*_, **__):
+        raise CommanderBelowMinimum(199)
+
+    execute(args, rows("a"), below_minimum, saved_analyzer(analyzed))
+    execute(args, rows("a"), lambda settings, **_: evidence("a"), saved_analyzer(analyzed))
+    assert analyzed == ["a"]
+    report = json.loads((args.output_dir / "a.json").read_text())
+    assert report["total_edhrec_decks"] == 200
+    assert report["collection"]["analysis_current"] is True
 
 
 def test_finite_sample_cannot_be_marked_full_catalog_coverage(tmp_path):
@@ -249,7 +309,7 @@ def test_rate_limit_learning_survives_cooldown_and_the_next_collection_batch(tmp
         for _ in range(100):
             limiter.record_success()
         limiter.record_throttle(now=NOW)
-        limiter.block("HTTP 429 rate limit")
+        limiter.block("HTTP 429 rate limit", kind="rate_limit")
         raise SourceBlocked("HTTP 429 rate limit")
 
     first = execute(args, rows("a"), throttled, saved_analyzer([]))
@@ -297,6 +357,23 @@ def test_rate_limit_learning_survives_cooldown_and_the_next_collection_batch(tmp
     assert {key: checkpoint(args)["source_rate"][key] for key in ("learned_rate", "last_throttle", "throttles")} == {
         key: learned[key] for key in ("learned_rate", "last_throttle", "throttles")}
     assert checkpoint(args)["source_rate"]["observed_rate_at"] == resumed_at.isoformat()
+
+
+def test_metadata_access_block_cannot_be_misclassified_as_an_edhrec_rate_pause(tmp_path):
+    args = options(tmp_path)
+
+    def collect(settings, **dependencies):
+        limiter = dependencies["limiter"]
+        limiter.record_throttle(now=NOW)
+        limiter.block("HTTP 429 EDHREC", kind="rate_limit")
+        value = evidence(settings.commander)
+        value.update(blocked=True, metadata_summary={"blocked": True})
+        return value
+
+    result = execute(args, rows("a"), collect, saved_analyzer([]))
+    assert result["blocked"] is True
+    assert result["block_reason"] == "access_restriction"
+    assert checkpoint(args)["block_reason"] == "access_restriction"
 
 
 @pytest.mark.parametrize("invalid", [0, -1, float("inf"), float("nan"), True, "2"])

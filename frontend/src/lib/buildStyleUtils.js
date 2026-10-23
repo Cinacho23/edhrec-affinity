@@ -79,14 +79,21 @@ const BUILD_EVIDENCE_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
 
 const BUILD_SOURCE_TARGET_HOURS = 96;
 
+export function hasBuildStylePopulation(report, minimum = 200) {
+  return Number.isSafeInteger(minimum) && minimum >= 200 && Number.isSafeInteger(report?.total_edhrec_decks)
+    && report.total_edhrec_decks >= minimum;
+}
+
 export function getCurrentBuildDiscoveryCommanders(index) {
   if (index?.discovery?.policy !== "current_collector" || !Array.isArray(index.discovery.commander_slugs)
-      || !Array.isArray(index.commanders)) return [];
+      || !Array.isArray(index.commanders) || !Number.isSafeInteger(index.discovery.min_total_decks)
+      || index.discovery.min_total_decks < 200) return [];
+  const minimum = index.discovery.min_total_decks;
   const approved = new Set(index.discovery.commander_slugs.filter((slug) => typeof slug === "string" && slug.trim()));
   const seen = new Set();
   return index.commanders.filter((commander) => {
     const slug = commander?.commander_slug;
-    if (!approved.has(slug) || seen.has(slug)) return false;
+    if (!approved.has(slug) || seen.has(slug) || !hasBuildStylePopulation(commander, minimum)) return false;
     seen.add(slug);
     return true;
   });
