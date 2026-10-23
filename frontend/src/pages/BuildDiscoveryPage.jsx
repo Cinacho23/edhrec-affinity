@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { loadBuildStyleIndex } from "../lib/api";
-import { getBuildCollectionProgress, getBuildSourceFreshness } from "../lib/buildStyleUtils";
+import { getBuildCollectionProgress, getBuildSourceFreshness, getCurrentBuildDiscoveryCommanders } from "../lib/buildStyleUtils";
 import { formatCollectionDuration, getBuildCollectorStatus } from "../lib/buildCollectionStatus";
 import { formatNumber } from "../lib/formatters";
 import "./BuildDiscoveryPage.css";
@@ -28,7 +28,7 @@ export default function BuildDiscoveryPage() {
     const controller = new AbortController();
     let active = true;
     loadBuildStyleIndex({ signal: controller.signal }).then(
-      (index) => { if (active) setState({ loading: false, commanders: index.commanders, index, error: null }); },
+      (index) => { if (active) setState({ loading: false, commanders: getCurrentBuildDiscoveryCommanders(index), index, error: null }); },
       (error) => { if (active && error.name !== "AbortError") setState({ loading: false, commanders: [], error: error.message }); }
     );
     return () => { active = false; controller.abort(); };
@@ -58,16 +58,16 @@ export default function BuildDiscoveryPage() {
     </div>
 
     <div className="panel build-discovery-coverage">
-      <h2>Available commander reports</h2>
-      <p>Each report covers sampled decks for one commander. The package count adapts to the evidence, and a package can suggest one or several themes. These reports describe a sample rather than every EDHREC deck.</p>
-      <p>Collection continues through every available deck preview and adapts its operating rate when EDHREC throttles requests. A first analysis can appear while collection is still in progress. Source-check age and full-index coverage are shown separately.</p>
+      <h2>Current collector reports</h2>
+      <p>These reports use the available decklists collected for each commander by the current collector. The list grows as commanders finish collection and analysis. The package count adapts to the evidence, and a package can suggest one or several themes.</p>
+      <p>Collection continues through every available deck preview and adapts its operating rate when EDHREC throttles requests. Source-check age and full-index coverage are shown separately.</p>
       <p>A package describes a recurring card pattern across decks; the generated deck under it is one 100-card example of that pattern. Changing the package count fits a different model.</p>
       {!state.loading && !state.error ? <>
         <strong>{totalCatalog === null
-          ? `${formatNumber(state.commanders.length)} ${state.commanders.length === 1 ? "commander report available" : "commander reports available"}`
-          : `${formatNumber(state.commanders.length)} of ${formatNumber(totalCatalog)} commanders analyzed`}</strong>
-        {pending !== null ? <p className="build-discovery-coverage__pending">{formatNumber(pending)} {pending === 1 ? "commander remains" : "commanders remain"} pending in this dataset. Analyzed commanders stay listed when there is insufficient data to fit packages.</p> : null}
-        <p className="build-discovery-coverage__freshness">{formatNumber(freshnessCounts.targetMet)}{totalCatalog !== null ? ` of ${formatNumber(totalCatalog)}` : ""} commanders have full index coverage with recent source checks. {formatNumber(freshnessCounts.unknown)} published reports have unknown source age; {formatNumber(freshnessCounts.mixed + freshnessCounts.stale)} contain source checks needing refresh.</p>
+          ? `${formatNumber(state.commanders.length)} ${state.commanders.length === 1 ? "current collector report" : "current collector reports"}`
+          : `${formatNumber(state.commanders.length)} of ${formatNumber(totalCatalog)} commanders have current collector reports`}</strong>
+        {pending !== null ? <p className="build-discovery-coverage__pending">{formatNumber(pending)} {pending === 1 ? "commander awaits" : "commanders await"} a current collector report. Completed collections stay listed when there is insufficient data to fit packages.</p> : null}
+        <p className="build-discovery-coverage__freshness">{formatNumber(freshnessCounts.targetMet)}{totalCatalog !== null ? ` of ${formatNumber(totalCatalog)}` : ""} commanders have full index coverage with recent source checks. {formatNumber(freshnessCounts.unknown)} shown reports have unknown source age; {formatNumber(freshnessCounts.mixed + freshnessCounts.stale)} contain source checks needing refresh.</p>
       </> : null}
     </div>
 
@@ -92,7 +92,7 @@ export default function BuildDiscoveryPage() {
 
     {state.loading ? <p className="muted" role="status">Loading available build reports…</p> : state.error ? <div className="panel"><p className="error-message">Could not load build discovery: {state.error}</p></div> : state.commanders.length ? <>
       <div className="search-panel build-discovery-search">
-        <label htmlFor="build-discovery-search">Search available commanders</label>
+        <label htmlFor="build-discovery-search">Search current collector reports</label>
         <input id="build-discovery-search" type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search commander name…" />
         <p className="muted" aria-live="polite">{formatNumber(visible.length)} of {formatNumber(state.commanders.length)} reports</p>
       </div>
@@ -121,6 +121,6 @@ export default function BuildDiscoveryPage() {
         <div className="build-discovery-card__footer"><span>Analysis built {reportDate(commander.generated_at)}</span><Link to={`/commanders/${encodeURIComponent(commander.commander_slug)}`}>Explore report →</Link></div>
       </article>; })}</div>
       {!visible.length ? <p className="muted">No available reports match this search.</p> : null}
-    </> : <div className="panel"><p className="muted">No build discovery reports are available in this dataset yet.</p><Link className="build-discovery-all-commanders" to="/commanders">Browse all commanders →</Link></div>}
+    </> : <div className="panel"><p className="muted">Waiting for completed reports from the current collector. New commander reports will appear here as collection and analysis finish.</p><Link className="build-discovery-all-commanders" to="/commanders">Browse all commanders →</Link></div>}
   </section>;
 }

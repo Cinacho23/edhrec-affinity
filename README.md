@@ -63,6 +63,10 @@ commanders can return profiles or an insufficient-data result instead of card
 packages. Source deck tags are optional. Public EDHREC previews supply cardlists
 without direct requests to Moxfield or Archidekt.
 
+Build Discovery displays reports completed by the repaired collector, starting
+with the 25 reports saved by run 39893813350. More cards appear as collection
+finishes for other commanders. Older reports remain stored for commander pages.
+
 Downloads and model processes run independently, using compact public JSON or
 React preview data and one adaptive shared request ceiling. The collector learns
 an operating rate below EDHREC's throttling threshold and remembers it across jobs.

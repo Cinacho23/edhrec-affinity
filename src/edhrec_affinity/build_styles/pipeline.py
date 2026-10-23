@@ -336,6 +336,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                             summary["new_previews_attempted"] += new_attempts
                             summary["collected"].append(slug)
                             record.update(frame_decks=collection.get("frame_decks") or 0,
+                                collection_dataset_sha256=collection.get("dataset_sha256"),
                                 current_previews=collection.get("fresh_previews", collection.get("previews_loaded", 0)),
                                 unavailable_previews=collection.get("unavailable_previews", 0),
                                 coverage_complete=collection.get("complete") is True and collection.get("target_mode") == "all",

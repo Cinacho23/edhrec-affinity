@@ -94,6 +94,7 @@ def test_complete_collection_is_saved_analyzed_and_published_separately(tmp_path
     assert result["publish_needed"] is True
     assert result["continuation_needed"] is False
     assert checkpoint(args)["commanders"]["a"]["coverage_complete"] is True
+    assert checkpoint(args)["commanders"]["a"]["collection_dataset_sha256"] == "stable-dataset"
     assert not list((args.output_dir / "_collection/evidence").glob("*.gz"))
     assert json.loads((args.output_dir / "a.json").read_text())["collection"]["analysis_current"] is True
 
