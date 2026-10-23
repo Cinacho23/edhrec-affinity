@@ -27,6 +27,10 @@ on:
         description: "Resample selected commanders that already have fitted reports"
         type: boolean
         default: false
+      recovery_run_id:
+        description: "Optional interrupted latest run whose summary survived a missing checkpoint upload"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -52,6 +56,8 @@ jobs:
     timeout-minutes: 5
     outputs:
       run: ${{ steps.ready.outputs.run }}
+      restore_run_id: ${{ steps.ready.outputs.restore_run_id }}
+      recovery_run_id: ${{ steps.ready.outputs.recovery_run_id }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -59,7 +65,13 @@ jobs:
         id: ready
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/coordinate_build_styles.py preflight --summary-file data/build-style-artifact/build_style_batch.json
+          RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
+        run: |
+          args=(preflight --summary-file data/build-style-artifact/build_style_batch.json)
+          if [[ -n "${RECOVERY_RUN_ID}" ]]; then
+            args+=(--recovery-run-id "${RECOVERY_RUN_ID}")
+          fi
+          python3 scripts/coordinate_build_styles.py "${args[@]}"
       - name: Retain a skipped-run summary
         if: steps.ready.outputs.run == 'false'
         uses: actions/upload-artifact@v4
@@ -94,9 +106,22 @@ jobs:
         run: echo "SAMPLE_DATE=$(TZ=America/Toronto date +%F)" >> "$GITHUB_ENV"
 
       - name: Restore accumulated build-style samples
+        id: restored_styles
         uses: ./.github/actions/restore-build-styles
         with:
           destination: ${{ env.STYLES_DIR }}
+          run-id: ${{ needs.preflight.outputs.restore_run_id }}
+
+      - name: Preserve newer source limits during explicit checkpoint recovery
+        if: needs.preflight.outputs.recovery_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECOVERY_RUN_ID: ${{ needs.preflight.outputs.recovery_run_id }}
+          RESTORED_RUN_ID: ${{ steps.restored_styles.outputs['run-id'] }}
+        run: |
+          python3 scripts/coordinate_build_styles.py recover-control \
+            --recovery-run-id "${RECOVERY_RUN_ID}" --restored-run-id "${RESTORED_RUN_ID}" \
+            --state-file "${STYLES_DIR}/_collection/state.json"
 
       - name: Restore shared card rules cache
         uses: actions/cache@v4
@@ -184,7 +209,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-styles-${{ env.SAMPLE_DATE }}-${{ github.run_id }}
-          path: ${{ env.STYLES_DIR }}/
+          # Raw responses and model scratch can still be pruned while a
+          # cancellation finishes. Resume from parsed previews/evidence instead.
+          path: |
+            ${{ env.STYLES_DIR }}/
+            !${{ env.STYLES_DIR }}/_collection/sources/*/previews/**
+            !${{ env.STYLES_DIR }}/_collection/analyzed/**
+            !${{ env.STYLES_DIR }}/**/*.tmp
           if-no-files-found: warn
           retention-days: 2
 

@@ -258,3 +258,90 @@ def test_snapshot_does_not_trust_a_summary_without_the_full_checkpoint(tmp_path)
     finally:
         os.environ.clear()
         os.environ.update(old)
+
+
+def test_only_explicit_latest_incomplete_run_can_recover_an_older_checkpoint():
+    github = GitHub([{"blocked": False, "source_rate": {"learned_rate": 1.75}}, {"blocked": False}])
+    github.saved[0].durable = False
+    assert not coordinator.coordinate(github, "watchdog", now=NOW)["run"]
+    assert not coordinator.coordinate(github, "preflight", now=NOW)["run"]
+    assert not coordinator.coordinate(github, "preflight", now=NOW, recovery_run_id=99)["run"]
+    result = coordinator.coordinate(github, "preflight", now=NOW, recovery_run_id=100)
+    assert result["run"] is True
+    assert (result["recovery_run_id"], result["restore_run_id"]) == (100, 99)
+    assert github.dispatches == []
+
+
+def test_manual_recovery_requires_a_durable_fallback_and_preserves_source_guards():
+    for summary in (paused(), paused(expiry=NOW, throttles=0)):
+        github = GitHub([summary, {"blocked": False}])
+        github.saved[0].durable = False
+        assert not coordinator.coordinate(github, "preflight", now=NOW, recovery_run_id=100)["run"]
+    github = GitHub([{"blocked": False}])
+    github.saved[0].durable = False
+    assert not coordinator.coordinate(github, "preflight", now=NOW, recovery_run_id=100)["run"]
+
+
+@pytest.mark.parametrize("summary", [
+    {"blocked": False, "block_reason": "access_restriction"},
+    {"blocked": False, "blocked_until": (NOW + timedelta(hours=1)).isoformat()},
+    {"blocked": False, "blocked_until": "invalid"},
+])
+def test_manual_recovery_cannot_ignore_newer_access_or_cooldown_controls(summary):
+    github = GitHub([summary, {"blocked": False}])
+    github.saved[0].durable = False
+    assert not coordinator.coordinate(github, "preflight", now=NOW, recovery_run_id=100)["run"]
+
+
+@pytest.mark.parametrize("older", [paused(), paused(expiry=NOW, throttles=0),
+                                  {"blocked": False, "block_reason": "access_restriction"}])
+def test_recovery_validates_the_older_durable_checkpoint_source_guards(older):
+    github = GitHub([{"blocked": False}, older])
+    github.saved[0].durable = False
+    assert not coordinator.coordinate(github, "preflight", now=NOW, recovery_run_id=100)["run"]
+
+
+def test_source_access_restriction_is_never_downgraded_by_a_newer_rate_pause():
+    state = {"schema_version": 1, "commanders": {}, "block_reason": "access_restriction",
+             "blocked_until": (NOW - timedelta(seconds=1)).isoformat()}
+    with pytest.raises(ValueError, match="access restriction"):
+        coordinator.merge_recovery_controls(state, paused(expiry=NOW, block_reason="rate_limit"),
+                                            source_run_id=100, checkpoint_run_id=99, now=NOW)
+    assert state["block_reason"] == "access_restriction"
+
+
+def test_recovery_cli_requires_a_manual_workflow_dispatch_event(tmp_path):
+    result = subprocess.run([sys.executable, str(SCRIPT), "preflight", "--recovery-run-id", "100"],
+                            env={**os.environ, "GITHUB_EVENT_NAME": "schedule"}, text=True, capture_output=True)
+    assert result.returncode == 1
+    assert "explicit workflow_dispatch" in result.stdout
+
+
+def test_recovery_merges_only_conservative_source_controls_not_unuploaded_progress():
+    state = {"schema_version": 1, "commanders": {"old": {"current_previews": 100}},
+             "progress": {"capacity": {"remaining_previews": 900}},
+             "source_rate": {"learned_rate": 1.75, "throttles": 2,
+                             "observed_requests_per_second": 1.5, "observed_rate_at": "2026-10-23T10:00:00Z"},
+             "blocked_until": "2026-10-23T11:00:00Z"}
+    summary = {"blocked": False, "completed": ["unuploaded"], "new_previews_attempted": 5000,
+               "capacity": {"remaining_previews": 1}, "blocked_until": "2026-10-23T11:30:00Z",
+               "source_rate": {"learned_rate": 2, "throttles": 3,
+                               "observed_requests_per_second": 1.6, "observed_rate_at": "2026-10-23T11:00:00Z"}}
+    coordinator.merge_recovery_controls(state, summary, source_run_id=100, checkpoint_run_id=99, now=NOW)
+    assert state["source_rate"]["learned_rate"] == 1.75
+    assert state["source_rate"]["throttles"] == 3
+    assert state["source_rate"]["observed_requests_per_second"] == 1.6
+    assert state["commanders"] == {"old": {"current_previews": 100}}
+    assert state["progress"] == {"capacity": {"remaining_previews": 900}}
+    assert state["blocked_until"] == "2026-10-23T11:30:00+00:00"
+    assert state["recovery"]["source_run_id"] == 100
+    summary["source_rate"]["learned_rate"] = 1
+    coordinator.merge_recovery_controls(state, summary, source_run_id=100, checkpoint_run_id=99, now=NOW)
+    assert state["source_rate"]["learned_rate"] == 1
+
+
+@pytest.mark.parametrize("rate", [True, 0, -1, float("nan"), float("inf"), "1.75"])
+def test_recovery_rejects_invalid_source_rate_controls(rate):
+    latest = coordinator.Snapshot(100, {"blocked": False, "source_rate": {"learned_rate": rate}}, durable=False)
+    with pytest.raises(ValueError, match="recovery learned_rate"):
+        coordinator.recovery_plan(latest, [coordinator.Snapshot(99, {})], requested_run_id=100, now=NOW)

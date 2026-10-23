@@ -11,6 +11,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -204,7 +205,92 @@ def classify_outcome(summary):
     return "failed" if summary.get("failures") and summary.get("no_progress") else "success"
 
 
-def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, attempt=0):
+def recovery_plan(latest, older, *, requested_run_id, now):
+    if latest is None or latest.run_id != requested_run_id or latest.durable:
+        return {"run": False, "reason": "Recovery must name the latest incomplete trusted collector run"}
+    if latest.summary.get("block_reason") == "access_restriction":
+        return {"run": False, "reason": "Recovery cannot bypass a source access restriction"}
+    known_expiry = timestamp(latest.summary.get("blocked_until"))
+    if latest.summary.get("blocked_until") is not None and known_expiry is None:
+        return {"run": False, "reason": "Recovery source has an invalid cooldown expiry"}
+    if known_expiry is not None and known_expiry > now:
+        return {"run": False, "reason": "Source cooldown is still active", "retry_at": known_expiry.isoformat()}
+    if latest.summary.get("blocked"):
+        expiry = timestamp(latest.summary.get("blocked_until"))
+        if expiry is None or block_reason(latest, iter(older)) != "rate_limit":
+            return {"run": False, "reason": "Recovery cannot bypass a source access restriction"}
+        if expiry > now:
+            return {"run": False, "reason": "Source cooldown is still active", "retry_at": expiry.isoformat()}
+    checkpoint = next((snapshot for snapshot in older if snapshot.durable), None)
+    if checkpoint is None:
+        return {"run": False, "reason": "No older durable checkpoint is available for recovery"}
+    if checkpoint.summary.get("block_reason") == "access_restriction":
+        return {"run": False, "reason": "The restored checkpoint retains a source access restriction"}
+    following = older[older.index(checkpoint) + 1:]
+    ready = decision(checkpoint, now=now, older=iter(following), allow_bounded=True)
+    if not ready["run"]:
+        return {"run": False, "reason": f"Restored checkpoint is not ready: {ready['reason']}"}
+    validated_rate_control(latest.summary.get("source_rate", {}))
+    return {"run": True, "recovery_run_id": latest.run_id, "restore_run_id": checkpoint.run_id,
+            "reason": "Explicit recovery from an older checkpoint with newer source controls retained"}
+
+
+def validated_rate_control(value):
+    if not isinstance(value, dict):
+        raise ValueError("Invalid recovery source rate controls")
+    for field in ("learned_rate", "observed_requests_per_second"):
+        rate = value.get(field)
+        if rate is not None and (isinstance(rate, bool) or not isinstance(rate, (int, float))
+                                 or not math.isfinite(rate) or rate <= 0):
+            raise ValueError(f"Invalid recovery {field}")
+    count = value.get("throttles", 0)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError("Invalid recovery throttle count")
+    return value
+
+
+def merge_recovery_controls(state, summary, *, source_run_id, checkpoint_run_id, now):
+    if (not isinstance(state, dict) or state.get("schema_version") != 1
+            or not isinstance(state.get("commanders"), dict)):
+        raise ValueError("Invalid restored collection checkpoint")
+    if state.get("block_reason") == "access_restriction" or summary.get("block_reason") == "access_restriction":
+        raise ValueError("Recovery cannot replace a source access restriction with a rate-limit pause")
+    for checkpoint in (state, summary):
+        expiry = timestamp(checkpoint.get("blocked_until"))
+        if checkpoint.get("blocked_until") is not None and expiry is None:
+            raise ValueError("Recovery source has an invalid cooldown expiry")
+        if expiry is not None and expiry > now:
+            raise ValueError("Recovery must wait for the source cooldown to expire")
+    previous = validated_rate_control(state.get("source_rate", {}))
+    newer = validated_rate_control(summary.get("source_rate", {}))
+    merged = dict(previous)
+    ceilings = [control["learned_rate"] for control in (previous, newer) if control.get("learned_rate") is not None]
+    if ceilings:
+        merged["learned_rate"] = min(ceilings)
+    observations = [(timestamp(control.get("observed_rate_at")), control) for control in (previous, newer)
+                    if control.get("observed_requests_per_second") is not None]
+    observations = [(observed, control) for observed, control in observations if observed is not None]
+    if observations:
+        _, control = max(observations, key=lambda candidate: candidate[0])
+        merged.update(observed_requests_per_second=control["observed_requests_per_second"],
+                      observed_rate_at=control["observed_rate_at"])
+    merged["throttles"] = max(previous.get("throttles", 0), newer.get("throttles", 0))
+    throttles = [control.get("last_throttle") for control in (previous, newer)]
+    throttles = [item for item in throttles if isinstance(item, dict) and timestamp(item.get("at")) is not None]
+    if throttles:
+        merged["last_throttle"] = max(throttles, key=lambda item: timestamp(item["at"]))
+    state["source_rate"] = merged
+    expiries = [value for value in (timestamp(state.get("blocked_until")), timestamp(summary.get("blocked_until")))
+                if value is not None]
+    if expiries:
+        state["blocked_until"] = max(expiries).isoformat()
+    if summary.get("blocked"):
+        state["block_reason"] = "rate_limit"  # The recovery plan rejects all other block reasons.
+    state["recovery"] = {"source_run_id": source_run_id, "checkpoint_run_id": checkpoint_run_id,
+                         "recovered_at": now.isoformat()}
+
+
+def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, attempt=0, recovery_run_id=None):
     if mode == "prepare-cooldown":
         source = client.source(source_run_id)
         if (source is None or not source.durable or not actual_rate_limit(source.summary)
@@ -223,7 +309,10 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
         return {"run": False, "reason": "A collector is already running or queued"}
     snapshots = iter(client.snapshots())
     latest = next(snapshots, None)
-    result = decision(latest, now=now, older=snapshots, allow_bounded=mode == "preflight")
+    if mode == "preflight" and recovery_run_id:
+        result = recovery_plan(latest, list(snapshots), requested_run_id=recovery_run_id, now=now)
+    else:
+        result = decision(latest, now=now, older=snapshots, allow_bounded=mode == "preflight")
     if mode == "resume" and result.get("retry_at"):
         if latest is not None and block_reason(latest, client.snapshots()) == "rate_limit" and attempt + 1 < MAX_WAIT_ATTEMPTS:
             client.verify_timer()
@@ -243,18 +332,25 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("preflight", "watchdog", "prepare-cooldown", "resume", "outcome"))
+    parser.add_argument("mode", choices=("preflight", "watchdog", "prepare-cooldown", "resume", "outcome", "recover-control"))
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--current-run-id", type=int, default=int(os.environ.get("GITHUB_RUN_ID", "0")))
     parser.add_argument("--source-run-id", type=int)
     parser.add_argument("--attempt", type=int, default=0)
     parser.add_argument("--summary-file", type=Path)
+    parser.add_argument("--recovery-run-id", type=int)
+    parser.add_argument("--restored-run-id", type=int)
+    parser.add_argument("--state-file", type=Path)
     args = parser.parse_args()
     try:
         if not 0 <= args.attempt <= MAX_WAIT_ATTEMPTS:
             raise ValueError("Invalid cooldown attempt")
         if args.mode in {"prepare-cooldown", "resume"} and not args.source_run_id:
             raise ValueError("A source collector run is required")
+        if args.recovery_run_id and args.mode not in {"preflight", "recover-control"}:
+            raise ValueError("Checkpoint recovery is available only for an explicit collector request")
+        if args.recovery_run_id and os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+            raise ValueError("Checkpoint recovery requires an explicit workflow_dispatch request")
         if args.mode == "outcome":
             summary = json.loads(args.summary_file.read_text(), parse_constant=reject_nonfinite)
             result = {"status": classify_outcome(summary)}
@@ -262,9 +358,27 @@ def main():
                 message = ("the separate cooldown timer resumes collection" if automatic_continuation_allowed(summary)
                            else "this bounded run does not restart collection automatically")
                 print(f"::notice::Rate-limit cooldown is active. Progress is saved; {message}.")
+        elif args.mode == "recover-control":
+            if not args.recovery_run_id or not args.restored_run_id or args.state_file is None:
+                raise ValueError("Recovery requires the interrupted run, restored run and state file")
+            client = GitHub(args.repository)
+            snapshots = iter(client.snapshots())
+            latest = next(snapshots, None)
+            now = datetime.now(timezone.utc)
+            plan = recovery_plan(latest, list(snapshots), requested_run_id=args.recovery_run_id, now=now)
+            if not plan.get("run") or plan["restore_run_id"] != args.restored_run_id:
+                raise ValueError("Restored checkpoint does not match the reviewed recovery plan")
+            state = json.loads(args.state_file.read_text(encoding="utf-8"), parse_constant=reject_nonfinite)
+            merge_recovery_controls(state, latest.summary, source_run_id=latest.run_id,
+                                    checkpoint_run_id=args.restored_run_id, now=now)
+            temporary = args.state_file.with_suffix(".recovery.tmp")
+            temporary.write_text(json.dumps(state, allow_nan=False, separators=(",", ":")), encoding="utf-8")
+            temporary.replace(args.state_file)
+            result = {"recovered": True, "source_run_id": latest.run_id, "checkpoint_run_id": args.restored_run_id}
         else:
             result = coordinate(GitHub(args.repository), args.mode, now=datetime.now(timezone.utc),
-                current_run_id=args.current_run_id, source_run_id=args.source_run_id, attempt=args.attempt)
+                current_run_id=args.current_run_id, source_run_id=args.source_run_id, attempt=args.attempt,
+                recovery_run_id=args.recovery_run_id)
         snapshot = result.pop("snapshot", {})
         if args.mode == "preflight" and not result["run"] and args.summary_file is not None:
             snapshot.update(publish_needed=False, continuation_needed=False, preflight_skipped=True,
