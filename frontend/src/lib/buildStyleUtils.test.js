@@ -3,8 +3,36 @@ import test from "node:test";
 
 import {
   formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildCollectionProgress, getBuildModel, getBuildModelOptions, getBuildSourceFreshness, getComparableProfilePairs,
-  getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckExport, getGeneratedDeckGroups, getPackageBracketLabel, getSupportedThemes, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
+  getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckExport, getGeneratedDeckGroups, getPackageBracketLabel, getSupportedThemes, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
 } from "./buildStyleUtils.js";
+
+test("discovery lists only explicitly approved current collector reports", () => {
+  const commanders = [
+    { commander_slug: "old-fitted", status: "fitted", generated_at: "2026-10-24T00:00:00Z" },
+    { commander_slug: "new-insufficient", status: "insufficient_data", generated_at: "2026-10-01T00:00:00Z" },
+    { commander_slug: "new-fitted", status: "fitted" },
+  ];
+  const index = { commanders, discovery: { policy: "current_collector", commander_slugs: ["new-fitted", "new-insufficient", "missing"] } };
+  assert.deepEqual(getCurrentBuildDiscoveryCommanders(index), commanders.slice(1));
+  assert.equal(index.commanders.length, 3);
+  assert.equal(getCurrentBuildDiscoveryCommanders(index)[0], commanders[1]);
+  for (const invalid of [null, { commanders }, { ...index, discovery: { commander_slugs: ["old-fitted"] } },
+    { ...index, discovery: { policy: "legacy", commander_slugs: ["old-fitted"] } },
+    { ...index, discovery: { policy: "current_collector", commander_slugs: null } }]) {
+    assert.deepEqual(getCurrentBuildDiscoveryCommanders(invalid), []);
+  }
+});
+
+test("current collector membership grows beyond its baseline without limiting or duplicating cards", () => {
+  const commanders = Array.from({ length: 80 }, (_, i) => ({ commander_slug: `current-${i}` }));
+  const approved = commanders.map((entry) => entry.commander_slug);
+  const index = { commanders: [...commanders, commanders[0]], discovery: {
+    policy: "current_collector", baseline_report_count: 25, commander_slugs: [...approved, approved[0], null, 8],
+  } };
+  assert.deepEqual(getCurrentBuildDiscoveryCommanders(index), commanders);
+  index.discovery.commander_slugs = [];
+  assert.deepEqual(getCurrentBuildDiscoveryCommanders(index), []);
+});
 
 test("models keep any number of packages and match alternative weights by deck ID", () => {
   for (const count of [1, 3, 7]) {

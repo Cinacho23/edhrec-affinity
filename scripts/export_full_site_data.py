@@ -1315,6 +1315,52 @@ def read_build_collection_progress(directories: list[Path]) -> dict[str, Any] | 
     return max(candidates, key=lambda candidate: candidate[0])[1] if candidates else None
 
 
+def read_build_discovery_policy() -> dict[str, Any]:
+    """The baseline documents a collector recovery, not a fixed report limit."""
+    path = Path(__file__).resolve().parents[1] / "data/build-style-discovery.json"
+    policy = json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_nonfinite_constant)
+    if policy.get("schema_version") != 1 or policy.get("policy") != "current_collector":
+        raise ValueError("Invalid build discovery policy")
+    cutoff = datetime.fromisoformat(policy["collection_started_after"].replace("Z", "+00:00"))
+    if cutoff.tzinfo is None:
+        raise ValueError("Build discovery cutoff must include a timezone")
+    return policy
+
+
+def current_build_discovery_slugs(directory: Path, reports: dict[str, dict[str, Any]],
+                                  policy: dict[str, Any]) -> set[str]:
+    """Require a completed current input without discarding older commander data."""
+    try:
+        state = json.loads((directory / "_collection/state.json").read_text(encoding="utf-8"),
+                           parse_constant=reject_nonfinite_constant)
+        if (not isinstance(state, dict) or state.get("schema_version") != 1
+                or not isinstance(state.get("commanders"), dict)):
+            return set()
+    except (OSError, ValueError, TypeError):
+        return set()
+    cutoff = datetime.fromisoformat(policy["collection_started_after"].replace("Z", "+00:00"))
+    eligible = set()
+    for slug, report in reports.items():
+        record, collection = state["commanders"].get(slug), report.get("collection")
+        if not isinstance(record, dict) or not isinstance(collection, dict):
+            continue
+        try:
+            collected_at = datetime.fromisoformat(record["last_collection_at"].replace("Z", "+00:00"))
+            if collected_at.tzinfo is None or collected_at < cutoff:
+                continue
+        except (KeyError, ValueError, TypeError, AttributeError):
+            continue
+        version, dataset = record.get("analysis_version"), collection.get("dataset_sha256")
+        if (isinstance(version, str) and version.strip()
+                and collection.get("complete") is True and collection.get("target_mode") == "all"
+                and collection.get("analysis_current") is True
+                and isinstance(dataset, str) and dataset.strip()
+                and ("collection_dataset_sha256" not in record or record["collection_dataset_sha256"] == dataset)
+                and collection.get("analysis_dataset_sha256") == dataset):
+            eligible.add(slug)
+    return eligible
+
+
 def export_build_style_files(
     df: pd.DataFrame,
     processed_dir: Path,
@@ -1325,9 +1371,17 @@ def export_build_style_files(
     """Publish only actual, dated samples; no synthetic entries for unsampled commanders."""
     from edhrec_affinity.build_styles.deck_tags import normalize_report_deck_tags
     seed_dir = seed_dir if seed_dir is not None else Path(__file__).resolve().parents[1] / "data/build-styles"
+    policy = read_build_discovery_policy()
+    current_reports = read_build_style_reports(processed_dir / "build-styles")
+    discovery_slugs = current_build_discovery_slugs(processed_dir / "build-styles", current_reports, policy)
     reports = read_build_style_reports(seed_dir)
-    for incoming in (previous_reports or {}, read_build_style_reports(processed_dir / "build-styles")):
+    for incoming in (previous_reports or {}, current_reports):
         for slug, report in incoming.items():
+            if incoming is current_reports and slug in discovery_slugs:
+                # Freshly completed insufficient-data outcomes must also replace
+                # an older fit; archived reports remain available for all others.
+                reports[slug] = report
+                continue
             old = reports.get(slug)
             if old:
                 if old["deck_analysis"]["status"] == "fitted" and report["deck_analysis"]["status"] != "fitted":
@@ -1379,6 +1433,11 @@ def export_build_style_files(
         "total_insufficient": sum(entry["status"] == "insufficient_data" for entry in entries),
         "commanders": entries,
     }
+    visible_slugs = sorted(entry["commander_slug"] for entry in entries if entry["commander_slug"] in discovery_slugs)
+    index["discovery"] = {key: policy[key] for key in (
+        "policy", "collection_started_after", "baseline_run_id", "baseline_previews", "baseline_report_count")}
+    index["discovery"].update(commander_slugs=visible_slugs, total_available=len(visible_slugs),
+                              total_hidden=len(entries) - len(visible_slugs))
     if any("freshness" in entry.get("collection", {}) for entry in entries):
         index["freshness"] = summarize_build_style_freshness(entries)
     progress = read_build_collection_progress([processed_dir / "build-styles", seed_dir])

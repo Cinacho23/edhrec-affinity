@@ -41,6 +41,17 @@ def report(slug="commander-a", *, date="2026-10-01T00:00:00+00:00", packages=3):
     }
 
 
+def current_report(slug="commander-a", **options):
+    value = report(slug, **options)
+    value["collection"].update(complete=True, target_mode="all", analysis_current=True,
+                               dataset_sha256="current-dataset", analysis_dataset_sha256="current-dataset")
+    return value
+
+
+def current_record(**changes):
+    return {"last_collection_at": "2026-10-23T03:14:00Z", "analysis_version": "current-model", **changes}
+
+
 def test_missing_samples_export_explicit_empty_coverage(tmp_path):
     result = exporter.export_build_style_files(
         pd.DataFrame({"commander_slug": ["commander-a"]}), tmp_path / "processed", tmp_path / "site",
@@ -50,7 +61,96 @@ def test_missing_samples_export_explicit_empty_coverage(tmp_path):
     assert result["commander_count"] == 0
     assert index == {"schema_version": 1, "coverage": "sampled_commanders", "total_available": 0,
                      "total_catalog": 1, "total_pending": 1, "total_fitted": 0,
-                     "total_insufficient": 0, "commanders": []}
+                     "total_insufficient": 0, "commanders": [], "discovery": {
+                         "policy": "current_collector", "collection_started_after": "2026-10-23T03:13:45Z",
+                         "baseline_run_id": 39893813350, "baseline_previews": 151, "baseline_report_count": 25,
+                         "commander_slugs": [], "total_available": 0, "total_hidden": 0}}
+
+
+def test_discovery_selects_current_reports_before_legacy_merge_and_keeps_archived_commander_data(tmp_path):
+    processed, site, seeds = tmp_path / "processed", tmp_path / "site", tmp_path / "seeds"
+    write_json(seeds / "commander-a.json", report(date="2026-10-25T00:00:00Z", packages=7))
+    write_json(seeds / "commander-b.json", report("commander-b", packages=2))
+    approved = current_report(packages=0)
+    write_json(processed / "build-styles/commander-a.json", approved)
+    write_json(processed / "build-styles/_collection/state.json", {"schema_version": 1,
+        "commanders": {"commander-a": current_record(status="blocked", collection_dataset_sha256="current-dataset")}})
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a", "commander-b", "pending"]}),
+        processed, site, previous_reports={"commander-a": report(date="2026-10-26T00:00:00Z", packages=6)}, seed_dir=seeds)
+    index = json.loads((site / "build-styles/index.json").read_text())
+    assert index["total_available"] == 2
+    assert {entry["commander_slug"] for entry in index["commanders"]} == {"commander-a", "commander-b"}
+    assert index["discovery"]["commander_slugs"] == ["commander-a"]
+    assert (index["discovery"]["total_available"], index["discovery"]["total_hidden"]) == (1, 1)
+    saved = json.loads((site / "build-styles/commander-a.json").read_text())
+    assert saved["deck_analysis"]["status"] == "insufficient_data"
+    assert saved["generated_at"] == approved["generated_at"]
+    assert (site / "build-styles/commander-b.json").is_file()
+    assert json.loads((site / "build-styles/commander-b.json").read_text())["deck_analysis"]["packages"] == [
+        {"id": 0, "top_cards": []}, {"id": 1, "top_cards": []}]
+
+
+def test_discovery_grows_with_future_verified_reports_even_when_model_generation_date_is_older(tmp_path):
+    processed, site = tmp_path / "processed", tmp_path / "site"
+    records = {"commander-a": current_record()}
+    for slug in ("commander-a", "commander-b"):
+        write_json(processed / f"build-styles/{slug}.json", current_report(slug))
+    state_path = processed / "build-styles/_collection/state.json"
+    write_json(state_path, {"schema_version": 1, "commanders": records})
+    frame = pd.DataFrame({"commander_slug": ["commander-a", "commander-b"]})
+    exporter.export_build_style_files(frame, processed, site, seed_dir=tmp_path / "none")
+    assert json.loads((site / "build-styles/index.json").read_text())["discovery"]["commander_slugs"] == ["commander-a"]
+    records["commander-b"] = current_record(last_collection_at="2026-11-01T00:00:00Z", status="failed")
+    write_json(state_path, {"schema_version": 1, "commanders": records})
+    exporter.export_build_style_files(frame, processed, site, seed_dir=tmp_path / "none")
+    index = json.loads((site / "build-styles/index.json").read_text())
+    assert index["discovery"]["commander_slugs"] == ["commander-a", "commander-b"]
+    assert index["discovery"]["total_available"] == 2
+    assert index["discovery"]["baseline_report_count"] == 25
+    assert all(entry["generated_at"] == "2026-10-01T00:00:00+00:00" for entry in index["commanders"])
+
+
+@pytest.mark.parametrize("record_changes,collection_changes", [
+    ({"last_collection_at": "2026-10-23T03:13:44Z"}, {}),
+    ({"last_collection_at": "2026-10-24T00:00:00"}, {}),
+    ({"analysis_version": ""}, {}),
+    ({"status": "analysis_pending", "collection_dataset_sha256": "new-input"}, {}),
+    ({}, {"complete": False}),
+    ({}, {"target_mode": "sample"}),
+    ({}, {"analysis_current": False}),
+    ({}, {"dataset_sha256": ""}),
+    ({}, {"analysis_dataset_sha256": "older-input"}),
+])
+def test_discovery_hides_unverified_or_partial_reports_without_removing_their_files(tmp_path, record_changes, collection_changes):
+    processed, site = tmp_path / "processed", tmp_path / "site"
+    source = current_report()
+    source["collection"].update(collection_changes)
+    write_json(processed / "build-styles/commander-a.json", source)
+    write_json(processed / "build-styles/_collection/state.json", {"schema_version": 1,
+        "commanders": {"commander-a": current_record(**record_changes)}})
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"]}), processed, site,
+                                     seed_dir=tmp_path / "none")
+    index = json.loads((site / "build-styles/index.json").read_text())
+    assert index["total_available"] == 1
+    assert index["discovery"]["commander_slugs"] == []
+    assert index["discovery"]["total_hidden"] == 1
+    assert (site / "build-styles/commander-a.json").is_file()
+
+
+@pytest.mark.parametrize("state", [None, [], {"schema_version": 2, "commanders": {}},
+                                  {"schema_version": 1, "commanders": []}])
+def test_discovery_requires_a_valid_processed_checkpoint_and_does_not_admit_seeds(tmp_path, state):
+    processed, site, seeds = tmp_path / "processed", tmp_path / "site", tmp_path / "seeds"
+    write_json(seeds / "commander-a.json", current_report())
+    write_json(processed / "build-styles/commander-b.json", current_report("commander-b"))
+    if state is not None:
+        write_json(processed / "build-styles/_collection/state.json", state)
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a", "commander-b"]}),
+                                     processed, site, seed_dir=seeds)
+    index = json.loads((site / "build-styles/index.json").read_text())
+    assert index["total_available"] == 2
+    assert index["discovery"]["commander_slugs"] == []
+    assert index["discovery"]["total_hidden"] == 2
 
 
 @pytest.mark.parametrize("packages", [1, 3, 7])
