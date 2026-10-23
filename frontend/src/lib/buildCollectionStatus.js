@@ -39,7 +39,20 @@ export function getBuildCollectorStatus(progress, now = Date.now()) {
   const paused = progress.blocked === true || Boolean(progress.resource_limit);
   const complete = remaining === 0 && capacity.status === "complete";
   const stale = now - updated >= SNAPSHOT_MAX_AGE_MS;
-  const cooldownAt = typeof progress.blocked_until === "string" ? Date.parse(progress.blocked_until) : NaN;
+  let blockedUntil = typeof progress.blocked_until === "string" ? progress.blocked_until : null;
+  let cooldownAt = blockedUntil === null ? NaN : Date.parse(blockedUntil);
+  // Older checkpoints retained the remaining cooldown in capacity before
+  // copying its end time into progress. Recover that recorded pause only when
+  // both the duration and its observation time are known.
+  if (!Number.isFinite(cooldownAt) && progress.blocked === true && positive(capacity.cooldown_seconds) !== null) {
+    const evaluated = typeof capacity.evaluated_at === "string" ? Date.parse(capacity.evaluated_at) : NaN;
+    const observed = Number.isFinite(evaluated) && evaluated <= now + FUTURE_TOLERANCE_MS ? evaluated : updated;
+    const inferred = new Date(observed + capacity.cooldown_seconds * 1000);
+    if (Number.isFinite(inferred.getTime())) {
+      cooldownAt = inferred.getTime();
+      blockedUntil = inferred.toISOString();
+    }
+  }
   const hasRecordedCooldown = Number.isFinite(cooldownAt) && !progress.resource_limit;
   const canProject = !paused || hasRecordedCooldown;
   const observedAt = capacity.observed_rate_at ?? control?.observed_rate_at;
@@ -53,7 +66,7 @@ export function getBuildCollectorStatus(progress, now = Date.now()) {
     projectedSeconds: canProject && (remaining !== 0 || complete) ? nonnegative(capacity.measured_projection_seconds) : null,
     projectedFinishAt: canProject && typeof capacity.projected_finish_at === "string"
       && Number.isFinite(Date.parse(capacity.projected_finish_at)) ? capacity.projected_finish_at : null,
-    blockedUntil: Number.isFinite(cooldownAt) && cooldownAt > now ? progress.blocked_until : null,
+    blockedUntil: Number.isFinite(cooldownAt) && cooldownAt > now ? blockedUntil : null,
     hasRecordedCooldown,
     lastThrottleAt: typeof control?.last_throttle?.at === "string" ? control.last_throttle.at : null,
     inventoryComplete: capacity.inventory_complete === true,

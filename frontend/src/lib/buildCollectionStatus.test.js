@@ -45,6 +45,31 @@ test("known cooldowns retain conditional projections while indefinite pauses def
   assert.equal(getBuildCollectorStatus({ ...progress(), blocked: true }, NOW).projectedFinishAt, null);
 });
 
+test("older checkpoints recover a recorded cooldown from its dated remaining duration", () => {
+  const source = { ...progress(), blocked: true, blocked_until: null, updated_at: "2026-10-23T03:15:23Z" };
+  source.capacity.evaluated_at = "2026-10-23T03:15:23Z";
+  source.capacity.cooldown_seconds = 3599.858;
+  const now = Date.parse("2026-10-23T03:16:00Z");
+  const result = getBuildCollectorStatus(source, now);
+  assert.equal(result.blockedUntil, "2026-10-23T04:15:22.858Z");
+  assert.equal(result.projectedSeconds, source.capacity.measured_projection_seconds);
+  assert.equal(result.hasRecordedCooldown, true);
+  delete source.capacity.evaluated_at;
+  assert.equal(getBuildCollectorStatus(source, now).blockedUntil, result.blockedUntil);
+  source.blocked_until = "2026-10-23T05:00:00Z";
+  assert.equal(getBuildCollectorStatus(source, now).blockedUntil, source.blocked_until);
+  source.blocked_until = null;
+  for (const seconds of [null, 0, -1, NaN, Infinity, "3600"]) {
+    source.capacity.cooldown_seconds = seconds;
+    const indefinite = getBuildCollectorStatus(source, now);
+    assert.equal(indefinite.hasRecordedCooldown, false);
+    assert.equal(indefinite.projectedSeconds, null);
+  }
+  source.capacity.cooldown_seconds = 3600;
+  source.updated_at = "invalid";
+  assert.equal(getBuildCollectorStatus(source, now), null);
+});
+
 test("missing and invalid observations never imply a known rate or completion time", () => {
   for (const source of [null, {}, { ...progress(), updated_at: "invalid" },
     { ...progress(), updated_at: "2026-10-24T00:00:00Z" }, { ...progress(), capacity: null }]) {

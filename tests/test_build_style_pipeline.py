@@ -252,6 +252,11 @@ def test_rate_limit_learning_survives_cooldown_and_the_next_collection_batch(tmp
         raise SourceBlocked("HTTP 429 rate limit")
 
     first = execute(args, rows("a"), throttled, saved_analyzer([]))
+    expected_expiry = (NOW + timedelta(hours=1)).isoformat()
+    assert first["blocked_until"] == checkpoint(args)["blocked_until"] == expected_expiry
+    assert checkpoint(args)["progress"]["blocked_until"] == expected_expiry
+    saved_summary = json.loads((args.output_dir.parent / "build_style_batch.json").read_text())
+    assert saved_summary["blocked_until"] == expected_expiry
     learned = checkpoint(args)["source_rate"]
     assert learned["learned_rate"] == pytest.approx(1.875)
     assert learned["throttles"] == 1

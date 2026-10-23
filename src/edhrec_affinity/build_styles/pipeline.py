@@ -233,6 +233,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                             >= args.index_max_age_hours * 3600 for slug in rows_by_slug)
         cooldown_until = source_time(state.get("blocked_until"))
         cooldown_seconds = max(0.0, (cooldown_until - now()).total_seconds()) if cooldown_until else 0.0
+        summary["blocked_until"] = cooldown_until.isoformat() if summary["blocked"] and cooldown_until else None
         summary["capacity"] = plan_capacity(rows, target_hours=args.target_completion_hours,
             max_requests_per_second=args.requests_per_second, effective_requests_per_second=effective_ceiling,
             observed_requests_per_second=rate, cooldown_seconds=cooldown_seconds,
