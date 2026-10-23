@@ -3,16 +3,16 @@ import test from "node:test";
 
 import {
   formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildCollectionProgress, getBuildModel, getBuildModelOptions, getBuildSourceFreshness, getComparableProfilePairs,
-  getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckExport, getGeneratedDeckGroups, getPackageBracketLabel, getSupportedThemes, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
+  getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckExport, getGeneratedDeckGroups, getPackageBracketLabel, getSupportedThemes, hasBuildStylePopulation, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
 } from "./buildStyleUtils.js";
 
 test("discovery lists only explicitly approved current collector reports", () => {
   const commanders = [
-    { commander_slug: "old-fitted", status: "fitted", generated_at: "2026-10-24T00:00:00Z" },
-    { commander_slug: "new-insufficient", status: "insufficient_data", generated_at: "2026-10-01T00:00:00Z" },
-    { commander_slug: "new-fitted", status: "fitted" },
+    { commander_slug: "old-fitted", total_edhrec_decks: 5000, status: "fitted", generated_at: "2026-10-24T00:00:00Z" },
+    { commander_slug: "new-insufficient", total_edhrec_decks: 200, unique_decks: 8, status: "insufficient_data", generated_at: "2026-10-01T00:00:00Z" },
+    { commander_slug: "new-fitted", total_edhrec_decks: 1000, status: "fitted" },
   ];
-  const index = { commanders, discovery: { policy: "current_collector", commander_slugs: ["new-fitted", "new-insufficient", "missing"] } };
+  const index = { commanders, discovery: { policy: "current_collector", min_total_decks: 200, commander_slugs: ["new-fitted", "new-insufficient", "missing"] } };
   assert.deepEqual(getCurrentBuildDiscoveryCommanders(index), commanders.slice(1));
   assert.equal(index.commanders.length, 3);
   assert.equal(getCurrentBuildDiscoveryCommanders(index)[0], commanders[1]);
@@ -24,14 +24,41 @@ test("discovery lists only explicitly approved current collector reports", () =>
 });
 
 test("current collector membership grows beyond its baseline without limiting or duplicating cards", () => {
-  const commanders = Array.from({ length: 80 }, (_, i) => ({ commander_slug: `current-${i}` }));
+  const commanders = Array.from({ length: 80 }, (_, i) => ({ commander_slug: `current-${i}`, total_edhrec_decks: 200 + i }));
   const approved = commanders.map((entry) => entry.commander_slug);
   const index = { commanders: [...commanders, commanders[0]], discovery: {
-    policy: "current_collector", baseline_report_count: 25, commander_slugs: [...approved, approved[0], null, 8],
+    policy: "current_collector", min_total_decks: 200, baseline_report_count: 25, commander_slugs: [...approved, approved[0], null, 8],
   } };
   assert.deepEqual(getCurrentBuildDiscoveryCommanders(index), commanders);
   index.discovery.commander_slugs = [];
   assert.deepEqual(getCurrentBuildDiscoveryCommanders(index), []);
+});
+
+test("fresh discovery requires the commander population threshold rather than its analyzed sample size", () => {
+  const commanders = [
+    { commander_slug: "small", total_edhrec_decks: 199, unique_decks: 199 },
+    { commander_slug: "enough", total_edhrec_decks: 200, unique_decks: 8 },
+    { commander_slug: "unknown", unique_decks: 500 },
+    { commander_slug: "invalid", total_edhrec_decks: "500", unique_decks: 500 },
+  ];
+  const index = { commanders, discovery: { policy: "current_collector", min_total_decks: 200,
+    commander_slugs: commanders.map((entry) => entry.commander_slug) } };
+  assert.deepEqual(getCurrentBuildDiscoveryCommanders(index), [commanders[1]]);
+  delete index.discovery.min_total_decks;
+  assert.deepEqual(getCurrentBuildDiscoveryCommanders(index), []);
+  index.discovery.min_total_decks = 300;
+  assert.deepEqual(getCurrentBuildDiscoveryCommanders(index), []);
+});
+
+test("native build reports require a known population of at least 200 before packages can be shown", () => {
+  for (const count of [undefined, null, 0, 6, 199, "200", NaN, Infinity, 200.5]) {
+    assert.equal(hasBuildStylePopulation({ total_edhrec_decks: count,
+      deck_analysis: { unique_decks: 500, packages: [{ id: 0, generated_deck: { status: "generated" } }] } }), false);
+  }
+  assert.equal(hasBuildStylePopulation(null), false);
+  assert.equal(hasBuildStylePopulation({ total_edhrec_decks: 200, deck_analysis: { unique_decks: 8 } }), true);
+  assert.equal(hasBuildStylePopulation({ total_edhrec_decks: 500 }, 600), false);
+  assert.equal(hasBuildStylePopulation({ total_edhrec_decks: 500 }, 199), false);
 });
 
 test("models keep any number of packages and match alternative weights by deck ID", () => {

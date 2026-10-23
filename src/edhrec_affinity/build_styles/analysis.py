@@ -110,19 +110,30 @@ def compare_profiles(base: dict, profiles: list[dict], *, threshold: float = 0.6
     }
 
 
-def prepare_decks(decks: list[dict], commander_names: list[str], *, min_cards: int = 90) -> tuple:
+def prepare_decks(decks: list[dict], commander_names: list[str], *, min_cards: int = 90,
+                  commander_name_groups: list[list[str]] | None = None) -> tuple:
     expected = {card_key(name) for name in commander_names}
+    allowed = {frozenset(expected)}
+    for group in commander_name_groups or []:
+        if (isinstance(group, list) and len(group) == len(commander_names)
+                and all(isinstance(name, str) and name.strip() for name in group)):
+            keys = frozenset(card_key(name) for name in group)
+            if len(keys) == len(expected):
+                allowed.add(keys)
+    commander_keys = set().union(*allowed)
     kept, rejected, seen = [], [], set()
     duplicates = 0
     for deck in decks:
-        if {card_key(name) for name in deck.get("commanders", [])} != expected:
+        actual = deck.get("commanders", [])
+        if (len(actual) != len(commander_names)
+                or frozenset(card_key(name) for name in actual) not in allowed):
             rejected.append({"id": deck["id"], "reason": "Commander mismatch"})
             continue
         counts = Counter()
         types, names = {}, {}
         for card in deck["cards"]:
             key = card_key(card["name"])
-            if key not in expected:
+            if key not in commander_keys:
                 counts[key] += card["quantity"]
                 names[key] = card["name"]
                 types[key] = card.get("type_line", "")
@@ -314,7 +325,8 @@ def analyze_decks(decks: list[dict], base: dict, profiles: list[dict], *, compon
         "validation_note": "Three seeded 80/20 deck splits; fixed full-sample vocabulary and IDF. Reconstruction, not independent predictive validation.",
         "stability_thresholds": {"seed_consistency": 0.9, "subsample_consistency": 0.8},
     }
-    kept, rejected, duplicates = prepare_decks(decks, base["commander_names"], min_cards=min_cards)
+    kept, rejected, duplicates = prepare_decks(decks, base["commander_names"], min_cards=min_cards,
+                                              commander_name_groups=base.get("commander_name_groups"))
     result = {"status": "insufficient_data", "input_decks": len(decks), "unique_decks": len(kept),
               "exact_duplicates_removed": duplicates, "rejected": rejected, "packages": [],
               "decks": [], "components_requested": components, "package_count": 0,

@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "policy": "current_collector",
+  "min_total_decks": 200,
   "collection_started_after": "2026-10-23T03:13:45Z",
   "baseline_run_id": 39893813350,
   "baseline_previews": 151,

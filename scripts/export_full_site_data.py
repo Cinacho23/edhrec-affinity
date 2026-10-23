@@ -40,6 +40,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from edhrec_affinity.build_styles.eligibility import commander_is_eligible, valid_deck_count, validate_minimum
+
 import pandas as pd
 
 from edhrec_affinity.scryfall_enrichment import (
@@ -1301,6 +1303,8 @@ def read_build_collection_progress(directories: list[Path]) -> dict[str, Any] | 
                     continue
                 public = {key: progress[key] for key in fields if key in progress}
                 public["updated_at"] = updated_at
+                if progress.get("block_reason") in {"rate_limit", "access_restriction"}:
+                    public["block_reason"] = progress["block_reason"]
                 for key, allowed in nested_fields.items():
                     if isinstance(progress.get(key), dict):
                         public[key] = {field: progress[key][field] for field in allowed if field in progress[key]}
@@ -1321,6 +1325,7 @@ def read_build_discovery_policy() -> dict[str, Any]:
     policy = json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_nonfinite_constant)
     if policy.get("schema_version") != 1 or policy.get("policy") != "current_collector":
         raise ValueError("Invalid build discovery policy")
+    policy["min_total_decks"] = validate_minimum(policy.get("min_total_decks"))
     cutoff = datetime.fromisoformat(policy["collection_started_after"].replace("Z", "+00:00"))
     if cutoff.tzinfo is None:
         raise ValueError("Build discovery cutoff must include a timezone")
@@ -1341,6 +1346,8 @@ def current_build_discovery_slugs(directory: Path, reports: dict[str, dict[str, 
     cutoff = datetime.fromisoformat(policy["collection_started_after"].replace("Z", "+00:00"))
     eligible = set()
     for slug, report in reports.items():
+        if not commander_is_eligible(report.get("total_edhrec_decks"), policy["min_total_decks"]):
+            continue
         record, collection = state["commanders"].get(slug), report.get("collection")
         if not isinstance(record, dict) or not isinstance(collection, dict):
             continue
@@ -1392,6 +1399,10 @@ def export_build_style_files(
                     continue
             reports[slug] = report
     known_slugs = set(df["commander_slug"].dropna().astype(str)) if "commander_slug" in df else set()
+    catalog_counts = {str(row["commander_slug"]): valid_deck_count(row.get("total_decks"))
+                      for row in df.to_dict("records") if row.get("commander_slug") is not None}
+    eligible_catalog = {slug for slug in known_slugs
+                        if commander_is_eligible(catalog_counts.get(slug), policy["min_total_decks"])}
     if (output_dir / "build-styles").is_dir():
         for path in (output_dir / "build-styles").glob("*.json"):
             path.unlink()
@@ -1399,12 +1410,25 @@ def export_build_style_files(
     for slug, report in sorted(reports.items()):
         if slug not in known_slugs:
             continue
+        # An archived fit cannot override a newer population check. Keep its
+        # evidence available, while making its ineligibility explicit to direct
+        # commander-page readers as well as the discovery index.
+        current_count = valid_deck_count(current_reports.get(slug, {}).get("total_edhrec_decks"))
+        if slug not in eligible_catalog:
+            report["total_edhrec_decks"] = catalog_counts.get(slug)
+        elif current_count is not None and current_count < policy["min_total_decks"]:
+            report["total_edhrec_decks"] = current_count
+            report.setdefault("collection", {})["analysis_current"] = False
         filename = f"build-styles/{slug}.json"
         normalize_report_deck_tags(report)
         write_json(output_dir / filename, report, compact=True)
+        if slug not in eligible_catalog or not commander_is_eligible(
+                report.get("total_edhrec_decks"), policy["min_total_decks"]):
+            continue
         analysis = report["deck_analysis"]
         entry = {
             "commander_slug": slug, "commander_name": report["commander_name"],
+            "total_edhrec_decks": valid_deck_count(report.get("total_edhrec_decks")),
             "file": filename, "generated_at": report["generated_at"],
             "profile_count": len(report["profiles"]["profiles"]),
             "package_count": len(analysis["packages"]),
@@ -1428,14 +1452,15 @@ def export_build_style_files(
         entries.append(entry)
     index = {
         "schema_version": 1, "coverage": "sampled_commanders", "total_available": len(entries),
-        "total_catalog": len(known_slugs), "total_pending": len(known_slugs) - len(entries),
+        "total_catalog": len(eligible_catalog), "total_pending": len(eligible_catalog) - len(entries),
+        "min_total_decks": policy["min_total_decks"],
         "total_fitted": sum(entry["status"] == "fitted" for entry in entries),
         "total_insufficient": sum(entry["status"] == "insufficient_data" for entry in entries),
         "commanders": entries,
     }
     visible_slugs = sorted(entry["commander_slug"] for entry in entries if entry["commander_slug"] in discovery_slugs)
     index["discovery"] = {key: policy[key] for key in (
-        "policy", "collection_started_after", "baseline_run_id", "baseline_previews", "baseline_report_count")}
+        "policy", "min_total_decks", "collection_started_after", "baseline_run_id", "baseline_previews", "baseline_report_count")}
     index["discovery"].update(commander_slugs=visible_slugs, total_available=len(visible_slugs),
                               total_hidden=len(entries) - len(visible_slugs))
     if any("freshness" in entry.get("collection", {}) for entry in entries):

@@ -210,9 +210,9 @@ def test_offline_cli_writes_an_honest_report_with_insufficient_deck_data(tmp_pat
     cache = tmp_path / "cache"
     cache.mkdir()
     payload = {"container": {"json_dict": {
-        "card": {"name": "Ghave", "names": ["Ghave"], "num_decks": 100, "url": "/commanders/ghave"},
+        "card": {"name": "Ghave", "names": ["Ghave"], "num_decks": 200, "url": "/commanders/ghave"},
         "cardlists": [{"tag": "creatures", "cardviews": [
-            {"name": "Engine", "num_decks": 40, "potential_decks": 100},
+            {"name": "Engine", "num_decks": 80, "potential_decks": 200},
         ]}],
     }}, "panels": {"taglinks": []}}
     if tag_panel == "missing_taglinks":
@@ -220,7 +220,6 @@ def test_offline_cli_writes_an_honest_report_with_insufficient_deck_data(tmp_pat
     elif tag_panel == "missing_panels":
         payload.pop("panels")
     if empty_page:
-        payload["container"]["json_dict"]["card"]["num_decks"] = 0
         payload["container"]["json_dict"]["cardlists"] = []
     (cache / "base.json").write_text(json.dumps(payload))
     output = tmp_path / "report"

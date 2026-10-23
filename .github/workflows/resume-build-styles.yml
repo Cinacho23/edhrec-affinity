@@ -1,0 +1,62 @@
+name: Resume commander collection after cooldown
+
+on:
+  workflow_run:
+    workflows: ["Update commander build styles"]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Collector run containing the original durable HTTP 429 checkpoint"
+        type: string
+        required: true
+      attempt:
+        description: "Bounded hourly wait attempt for longer server Retry-After values"
+        type: number
+        default: 0
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: commander-build-style-cooldown
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    name: Verify the saved rate-limit pause and free wait timer
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      wait: ${{ steps.pause.outputs.wait }}
+      source_run_id: ${{ steps.pause.outputs.source_run_id }}
+      attempt: ${{ steps.pause.outputs.attempt }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify actual HTTP 429 and the configured timer
+        id: pause
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.source_run_id }}
+          WAIT_ATTEMPT: ${{ inputs.attempt || 0 }}
+        run: python3 scripts/coordinate_build_styles.py prepare-cooldown --source-run-id "${SOURCE_RUN_ID}" --attempt "${WAIT_ATTEMPT}"
+
+  resume:
+    name: Resume after GitHub's unbilled environment wait
+    needs: inspect
+    if: needs.inspect.outputs.wait == 'true'
+    environment:
+      name: build-style-cooldown
+      deployment: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Recheck latest cooldown and dispatch only when due
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ needs.inspect.outputs.source_run_id }}
+          WAIT_ATTEMPT: ${{ needs.inspect.outputs.attempt }}
+        run: python3 scripts/coordinate_build_styles.py resume --source-run-id "${SOURCE_RUN_ID}" --attempt "${WAIT_ATTEMPT}"

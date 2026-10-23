@@ -1,0 +1,26 @@
+name: Watch commander collection
+
+on:
+  schedule:
+    - cron: "7,17,27,37,47,57 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: commander-build-style-watchdog
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Recover an idle collector without restoring decks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check active jobs, latest checkpoint and cooldown
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/coordinate_build_styles.py watchdog

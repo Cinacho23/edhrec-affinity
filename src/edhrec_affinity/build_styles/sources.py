@@ -27,6 +27,92 @@ def card_key(name: str) -> str:
     return unicodedata.normalize("NFKC", name).replace("’", "'").strip().casefold()
 
 
+def _commander_name_groups(card: dict) -> list[list[str]]:
+    """Read only EDHREC's explicit equivalent full commander configurations."""
+    names = card.get("names") or [card.get("name")]
+    if (not isinstance(names, list) or not names
+            or any(not isinstance(name, str) or not name.strip() for name in names)
+            or len({card_key(name) for name in names}) != len(names)):
+        return []
+    groups = [list(names)]
+    references = card.get("flavor_refs", [])
+    references = list(references) if isinstance(references, list) else []
+    if isinstance(card.get("flavor_ref"), dict):
+        references.append(card["flavor_ref"])
+    for reference in references:
+        if not isinstance(reference, dict):
+            continue
+        aliases = reference.get("names")
+        if aliases is None and isinstance(reference.get("name"), str):
+            # A single double-faced card's full name must remain one commander.
+            aliases = reference["name"].split(" // ") if len(names) > 1 else [reference["name"]]
+        if (isinstance(aliases, list) and len(aliases) == len(names)
+                and all(isinstance(name, str) and name.strip() for name in aliases)
+                and len({card_key(name) for name in aliases}) == len(names)):
+            groups.append(list(aliases))
+    return groups
+
+
+class CommanderAliasCatalog:
+    """Index explicit flavor-name equivalents from already saved base pages.
+
+    Alternate-art commander pages can omit their canonical names, while the
+    canonical page explicitly links to those alternate configurations. Read
+    the local source cache once and retain these small name groups rather than
+    making another source request or guessing identities from card names.
+    """
+
+    def __init__(self, source_root: Path | None = None, *, cards: list[dict] | None = None):
+        self.source_root = source_root
+        self._loaded = False
+        self._lock = threading.Lock()
+        self._names: dict[frozenset[str], list[str]] = {}
+        self._links: dict[frozenset[str], set[frozenset[str]]] = {}
+        for card in cards or []:
+            self._register(card)
+
+    def _register(self, card: dict) -> None:
+        groups = _commander_name_groups(card)
+        if not groups:
+            return
+        root = frozenset(card_key(name) for name in groups[0])
+        for group in groups:
+            key = frozenset(card_key(name) for name in group)
+            self._names.setdefault(key, group)
+            self._links.setdefault(root, set()).add(key)
+            self._links.setdefault(key, set()).add(root)
+
+    def _read_once(self) -> None:
+        if self._loaded:
+            return
+        if self.source_root is not None:
+            for path in sorted(self.source_root.glob("*/base.json")):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    card = payload["container"]["json_dict"]["card"]
+                    if isinstance(card, dict):
+                        self._register(card)
+                except (OSError, ValueError, KeyError, TypeError):
+                    # A corrupt unrelated cache must never broaden identities.
+                    continue
+        self._loaded = True
+
+    def groups(self, card: dict) -> list[list[str]]:
+        with self._lock:
+            self._read_once()
+            self._register(card)
+            names = _commander_name_groups(card)
+            if not names:
+                raise ValueError("Commander page has invalid commander names")
+            expected = frozenset(card_key(name) for name in names[0])
+            seen, pending = {expected}, [expected]
+            while pending:
+                for equivalent in self._links.get(pending.pop(), set()) - seen:
+                    seen.add(equivalent)
+                    pending.append(equivalent)
+            return [names[0], *[list(self._names[key]) for key in sorted(seen - {expected}, key=lambda keys: sorted(keys))]]
+
+
 def checked_identifier(value: str, *, deck: bool = False) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_-]+" if deck else r"[a-z0-9-]+", value):
         raise ValueError(f"Invalid {'deck ID' if deck else 'slug'}: {value!r}")
@@ -74,8 +160,10 @@ class RequestLimiter:
         self._successes = 0
         self.monotonic, self.sleep = monotonic, sleep
         self._lock = threading.Lock()
+        self._block_lock = threading.Lock()
         self._next_request = 0.0
         self._blocked_reason: str | None = None
+        self._block_kind: str | None = None
         self._blocked_event = threading.Event()
         self._started_at: float | None = None
         self._requests_started = 0
@@ -104,6 +192,7 @@ class RequestLimiter:
                 "observed_requests_per_second": max(0, self._requests_started - 1) / elapsed if elapsed else 0.0,
                 "retry_after_seconds": max(0.0, self._retry_after_until - self.monotonic()),
                 "elapsed_seconds": elapsed, "blocked": self.blocked,
+                "block_kind": self._block_kind,
                 "throttles": self._throttles,
                 "last_throttle": dict(self._last_throttle) if self._last_throttle else None,
             }
@@ -142,11 +231,21 @@ class RequestLimiter:
             self._retry_after_until = max(self._retry_after_until, deadline)
             self._deferrals += 1
 
-    def block(self, reason: str) -> None:
+    def block(self, reason: str, *, kind: str | None = None) -> None:
         # Do not wait behind another worker's pacing sleep before announcing an
         # access block. That waiter checks again before issuing its request.
-        self._blocked_reason = reason
-        self._blocked_event.set()
+        if kind not in {None, "rate_limit", "access_restriction"}:
+            raise ValueError("Unknown source block kind")
+        with self._block_lock:
+            # A later response from an already running request can reveal an
+            # access restriction after a 429. Never let it become an automatic
+            # rate-limit resume, even if another 429 or generic stop follows.
+            if (self._block_kind is None or kind == "access_restriction"
+                    or kind == self._block_kind):
+                self._blocked_reason = reason
+                if kind is not None:
+                    self._block_kind = kind
+            self._blocked_event.set()
 
     def record_success(self) -> None:
         with self._lock:
@@ -250,10 +349,10 @@ class Cache:
     def blocked(self) -> bool:
         return self._blocked or bool(self.limiter and self.limiter.blocked)
 
-    def _block(self, reason: str) -> None:
+    def _block(self, reason: str, *, kind: str = "access_restriction") -> None:
         self._blocked = True
         if self.limiter is not None:
-            self.limiter.block(reason)
+            self.limiter.block(reason, kind=kind)
 
     def provenance_for(self, url: str) -> list[dict]:
         with self._provenance_lock:
@@ -307,7 +406,8 @@ class Cache:
                     self.limiter.record_failure()
                 raise
             if response.status_code in {401, 403, 429}:
-                self._block(f"HTTP {response.status_code}: {url}")
+                self._block(f"HTTP {response.status_code}: {url}",
+                            kind="rate_limit" if response.status_code == 429 else "access_restriction")
                 if response.status_code == 429 and self.limiter is not None:
                     self.limiter.record_throttle(now=self.now())
                 retry_after = _retry_after_seconds(response.headers.get("Retry-After"), self.now())

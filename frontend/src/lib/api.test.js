@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { loadBuildStyleIndex, loadCommanderBuildStyles, loadThemeBracketDetail, loadThemeReport } from "./api.js";
+import { loadBuildCollectorExecution, loadBuildStyleIndex, loadCommanderBuildStyles, loadThemeBracketDetail, loadThemeReport } from "./api.js";
 
 test("compact report loading rejects legacy-qualified data so complete tags can be used", async () => {
   const previousFetch = globalThis.fetch;
@@ -114,6 +114,64 @@ test("compact theme loading rejects old empty lists and unwraps upgraded qualifi
       });
       assert.deepEqual(await loadThemeBracketDetail("tokens"), rows);
     }
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("optional collector status validates public main-branch runs and constructs a trusted run link", async () => {
+  const previousFetch = globalThis.fetch;
+  const now = Date.parse("2026-10-23T11:30:00Z");
+  const run = { id: 39936571861, status: "in_progress", conclusion: null, head_branch: "main",
+    created_at: "2026-10-23T10:05:00Z", run_started_at: "2026-10-23T10:06:00Z", updated_at: "2026-10-23T10:06:00Z",
+    html_url: "https://untrusted.invalid/" };
+  try {
+    for (const status of ["in_progress", "queued", "completed"]) {
+      globalThis.fetch = async (url, options) => {
+        assert.equal(url, "https://api.github.com/repos/Cinacho23/edhrec-affinity/actions/workflows/build-commander-styles.yml/runs?per_page=1&branch=main");
+        assert.equal(options.credentials, "omit");
+        assert.equal(options.cache, "no-store");
+        return { ok: true, json: async () => ({ workflow_runs: [{ ...run, status }] }) };
+      };
+      const result = await loadBuildCollectorExecution({ now });
+      assert.equal(result.status, status);
+      assert.equal(result.url, "https://github.com/Cinacho23/edhrec-affinity/actions/runs/39936571861");
+      assert.equal(result.checkedAt, "2026-10-23T11:30:00.000Z");
+    }
+    for (const invalid of [{}, { workflow_runs: [] }, { workflow_runs: {} },
+      { workflow_runs: [{ ...run, id: "39936571861" }] },
+      { workflow_runs: [{ ...run, head_branch: "other" }] },
+      { workflow_runs: [{ ...run, created_at: "invalid" }] },
+      { workflow_runs: [{ ...run, status: "unexpected" }] }]) {
+      globalThis.fetch = async () => ({ ok: true, json: async () => invalid });
+      assert.equal(await loadBuildCollectorExecution({ now }), null);
+    }
+    globalThis.fetch = async () => ({ ok: true, json: async () => { throw new SyntaxError("HTML response"); } });
+    assert.equal(await loadBuildCollectorExecution({ now }), null);
+    globalThis.fetch = async () => { throw new TypeError("Network unavailable"); };
+    assert.equal(await loadBuildCollectorExecution({ now }), null);
+    globalThis.fetch = async () => { throw new DOMException("Canceled", "AbortError"); };
+    await assert.rejects(loadBuildCollectorExecution({ now }), { name: "AbortError" });
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("optional collector checks honor GitHub rate-limit reset instead of retrying every poll", async () => {
+  const previousFetch = globalThis.fetch;
+  const now = Date.parse("2026-10-23T12:00:00Z");
+  let calls = 0;
+  try {
+    globalThis.fetch = async () => {
+      calls += 1;
+      return { ok: false, status: 429, headers: new Headers({ "x-ratelimit-reset": String((now + 3600000) / 1000) }) };
+    };
+    assert.equal(await loadBuildCollectorExecution({ now }), null);
+    assert.equal(await loadBuildCollectorExecution({ now: now + 2 * 60000 }), null);
+    assert.equal(calls, 1);
+    globalThis.fetch = async () => { calls += 1; return { ok: true, json: async () => ({ workflow_runs: [] }) }; };
+    assert.equal(await loadBuildCollectorExecution({ now: now + 3600001 }), null);
+    assert.equal(calls, 2);
   } finally {
     globalThis.fetch = previousFetch;
   }

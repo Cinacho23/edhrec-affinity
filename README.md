@@ -53,19 +53,20 @@ GitHub Actions scheduled workflow
 
 The [build-discovery documentation](docs/build_style_prototype.md) explains the
 website feature, automatic package-count selection, local analysis and static
-data generation. Real seed samples cover Ghave, Hapatra and Jasmine. Rolling
-four-hour jobs continue through the full commander catalog, preserving completed
-reports and collection checkpoints between runs, with an hourly recovery schedule.
-Collection targets every
-available deck-index ID, with no commander or preview count cap. Time slices let
-unfinished commanders resume across runs. There is no minimum popularity gate. Low-data
-commanders can return profiles or an insufficient-data result instead of card
-packages. Source deck tags are optional. Public EDHREC previews supply cardlists
+data generation. Rolling 30-minute jobs analyze commanders with at least 200 total
+EDHREC decks, preserving completed reports and collection checkpoints between runs.
+Collection targets every available deck-index ID for eligible commanders, with no
+preview count cap. Time slices let unfinished commanders resume across runs. The
+200-deck minimum concerns the commander’s total population, not its collected sample.
+An eligible commander can still return insufficient usable evidence for packages. Source deck tags are optional. Public EDHREC previews supply cardlists
 without direct requests to Moxfield or Archidekt.
 
-Build Discovery displays reports completed by the repaired collector, starting
-with the 25 reports saved by run 39893813350. More cards appear as collection
-finishes for other commanders. Older reports remain stored for commander pages.
+Build Discovery starts fresh with zero eligible reports: the earlier 66 visible
+reports all had fewer than 200 total decks. New cards appear after qualifying
+commanders finish collection and analysis. The minimum is enforced in collection,
+export, discovery cards and individual commander package views. Older evidence
+remains stored. A visible browser tab refreshes published results and checks the
+collector’s GitHub execution status every two minutes.
 
 Downloads and model processes run independently, using compact public JSON or
 React preview data and one adaptive shared request ceiling. The collector learns
@@ -83,3 +84,9 @@ Every supported package can generate a native 100-card deck using learned card
 preferences and the sampled card pool, with one primary category tag per card,
 a primer, Moxfield text export and per-card inclusion/lift averages. Bracket estimates and recorded
 external ratings are shown separately from card legality checks.
+
+Collector batches continue after durable checkpoint uploads. A separate protected
+GitHub environment waits through confirmed HTTP 429 cooldowns before resuming;
+its 60-minute wait timer is configured outside the workflow. A metadata-only
+ten-minute watchdog recovers idle work without downloading the full dataset.
+Access restrictions remain distinct from rate-limit pauses.

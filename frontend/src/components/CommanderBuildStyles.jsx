@@ -17,6 +17,7 @@ import {
   getGeneratedDeckGroups,
   getPackageBracketLabel,
   getSupportedThemes,
+  hasBuildStylePopulation,
   isBuildMetadataFresh,
   safeExternalUrl,
   splitPrimerCardReferences,
@@ -338,5 +339,6 @@ export default function CommanderBuildStyles({ commanderSlug }) {
   if (state.loading) return <p className="muted" role="status">Loading build discovery…</p>;
   if (state.error) return <section className="commander-build-styles panel"><h2>Build discovery</h2><p className="muted">The build discovery report could not load. The commander’s tag table is still available.</p><details><summary>Report details</summary><p>{state.error}</p></details></section>;
   if (!state.report) return <section className="commander-build-styles panel"><h2>Build discovery</h2><p className="muted">No build discovery report has been collected for this commander yet. Reports use tag-specific card profiles and a sample of individual decklists.</p></section>;
+  if (!hasBuildStylePopulation(state.report)) return <section className="commander-build-styles panel"><h2>Build discovery</h2><p className="muted">Build discovery requires at least 200 total EDHREC decks for this commander. This report does not have an eligible deck population.</p></section>;
   return <BuildReport report={state.report} />;
 }

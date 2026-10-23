@@ -19,7 +19,8 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from .capacity import plan_capacity
-from .sources import PreviewTransport, RequestLimiter, SourceBlocked, source_time
+from .eligibility import CommanderBelowMinimum, commander_is_eligible, valid_deck_count, validate_minimum
+from .sources import CommanderAliasCatalog, PreviewTransport, RequestLimiter, SourceBlocked, source_time
 
 
 def atomic_json(path: Path, value: dict) -> None:
@@ -102,6 +103,7 @@ def collection_options(args, slug: str, remaining_seconds: float):
     options.card_metadata_cache = args.card_metadata_cache
     options.fetch, options.sample_decks, options.seed = args.fetch, args.sample_decks, args.seed
     options.max_components, options.max_tags, options.min_tag_decks = args.max_components, args.max_tags, args.min_tag_decks
+    options.min_total_decks = validate_minimum(args.min_total_decks)
     options.request_delay, options.preview_workers = args.request_delay, args.preview_workers
     options.source_max_age_hours, options.index_max_age_hours = args.source_max_age_hours, args.index_max_age_hours
     options.target_completion_hours = args.target_completion_hours
@@ -144,8 +146,12 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     known = {row["commander_slug"] for row in rows}
     if requested - known:
         raise ValueError("Requested commanders not found in catalog")
+    minimum = validate_minimum(args.min_total_decks)
+    if any(row["commander_slug"] in requested and not commander_is_eligible(row.get("total_decks"), minimum)
+           for row in rows):
+        raise ValueError(f"Requested commanders must each have at least {minimum} total decks")
     rows = [row for row in rows if (not requested or row["commander_slug"] in requested)
-            and (bool(requested) or float(row.get("total_decks") or 0) >= args.min_total_decks)]
+            and commander_is_eligible(row.get("total_decks"), minimum)]
     rows_by_slug = {row["commander_slug"]: row for row in rows}
     cycle = state.setdefault("pipeline", {"version": 1, "cycle_started_at": observed_at.isoformat()})
     cycle_start = source_time(cycle.get("cycle_started_at")) or observed_at
@@ -167,6 +173,11 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     summary = {"snapshot_date": args.snapshot_date, "pipeline_version": 1, "catalog_size": len(rows),
                "cycle_started_at": cycle_start.isoformat(), "target_completion_hours": args.target_completion_hours,
                "freshness_target_hours": getattr(args, "freshness_target_hours", 96),
+               "scope": {"commanders": args.commanders or [], "max_commanders": args.max_commanders,
+                         "sample_decks": args.sample_decks, "refresh": args.refresh},
+               "automatic_continuation_allowed": (not args.commanders and not args.max_commanders
+                                                   and args.sample_decks is None and not args.refresh),
+               "min_total_decks": minimum, "skipped": [],
                "completed": [], "collected": [], "failures": [], "blocked": False,
                "dry_run": args.dry_run, "publish_needed": False, "continuation_needed": False,
                "no_progress": True, "time_budget_reached": False, "new_previews_attempted": 0,
@@ -187,17 +198,21 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
 
     queue = sorted((slug for slug in rows_by_slug if eligible(slug)), key=lambda slug: (
         state["commanders"].get(slug, {}).get("attempted_at", ""),
-        float(rows_by_slug[slug].get("total_decks") or 0), slug))
+        valid_deck_count(rows_by_slug[slug].get("total_decks")), slug))
     if args.max_commanders:
         queue = queue[:args.max_commanders]
     summary["selected"] = list(queue)
 
     def checkpoint():
         elapsed = max(0.0, monotonic() - started)
+        planning_rows = [row for row in rows if not (
+            state["commanders"].get(row["commander_slug"], {}).get("status") == "ineligible"
+            and not eligible(row["commander_slug"]))]
+        planning_slugs = {row["commander_slug"] for row in planning_rows}
         remaining = sum(max(0, int(record.get("frame_decks", rows_by_slug[slug].get("total_decks") or 0))
                             - (int(record.get("current_previews", 0)) if source_time(record.get("verified_at"))
                                and (now() - source_time(record["verified_at"])).total_seconds() < getattr(args, "freshness_target_hours", 96) * 3600 else 0))
-                        for slug in rows_by_slug for record in [state["commanders"].get(slug, {})])
+                        for slug in planning_slugs for record in [state["commanders"].get(slug, {})])
         preview_rate = summary["new_previews_attempted"] / elapsed if elapsed > 0 and summary["new_previews_attempted"] else None
         # ``limiter`` lives in the enclosing run after initialization; before
         # then (including dry runs) no throughput measurement exists.
@@ -230,11 +245,12 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         summary["preview_processing_rate"] = preview_rate
         overhead = 19 * sum(not source_time(state["commanders"].get(slug, {}).get("last_collection_at"))
                             or (now() - source_time(state["commanders"][slug]["last_collection_at"])).total_seconds()
-                            >= args.index_max_age_hours * 3600 for slug in rows_by_slug)
+                            >= args.index_max_age_hours * 3600 for slug in planning_slugs)
         cooldown_until = source_time(state.get("blocked_until"))
         cooldown_seconds = max(0.0, (cooldown_until - now()).total_seconds()) if cooldown_until else 0.0
         summary["blocked_until"] = cooldown_until.isoformat() if summary["blocked"] and cooldown_until else None
-        summary["capacity"] = plan_capacity(rows, target_hours=args.target_completion_hours,
+        summary["block_reason"] = state.get("block_reason") if summary["blocked"] else None
+        summary["capacity"] = plan_capacity(planning_rows, target_hours=args.target_completion_hours,
             max_requests_per_second=args.requests_per_second, effective_requests_per_second=effective_ceiling,
             observed_requests_per_second=rate, cooldown_seconds=cooldown_seconds,
             elapsed_seconds=max(0, (now() - cycle_start).total_seconds()), remaining_previews=remaining,
@@ -251,7 +267,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         summary["capacity"]["disk_free_bytes"] = shutil.disk_usage(root).free
         summary["elapsed_seconds"] = round(elapsed, 3)
         state["progress"] = {"updated_at": now().isoformat(), "cycle_started_at": cycle_start.isoformat(),
-            **{key: summary.get(key) for key in ("blocked", "blocked_until", "time_budget_reached", "no_progress", "resource_limit")},
+            **{key: summary.get(key) for key in ("blocked", "blocked_until", "block_reason", "time_budget_reached", "no_progress", "resource_limit")},
             "capacity": summary["capacity"], "measured_request_rate": stats,
             "rate_control": {"learned_rate": state.get("source_rate", {}).get("learned_rate"),
                 "last_throttle": state.get("source_rate", {}).get("last_throttle"),
@@ -279,6 +295,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     limiter_holder[0] = limiter
     transport, metadata_lock = PreviewTransport(), threading.Lock()
     repository = MetadataRepository(args.card_metadata_cache, max_age_days=args.source_max_age_hours / 24)
+    commander_aliases = CommanderAliasCatalog(root / "sources")
     collector, analyzer = collector or collect_evidence, analyzer or analyze_saved_evidence
     analysis_executor_factory = analysis_executor_factory or (lambda: ProcessPoolExecutor(
         max_workers=args.analysis_workers, mp_context=multiprocessing.get_context("spawn")))
@@ -313,7 +330,8 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                     state["commanders"].setdefault(slug, {}).update(
                         status="collecting", attempted_at=now().isoformat(), cache_snapshot="rolling")
                     future = network_pool.submit(collector, options, limiter=limiter, preview_transport=transport,
-                                                 metadata_lock=metadata_lock, metadata_provider=repository)
+                                                 metadata_lock=metadata_lock, metadata_provider=repository,
+                                                 commander_alias_provider=commander_aliases)
                     network_jobs[future] = (slug, options)
                 while analysis_queue and len(model_jobs) < args.analysis_workers:
                     slug, evidence_path, options = analysis_queue.pop(0)
@@ -330,6 +348,8 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                         result = future.result()
                         if is_collection:
                             collection = result["collection"]
+                            if result.get("metadata_summary", {}).get("blocked"):
+                                limiter.block("Card metadata source access restriction", kind="access_restriction")
                             if result.get("blocked") or limiter.blocked:
                                 raise SourceBlocked("Source access restriction or rate limit; shared workers stopped")
                             new_attempts = int(collection.get("new_previews_attempted", 0))
@@ -353,6 +373,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                 result["analysis_version"] = version
                                 if record.get("analysis_version") == version and destination.exists():
                                     report = json.loads(destination.read_text())
+                                    report["total_edhrec_decks"] = result["base"]["deck_count"]
                                     report["collection"] = {**report.get("collection", {}), **published_collection(result)}
                                     refresh_unchanged_report_metadata(report, result.get("metadata_summary", {}))
                                     atomic_json(destination, report)
@@ -388,11 +409,27 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                             summary.update(publish_needed=True, no_progress=False)
                             context.unlink(missing_ok=True)
                             shutil.rmtree(root / "analyzed" / slug, ignore_errors=True)
+                    except CommanderBelowMinimum as error:
+                        record.update(status="ineligible", observed_total_decks=error.count,
+                                      eligibility_checked_at=now().isoformat(),
+                                      retry_after=(now() + timedelta(hours=args.index_max_age_hours)).isoformat())
+                        summary["skipped"].append({"commander_slug": slug, "reason": str(error),
+                                                   "total_decks": error.count, "minimum": error.minimum})
+                        destination = args.output_dir / f"{slug}.json"
+                        if destination.exists():
+                            report = json.loads(destination.read_text())
+                            report["total_edhrec_decks"] = error.count
+                            report.setdefault("collection", {})["analysis_current"] = False
+                            atomic_json(destination, report)
+                            summary["publish_needed"] = True
+                        if not is_collection:
+                            context.unlink(missing_ok=True)
                     except SourceBlocked as error:
                         summary["blocked"] = True
                         limiter.block(str(error))
                         cooldown_seconds = max(3600, limiter.stats.get("retry_after_seconds", 0))
                         state["blocked_until"] = (now() + timedelta(seconds=cooldown_seconds)).isoformat()
+                        state["block_reason"] = limiter.stats.get("block_kind") or "access_restriction"
                         record.update(status="blocked", retry_after=state["blocked_until"])
                         summary["failures"].append({"commander_slug": slug, "error": str(error)})
                     except (OSError, ValueError, KeyError, TypeError, RuntimeError, httpx.HTTPError) as error:
