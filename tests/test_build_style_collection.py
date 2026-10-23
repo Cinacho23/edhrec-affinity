@@ -11,7 +11,7 @@ from scipy import sparse
 from edhrec_affinity.build_styles.__main__ import parser
 from edhrec_affinity.build_styles.analysis import _reconstruction_ratio, analyze_decks
 from edhrec_affinity.build_styles.collection import collect_previews
-from edhrec_affinity.build_styles.sources import SourceBlocked
+from edhrec_affinity.build_styles.sources import SourceBlocked, SourceFormatError
 
 
 class PreviewCache:
@@ -59,7 +59,8 @@ def test_time_slice_resumes_frozen_frame_and_lists_without_refetch(tmp_path):
     assert all(deck["source_bracket"] == 3 for deck in decks)
 
 
-@pytest.mark.parametrize("error", [SourceBlocked("challenge"), httpx.ConnectError("temporary outage"), FileNotFoundError("offline")])
+@pytest.mark.parametrize("error", [SourceBlocked("challenge"), SourceFormatError("new response format"),
+                                 httpx.ConnectError("temporary outage"), FileNotFoundError("offline")])
 def test_access_or_transient_failure_is_not_a_permanent_exclusion(tmp_path, error):
     path = tmp_path / "state.gz"
     cache = PreviewCache(2)

@@ -216,7 +216,7 @@ test("version verification can retain cached lists without changing their actual
     unchanged_verified: 98 });
   const freshness = getBuildSourceFreshness(collection, now);
   assert.equal(freshness.status, "fresh");
-  assert.equal(freshness.label, "Collected deck versions verified within 4 days");
+  assert.equal(freshness.label, "Collected deck versions verified recently");
   assert.equal(freshness.oldestSourceAt, "2026-09-01T12:00:00Z");
   assert.equal(getBuildCollectionProgress(collection, now).targetMet, true);
   assert.equal(getBuildSourceFreshness({ ...collection, freshness: { ...collection.freshness, basis: undefined } }, now).status, "stale");

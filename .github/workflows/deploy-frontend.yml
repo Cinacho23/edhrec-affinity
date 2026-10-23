@@ -29,7 +29,9 @@ env:
 jobs:
   changes:
     name: Check whether collected reports changed
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    # A collector may fail after uploading useful reports and a valid retry
+    # checkpoint. The summary below decides whether those reports need deploy.
+    if: github.event_name != 'workflow_run' || contains(fromJSON('["success", "failure"]'), github.event.workflow_run.conclusion)
     runs-on: ubuntu-latest
     outputs:
       publish: ${{ steps.changes.outputs.publish }}

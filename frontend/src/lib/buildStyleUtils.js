@@ -110,7 +110,7 @@ export function getBuildSourceFreshness(collection, now = Date.now()) {
   if (!Number.isFinite(now) || !countsKnown || !observed || !dated || !Number.isFinite(oldest)
       || !Number.isFinite(newest) || oldest > newest) return result;
   if (now - newest >= targetAge && undated === 0) {
-    return { ...result, status: "stale", label: versionsVerified ? "Collected verification checks exceed 4 days" : "Collected sources exceed 4 days" };
+    return { ...result, status: "stale", label: versionsVerified ? "Collected verification checks need refresh" : "Collected sources need refresh" };
   }
   if (now - oldest >= targetAge || undated > 0) {
     return { ...result, status: "mixed", label: versionsVerified ? "Mixed or incomplete verification ages" : "Mixed or incomplete source ages" };
@@ -118,7 +118,7 @@ export function getBuildSourceFreshness(collection, now = Date.now()) {
   if (stale > 0) {
     return { ...result, status: "mixed", label: versionsVerified ? "Collected deck versions need verification" : "Collected sources need a refresh" };
   }
-  return { ...result, status: "fresh", label: versionsVerified ? "Collected deck versions verified within 4 days" : "Collected sources checked within 4 days" };
+  return { ...result, status: "fresh", label: versionsVerified ? "Collected deck versions verified recently" : "Collected sources checked recently" };
 }
 
 export function getBuildCollectionProgress(collection, now = Date.now()) {

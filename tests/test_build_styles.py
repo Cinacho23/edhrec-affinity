@@ -205,7 +205,8 @@ def test_report_embedding_does_not_allow_source_text_to_end_script(tmp_path):
 
 
 @pytest.mark.parametrize("empty_page", [False, True])
-def test_offline_cli_writes_an_honest_report_with_insufficient_deck_data(tmp_path, empty_page):
+@pytest.mark.parametrize("tag_panel", ["empty", "missing_taglinks", "missing_panels"])
+def test_offline_cli_writes_an_honest_report_with_insufficient_deck_data(tmp_path, empty_page, tag_panel):
     cache = tmp_path / "cache"
     cache.mkdir()
     payload = {"container": {"json_dict": {
@@ -214,6 +215,10 @@ def test_offline_cli_writes_an_honest_report_with_insufficient_deck_data(tmp_pat
             {"name": "Engine", "num_decks": 40, "potential_decks": 100},
         ]}],
     }}, "panels": {"taglinks": []}}
+    if tag_panel == "missing_taglinks":
+        payload["panels"].pop("taglinks")
+    elif tag_panel == "missing_panels":
+        payload.pop("panels")
     if empty_page:
         payload["container"]["json_dict"]["card"]["num_decks"] = 0
         payload["container"]["json_dict"]["cardlists"] = []

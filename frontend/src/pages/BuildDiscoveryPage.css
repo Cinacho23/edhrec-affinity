@@ -3,6 +3,12 @@
 .build-discovery-coverage p { color: var(--muted); max-width: 880px; line-height: 1.6; }
 .build-discovery-coverage > strong { color: var(--accent); font-size: .9rem; }
 .build-discovery-coverage .build-discovery-coverage__pending { margin-bottom: 0; font-size: .85rem; }
+.build-discovery-collector { margin-bottom: 1rem; }
+.build-discovery-collector p { max-width: 1000px; line-height: 1.6; color: var(--muted); font-size: .85rem; }
+.build-discovery-collector__stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 1.2rem; margin: 1.4rem 0; }
+.build-discovery-collector__stats > div { display: grid; gap: .4rem; }
+.build-discovery-collector__stats strong { color: var(--accent); font-size: 1.4rem; }
+.build-discovery-collector__stats span { color: var(--muted); font-size: .78rem; }
 .build-discovery-search { margin-bottom: 1rem; }
 .build-discovery-search input { margin-top: .6rem; }
 .build-discovery-search p { margin-bottom: 0; font-size: .82rem; }

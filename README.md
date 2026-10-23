@@ -63,15 +63,17 @@ commanders can return profiles or an insufficient-data result instead of card
 packages. Source deck tags are optional. Public EDHREC previews supply cardlists
 without direct requests to Moxfield or Archidekt.
 
-The complete-deck refresh objective is 96 hours. Downloads and model processes
-run independently, using compact public JSON previews and one adaptive shared
-request ceiling. The configured ceiling is not a guarantee of sustained speed:
-collection summaries measure throughput and expose missed projections. Daily
+Downloads and model processes run independently, using compact public JSON or
+React preview data and one adaptive shared request ceiling. The collector learns
+an operating rate below EDHREC's throttling threshold and remembers it across jobs.
+Build Discovery reports the fastest collection estimate at that rate and a
+projection from measured throughput, rather than imposing a fixed deadline. Daily
 deck-index checks add changed/new versions and remove deleted entries while
 preserving unchanged lists and their original download dates. The site separately
 shows index verification, deck coverage, pending analysis, and unknown/stale data.
 Full automated collection relies on the repository owner's stated permission
 from EDHREC; access restrictions and server cooldowns stop all source workers.
+Rate learning preserves existing decks and their original source-check dates.
 
 Every supported package can generate a native 100-card deck using learned card
 preferences and the sampled card pool, with one primary category tag per card,

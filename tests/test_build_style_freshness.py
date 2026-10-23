@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from edhrec_affinity.build_styles.collection import collect_previews, deck_dataset_sha256
-from edhrec_affinity.build_styles.sources import Cache, PreviewTransport, RequestLimiter, SourceBlocked
+from edhrec_affinity.build_styles.sources import Cache, PreviewTransport, RequestLimiter, SourceBlocked, SourceFormatError
 
 
 START = datetime(2026, 10, 21, 12, tzinfo=timezone.utc)
@@ -89,6 +89,73 @@ def test_shared_limiter_spaces_workers_and_access_block_stops_all(tmp_path):
     finally:
         first.close()
         second.close()
+
+
+@pytest.mark.parametrize("response", [
+    httpx.Response(200, json={"pageProps": {"changed": True}}),
+    httpx.Response(200, text="<html><title>Deck with Ghave | EDHREC</title></html>"),
+])
+def test_changed_response_format_does_not_block_other_workers_or_cache_bad_data(tmp_path, response):
+    limiter, _, _ = fake_limiter()
+    first = Cache(tmp_path / "first", fetch=True, limiter=limiter)
+    second = Cache(tmp_path / "second", fetch=True, limiter=limiter)
+    attach_transport(first, lambda request: response)
+    attach_transport(second, lambda request: httpx.Response(200, json={"valid": True}))
+    try:
+        with pytest.raises(SourceFormatError, match="Unsupported or invalid response"):
+            first.get("one.json", "https://json.edhrec.com/one.json", validate=lambda data: data["deck"])
+        assert not first.blocked and not second.blocked
+        assert not list((tmp_path / "first").glob("**/*"))
+        assert second.get("two.json", "https://json.edhrec.com/two.json") == {"valid": True}
+        assert limiter.stats["failures"] == 1
+        assert not limiter.stats["blocked"]
+    finally:
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize("response", [
+    httpx.Response(200, text='<html><title>Just a moment...</title><form id="challenge-form"></form></html>'),
+    httpx.Response(200, text="Challenge", headers={"cf-mitigated": "challenge"}),
+])
+def test_http_success_with_explicit_challenge_still_blocks_shared_collection(tmp_path, response):
+    limiter, _, _ = fake_limiter()
+    cache = Cache(tmp_path, fetch=True, limiter=limiter)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return response
+
+    attach_transport(cache, handler)
+    try:
+        with pytest.raises(SourceBlocked, match="Access challenge"):
+            cache.get("one.json", "https://json.edhrec.com/one.json")
+        with pytest.raises(SourceBlocked, match="stopped"):
+            cache.get("two.json", "https://json.edhrec.com/two.json")
+        assert len(calls) == 1 and cache.blocked
+        assert not list(tmp_path.iterdir())
+    finally:
+        cache.close()
+
+
+def test_failed_format_refresh_preserves_the_last_usable_cached_observation(tmp_path):
+    limiter, _, _ = fake_limiter()
+    cache = Cache(tmp_path, fetch=True, limiter=limiter, now=lambda: START)
+    responses = iter([httpx.Response(200, json={"deck": {"cards": {}}}),
+                      httpx.Response(200, json={"changed": True})])
+    attach_transport(cache, lambda request: next(responses))
+    try:
+        expected = cache.get("one.json", "https://json.edhrec.com/one.json")
+        before_metadata = (tmp_path / "one.json.meta.json").read_bytes()
+        with pytest.raises(SourceFormatError):
+            cache.get("one.json", "https://json.edhrec.com/one.json", force_refresh=True,
+                      validate=lambda data: data["deck"])
+        assert json.loads((tmp_path / "one.json").read_text()) == expected
+        assert (tmp_path / "one.json.meta.json").read_bytes() == before_metadata
+        assert not cache.blocked
+    finally:
+        cache.close()
 
 
 class UpdatingSource:
@@ -272,6 +339,84 @@ def test_adaptive_rate_ramps_only_after_successes_and_slows_on_failure():
     limiter.record_failure(cooldown=3)
     assert limiter.delay == pytest.approx(1 / 20)
     assert limiter._next_request == 3
+
+
+@pytest.mark.parametrize("learned_rate", [True, False, 0, -1, float("inf"), float("nan"), "2"])
+def test_learned_request_rate_rejects_invalid_persistent_values(learned_rate):
+    with pytest.raises(ValueError, match="Learned request rate"):
+        RequestLimiter(max_rate=40, learned_rate=learned_rate)
+
+
+def test_persistent_learned_ceiling_limits_startup_and_future_ramping():
+    limiter = RequestLimiter(max_rate=40, learned_rate=1.25, ramp_after=1)
+    assert limiter.delay == .8
+    for _ in range(100):
+        limiter.record_success()
+    assert limiter.delay == .8
+    assert limiter.stats["configured_maximum_requests_per_second"] == 40
+    assert limiter.stats["maximum_requests_per_second"] == 1.25
+    assert limiter.stats["learned_maximum_requests_per_second"] == 1.25
+    # A previously higher limit cannot override a lower configured maximum.
+    lowered_configuration = RequestLimiter(max_rate=1, learned_rate=1.25)
+    assert lowered_configuration.stats["maximum_requests_per_second"] == 1
+    assert lowered_configuration.learning_state["learned_rate"] == 1
+
+
+def test_throttle_learns_from_current_rate_once_per_job_and_survives_restart():
+    limiter = RequestLimiter(max_rate=40, ramp_after=1, monotonic=lambda: 0)
+    limiter.record_success()  # Current rate is 2.5, below the configured ceiling.
+    limiter.record_throttle(now=START)
+    assert limiter.learning_state == {
+        "learned_rate": 1.875, "throttles": 1,
+        "last_throttle": {"at": START.isoformat(), "rate_before": 2.5, "rate_after": 1.875},
+    }
+    workers = [threading.Thread(target=limiter.record_throttle) for _ in range(12)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    assert limiter.learning_state["throttles"] == 1
+    assert limiter.learning_state["learned_rate"] == 1.875
+    limiter.record_failure(cooldown=0)
+    for _ in range(100):
+        limiter.record_success()
+    assert limiter.stats["current_requests_per_second"] <= 1.875
+    restarted = RequestLimiter(max_rate=40, learned_rate=limiter.learning_state["learned_rate"])
+    assert restarted.stats["current_requests_per_second"] == 1.875
+    restarted.record_throttle(now=START + timedelta(hours=1))
+    assert restarted.learning_state["learned_rate"] == 1.40625
+
+
+def test_learning_can_reduce_rates_below_a_fixed_practical_floor():
+    limiter = RequestLimiter(max_rate=.02, learned_rate=.01)
+    limiter.record_throttle(now=START)
+    assert limiter.stats["maximum_requests_per_second"] == pytest.approx(.0075)
+    assert limiter.stats["current_requests_per_second"] == pytest.approx(.0075)
+
+
+@pytest.mark.parametrize("status", [403, 429])
+def test_only_http_429_lowers_the_ceiling_while_both_access_codes_stop_collection(tmp_path, status):
+    limiter, _, _ = fake_limiter()
+    cache = Cache(tmp_path, fetch=True, limiter=limiter, now=lambda: START)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(status, headers={"Retry-After": "7200"})
+
+    attach_transport(cache, handler)
+    try:
+        with pytest.raises(SourceBlocked, match=str(status)):
+            cache.get("one.json", "https://json.edhrec.com/one.json")
+        assert limiter.learning_state["learned_rate"] == (1.5 if status == 429 else None)
+        assert limiter.learning_state["throttles"] == (1 if status == 429 else 0)
+        assert limiter.stats["retry_after_seconds"] == 7200
+        with pytest.raises(SourceBlocked, match="stopped"):
+            cache.get("two.json", "https://json.edhrec.com/two.json")
+        assert len(calls) == 1
+    finally:
+        cache.close()
 
 
 def test_access_block_interrupts_a_worker_already_waiting_for_its_request_slot():

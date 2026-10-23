@@ -1,8 +1,4 @@
-"""Rolling full-catalog collection with independent network and model workers.
-
-The 96-hour window is a measured objective, never a claim that a configured
-request ceiling establishes source capacity or guarantees completion.
-"""
+"""Rolling full-catalog collection with source-paced completion estimates."""
 
 from __future__ import annotations
 
@@ -12,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import gzip
 import hashlib
 import json
+import math
 import multiprocessing
 from pathlib import Path
 import shutil
@@ -108,6 +105,7 @@ def collection_options(args, slug: str, remaining_seconds: float):
     options.request_delay, options.preview_workers = args.request_delay, args.preview_workers
     options.source_max_age_hours, options.index_max_age_hours = args.source_max_age_hours, args.index_max_age_hours
     options.target_completion_hours = args.target_completion_hours
+    options.freshness_target_hours = getattr(args, "freshness_target_hours", 96)
     options.trust_index_versions, options.defer_partial_analysis = True, True
     options.max_preview_seconds = min(args.max_preview_seconds, max(1, remaining_seconds))
     return options
@@ -126,6 +124,22 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     state = json.loads(state_path.read_text()) if state_path.exists() else {"schema_version": 1, "commanders": {}}
     if state.get("schema_version") != 1 or not isinstance(state.get("commanders"), dict):
         raise ValueError("Invalid collection checkpoint")
+    source_rate = state.get("source_rate", {})
+    if not isinstance(source_rate, dict):
+        raise ValueError("Invalid source rate checkpoint")
+    learned_rate = source_rate.get("learned_rate")
+    if learned_rate is not None:
+        if (isinstance(learned_rate, bool) or not isinstance(learned_rate, (float, int))
+                or not math.isfinite(learned_rate) or learned_rate <= 0):
+            raise ValueError("Learned source rate must be finite and positive")
+    saved_observed_rate = source_rate.get("observed_requests_per_second")
+    if saved_observed_rate is not None:
+        if (isinstance(saved_observed_rate, bool) or not isinstance(saved_observed_rate, (float, int))
+                or not math.isfinite(saved_observed_rate) or saved_observed_rate <= 0):
+            raise ValueError("Observed source rate must be finite and positive")
+    prior_throttles = source_rate.get("throttles", 0)
+    if isinstance(prior_throttles, bool) or not isinstance(prior_throttles, int) or prior_throttles < 0:
+        raise ValueError("Invalid source throttle count")
     requested = set(args.commanders or [])
     known = {row["commander_slug"] for row in rows}
     if requested - known:
@@ -145,13 +159,14 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                          and state["commanders"][slug].get("coverage_complete")
                          and not state["commanders"][slug].get("unavailable_previews")
                          and (verified := source_time(state["commanders"][slug].get("verified_at"))) is not None
-                         and -300 <= (observed_at - verified).total_seconds() < args.target_completion_hours * 3600
+                         and -300 <= (observed_at - verified).total_seconds() < getattr(args, "freshness_target_hours", 96) * 3600
                          and (args.output_dir / f"{slug}.json").exists() for slug in rows_by_slug)
     if cycle_complete and (observed_at - cycle_start).total_seconds() >= args.refresh_after_days * 86400:
         cycle_start = observed_at
         cycle["cycle_started_at"] = observed_at.isoformat()
     summary = {"snapshot_date": args.snapshot_date, "pipeline_version": 1, "catalog_size": len(rows),
                "cycle_started_at": cycle_start.isoformat(), "target_completion_hours": args.target_completion_hours,
+               "freshness_target_hours": getattr(args, "freshness_target_hours", 96),
                "completed": [], "collected": [], "failures": [], "blocked": False,
                "dry_run": args.dry_run, "publish_needed": False, "continuation_needed": False,
                "no_progress": True, "time_budget_reached": False, "new_previews_attempted": 0,
@@ -181,31 +196,70 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         elapsed = max(0.0, monotonic() - started)
         remaining = sum(max(0, int(record.get("frame_decks", rows_by_slug[slug].get("total_decks") or 0))
                             - (int(record.get("current_previews", 0)) if source_time(record.get("verified_at"))
-                               and (now() - source_time(record["verified_at"])).total_seconds() < args.target_completion_hours * 3600 else 0))
+                               and (now() - source_time(record["verified_at"])).total_seconds() < getattr(args, "freshness_target_hours", 96) * 3600 else 0))
                         for slug in rows_by_slug for record in [state["commanders"].get(slug, {})])
         preview_rate = summary["new_previews_attempted"] / elapsed if elapsed > 0 and summary["new_previews_attempted"] else None
         # ``limiter`` lives in the enclosing run after initialization; before
         # then (including dry runs) no throughput measurement exists.
         measured_limiter = limiter_holder[0]
         stats = measured_limiter.stats if measured_limiter is not None else None
-        rate = stats.get("successful_responses", 0) / elapsed if stats and elapsed > 0 and stats.get("successful_responses") else None
+        if measured_limiter is not None:
+            learning = measured_limiter.learning_state
+            if learning["learned_rate"] is not None:
+                persisted = dict(state.get("source_rate", {}))
+                persisted.update(learned_rate=learning["learned_rate"],
+                                 throttles=prior_throttles + learning["throttles"])
+                if learning["last_throttle"] is not None:
+                    persisted["last_throttle"] = learning["last_throttle"]
+                state["source_rate"] = persisted
+        effective_ceiling = min(args.requests_per_second, state.get("source_rate", {}).get("learned_rate")
+                                or args.requests_per_second)
+        if stats is not None:
+            effective_ceiling = min(effective_ceiling, stats["maximum_requests_per_second"])
+        measured_rate = (stats.get("successful_responses", 0) / elapsed
+                         if stats and elapsed > 0 and stats.get("successful_responses") else None)
+        if measured_rate is not None:
+            state.setdefault("source_rate", {}).update(observed_requests_per_second=measured_rate,
+                                                       observed_rate_at=now().isoformat())
+        rate = measured_rate or state.get("source_rate", {}).get("observed_requests_per_second")
+        summary["effective_request_ceiling_per_second"] = effective_ceiling
+        summary["source_rate"] = dict(state.get("source_rate", {}))
+        if (summary["new_previews_attempted"] > 0
+                or state.get("source_rate", {}).get("learned_rate") != learned_rate):
+            summary["publish_needed"] = True
         summary["preview_processing_rate"] = preview_rate
         overhead = 19 * sum(not source_time(state["commanders"].get(slug, {}).get("last_collection_at"))
                             or (now() - source_time(state["commanders"][slug]["last_collection_at"])).total_seconds()
                             >= args.index_max_age_hours * 3600 for slug in rows_by_slug)
+        cooldown_until = source_time(state.get("blocked_until"))
+        cooldown_seconds = max(0.0, (cooldown_until - now()).total_seconds()) if cooldown_until else 0.0
         summary["capacity"] = plan_capacity(rows, target_hours=args.target_completion_hours,
-            max_requests_per_second=args.requests_per_second, observed_requests_per_second=rate,
+            max_requests_per_second=args.requests_per_second, effective_requests_per_second=effective_ceiling,
+            observed_requests_per_second=rate, cooldown_seconds=cooldown_seconds,
             elapsed_seconds=max(0, (now() - cycle_start).total_seconds()), remaining_previews=remaining,
             remaining_overhead_requests=overhead, now=now())
+        summary["capacity"]["rate_limit_learned"] = state.get("source_rate", {}).get("learned_rate") is not None
+        summary["capacity"]["observed_rate_at"] = state.get("source_rate", {}).get("observed_rate_at")
         summary["capacity"]["unavailable_previews"] = sum(state["commanders"].get(slug, {}).get("unavailable_previews", 0)
                                                          for slug in rows_by_slug)
         summary["capacity"]["analysis_pending"] = sum(state["commanders"].get(slug, {}).get("status") == "analysis_pending"
                                                       for slug in rows_by_slug)
         summary["remaining_in_batch"] = sum(eligible(slug) for slug in rows_by_slug)
-        summary["deadline_target_met"] = (remaining == 0 and summary["remaining_in_batch"] == 0
-                                           and not summary["capacity"]["unavailable_previews"])
+        summary["deadline_target_met"] = (None if args.target_completion_hours is None else
+            remaining == 0 and summary["remaining_in_batch"] == 0 and not summary["capacity"]["unavailable_previews"])
         summary["capacity"]["disk_free_bytes"] = shutil.disk_usage(root).free
         summary["elapsed_seconds"] = round(elapsed, 3)
+        state["progress"] = {"updated_at": now().isoformat(), "cycle_started_at": cycle_start.isoformat(),
+            **{key: summary.get(key) for key in ("blocked", "blocked_until", "time_budget_reached", "no_progress", "resource_limit")},
+            "capacity": summary["capacity"], "measured_request_rate": stats,
+            "rate_control": {"learned_rate": state.get("source_rate", {}).get("learned_rate"),
+                "last_throttle": state.get("source_rate", {}).get("last_throttle"),
+                "throttles": state.get("source_rate", {}).get("throttles", 0),
+                "observed_requests_per_second": rate,
+                "observed_rate_at": state.get("source_rate", {}).get("observed_rate_at"),
+                "configured_requests_per_second": args.requests_per_second,
+                "effective_requests_per_second": effective_ceiling,
+                "status": "learned_below_observed_throttle" if state.get("source_rate", {}).get("learned_rate") else "calibrating"}}
         if not args.dry_run:
             atomic_json(state_path, state)
             atomic_json(summary_path, summary)
@@ -219,7 +273,8 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         return summary
     if args.dry_run:
         return summary
-    limiter = RequestLimiter(max_rate=args.requests_per_second, start_rate=min(2, args.requests_per_second), ramp_after=100)
+    limiter = RequestLimiter(max_rate=args.requests_per_second, learned_rate=learned_rate,
+                             start_rate=min(2, args.requests_per_second), ramp_after=100)
     limiter_holder[0] = limiter
     transport, metadata_lock = PreviewTransport(), threading.Lock()
     repository = MetadataRepository(args.card_metadata_cache, max_age_days=args.source_max_age_hours / 24)

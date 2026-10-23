@@ -140,7 +140,7 @@ jobs:
                 --max-runtime-seconds 14400 --pipeline --workers 6 --preview-workers 16 --analysis-workers 2
                 --requests-per-second "${REQUESTS_PER_SECOND}"
                 --source-max-age-hours 72 --refresh-after-days 3
-                --target-completion-hours 96 --prune-completed-cache)
+                --freshness-target-hours 96 --prune-completed-cache)
           if [[ -n "${DATASET_DATE:-}" ]]; then
             args+=(--upstream-snapshot-date "${DATASET_DATE}")
           fi
@@ -219,3 +219,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: gh workflow run build-commander-styles.yml --ref "${DEFAULT_BRANCH}"
+
+      - name: Fail the run after preserving collection progress
+        if: always() && steps.collect_styles.outcome == 'failure'
+        run: |
+          echo "::error::Collection stopped or failed. Uploaded checkpoints retain progress; inspect the collection summary before retrying."
+          exit 1

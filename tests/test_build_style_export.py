@@ -127,6 +127,53 @@ def test_freshness_summary_counts_full_current_sources_and_unknown_legacy_report
     assert (summary["target_met"], summary["overdue"]) == (1, 0)
 
 
+def test_export_publishes_compact_checkpoint_rate_and_eta_without_internal_state(tmp_path):
+    processed, site = tmp_path / "processed", tmp_path / "site"
+    progress = {
+        "updated_at": "2026-10-23T02:47:17Z", "blocked": True, "blocked_until": "2026-10-23T03:47:17Z",
+        "capacity": {"remaining_requests": 12_000_000, "effective_requests_per_second": 1.5,
+                     "configured_requests_per_second": 40, "rate_limit_learned": True,
+                     "estimated_minimum_seconds": 8_000_000, "measured_projection_seconds": 9_000_000,
+                     "projected_finish_at": "2027-02-04T06:47:17Z", "internal_cache_file": "/private/cache"},
+        "rate_control": {"learned_rate": 1.5, "status": "learned_below_observed_throttle", "throttles": 1,
+                         "last_throttle": {"at": "2026-10-23T02:47:17Z", "rate_before": 2, "rate_after": 1.5,
+                                           "raw_response": "private debug content"}},
+        "measured_request_rate": {"successful_responses": 128, "elapsed_seconds": 65.4},
+        "selected": ["private-queue-entry"],
+    }
+    write_json(processed / "build-styles/_collection/state.json", {
+        "progress": progress, "commanders": {"private-queue-entry": {"cache_file": "/private/state"}}})
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"]}), processed, site,
+                                     seed_dir=tmp_path / "missing-seeds")
+    index = json.loads((site / "build-styles/index.json").read_text())
+    public = index["collection_progress"]
+    assert public["updated_at"] == progress["updated_at"]
+    assert public["capacity"]["estimated_minimum_seconds"] == 8_000_000
+    assert public["rate_control"]["learned_rate"] == 1.5
+    assert public["blocked"] is True
+    assert "/private" not in json.dumps(public)
+    assert "selected" not in public and "commanders" not in public
+    assert "raw_response" not in public["rate_control"]["last_throttle"]
+
+
+def test_progress_export_chooses_latest_valid_snapshot_and_tolerates_bad_optional_state(tmp_path):
+    processed, seed = tmp_path / "processed/build-styles", tmp_path / "seeds"
+    write_json(seed / "_collection/state.json", {"progress": {
+        "updated_at": "2026-10-20T00:00:00Z", "capacity": {"remaining_requests": 100}}})
+    write_json(processed / "_collection/state.json", {"progress": {
+        "updated_at": "2026-10-21T00:00:00Z", "capacity": {"remaining_requests": 90}}})
+    write_json(processed.parent / "build_style_batch.json", {
+        "capacity": {"evaluated_at": "2026-10-22T00:00:00Z", "remaining_requests": 80}})
+    progress = exporter.read_build_collection_progress([processed, seed])
+    assert progress["capacity"]["remaining_requests"] == 80
+    assert progress["updated_at"] == "2026-10-22T00:00:00Z"
+    (processed.parent / "build_style_batch.json").write_text('{"capacity":NaN}')
+    assert exporter.read_build_collection_progress([processed, seed])["capacity"]["remaining_requests"] == 90
+    write_json(processed / "_collection/state.json", {"progress": {
+        "updated_at": "2026-10-23T00:00:00", "capacity": {"remaining_requests": 70}}})
+    assert exporter.read_build_collection_progress([processed, seed])["capacity"]["remaining_requests"] == 100
+
+
 def test_malformed_samples_do_not_prevent_other_exports(tmp_path):
     samples = tmp_path / "samples"
     write_json(samples / "commander-a.json", report())

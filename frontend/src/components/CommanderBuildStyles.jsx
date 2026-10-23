@@ -306,16 +306,16 @@ function BuildReport({ report }) {
     <p className="build-intro">Themes can overlap or describe different builds. Explore related tag profiles and the recurring card packages found in individual decks.</p>
     <p className="build-coverage">Coverage: {formatNumber(report.profiles.profiles.length)} tag profiles and {formatNumber(analyzed)} unique sampled decks from {formatNumber(report.total_edhrec_decks)} decks listed by EDHREC. This sample is not every deck and does not establish how common a style is.</p>
     <div className="build-source-status">
-      <strong>{progress.targetMet ? "Full index meets the four-day freshness target" : progress.label}</strong>
+      <strong>{progress.targetMet ? "Full index verified recently" : progress.label}</strong>
       {!progress.analysisCurrent ? <p>Analysis awaiting the current deck collection. The packages shown still describe the previously analyzed decklists.</p> : null}
       {progress.known ? <p>{formatNumber(progress.attempted)} of {formatNumber(progress.frame)} available deck previews attempted. {progress.complete ? "Unavailable or unusable lists can still be excluded from analysis." : "Collection resumes across runs. A completed analysis of the collected decks does not mean the full index has been checked."}</p> : <p>The available index size and collection progress were not recorded for this report.</p>}
-      {progress.unavailable > 0 ? <p>{formatNumber(progress.unavailable)} previews were unavailable or could not be read. The full-deck freshness target remains unmet.</p> : null}
+      {progress.unavailable > 0 ? <p>{formatNumber(progress.unavailable)} previews were unavailable or could not be read. Full deck coverage remains incomplete.</p> : null}
       <p className={`build-source-status__age build-source-status__age--${freshness.status}`}>{freshness.label}.{freshness.versionsVerified
         ? (freshness.oldestVerifiedAt ? ` Oldest version verification: ${checkedDate(freshness.oldestVerifiedAt)}.` : " Version-verification dates are unavailable.")
         : (freshness.oldestSourceAt ? ` Oldest successful preview check: ${checkedDate(freshness.oldestSourceAt)}.` : " This report has no verified source-check dates.")}</p>
       {freshness.versionsVerified ? <p className="build-note">{freshness.oldestSourceAt ? `Oldest actual decklist download: ${checkedDate(freshness.oldestSourceAt)}.` : "Original decklist-download dates are unavailable."} Current index checks verify unchanged deck IDs; new or changed versions require downloading the decklist.</p> : null}
       <p className="build-note">{progress.indexSourceAt ? `Deck index checked ${checkedDate(progress.indexSourceAt)}.${progress.indexFresh ? "" : " The index needs a freshness check."}` : "The deck index’s source-check date is unknown."}</p>
-      <p className="build-note">The target is to check the full available index within four days. Check dates record when EDHREC was read; they do not establish when a deck owner last changed a deck. Rebuilding this analysis does not reset source age.</p>
+      <p className="build-note">Collection follows the request rate learned from EDHREC. Build discovery shows the catalog’s completion estimate. Check dates record when EDHREC was read; they do not establish when a deck owner last changed a deck. Rebuilding this analysis does not reset source age.</p>
     </div>
     <div className="build-view-switch" role="group" aria-label="Build discovery views"><button type="button" aria-pressed={view === "decks"} onClick={() => setView("decks")}>Individual deck packages</button><button type="button" aria-pressed={view === "profiles"} onClick={() => setView("profiles")}>Tag profile similarities</button></div>
     {view === "decks" ? <DeckPackages analysis={report.deck_analysis} /> : <TagProfiles profiles={report.profiles} />}
