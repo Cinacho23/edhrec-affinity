@@ -11,6 +11,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+from itertools import tee
 import math
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ import tempfile
 
 COLLECTOR = "build-commander-styles.yml"
 COOLDOWN = "resume-build-styles.yml"
+FRONTEND = "deploy-frontend.yml"
 ENVIRONMENT = "build-style-cooldown"
 MAX_WAIT_ATTEMPTS = 48
 ACTIVE = {"queued", "in_progress", "waiting", "pending", "requested"}
@@ -74,16 +76,17 @@ class GitHub:
             self._runs = self.api(f"{self.root}/actions/workflows/{COLLECTOR}/runs?per_page=30")["workflow_runs"]
         return self._runs
 
-    def trusted(self, run):
+    def trusted(self, run, workflow=COLLECTOR):
         return (run.get("head_branch") == self.default_branch and not str(run.get("event", "")).startswith("pull_request")
-                and str(run.get("path", "")).split("@", 1)[0].endswith(f"/{COLLECTOR}"))
+                and str(run.get("path", "")).split("@", 1)[0].endswith(f"/{workflow}"))
 
     def active(self, excluding=None):
         return any(self.trusted(run) and run.get("status") in ACTIVE and run["id"] != excluding
                    for run in self.runs())
 
-    def snapshot(self, run):
-        if not self.trusted(run) or run.get("status") != "completed":
+    def snapshot(self, run, *, allow_uploaded=False):
+        statuses = {"completed", "in_progress"} if allow_uploaded else {"completed"}
+        if not self.trusted(run) or run.get("status") not in statuses:
             return None
         run_id = run["id"]
         artifacts = self.api(f"{self.root}/actions/runs/{run_id}/artifacts?per_page=100")["artifacts"]
@@ -110,8 +113,27 @@ class GitHub:
                 if value is not None:
                     yield value
 
-    def source(self, run_id):
-        return self.snapshot(self.api(f"{self.root}/actions/runs/{run_id}"))
+    def source(self, run_id, *, allow_uploaded=False):
+        return self.snapshot(self.api(f"{self.root}/actions/runs/{run_id}"), allow_uploaded=allow_uploaded)
+
+    def publication_exists(self, source_run_id):
+        runs = self.api(f"{self.root}/actions/workflows/{FRONTEND}/runs?per_page=30")["workflow_runs"]
+        for run in runs:
+            match = re.fullmatch(r"Publish collector #(\d+)", str(run.get("display_title", "")))
+            if (self.trusted(run, FRONTEND) and match and int(match[1]) >= source_run_id
+                    and (run.get("status") in ACTIVE or run.get("conclusion") == "success")):
+                return True
+        return False
+
+    def cooldown_exists(self, source_run_id):
+        runs = self.api(f"{self.root}/actions/workflows/{COOLDOWN}/runs?per_page=30")["workflow_runs"]
+        title = rf"Resume collector #{source_run_id} after cooldown \(attempt \d+\)"
+        for run in sorted(runs, key=lambda value: value["id"], reverse=True):
+            if self.trusted(run, COOLDOWN) and re.fullmatch(title, str(run.get("display_title", ""))):
+                # A successful earlier attempt may only have queued a longer
+                # wait. A later failed attempt must remain repairable.
+                return run.get("status") in ACTIVE or run.get("conclusion") == "success"
+        return False
 
     def verify_timer(self):
         environment = self.api(f"{self.root}/environments/{ENVIRONMENT}")
@@ -205,6 +227,44 @@ def classify_outcome(summary):
     return "failed" if summary.get("failures") and summary.get("no_progress") else "success"
 
 
+def publish_source(client, source, *, pending_changes=False):
+    if source is None or not source.durable:
+        raise ValueError("Frontend publication requires an uploaded collector checkpoint and summary")
+    if not pending_changes and source.summary.get("publish_needed", bool(source.summary.get("completed"))) is not True:
+        return {"publication_dispatched": False}
+    if client.publication_exists(source.run_id):
+        return {"publication_dispatched": False, "publication_current": True}
+    client.dispatch(FRONTEND, {"source_run_id": str(source.run_id)})
+    return {"publication_dispatched": True, "publication_source_run_id": source.run_id}
+
+
+def repair_publication(client, source, older):
+    if source.summary.get("publish_needed", bool(source.summary.get("completed"))) is True:
+        return publish_source(client, source)
+    # An unchanged batch still includes previous cumulative reports. If their
+    # dispatch failed, publish the newest checkpoint rather than losing that
+    # retry opportunity or rolling the website back to an older checkpoint.
+    pending = next((previous for previous in older if previous.durable and
+                    previous.summary.get("publish_needed", bool(previous.summary.get("completed"))) is True), None)
+    if pending is None or client.publication_exists(pending.run_id):
+        return {"publication_dispatched": False}
+    return publish_source(client, source, pending_changes=True)
+
+
+def queue_cooldown(client, source, *, now):
+    if source is None or not source.durable:
+        raise ValueError("Cooldown scheduling requires an uploaded collector checkpoint and summary")
+    expiry = timestamp(source.summary.get("blocked_until"))
+    if (not actual_rate_limit(source.summary) or not automatic_continuation_allowed(source.summary)
+            or expiry is None or expiry <= now):
+        return {"cooldown_dispatched": False}
+    if client.cooldown_exists(source.run_id):
+        return {"cooldown_dispatched": False, "cooldown_current": True}
+    client.verify_timer()
+    client.dispatch(COOLDOWN, {"source_run_id": str(source.run_id), "attempt": "0"})
+    return {"cooldown_dispatched": True, "cooldown_source_run_id": source.run_id}
+
+
 def recovery_plan(latest, older, *, requested_run_id, now):
     if latest is None or latest.run_id != requested_run_id or latest.durable:
         return {"run": False, "reason": "Recovery must name the latest incomplete trusted collector run"}
@@ -292,7 +352,9 @@ def merge_recovery_controls(state, summary, *, source_run_id, checkpoint_run_id,
 
 def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, attempt=0, recovery_run_id=None):
     if mode == "prepare-cooldown":
-        source = client.source(source_run_id)
+        # The collector dispatches immediately after immutable artifact upload,
+        # before its own final bookkeeping steps finish.
+        source = client.source(source_run_id, allow_uploaded=True)
         if (source is None or not source.durable or not actual_rate_limit(source.summary)
                 or not automatic_continuation_allowed(source.summary)):
             return {"wait": False, "reason": "No durable rate-limit pause to resume"}
@@ -305,10 +367,28 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
         client.verify_timer()
         return {"wait": True, "source_run_id": source.run_id, "attempt": attempt,
                 "reason": "Waiting through the configured GitHub environment timer"}
+    downstream = {}
+    prefetched = None
+    if mode == "watchdog":
+        prefetched = iter(client.snapshots())
+        candidate = next(prefetched, None)
+        if candidate is not None and candidate.durable:
+            history, prefetched = tee(prefetched)
+            for name, dispatch in (("publication", lambda: repair_publication(client, candidate, history)),
+                                   ("cooldown", lambda: queue_cooldown(client, candidate, now=now))):
+                try:
+                    downstream.update(dispatch())
+                except (ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    # A broken downstream route must not stop collection or
+                    # prevent the independent publication/cooldown repair.
+                    downstream[f"{name}_error"] = str(error)
     if client.active(excluding=current_run_id):
-        return {"run": False, "reason": "A collector is already running or queued"}
-    snapshots = iter(client.snapshots())
-    latest = next(snapshots, None)
+        return {"run": False, "reason": "A collector is already running or queued", **downstream}
+    if prefetched is not None:
+        latest, snapshots = candidate, prefetched
+    else:
+        snapshots = iter(client.snapshots())
+        latest = next(snapshots, None)
     if mode == "preflight" and recovery_run_id:
         result = recovery_plan(latest, list(snapshots), requested_run_id=recovery_run_id, now=now)
     else:
@@ -327,12 +407,12 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
         result["dispatched"] = True
     if latest is not None:
         result["snapshot"] = latest.summary
-    return result
+    return {**result, **downstream}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("preflight", "watchdog", "prepare-cooldown", "resume", "outcome", "recover-control"))
+    parser.add_argument("mode", choices=("preflight", "watchdog", "prepare-cooldown", "resume", "outcome", "recover-control", "publish", "publication", "queue-cooldown"))
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--current-run-id", type=int, default=int(os.environ.get("GITHUB_RUN_ID", "0")))
     parser.add_argument("--source-run-id", type=int)
@@ -358,6 +438,24 @@ def main():
                 message = ("the separate cooldown timer resumes collection" if automatic_continuation_allowed(summary)
                            else "this bounded run does not restart collection automatically")
                 print(f"::notice::Rate-limit cooldown is active. Progress is saved; {message}.")
+        elif args.mode in {"publish", "publication", "queue-cooldown"}:
+            if args.mode == "publication" and args.source_run_id is None:
+                result = {"publish": True}
+            else:
+                if args.source_run_id is None or args.source_run_id <= 0:
+                    raise ValueError("A valid collector source run is required")
+                client = GitHub(args.repository)
+                source = client.source(args.source_run_id, allow_uploaded=True)
+                if args.mode == "publish":
+                    result = publish_source(client, source)
+                elif args.mode == "queue-cooldown":
+                    result = queue_cooldown(client, source, now=datetime.now(timezone.utc))
+                elif source is None or not source.durable:
+                    raise ValueError("Frontend publication source is not a trusted uploaded collector checkpoint")
+                else:
+                    # An explicit validated dispatch may repair a missed prior
+                    # publication using this newer cumulative checkpoint.
+                    result = {"publish": True, "source_run_id": source.run_id}
         elif args.mode == "recover-control":
             if not args.recovery_run_id or not args.restored_run_id or args.state_file is None:
                 raise ValueError("Recovery requires the interrupted run, restored run and state file")
@@ -391,7 +489,7 @@ def main():
                 for key, value in result.items():
                     output.write(f"{key}={str(value).lower() if isinstance(value, bool) else value}\n")
         print(json.dumps(result, allow_nan=False))
-        return 0
+        return 1 if result.get("publication_error") or result.get("cooldown_error") else 0
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.TimeoutExpired) as error:
         print(f"::error::{error}")
         return 1

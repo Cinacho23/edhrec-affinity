@@ -183,7 +183,7 @@ jobs:
                 --output-dir "${STYLES_DIR}" --snapshot-date "${SAMPLE_DATE}"
                 --max-commanders "${MAX_COMMANDERS}" --sample-decks "${SAMPLE_DECKS}"
                 --max-components "${MAX_COMPONENTS}" --min-total-decks 200
-                --max-runtime-seconds 1800 --pipeline --workers 6 --preview-workers 16 --analysis-workers 2
+                --max-runtime-seconds 1800 --pipeline --workers 1 --preview-workers 16 --analysis-workers 2
                 --requests-per-second "${REQUESTS_PER_SECOND}"
                 --source-max-age-hours 72 --refresh-after-days 3
                 --freshness-target-hours 96 --prune-completed-cache)
@@ -220,6 +220,7 @@ jobs:
           retention-days: 2
 
       - name: Upload collection summary
+        id: collection_summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -232,6 +233,22 @@ jobs:
         id: collection_status
         if: always() && steps.checkpoint.outcome == 'success'
         run: python3 scripts/coordinate_build_styles.py outcome --summary-file data/build-style-artifact/build_style_batch.json
+
+      - name: Publish the uploaded collector checkpoint
+        id: publication
+        if: always() && steps.checkpoint.outcome == 'success' && steps.collection_summary.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/coordinate_build_styles.py publish --source-run-id "${GITHUB_RUN_ID}"
+
+      - name: Schedule a saved rate-limit cooldown
+        id: cooldown
+        if: always() && steps.checkpoint.outcome == 'success' && steps.collection_summary.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/coordinate_build_styles.py queue-cooldown --source-run-id "${GITHUB_RUN_ID}"
 
       - name: Decide whether collection can continue immediately
         id: continuation
@@ -282,4 +299,16 @@ jobs:
         if: always() && steps.collect_styles.outcome == 'failure' && steps.collection_status.outputs.status != 'rate_limit_paused'
         run: |
           echo "::error::Collection stopped or failed. Uploaded checkpoints retain progress; inspect the collection summary before retrying."
+          exit 1
+
+      - name: Report a frontend publication failure
+        if: always() && steps.publication.outcome == 'failure'
+        run: |
+          echo "::error::Checkpoint was saved, but frontend publication could not be dispatched. Collection continues and the watchdog retries publication."
+          exit 1
+
+      - name: Report a cooldown scheduling failure
+        if: always() && steps.cooldown.outcome == 'failure'
+        run: |
+          echo "::error::Checkpoint was saved, but the cooldown waiter could not be dispatched. The watchdog retries scheduling the saved pause."
           exit 1
