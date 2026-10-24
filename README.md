@@ -81,7 +81,7 @@ from EDHREC; access restrictions and server cooldowns stop all source workers.
 Rate learning preserves existing decks and their original source-check dates.
 
 Every supported package can generate a native 100-card deck using learned card
-preferences and the sampled card pool, with one primary category tag per card,
+preferences and the sampled card pool, with untagged card lists,
 a primer, Moxfield text export and per-card inclusion/lift averages. Bracket estimates and recorded
 external ratings are shown separately from card legality checks.
 

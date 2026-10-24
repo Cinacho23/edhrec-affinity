@@ -103,7 +103,7 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
     }
   }
   return <details className="build-generated-deck" onToggle={(event) => setExpanded(event.currentTarget.open)}>
-    <summary><span>Generated {formatNumber(deck.card_count)}-card deck</span><span className="build-generated-deck__summary-note">Cards, tagged export & primer</span></summary>
+    <summary><span>Generated {formatNumber(deck.card_count)}-card deck</span><span className="build-generated-deck__summary-note">Cards, export & primer</span></summary>
     {expanded ? <div className="build-generated-deck__content">
       <h5>{deck.name || `Package ${packageNumber} deck`}</h5>
       <p className="build-note">A suggested deck assembled from the sampled card pool for this package. Card names support hover and keyboard previews.</p>
@@ -118,20 +118,19 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
       </div>
       {!metadataFresh ? <p className="build-generated-deck__review-note">Current card-rule freshness has not been verified. Refresh card metadata before relying on current legality.</p> : null}
       <div className="build-generated-deck__actions">
-        {exportText ? <><button type="button" onClick={() => copyText(exportText, "Tagged deck")}>Copy for Moxfield</button><button type="button" onClick={() => downloadDeckText(exportText, deck.name, "txt")}>Download deck .txt</button></> : null}
+        {exportText ? <><button type="button" onClick={() => copyText(exportText, "Deck")}>Copy for Moxfield</button><button type="button" onClick={() => downloadDeckText(exportText, deck.name, "txt")}>Download deck .txt</button></> : null}
         {primer ? <button type="button" onClick={() => copyText(primer, "Primer")}>Copy primer</button> : null}
       </div>
       {validation.external_url ? <p className="build-source-links"><SourceLink url={validation.external_url}>Check on EDHPowerLevel</SourceLink></p> : null}
       <ExternalDeckRating rating={validation.external_rating} />
       <p className="build-generated-deck__copy-status" role="status" aria-live="polite">{copyStatus}</p>
-      <p className="build-note">Paste the tagged card list into Moxfield’s text import. Each card has one primary category tag, matching its group below. Commander markers are included.</p>
+      <p className="build-note">Paste the card list into Moxfield’s text import. Commander markers are included.</p>
       <div className="build-generated-deck__card-list" tabIndex="0" role="region" aria-label={`Package ${packageNumber} generated deck cards`}>
         {groups.map((group) => <section className="build-generated-deck__role" key={group.name}>
           <h6>{group.name} <span>{formatNumber(group.count)}</span></h6>
-          <table><thead><tr><th scope="col">Card</th><th scope="col">Tags</th><th scope="col">Avg. inclusion</th><th scope="col">Avg. lift</th></tr></thead>
+          <table><thead><tr><th scope="col">Card</th><th scope="col">Avg. inclusion</th><th scope="col">Avg. lift</th></tr></thead>
             <tbody>{group.cards.map((card) => <tr key={card.name}>
               <th scope="row"><span className="build-generated-deck__quantity">{card.quantity}</span> <DeckCardName name={card.name} /></th>
-              <td><div className="build-generated-deck__card-tags">{card.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></td>
               <td>{formatBuildShare(card.average_inclusion)}</td><td>{formatBuildLift(card.average_lift)}</td>
             </tr>)}</tbody>
           </table>
@@ -160,7 +159,7 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
       </details>
       {primer ? <details className="build-evidence build-generated-deck__primer" open><summary>Package primer</summary><div className="build-generated-deck__primer-text">{splitPrimerCardReferences(primer).map((part, index) => part.type === "card"
         ? <span key={index}>[[<DeckCardName name={part.text} />]]</span> : <span key={index}>{part.text}</span>)}</div><button type="button" onClick={() => downloadDeckText(primer, `${deck.name || "generated-deck"}-primer`, "md")}>Download primer .md</button></details> : null}
-      {exportText ? <details className="build-evidence"><summary>Tagged import text</summary><textarea className="build-generated-deck__export" aria-label={`Package ${packageNumber} tagged import text`} readOnly value={exportText} spellCheck={false} /></details> : null}
+      {exportText ? <details className="build-evidence"><summary>Import text</summary><textarea className="build-generated-deck__export" aria-label={`Package ${packageNumber} import text`} readOnly value={exportText} spellCheck={false} /></details> : null}
     </div> : null}
   </details>;
 }
@@ -193,7 +192,7 @@ function PackageCard({ pkg, index, decks }) {
           <table>
             <thead><tr><th scope="col">Card</th><th scope="col">In package decks</th><th scope="col">Other decks</th></tr></thead>
             <tbody>{(pkg.top_cards || []).map((card) => (
-              <tr key={card.name}><th scope="row">{card.name}</th><td>{formatBuildShare(card.member_rate)}</td><td>{formatBuildShare(card.other_rate)}</td></tr>
+              <tr key={card.name}><th scope="row"><DeckCardName name={card.name} /></th><td>{formatBuildShare(card.member_rate)}</td><td>{formatBuildShare(card.other_rate)}</td></tr>
             ))}</tbody>
           </table>
         </div>

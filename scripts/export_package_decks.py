@@ -29,14 +29,15 @@ def export_decks(report: dict, output: Path) -> list[dict]:
             stem.with_suffix(".txt").write_text(deck["export_text"], encoding="utf-8")
             stem.with_suffix(".primer.md").write_text(deck["primer"], encoding="utf-8")
             with stem.with_suffix(".ranking.csv").open("w", encoding="utf-8", newline="") as handle:
-                fields = ["name", "quantity", "average_inclusion", "average_lift", "member_inclusion", "tags"]
+                fields = ["name", "quantity", "average_inclusion", "average_lift", "member_inclusion"]
                 writer = csv.DictWriter(handle, fieldnames=fields)
                 writer.writeheader()
                 for row in deck["cards"]:
-                    writer.writerow({field: "; ".join(row.get("tags", [])) if field == "tags" else row.get(field)
-                                     for field in fields})
+                    writer.writerow({field: row.get(field) for field in fields})
+            commanders = {row["name"] for row in deck.get("commanders", [])}
             measured = [row for row in deck["cards"]
-                        if "Commander" not in row.get("tags", []) and row.get("average_lift") is not None]
+                        if row["name"] not in commanders and row.get("primary_role") != "Commander"
+                        and row.get("average_lift") is not None]
             highest = max(measured, key=lambda row: row["average_lift"], default=None)
             summaries.append({"model": model_name, "package": index, "card_count": deck["card_count"],
                               "highest_average_lift": {"name": highest["name"], "lift": highest["average_lift"]} if highest else None,
