@@ -31,6 +31,10 @@ class GitHub:
         self.is_active, self.timer = active, timer
         self.dispatches = []
         self.timer_checks = 0
+        self.publications = set()
+        self.publication_failure = False
+        self.cooldowns = set()
+        self.cooldown_failure = False
 
     def active(self, excluding=None):
         return self.is_active
@@ -38,7 +42,7 @@ class GitHub:
     def snapshots(self):
         return iter(self.saved)
 
-    def source(self, run_id):
+    def source(self, run_id, *, allow_uploaded=False):
         return next((item for item in self.saved if item.run_id == run_id), None)
 
     def verify_timer(self):
@@ -47,7 +51,21 @@ class GitHub:
             raise ValueError("Environment must have a wait timer of at least 60 minutes")
 
     def dispatch(self, workflow, inputs=None):
+        if workflow == coordinator.FRONTEND and self.publication_failure:
+            raise RuntimeError("Publication dispatch unavailable")
+        if workflow == coordinator.COOLDOWN and self.cooldown_failure:
+            raise RuntimeError("Cooldown dispatch unavailable")
         self.dispatches.append((workflow, inputs or {}))
+        if workflow == coordinator.FRONTEND:
+            self.publications.add(int(inputs["source_run_id"]))
+        if workflow == coordinator.COOLDOWN:
+            self.cooldowns.add(int(inputs["source_run_id"]))
+
+    def publication_exists(self, source_run_id):
+        return any(run_id >= source_run_id for run_id in self.publications)
+
+    def cooldown_exists(self, source_run_id):
+        return source_run_id in self.cooldowns
 
 
 def test_watchdog_and_preflight_skip_active_collectors_before_reading_checkpoints():
@@ -62,7 +80,8 @@ def test_watchdog_waits_without_retrying_source_before_known_cooldown_expires():
     result = coordinator.coordinate(github, "watchdog", now=NOW)
     assert result["run"] is False
     assert result["retry_at"] == (NOW + timedelta(hours=1)).isoformat()
-    assert github.dispatches == [] and github.timer_checks == 0
+    assert github.dispatches == [(coordinator.COOLDOWN, {"source_run_id": "100", "attempt": "0"})]
+    assert github.timer_checks == 1
 
 
 @pytest.mark.parametrize("scope", [{"commanders": ["commander-a"]}, {"sample_decks": 60},
@@ -209,11 +228,17 @@ def github_stub(tmp_path, summary, *, durable=True):
         elif "/workflows/" in endpoint and "/runs?" in endpoint:
             print(json.dumps({"workflow_runs":[{"id":100,"path":".github/workflows/build-commander-styles.yml",
                 "head_branch":"main","event":"workflow_dispatch","status":"completed"}]}))
+        elif endpoint.endswith("/actions/runs/100"):
+            print(json.dumps({"id":100,"path":".github/workflows/build-commander-styles.yml",
+                "head_branch":"main","event":"workflow_dispatch",
+                "status":os.environ.get("TEST_SOURCE_STATUS","completed")}))
         elif "/artifacts?" in endpoint:
             artifacts=[{"name":"build-style-summary-100","expired":False}]
             if os.environ["TEST_DURABLE"] == "1":
                 artifacts.append({"name":"build-styles-2026-10-23-100","expired":False})
             print(json.dumps({"artifacts":artifacts}))
+        elif "/environments/" in endpoint:
+            print(json.dumps({"protection_rules":[{"type":"wait_timer","wait_timer":60}]}))
         else:
             sys.exit("Unexpected GitHub endpoint")
     '''))
@@ -315,6 +340,181 @@ def test_recovery_cli_requires_a_manual_workflow_dispatch_event(tmp_path):
                             env={**os.environ, "GITHUB_EVENT_NAME": "schedule"}, text=True, capture_output=True)
     assert result.returncode == 1
     assert "explicit workflow_dispatch" in result.stdout
+
+
+def test_saved_rate_limit_progress_dispatches_frontend_explicitly_once():
+    github = GitHub([paused(publish_needed=True)])
+    source = github.saved[0]
+    assert coordinator.publish_source(github, source)["publication_dispatched"] is True
+    assert github.dispatches == [(coordinator.FRONTEND, {"source_run_id": "100"})]
+    assert coordinator.publish_source(github, source)["publication_current"] is True
+    assert len(github.dispatches) == 1
+
+
+def test_newer_queued_publication_prevents_watchdog_from_republishing_an_older_checkpoint():
+    client = object.__new__(coordinator.GitHub)
+    client.root, client.default_branch = "repos/owner/repo", "main"
+    runs = [{"display_title": "Publish collector #101", "status": "queued", "head_branch": "main",
+             "event": "workflow_dispatch", "path": ".github/workflows/deploy-frontend.yml"}]
+    client.api = lambda endpoint: {"workflow_runs": runs}
+    assert client.publication_exists(100) is True
+    assert client.publication_exists(102) is False
+    github = GitHub([{"publish_needed": True}], active=True)
+    github.publications.add(101)
+    assert coordinator.coordinate(github, "watchdog", now=NOW)["publication_current"] is True
+    assert github.dispatches == []
+
+
+def test_saved_actual_429_dispatches_the_explicit_waiter_once():
+    github = GitHub([paused()])
+    source = github.saved[0]
+    assert coordinator.queue_cooldown(github, source, now=NOW)["cooldown_dispatched"] is True
+    assert github.dispatches == [(coordinator.COOLDOWN, {"source_run_id": "100", "attempt": "0"})]
+    assert coordinator.queue_cooldown(github, source, now=NOW)["cooldown_current"] is True
+    assert len(github.dispatches) == 1 and github.timer_checks == 1
+
+
+def test_a_failed_later_cooldown_attempt_can_be_repaired_despite_an_earlier_success():
+    client = object.__new__(coordinator.GitHub)
+    client.root, client.default_branch = "repos/owner/repo", "main"
+    trusted = {"head_branch": "main", "event": "workflow_dispatch",
+               "path": ".github/workflows/resume-build-styles.yml", "status": "completed"}
+    runs = [{**trusted, "id": 201, "display_title": "Resume collector #100 after cooldown (attempt 0)",
+             "conclusion": "success"},
+            {**trusted, "id": 202, "display_title": "Resume collector #100 after cooldown (attempt 1)",
+             "conclusion": "failure"}]
+    client.api = lambda endpoint: {"workflow_runs": runs}
+    assert client.cooldown_exists(100) is False
+    runs[1].update(status="waiting", conclusion=None)
+    assert client.cooldown_exists(100) is True
+
+
+@pytest.mark.parametrize("summary", [
+    {"blocked": False}, paused(throttles=0), paused(block_reason="access_restriction"),
+    paused(scope={"sample_decks": 60}), paused(automatic_continuation_allowed=False),
+    paused(expiry=NOW), paused(blocked_until="invalid"),
+])
+def test_cooldown_dispatch_does_not_turn_other_stops_into_automatic_full_collection(summary):
+    github = GitHub([summary])
+    assert coordinator.queue_cooldown(github, github.saved[0], now=NOW)["cooldown_dispatched"] is False
+    assert github.dispatches == [] and github.timer_checks == 0
+
+
+def test_cooldown_dispatch_requires_an_uploaded_checkpoint_and_a_verified_free_timer():
+    github = GitHub([paused()], timer=False)
+    for source in (None, coordinator.Snapshot(100, paused(), durable=False)):
+        with pytest.raises(ValueError, match="uploaded collector checkpoint"):
+            coordinator.queue_cooldown(github, source, now=NOW)
+    with pytest.raises(ValueError, match="60 minutes"):
+        coordinator.queue_cooldown(github, github.saved[0], now=NOW)
+    assert github.dispatches == []
+
+
+def test_watchdog_repairs_a_missing_cooldown_even_when_publication_fails():
+    github = GitHub([paused(publish_needed=True)])
+    github.publication_failure = True
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["run"] is False and result["cooldown_dispatched"] is True
+    assert result["publication_error"] == "Publication dispatch unavailable"
+    assert github.dispatches == [(coordinator.COOLDOWN, {"source_run_id": "100", "attempt": "0"})]
+
+
+def test_failed_cooldown_dispatch_does_not_prevent_saved_partial_progress_publication():
+    github = GitHub([paused(publish_needed=True)])
+    github.cooldown_failure = True
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["run"] is False and result["publication_dispatched"] is True
+    assert result["cooldown_error"] == "Cooldown dispatch unavailable"
+    assert github.dispatches == [(coordinator.FRONTEND, {"source_run_id": "100"})]
+
+
+def test_publication_requires_a_checkpoint_and_does_not_deploy_unchanged_data():
+    github = GitHub([{"publish_needed": False}])
+    assert coordinator.publish_source(github, github.saved[0])["publication_dispatched"] is False
+    assert github.dispatches == []
+    for source in (None, coordinator.Snapshot(100, {"publish_needed": True}, durable=False)):
+        with pytest.raises(ValueError, match="uploaded collector checkpoint"):
+            coordinator.publish_source(github, source)
+    assert github.dispatches == []
+
+
+def test_watchdog_repairs_publication_while_another_collector_is_active():
+    github = GitHub([{"publish_needed": True}], active=True)
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["run"] is False and result["publication_dispatched"] is True
+    assert github.dispatches == [(coordinator.FRONTEND, {"source_run_id": "100"})]
+
+
+def test_watchdog_publishes_the_latest_cumulative_checkpoint_for_older_missed_changes(tmp_path):
+    github = GitHub([{"publish_needed": False}, {"publish_needed": True}], active=True)
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["run"] is False and result["publication_source_run_id"] == 100
+    assert github.dispatches == [(coordinator.FRONTEND, {"source_run_id": "100"})]
+    assert coordinator.coordinate(github, "watchdog", now=NOW)["publication_dispatched"] is False
+    assert len(github.dispatches) == 1
+    environment, _ = github_stub(tmp_path, github.saved[0].summary)
+    source_run_id = github.dispatches[0][1]["source_run_id"]
+    receiver = subprocess.run([sys.executable, str(SCRIPT), "publication", "--source-run-id", source_run_id],
+                              env=environment, text=True, capture_output=True)
+    assert receiver.returncode == 0, receiver.stdout + receiver.stderr
+    assert "publish=true" in (tmp_path / "output").read_text()
+
+
+def test_failed_publication_does_not_prevent_collection_continuation():
+    github = GitHub([{"publish_needed": True, "remaining_in_batch": 10}])
+    github.publication_failure = True
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["run"] is True and result["dispatched"] is True
+    assert result["publication_error"] == "Publication dispatch unavailable"
+    assert github.dispatches == [(coordinator.COLLECTOR, {})]
+
+
+def test_watchdog_can_publish_when_collection_is_complete_and_no_next_batch_is_due():
+    github = GitHub([{"publish_needed": True, "remaining_in_batch": 0,
+                      "capacity": {"evaluated_at": NOW.isoformat()}}])
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["run"] is False and result["publication_dispatched"] is True
+    assert github.dispatches == [(coordinator.FRONTEND, {"source_run_id": "100"})]
+
+
+@pytest.mark.parametrize("changed", [True, False])
+def test_frontend_receiver_accepts_an_explicit_uploaded_source_before_collector_completion(tmp_path, changed):
+    environment, dispatches = github_stub(tmp_path, {"publish_needed": changed})
+    environment["TEST_SOURCE_STATUS"] = "in_progress"
+    result = subprocess.run([sys.executable, str(SCRIPT), "publication", "--source-run-id", "100"],
+                            env=environment, text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "publish=true" in (tmp_path / "output").read_text()
+    assert "source_run_id=100" in (tmp_path / "output").read_text()
+    assert not dispatches.exists()
+
+
+def test_real_publish_cli_uses_authenticated_workflow_dispatch_instead_of_workflow_run(tmp_path):
+    environment, dispatches = github_stub(tmp_path, {"publish_needed": True})
+    environment["TEST_SOURCE_STATUS"] = "in_progress"
+    result = subprocess.run([sys.executable, str(SCRIPT), "publish", "--source-run-id", "100"],
+                            env=environment, text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    request = json.loads(dispatches.read_text())
+    assert request["endpoint"].endswith("/workflows/deploy-frontend.yml/dispatches")
+    assert request["body"] == {"ref": "main", "inputs": {"source_run_id": "100"}}
+
+
+def test_explicit_cooldown_cli_accepts_uploaded_artifacts_before_the_collector_finishes(tmp_path):
+    environment, dispatches = github_stub(tmp_path, paused(expiry=datetime(2099, 1, 1, tzinfo=timezone.utc)))
+    environment["TEST_SOURCE_STATUS"] = "in_progress"
+    result = subprocess.run([sys.executable, str(SCRIPT), "queue-cooldown", "--source-run-id", "100"],
+                            env=environment, text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    request = json.loads(dispatches.read_text())
+    assert request["endpoint"].endswith("/workflows/resume-build-styles.yml/dispatches")
+    assert request["body"] == {"ref": "main", "inputs": {"source_run_id": "100", "attempt": "0"}}
+    dispatches.unlink()
+    result = subprocess.run([sys.executable, str(SCRIPT), "prepare-cooldown", "--source-run-id", "100"],
+                            env=environment, text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "wait=true" in (tmp_path / "output").read_text()
+    assert not dispatches.exists()
 
 
 def test_recovery_merges_only_conservative_source_controls_not_unuploaded_progress():

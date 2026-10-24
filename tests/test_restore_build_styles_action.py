@@ -73,3 +73,22 @@ def test_api_failure_is_not_hidden_by_jq_success(tmp_path):
     result, candidates = run_listing(tmp_path, [], api_failure=True)
     assert result.returncode == 7
     assert candidates == ""
+
+
+@pytest.mark.parametrize("status,preferred,allow,branch,event,accepted", [
+    ("completed", "100", "false", "main", "workflow_dispatch", True),
+    ("in_progress", "100", "true", "main", "workflow_dispatch", True),
+    ("in_progress", "100", "false", "main", "workflow_dispatch", False),
+    ("in_progress", "200", "true", "main", "workflow_dispatch", False),
+    ("in_progress", "100", "true", "feature", "workflow_dispatch", False),
+    ("in_progress", "100", "true", "main", "pull_request_target", False),
+])
+def test_only_the_verified_preferred_upload_may_be_restored_before_workflow_completion(status, preferred, allow, branch, event, accepted):
+    script = textwrap.dedent(ACTION.read_text().split("      run: |\n", 1)[1])
+    block = script[script.index('uploaded_preferred="false"'):script.index('staging="$(mktemp', script.index('uploaded_preferred="false"'))]
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", f"for run_id in 100; do\n{block}\necho accepted\ndone"],
+        env={**os.environ, "status": status, "BUILD_STYLE_PREFERRED_RUN": preferred,
+             "BUILD_STYLE_ALLOW_UPLOADED_RUN": allow, "source_branch": branch,
+             "source_event": event, "BUILD_STYLE_DEFAULT_BRANCH": "main"}, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert ("accepted" in result.stdout) is accepted

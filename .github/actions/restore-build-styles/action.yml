@@ -8,6 +8,10 @@ inputs:
     description: Prefer this completed run, falling back to the newest usable default-branch checkpoint
     required: false
     default: ""
+  allow-uploaded-preferred-run:
+    description: Accept a verified immutable upload from the explicitly preferred run before its workflow finishes
+    required: false
+    default: "false"
 outputs:
   restored:
     description: Whether a usable artifact was restored
@@ -23,6 +27,7 @@ runs:
       env:
         BUILD_STYLE_DESTINATION: ${{ inputs.destination }}
         BUILD_STYLE_PREFERRED_RUN: ${{ inputs.run-id }}
+        BUILD_STYLE_ALLOW_UPLOADED_RUN: ${{ inputs.allow-uploaded-preferred-run }}
         GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
@@ -44,7 +49,11 @@ runs:
           IFS=$'\t' read -r status source_branch source_event < <(
             gh run view "${run_id}" --json status,headBranch,event --jq '[.status, .headBranch, .event] | @tsv'
           )
-          if [[ "${status}" != "completed" || "${source_branch}" != "${BUILD_STYLE_DEFAULT_BRANCH}" || "${source_event}" == pull_request* ]]; then
+          uploaded_preferred="false"
+          if [[ "${BUILD_STYLE_ALLOW_UPLOADED_RUN}" == "true" && "${run_id}" == "${BUILD_STYLE_PREFERRED_RUN}" && "${status}" == "in_progress" ]]; then
+            uploaded_preferred="true"
+          fi
+          if [[ ( "${status}" != "completed" && "${uploaded_preferred}" != "true" ) || "${source_branch}" != "${BUILD_STYLE_DEFAULT_BRANCH}" || "${source_event}" == pull_request* ]]; then
             continue
           fi
           staging="$(mktemp -d "${RUNNER_TEMP}/build-style-restore.XXXXXX")"

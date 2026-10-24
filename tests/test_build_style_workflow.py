@@ -25,7 +25,9 @@ def step(path, name):
             break
         lines.append(line)
     body = "\n".join(lines)
-    return body, textwrap.dedent(body.split("        run: |\n", 1)[1])
+    script = (textwrap.dedent(body.split("        run: |\n", 1)[1]) if "        run: |\n" in body
+              else body.split("        run: ", 1)[1].splitlines()[0])
+    return body, script
 
 
 def stub(tmp_path, name, program):
@@ -49,6 +51,8 @@ def test_scheduled_collection_uses_source_freshness_without_a_completion_deadlin
     args = json.loads(result.stdout)
     assert args[args.index("--freshness-target-hours") + 1] == "96"
     assert args[args.index("--max-runtime-seconds") + 1] == "1800"
+    assert args[args.index("--workers") + 1] == "1"
+    assert args[args.index("--preview-workers") + 1] == "16"
     assert args[args.index("--min-total-decks") + 1] == "200"
     assert "--target-completion-hours" not in args
     assert "reset_target" not in COLLECTOR.read_text()
@@ -135,21 +139,40 @@ def test_explicit_recovery_pins_restore_and_merges_source_controls_before_collec
     assert "recover-control" in script and "--restored-run-id" in script
 
 
-@pytest.mark.parametrize("publish", [True, False])
-def test_failed_collector_only_publishes_when_summary_reports_changes(tmp_path, publish):
+def test_frontend_routes_an_explicit_source_to_validated_publication_helper(tmp_path):
     _, script = step(DEPLOY, "Inspect collection summary")
-    (tmp_path / "python").symlink_to(sys.executable)
-    stub(tmp_path, "gh", """\
-        import os, pathlib, sys
-        destination = pathlib.Path(sys.argv[sys.argv.index("--dir") + 1])
-        (destination / "build_style_batch.json").write_text(os.environ["TEST_SUMMARY"])
+    stub(tmp_path, "python3", """\
+        import json, sys
+        print(json.dumps(sys.argv[1:]))
     """)
-    output = tmp_path / "output"
     result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], text=True, capture_output=True,
         env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
-             "RUNNER_TEMP": str(tmp_path), "SOURCE_RUN_ID": "123", "GITHUB_EVENT_NAME": "workflow_run",
-             "GITHUB_REPOSITORY": "owner/repository", "GITHUB_OUTPUT": str(output),
-             "TEST_SUMMARY": json.dumps({"blocked": True, "publish_needed": publish})})
+             "SOURCE_RUN_ID": "123"})
     assert result.returncode == 0, result.stderr
-    assert output.read_text() == f"publish={str(publish).lower()}\n"
-    assert "contains(fromJSON('[\"success\", \"failure\"]'), github.event.workflow_run.conclusion)" in DEPLOY.read_text()
+    assert json.loads(result.stdout) == ["scripts/coordinate_build_styles.py", "publication", "--source-run-id", "123"]
+    assert "workflow_run:" not in DEPLOY.read_text()
+    assert "workflow_dispatch:" in DEPLOY.read_text() and "  push:" in DEPLOY.read_text()
+
+
+def test_publication_requires_both_uploads_but_failure_does_not_stop_source_continuation():
+    body, script = step(COLLECTOR, "Publish the uploaded collector checkpoint")
+    assert "steps.checkpoint.outcome == 'success'" in body
+    assert "steps.collection_summary.outcome == 'success'" in body
+    assert "continue-on-error: true" in body
+    assert " publish --source-run-id " in script
+    workflow = COLLECTOR.read_text()
+    assert workflow.index("      - name: Continue from the uploaded checkpoint") < workflow.index(
+        "      - name: Report a frontend publication failure")
+
+
+def test_cooldown_dispatch_uses_the_token_exception_after_both_durable_uploads():
+    body, script = step(COLLECTOR, "Schedule a saved rate-limit cooldown")
+    assert "steps.checkpoint.outcome == 'success'" in body
+    assert "steps.collection_summary.outcome == 'success'" in body
+    assert "continue-on-error: true" in body
+    assert "GH_TOKEN: ${{ github.token }}" in body
+    assert 'queue-cooldown --source-run-id "${GITHUB_RUN_ID}"' in script
+    waiter = (ROOT / ".github/workflows/resume-build-styles.yml").read_text()
+    assert "workflow_run:" not in waiter and "workflow_dispatch:" in waiter
+    assert "SOURCE_RUN_ID: ${{ inputs.source_run_id }}" in waiter
+    assert "Resume collector #{0} after cooldown (attempt {1})" in waiter

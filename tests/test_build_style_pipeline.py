@@ -100,6 +100,86 @@ def test_complete_collection_is_saved_analyzed_and_published_separately(tmp_path
     assert json.loads((args.output_dir / "a.json").read_text())["collection"]["analysis_current"] is True
 
 
+def chunked_collector(ticks, progress, calls, *, frames=None):
+    """One virtual second represents one finite preview-collection visit."""
+    def collect(settings, **_):
+        slug = settings.commander
+        frame = (frames or {}).get(slug, 200)
+        before = progress.get(slug, 0)
+        progress[slug] = min(frame, before + 50)
+        calls.append(slug)
+        ticks[0] += 1
+        return evidence(slug, frame=frame, loaded=progress[slug],
+                        new_attempts=progress[slug] - before, complete=progress[slug] == frame,
+                        dataset=f"{slug}-{progress[slug]}")
+    return collect
+
+
+def test_time_sliced_full_frames_finish_before_visiting_the_entire_catalog(tmp_path):
+    args = options(tmp_path, max_runtime_seconds=8, max_preview_seconds=1)
+    ticks, progress, calls, analyzed = [0], {}, [], []
+    inventory = rows(*[f"commander-{index:02d}" for index in range(20)])
+    result = execute(args, inventory, chunked_collector(ticks, progress, calls), saved_analyzer(analyzed),
+                     monotonic=lambda: ticks[0])
+    assert result["completed"]
+    assert result["time_budget_reached"]
+    assert len(set(calls)) < len(inventory)
+    for slug in result["completed"]:
+        report = json.loads((args.output_dir / f"{slug}.json").read_text())
+        assert report["total_edhrec_decks"] == 200
+        assert report["collection"]["frame_decks"] == report["collection"]["previews_loaded"] == 200
+        assert report["collection"]["complete"] is True
+        assert report["collection"]["target_mode"] == "all"
+
+
+def test_saved_partial_finishes_before_a_new_equal_sized_frame_on_the_next_job(tmp_path):
+    args = options(tmp_path, max_runtime_seconds=2, max_preview_seconds=1)
+    ticks, progress, calls, analyzed = [0], {}, [], []
+    collect = chunked_collector(ticks, progress, calls)
+    first = execute(args, rows("partial"), collect, saved_analyzer(analyzed), monotonic=lambda: ticks[0])
+    assert first["completed"] == []
+    assert checkpoint(args)["commanders"]["partial"]["current_previews"] == 100
+    calls.clear()
+    ticks[0] = 0
+    second = execute(args, rows("a-new", "partial"), collect, saved_analyzer(analyzed),
+                     checked=NOW + timedelta(minutes=31), monotonic=lambda: ticks[0])
+    assert second["completed"] == ["partial"]
+    assert "a-new" not in calls
+    assert checkpoint(args)["commanders"]["partial"]["coverage_complete"] is True
+
+
+def test_two_large_frames_do_not_monopolize_a_small_queued_commander(tmp_path):
+    args = options(tmp_path, max_runtime_seconds=8, max_preview_seconds=1)
+    ticks, progress, calls, analyzed = [0], {}, [], []
+    # Catalog counts may initially underestimate the actual available index.
+    # Once each large frame is discovered, its continuation must yield to the
+    # smaller remaining frame instead of trading priority with the other giant.
+    frames = {"a-giant": 100_000, "b-giant": 100_000, "c-small": 200}
+    result = execute(args, rows(*frames), chunked_collector(ticks, progress, calls, frames=frames),
+                     saved_analyzer(analyzed), monotonic=lambda: ticks[0])
+    assert "c-small" in result["completed"]
+    assert set(calls[:2]) == {"a-giant", "b-giant"}
+    assert progress["a-giant"] < frames["a-giant"] and progress["b-giant"] < frames["b-giant"]
+    report = json.loads((args.output_dir / "c-small.json").read_text())
+    assert report["collection"]["complete"] is True
+    assert report["collection"]["previews_loaded"] == 200
+
+
+def test_completed_report_refresh_waits_for_the_unfinished_backlog(tmp_path):
+    args = options(tmp_path, max_runtime_seconds=4, max_preview_seconds=1)
+    old = NOW - timedelta(days=2)
+    atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": {
+        "a-refresh": {"status": "fitted", "coverage_complete": True, "frame_decks": 200,
+                      "current_previews": 200, "verified_at": old.isoformat()},
+    }})
+    atomic_json(args.output_dir / "a-refresh.json", {"commander_slug": "a-refresh"})
+    ticks, progress, calls, analyzed = [0], {}, [], []
+    result = execute(args, rows("a-refresh", "new"), chunked_collector(ticks, progress, calls),
+                     saved_analyzer(analyzed), monotonic=lambda: ticks[0])
+    assert result["completed"] == ["new"]
+    assert "a-refresh" not in calls
+
+
 def test_pipeline_collects_only_commanders_with_at_least_200_total_decks(tmp_path):
     args, collected = options(tmp_path), []
     inventory = [{"commander_slug": slug, "total_decks": count}

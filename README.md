@@ -89,4 +89,7 @@ Collector batches continue after durable checkpoint uploads. A separate protecte
 GitHub environment waits through confirmed HTTP 429 cooldowns before resuming;
 its 60-minute wait timer is configured outside the workflow. A metadata-only
 ten-minute watchdog recovers idle work without downloading the full dataset.
+Collection focuses on one commander at a time, using saved progress and remaining
+work to finish reports promptly. Completed checkpoints explicitly trigger website
+publication, including collections started by GitHub Actions itself.
 Access restrictions remain distinct from rate-limit pauses.

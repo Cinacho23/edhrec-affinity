@@ -1,10 +1,7 @@
 name: Resume commander collection after cooldown
+run-name: "${{ format('Resume collector #{0} after cooldown (attempt {1})', inputs.source_run_id, inputs.attempt || 0) }}"
 
 on:
-  workflow_run:
-    workflows: ["Update commander build styles"]
-    branches: [main]
-    types: [completed]
   workflow_dispatch:
     inputs:
       source_run_id:
@@ -39,7 +36,7 @@ jobs:
         id: pause
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.source_run_id }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           WAIT_ATTEMPT: ${{ inputs.attempt || 0 }}
         run: python3 scripts/coordinate_build_styles.py prepare-cooldown --source-run-id "${SOURCE_RUN_ID}" --attempt "${WAIT_ATTEMPT}"
 

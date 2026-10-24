@@ -196,9 +196,21 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                 or (verified - now()).total_seconds() > 300
                 or (now() - verified).total_seconds() >= min(args.refresh_after_days * 86400, args.index_max_age_hours * 3600))
 
-    queue = sorted((slug for slug in rows_by_slug if eligible(slug)), key=lambda slug: (
-        state["commanders"].get(slug, {}).get("attempted_at", ""),
-        valid_deck_count(rows_by_slug[slug].get("total_decks")), slug))
+    def collection_priority(slug):
+        record = state["commanders"].get(slug, {})
+        published = (args.output_dir / f"{slug}.json").exists()
+        # Finish current inputs before refreshing already published reports.
+        # Inside that backlog, the smallest remaining frame can produce a full
+        # report soonest. A started frame wins ties without letting a huge
+        # partial displace every untouched, much smaller commander.
+        phase = (0 if record.get("status") == "analysis_pending" else
+                 2 if record.get("coverage_complete") and published else 1)
+        frame = valid_deck_count(record.get("frame_decks")) or valid_deck_count(rows_by_slug[slug].get("total_decks"))
+        loaded = valid_deck_count(record.get("current_previews")) or 0
+        remaining = max(0, frame - loaded)
+        return (phase, remaining, not bool(loaded), record.get("attempted_at", ""), slug)
+
+    queue = sorted((slug for slug in rows_by_slug if eligible(slug)), key=collection_priority)
     if args.max_commanders:
         queue = queue[:args.max_commanders]
     summary["selected"] = list(queue)
@@ -392,7 +404,12 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                     atomic_json(destination, report)
                                     summary["publish_needed"] = True
                                 if new_attempts:
-                                    queue.append(slug)  # Continue full coverage, never a sample-count ceiling.
+                                    # A finite visit must not send useful partial
+                                    # work behind thousands of untouched frames.
+                                    # Reapply the same remaining-work priority;
+                                    # other small frames can still outrank a giant.
+                                    queue.append(slug)
+                                    queue.sort(key=collection_priority)
                                 else:
                                     record.update(status="failed", retry_after=(now() + timedelta(minutes=30)).isoformat())
                             if args.prune_completed_cache:
