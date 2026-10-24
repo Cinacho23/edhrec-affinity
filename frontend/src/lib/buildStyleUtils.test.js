@@ -133,8 +133,8 @@ test("shares distinguish missing evidence from a measured zero; external links d
   assert.equal(safeExternalUrl("https://edhrec.com/deckpreview/abc"), "https://edhrec.com/deckpreview/abc");
 });
 
-test("legacy decks display and export one primary category per card", () => {
-  const deck = { commanders: [{ name: "Commander A", quantity: 1 }], cards: [
+test("legacy decks display and export plain card lists without category tags", () => {
+  const deck = { commanders: [{ name: "Commander A", quantity: 1 }], export_text: "1 Hybrid spell #Card Draw\n", cards: [
     { name: "Hybrid spell", quantity: 1, primary_role: "Card Draw", tags: ["Card Draw", "Tokens", "+1/+1 Counters"] },
     { name: "Forest", quantity: 35, tags: ["Lands"] },
     { name: "Commander A", quantity: 1, primary_role: "Tokens", tags: ["Commander", "Tokens"] },
@@ -143,14 +143,11 @@ test("legacy decks display and export one primary category per card", () => {
   ] };
   const groups = getGeneratedDeckGroups(deck);
   assert.deepEqual(groups.map(({ name, count }) => [name, count]), [
-    ["Commander", 1], ["Lands", 35], ["Card Draw", 1], ["Other Spells", 1],
+    ["Commander", 1], ["Main deck", 37],
   ]);
-  assert.deepEqual(groups.find((group) => group.name === "Card Draw").cards[0].tags,
-    ["Card Draw"]);
+  assert.ok(groups.flatMap((group) => group.cards).every((card) => !("tags" in card)));
   const exported = getGeneratedDeckExport(deck);
-  assert.ok(exported.includes("1 Hybrid spell #Card Draw\n"));
-  assert.ok(exported.includes("1 Commander A *CMDR* #Commander\n"));
-  assert.ok(exported.trim().split("\n").every((line) => line.split("#").length === 2));
+  assert.equal(exported, "1 Commander A *CMDR*\n35 Forest\n1 Hybrid spell\n1 Unknown role\n");
   assert.deepEqual(deck.cards[0].tags, ["Card Draw", "Tokens", "+1/+1 Counters"]);
   assert.equal(groups.reduce((total, group) => total + group.count, 0), 38);
   assert.equal(deck.cards[0].name, "Hybrid spell");
@@ -208,10 +205,12 @@ test("static external ratings and card-rule metadata expire at view time", () =>
   assert.equal(isBuildMetadataFresh(metadata, checked - 5 * 60 * 1000 - 1), false);
 });
 
-test("generated deck groups preserve the generator's functional role order", () => {
+test("generated deck sections use commanders and alphabetical main deck cards", () => {
   const roles = ["Commander", "Lands", "Fast Mana", "Ramp", "Card Advantage", "Wipe", "Removal", "Tutor", "Recursion", "Protection", "Leftover"];
   const cards = roles.toReversed().map((primary_role) => ({ name: `${primary_role} card`, quantity: 1, primary_role, tags: [primary_role, "Theme A"] }));
-  assert.deepEqual(getGeneratedDeckGroups({ cards }).map((group) => group.name), roles);
+  const groups = getGeneratedDeckGroups({ cards });
+  assert.deepEqual(groups.map((group) => group.name), ["Commander", "Main deck"]);
+  assert.deepEqual(groups[1].cards.map((card) => card.name), roles.slice(1).map((role) => `${role} card`).toSorted());
 });
 
 function sourceCollection(overrides = {}) {

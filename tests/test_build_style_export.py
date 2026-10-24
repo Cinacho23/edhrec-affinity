@@ -1,6 +1,8 @@
 """Static build-style coverage and collection bounds; no live EDHREC requests."""
 
 import importlib.util
+import csv
+from copy import deepcopy
 import json
 from pathlib import Path
 
@@ -616,17 +618,40 @@ def test_partial_collection_retains_durable_state_and_rotates_with_new_coverage(
     assert "commander-a" in queue and "commander-b" in queue
 
 
-def test_export_converts_existing_decks_to_one_tag_without_changing_cards_or_rating(tmp_path):
+def test_export_removes_legacy_tags_from_all_models_without_changing_cards_primers_or_rating(tmp_path):
     source = report()
     deck = {"status": "generated", "commanders": [{"name": "Commander"}], "cards": [
-        {"name": "Commander", "quantity": 1, "primary_role": "Commander", "tags": ["Commander", "Tokens"]},
-        {"name": "Hybrid", "quantity": 1, "primary_role": "Ramp", "tags": ["Ramp", "Removal", "Tokens"]},
-    ], "validation": {"external_rating": {"deck_sha256": "same-card-list"}}, "export_text": "old multi-tag export"}
+        {"name": "Commander", "quantity": 1, "tags": ["Commander", "Tokens"], "average_lift": 100},
+        {"name": "Hybrid", "quantity": 1, "primary_role": "Ramp", "tags": ["Removal", "Tokens"], "average_lift": 3},
+        {"name": "Forest", "quantity": 98, "tags": ["Lands"]},
+    ], "card_count": 100, "primer": "Plan\nDevelop mana with [[Hybrid]].",
+        "validation": {"external_rating": {"deck_sha256": "same-card-list"}}, "export_text": "old multi-tag export"}
     source["deck_analysis"]["packages"][0]["generated_deck"] = deck
+    source["deck_analysis"]["alternative_models"] = [{"components": 2, "packages": [{"generated_deck": deepcopy(deck)}]}]
     write_json(tmp_path / "processed/build-styles/commander-a.json", source)
     exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"]}),
                                      tmp_path / "processed", tmp_path / "site", seed_dir=tmp_path / "none")
-    saved = json.loads((tmp_path / "site/build-styles/commander-a.json").read_text())["deck_analysis"]["packages"][0]["generated_deck"]
-    assert [card["tags"] for card in saved["cards"]] == [["Commander"], ["Ramp"]]
-    assert saved["validation"] == deck["validation"]
-    assert saved["export_text"] == "1 Commander *CMDR* #Commander\n1 Hybrid #Ramp\n"
+    saved_report = json.loads((tmp_path / "site/build-styles/commander-a.json").read_text())
+    analysis = saved_report["deck_analysis"]
+    saved_decks = [analysis["packages"][0]["generated_deck"],
+                   analysis["alternative_models"][0]["packages"][0]["generated_deck"]]
+    for saved in saved_decks:
+        assert all("tags" not in card for card in saved["cards"])
+        assert [card["primary_role"] for card in saved["cards"]] == ["Commander", "Ramp", "Lands"]
+        assert [(card["name"], card["quantity"]) for card in saved["cards"]] == [
+            (card["name"], card["quantity"]) for card in deck["cards"]]
+        assert saved["validation"] == deck["validation"]
+        assert saved["primer"] == deck["primer"]
+        assert saved["export_text"] == "1 Commander *CMDR*\n1 Hybrid\n98 Forest\n"
+
+    # The downloadable files normalize legacy reports too, and commander lift
+    # must remain excluded after public card tags are removed.
+    summaries = load_script("export_package_decks").export_decks(source, tmp_path / "decks")
+    assert len(summaries) == 2
+    for summary in summaries:
+        assert summary["highest_average_lift"] == {"name": "Hybrid", "lift": 3}
+        assert Path(summary["deck_file"]).read_text() == "1 Commander *CMDR*\n1 Hybrid\n98 Forest\n"
+        with Path(summary["ranking_file"]).open(newline="") as handle:
+            ranking = csv.DictReader(handle)
+            assert ranking.fieldnames == ["name", "quantity", "average_inclusion", "average_lift", "member_inclusion"]
+            assert [(row["name"], row["quantity"]) for row in ranking] == [("Commander", "1"), ("Hybrid", "1"), ("Forest", "98")]

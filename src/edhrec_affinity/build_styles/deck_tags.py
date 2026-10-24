@@ -1,4 +1,4 @@
-"""One public category per card; internal deckbuilding roles can still overlap."""
+"""Keep generated exports untagged while retaining internal deckbuilding roles."""
 
 
 def normalize_deck_tags(deck: dict) -> None:
@@ -6,11 +6,12 @@ def normalize_deck_tags(deck: dict) -> None:
     lines = []
     for card in deck.get("cards", []):
         role = ("Commander" if card["name"] in commanders else
-                card.get("primary_role") or card.get("role") or next(iter(card.get("tags", [])), "Leftover"))
+                card.get("primary_role") or card.get("role") or next(iter(card.get("tags") or []), "Leftover"))
         role = str(role).replace("#", "").replace("\n", " ").strip() or "Leftover"
-        card.update(tags=[role], primary_role=role)
+        card["primary_role"] = role
+        card.pop("tags", None)
         marker = " *CMDR*" if role == "Commander" else ""
-        lines.append(f"{card['quantity']} {card['name']}{marker} #{role}")
+        lines.append(f"{card['quantity']} {card['name']}{marker}")
     if lines:
         deck["export_text"] = "\n".join(lines) + "\n"
 

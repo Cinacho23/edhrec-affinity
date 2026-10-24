@@ -11,6 +11,8 @@ Each sampled commander has two views:
 
 **Auto** chooses a package count starting at one. The selector also offers each supported precomputed alternative, so visitors can explore one or more packages without browser-side fitting or live scraping. The count is not fixed at three. Each package can suggest one, several, or no themes; a deck can combine several packages. Source tags are optional annotations and never determine packages.
 
+The Build Discovery catalog defaults to most Auto-selected packages, with analyzed deck count breaking ties. Visitors can sort either direction by package count, analyzed decks, total EDHREC decks, tag-profile count, index coverage, analysis date or commander name. Inclusive count ranges, commander search, analysis status, coverage and source-check age filters combine across every current collector report before pagination. Filter state is preserved in the URL; unknown metrics remain distinct from zero and sort last. The catalog's existing 200-deck eligibility and fresh-start scope still apply before these display filters.
+
 Coverage, sample size and collection date are shown. The collection queue includes every commander in the current index, including commanders with few decks. Missing reports produce an explanatory unavailable state without interrupting the commander’s tag table. Low-data results are recorded instead of forcing packages. Reports are sampled evidence, not estimates of every build’s population share.
 
 ## Automatic package count: 1–N
@@ -61,7 +63,7 @@ Omit `--fetch` for cache-only analysis. Existing pages are reused even with `--f
 
 The collector defaults to `--sample-decks all`, with no preview-count ceiling. A nonnegative count remains available for experiments; `0` uses imports only. IDs are shuffled before examining cardlists or tags. Batch jobs collect for up to five minutes per commander before analyzing all lists collected so far, saving compressed parsed lists and a frozen index in `_collection/previews/`. Later jobs resume rather than starting over. Reports expose the index size, cumulative attempts, loaded lists and completion status. All available index IDs does not guarantee every source-site deck is accessible or usable. Profiles use the most numerous reported tags with at least 25 decks by default, without a z-score gate. Use `--tags`, `--min-tag-decks` and `--max-tags` to adjust the profile cohort.
 
-A package is a recurring card pattern across collected decks, and one deck can mix several patterns. Each selectable count is fitted separately: package numbers do not identify the same strategy across models. Each package gets its own generated 100-card example. Published card rows and Moxfield exports have exactly one primary category tag; internal role checks can still recognize multiple functions.
+A package is a recurring card pattern across collected decks, and one deck can mix several patterns. Each selectable count is fitted separately: package numbers do not identify the same strategy across models. Each package gets its own generated 100-card example. Generated card lists and Moxfield exports omit category tags; internal role checks can still recognize multiple functions for construction and primers.
 
 Collections above 1,000 usable lists use sparse card matrices and a rank probe up to the model-count ceiling. All usable decks still enter model fitting. The optional quadratic near-copy diagnostic is omitted at that size (reported as unavailable); exact-copy filtering remains active. This avoids dense full-rank decompositions and pairwise comparisons growing with the uncapped index.
 
@@ -131,8 +133,8 @@ Scryfall supplies exact-name card rules, color identity and Commander legality
 in cached batches. Missing verified metadata or a complete legal anchor produces
 an unavailable result. Functional buckets use Oracle-text heuristics: Card
 Advantage, Ramp, Removal, Wipe, Tutor, Recursion, Protection, Lands, Fast Mana
-and Leftover. Cards can have several roles and supported package themes; labels
-are reused in the native list and Moxfield export. Primers use `[[Full Card Name]]`
+and Leftover. Cards can have several internal roles for construction and primers;
+the native card list and Moxfield export do not display category tags. Primers use `[[Full Card Name]]`
 references, with native hover previews and copy/download.
 
 Per-card ranking uses matched package themes and the selected bracket page,

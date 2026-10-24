@@ -77,8 +77,6 @@
 .build-generated-deck__quantity { color: var(--muted); }
 .build-card-name { color: var(--accent); cursor: help; }
 .build-card-name:hover { text-decoration: underline; }
-.build-generated-deck__card-tags { display: flex; flex-wrap: wrap; gap: .25rem; min-width: 110px; }
-.build-generated-deck__card-tags span { padding: .15rem .3rem; border-radius: 3px; background: rgb(148 163 184 / .09); color: var(--muted-strong); font-size: .65rem; }
 .build-generated-deck__checks { display: flex; flex-wrap: wrap; gap: .5rem .8rem; padding: 0; list-style: none; font-size: .73rem; color: var(--muted); }
 .build-generated-deck__checks li[data-passed="true"] > span { color: var(--accent); }
 .build-generated-deck__review-note { padding: .65rem .75rem; border: 1px solid rgb(253 230 138 / .25); border-radius: var(--radius-xs); color: var(--warning); background: var(--warning-bg); font-size: .76rem; }

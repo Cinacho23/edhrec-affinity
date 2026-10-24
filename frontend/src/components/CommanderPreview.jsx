@@ -25,6 +25,8 @@ export default function CommanderPreview({ commander, anchorRef, popupRef, id, o
       ? `${face.name || card.name} (${index === 0 ? "front" : "back"})`
       : face.name || card.name,
   })));
+  const preferredWidth = Math.max(360, Math.min(1040,
+    faces.length * 320 + Math.max(0, faces.length - 1) * 12 + 26));
 
   useEffect(() => {
     let active = true;
@@ -49,6 +51,7 @@ export default function CommanderPreview({ commander, anchorRef, popupRef, id, o
         onClose();
         return;
       }
+      popup.style.maxWidth = `${Math.max(0, viewportWidth - margin * 2)}px`;
       popup.style.maxHeight = `${Math.max(80, viewportHeight - margin * 2)}px`;
       const { width, height } = popup.getBoundingClientRect();
       let left = Math.max(margin, Math.min(rect.left, viewportWidth - width - margin));
@@ -95,7 +98,7 @@ export default function CommanderPreview({ commander, anchorRef, popupRef, id, o
       id={id}
       role="tooltip"
       className="commander-preview"
-      style={{ width: Math.max(220, Math.min(760, faces.length * 188 + 12)) }}
+      style={{ width: preferredWidth }}
       onPointerEnter={onPointerEnter}
       onPointerLeave={onPointerLeave}
     >

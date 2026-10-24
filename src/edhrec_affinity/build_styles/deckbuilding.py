@@ -444,7 +444,7 @@ def _primer(name, commander_rows, rows, package, statistics, bracket):
     lines = [title, "", "Plan", f"Build around {references(commander_rows)}."]
     if themes:
         lines.append(f"The learned package most closely matches these EDHREC profiles: {themes}.")
-    defining = sorted((row for row in rows if "Commander" not in row["tags"] and row["primary_role"] != "Lands"),
+    defining = sorted((row for row in rows if row["primary_role"] not in {"Commander", "Lands"}),
                       key=lambda row: (-row["member_inclusion"], row["name"]))[:5]
     if defining:
         lines.append(f"Recurring cards in this package include {references(defining)}; prioritize hands that can cast and support these cards.")
@@ -456,7 +456,7 @@ def _primer(name, commander_rows, rows, package, statistics, bracket):
                     "Protection": "Protect resources using", "Recursion": "Recover resources with", "Tokens": "Token-producing cards include",
                     "Counters": "Counter-related cards include", "Sacrifice": "Sacrifice-related cards include"}
     for role, explanation in explanations.items():
-        selected = sorted((row for row in rows if role in row["tags"] and "Commander" not in row["tags"]),
+        selected = sorted((row for row in rows if row["primary_role"] == role),
                           key=lambda row: (-row["member_inclusion"], row["name"]))[:3]
         if selected:
             lines += ["", role, f"{explanation} {references(selected)}. Check each card's conditions and timing before committing resources."]
@@ -634,8 +634,8 @@ def _generate_one(package, model_decks, source_decks, base, profiles, metadata, 
     rows = []
     for key, quantity in counts.items():
         card = metadata[key]
-        tags = ["Commander" if key in commander_keys else functional_tags(card)[0]]
-        rows.append({"name": card["name"], "quantity": quantity, "tags": tags, "primary_role": tags[0],
+        role = "Commander" if key in commander_keys else functional_tags(card)[0]
+        rows.append({"name": card["name"], "quantity": quantity, "primary_role": role,
                      **metrics[key], "member_inclusion": support.get(key, 0)})
     rows.sort(key=lambda row: (ROLES.index(row["primary_role"]), card_key(row["name"])))
     commander_rows = [{"name": metadata[key]["name"], "quantity": 1} for key in commander_keys]
@@ -657,11 +657,11 @@ def _generate_one(package, model_decks, source_decks, base, profiles, metadata, 
         "method": "NMF-membership-weighted observed card inclusion; verified 100-card anchor; role/type/curve-preserving consensus swaps",
         "metric_note": "Unweighted mean across the package's matched theme pages and target bracket page, excluding the general page; missing measurements contribute zero. Lift is the raw EDHREC ratio, not a percentage-point difference. Coverage counts show observed measurements.",
     }
-    measured = [row for row in rows if row["lift_observed_profiles"] > 0 and "Commander" not in row["tags"]]
+    measured = [row for row in rows if row["lift_observed_profiles"] > 0 and row["primary_role"] != "Commander"]
     highest_lift = max(measured, key=lambda row: (row["average_lift"], row["average_inclusion"], row["name"]), default=None)
     statistics["highest_average_lift"] = {"name": highest_lift["name"], "lift": highest_lift["average_lift"]} if highest_lift else None
-    export = "\n".join(f"{row['quantity']} {row['name']}" + (" *CMDR*" if "Commander" in row["tags"] else "") +
-                       " " + " ".join("#" + tag.replace("#", "").replace("\n", " ") for tag in row["tags"]) for row in rows) + "\n"
+    export = "\n".join(f"{row['quantity']} {row['name']}" +
+                       (" *CMDR*" if row["primary_role"] == "Commander" else "") for row in rows) + "\n"
     plain = "~".join(f"{row['quantity']} {row['name']}" for row in rows) + "~Z~"
     validation.update({"bracket": bracket, "external_url": "https://edhpowerlevel.com?d=" + quote_plus(plain),
                        "scope": "Construction rules checked with supplied card metadata; not playtested or certified for a bracket."})

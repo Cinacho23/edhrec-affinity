@@ -1,9 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 
 import { getBuildCollectionProgress, getBuildSourceFreshness, getCurrentBuildDiscoveryCommanders } from "../lib/buildStyleUtils";
 import { formatCollectionDuration, getBuildCollectorExecutionStatus, getBuildCollectorStatus } from "../lib/buildCollectionStatus";
 import { watchBuildDiscovery } from "../lib/buildDiscoveryRefresh";
+import {
+  BUILD_DISCOVERY_SORT_OPTIONS,
+  DEFAULT_BUILD_DISCOVERY_FILTERS,
+  buildDiscoverySearchParams,
+  filterBuildDiscoveryCommanders,
+  getBuildDiscoveryFilterErrors,
+  readBuildDiscoveryFilters,
+} from "../lib/buildDiscoveryFilters";
 import { formatNumber } from "../lib/formatters";
 import "./BuildDiscoveryPage.css";
 
@@ -21,10 +29,36 @@ function collectorDate(value) {
     : "Date unavailable";
 }
 
+const COUNT_FILTERS = [
+  { title: "Auto-selected packages", minKey: "minPackages", maxKey: "maxPackages" },
+  { title: "Analyzed unique decks", minKey: "minAnalyzed", maxKey: "maxAnalyzed" },
+  { title: "Total EDHREC decks", minKey: "minTotalDecks", maxKey: "maxTotalDecks" },
+  { title: "Tag profiles", minKey: "minProfiles", maxKey: "maxProfiles" },
+];
+const PAGE_SIZE = 50;
+
+function CountRange({ title, minKey, maxKey, filters, onChange }) {
+  return <fieldset className="build-discovery-range">
+    <legend>{title}</legend>
+    <div>
+      <label htmlFor={`build-discovery-${minKey}`}>Minimum
+        <input id={`build-discovery-${minKey}`} aria-label={`Minimum ${title.toLowerCase()}`} type="number" min="0" step="1" inputMode="numeric" placeholder="Any" value={filters[minKey]} onChange={(event) => onChange(minKey, event.target.value)} />
+      </label>
+      <label htmlFor={`build-discovery-${maxKey}`}>Maximum
+        <input id={`build-discovery-${maxKey}`} aria-label={`Maximum ${title.toLowerCase()}`} type="number" min="0" step="1" inputMode="numeric" placeholder="Any" value={filters[maxKey]} onChange={(event) => onChange(maxKey, event.target.value)} />
+      </label>
+    </div>
+  </fieldset>;
+}
+
 export default function BuildDiscoveryPage() {
   const [state, setState] = useState({ loading: true, commanders: [], index: null, error: null });
   const [execution, setExecution] = useState(null);
-  const [query, setQuery] = useState("");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const filters = useMemo(() => readBuildDiscoveryFilters(searchParams), [searchParams]);
+  const pendingFilters = useRef(filters);
+  const [page, setPage] = useState(1);
+  useEffect(() => { pendingFilters.current = filters; }, [filters]);
   useEffect(() => watchBuildDiscovery({
     onIndex: (index) => setState({ loading: false, commanders: getCurrentBuildDiscoveryCommanders(index), index, error: null, refreshError: null }),
     onExecution: setExecution,
@@ -33,11 +67,29 @@ export default function BuildDiscoveryPage() {
       : { ...previous, loading: false, error: error.message }),
   }), []);
 
-  const visible = useMemo(() => {
-    const normalized = query.trim().toLowerCase();
-    return state.commanders.filter((commander) => String(commander.commander_name || commander.commander_slug).toLowerCase().includes(normalized))
-      .toSorted((left, right) => String(left.commander_name || left.commander_slug).localeCompare(String(right.commander_name || right.commander_slug)));
-  }, [state.commanders, query]);
+  const filterErrors = getBuildDiscoveryFilterErrors(filters);
+  const matching = useMemo(() => filterBuildDiscoveryCommanders(state.commanders, filters), [state.commanders, filters]);
+  const pageCount = Math.max(1, Math.ceil(matching.length / PAGE_SIZE));
+  const currentPage = Math.min(page, pageCount);
+  const firstIndex = (currentPage - 1) * PAGE_SIZE;
+  const visible = matching.slice(firstIndex, firstIndex + PAGE_SIZE);
+  const hasChanges = Object.entries(DEFAULT_BUILD_DISCOVERY_FILTERS).some(([key, value]) => filters[key] !== value);
+  const textualSort = filters.sortBy === "commander_name";
+  const dateSort = filters.sortBy === "generated_at";
+
+  function updateFilter(key, value) {
+    // Router navigation can commit after the next control changes. Merge into
+    // the latest selection so quick edits cannot overwrite another field.
+    pendingFilters.current = { ...pendingFilters.current, [key]: value };
+    setSearchParams(buildDiscoverySearchParams(pendingFilters.current), { replace: true });
+    setPage(1);
+  }
+
+  function resetFilters() {
+    pendingFilters.current = DEFAULT_BUILD_DISCOVERY_FILTERS;
+    setSearchParams({}, { replace: true });
+    setPage(1);
+  }
 
   const scopedMinimum = state.index?.discovery?.min_total_decks;
   const scopeKnown = Number.isSafeInteger(scopedMinimum) && scopedMinimum >= 200;
@@ -100,10 +152,57 @@ export default function BuildDiscoveryPage() {
     </div> : null}
 
     {state.loading ? <p className="muted" role="status">Loading available build reports…</p> : state.error ? <div className="panel"><p className="error-message">Could not load build discovery: {state.error}</p></div> : state.commanders.length ? <>
-      <div className="search-panel build-discovery-search">
-        <label htmlFor="build-discovery-search">Search current collector reports</label>
-        <input id="build-discovery-search" type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search commander name…" />
-        <p className="muted" aria-live="polite">{formatNumber(visible.length)} of {formatNumber(state.commanders.length)} reports</p>
+      <section className="filter-panel build-discovery-filters" aria-labelledby="build-discovery-filter-heading">
+        <div className="filter-panel-header">
+          <div><h2 id="build-discovery-filter-heading">Find build reports</h2><p className="muted">Combine filters across all current reports. Leave a bound blank for any value; use the same minimum and maximum for an exact count.</p></div>
+          <button type="button" onClick={resetFilters} disabled={!hasChanges}>Reset filters</button>
+        </div>
+        <div className="filter-grid build-discovery-filters__search">
+          <label htmlFor="build-discovery-search">Commander name
+            <input id="build-discovery-search" type="search" value={filters.query} onChange={(event) => updateFilter("query", event.target.value)} placeholder="Search commander name…" />
+          </label>
+          <label htmlFor="build-discovery-sort">Sort by
+            <select id="build-discovery-sort" aria-label="Sort by" value={filters.sortBy} onChange={(event) => updateFilter("sortBy", event.target.value)}>
+              {BUILD_DISCOVERY_SORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+          </label>
+          <label htmlFor="build-discovery-direction">Order
+            <select id="build-discovery-direction" aria-label="Order" value={filters.direction} onChange={(event) => updateFilter("direction", event.target.value)}>
+              <option value="desc">{textualSort ? "Z–A" : dateSort ? "Newest first" : "Highest first"}</option>
+              <option value="asc">{textualSort ? "A–Z" : dateSort ? "Oldest first" : "Lowest first"}</option>
+            </select>
+          </label>
+        </div>
+        <div className="build-discovery-filters__ranges">
+          {COUNT_FILTERS.map((range) => <CountRange key={range.minKey} {...range} filters={filters} onChange={updateFilter} />)}
+        </div>
+        <div className="filter-grid">
+          <label htmlFor="build-discovery-status">Analysis result
+            <select id="build-discovery-status" aria-label="Analysis result" value={filters.status} onChange={(event) => updateFilter("status", event.target.value)}>
+              <option value="all">All reports</option><option value="fitted">Packages discovered</option><option value="insufficient_data">Insufficient usable evidence</option>
+            </select>
+          </label>
+          <label htmlFor="build-discovery-coverage">Deck index coverage
+            <select id="build-discovery-coverage" aria-label="Deck index coverage" value={filters.coverage} onChange={(event) => updateFilter("coverage", event.target.value)}>
+              <option value="all">Any coverage</option><option value="complete">Full index checked</option><option value="partial">Partial index coverage</option><option value="unknown">Coverage unknown</option>
+            </select>
+          </label>
+          <label htmlFor="build-discovery-freshness">Source checks
+            <select id="build-discovery-freshness" aria-label="Source checks" value={filters.freshness} onChange={(event) => updateFilter("freshness", event.target.value)}>
+              <option value="all">Any source age</option><option value="fresh">Recently checked</option><option value="needs_refresh">Need refresh or incomplete dates</option><option value="unknown">Source age unknown</option>
+            </select>
+          </label>
+        </div>
+        <p className="build-discovery-filters__note muted">Analyzed decks are usable unique lists; total decks are EDHREC’s commander population. Tag profiles count the source tag pages compared. Coverage measures previews checked, independently of source age. Filters stay in the page URL when you open a report or share this view.</p>
+        {filterErrors.length ? <div className="error-message" role="alert">{filterErrors.map((error) => <p key={error}>{error}</p>)}</div> : null}
+      </section>
+      <div className="build-discovery-results">
+        <p className="muted" aria-live="polite">{matching.length ? `Showing ${formatNumber(firstIndex + 1)}–${formatNumber(firstIndex + visible.length)} of ${formatNumber(matching.length)} matching reports` : "0 matching reports"} · {formatNumber(state.commanders.length)} current reports available</p>
+        {pageCount > 1 ? <nav className="build-discovery-pagination" aria-label="Build report pages">
+          <button type="button" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}>Previous</button>
+          <span>Page {formatNumber(currentPage)} of {formatNumber(pageCount)}</span>
+          <button type="button" disabled={currentPage >= pageCount} onClick={() => setPage(currentPage + 1)}>Next</button>
+        </nav> : null}
       </div>
       <div className="build-discovery-grid">{visible.map((commander) => {
         const freshness = getBuildSourceFreshness(commander.collection);
@@ -111,7 +210,7 @@ export default function BuildDiscoveryPage() {
         return <article className="panel build-discovery-card" key={commander.commander_slug}>
         <h2><Link to={`/commanders/${encodeURIComponent(commander.commander_slug)}`}>{commander.commander_name || commander.commander_slug}</Link></h2>
         <div className="build-discovery-card__stats">
-          <div><strong>{formatNumber(commander.package_count)}</strong><span>{commander.package_count === 1 ? "suggested package" : "suggested packages"}</span></div>
+          <div><strong>{formatNumber(commander.package_count)}</strong><span>Auto-selected {commander.package_count === 1 ? "package" : "packages"}</span></div>
           <div><strong>{formatNumber(commander.profile_count)}</strong><span>tag profiles</span></div>
           <div><strong>{formatNumber(commander.unique_decks)}</strong><span>analyzed decks</span></div>
         </div>
@@ -119,6 +218,7 @@ export default function BuildDiscoveryPage() {
           ? "Tag profile comparisons available; deck evidence is insufficient to fit packages."
           : "Insufficient data for tag comparisons or packages."}</p> : null}
         <div className="build-discovery-card__sources">
+          <span>{formatNumber(commander.total_edhrec_decks)} total EDHREC decks</span>
           <strong>{progress.targetMet ? "Full index checked recently" : progress.label}</strong>
           {!progress.analysisCurrent ? <span>Analysis awaiting the current deck collection</span> : null}
           {progress.known ? <span>{formatNumber(progress.attempted)} / {formatNumber(progress.frame)} previews attempted</span> : null}
@@ -129,7 +229,7 @@ export default function BuildDiscoveryPage() {
         </div>
         <div className="build-discovery-card__footer"><span>Analysis built {reportDate(commander.generated_at)}</span><Link to={`/commanders/${encodeURIComponent(commander.commander_slug)}`}>Explore report →</Link></div>
       </article>; })}</div>
-      {!visible.length ? <p className="muted">No available reports match this search.</p> : null}
+      {!matching.length ? <div className="panel build-discovery-empty"><p className="muted">{filterErrors.length ? "Correct the filter ranges to see matching reports." : "No current reports match these filters. Try widening a range or clearing the search."}</p><button type="button" onClick={resetFilters}>Reset filters</button></div> : null}
     </> : <div className="panel"><p className="muted">Waiting for the first completed report since the fresh start from a commander with at least {formatNumber(minimumDecks)} total EDHREC decks. New reports will appear as collection and analysis finish.</p><Link className="build-discovery-all-commanders" to="/commanders">Browse all commanders →</Link></div>}
   </section>;
 }

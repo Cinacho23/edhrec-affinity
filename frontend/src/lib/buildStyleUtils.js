@@ -68,12 +68,6 @@ export function getDeckMixtureRows(model, selectedPackage = "all", threshold = 0
     .toSorted((left, right) => Number(right.memberships?.[index] || 0) - Number(left.memberships?.[index] || 0));
 }
 
-const DECK_ROLE_ORDER = [
-  "Commander", "Lands", "Fast Mana", "Ramp", "Card Advantage", "Wipe", "Removal",
-  "Tutor", "Recursion", "Protection", "Leftover", "Card Draw", "Draw", "Board Wipes",
-  "Tutors", "Tokens", "Counters", "Sacrifice", "Finishers", "Other", "Other Spells",
-];
-
 const BUILD_EVIDENCE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const BUILD_EVIDENCE_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
 
@@ -192,29 +186,26 @@ export function getGeneratedDeckGroups(deck) {
   const groups = new Map();
   for (const card of deck?.cards || []) {
     if (!card?.name || !Number.isInteger(card.quantity) || card.quantity <= 0) continue;
-    const tags = Array.isArray(card.tags) ? card.tags.filter((tag) => typeof tag === "string" && tag.trim()) : [];
-    const explicitRole = card.role || card.primary_role;
-    const role = commanders.has(card.name) ? "Commander" : explicitRole
-      || tags.find((tag) => DECK_ROLE_ORDER.some((known) => known.toLowerCase() === tag.toLowerCase()))
-      || "Other Spells";
-    if (!groups.has(role)) groups.set(role, { name: role, count: 0, cards: [] });
-    const group = groups.get(role);
+    const isCommander = commanders.has(card.name) || card.primary_role === "Commander"
+      || card.role === "Commander" || (Array.isArray(card.tags) && card.tags.includes("Commander"));
+    const section = isCommander ? "Commander" : "Main deck";
+    if (!groups.has(section)) groups.set(section, { name: section, count: 0, cards: [] });
+    const group = groups.get(section);
     group.count += card.quantity;
-    group.cards.push({ ...card, tags: [role] });
+    const untagged = { ...card };
+    delete untagged.tags;
+    group.cards.push(untagged);
   }
-  const order = (role) => {
-    const index = DECK_ROLE_ORDER.findIndex((known) => known.toLowerCase() === role.toLowerCase());
-    return index === -1 ? DECK_ROLE_ORDER.length : index;
-  };
   return [...groups.values()].map((group) => ({
     ...group, cards: group.cards.toSorted((left, right) => left.name.localeCompare(right.name)),
-  })).sort((left, right) => order(left.name) - order(right.name) || left.name.localeCompare(right.name));
+  })).sort((left, right) => Number(right.name === "Commander") - Number(left.name === "Commander"));
 }
 
 export function getGeneratedDeckExport(deck) {
-  return getGeneratedDeckGroups(deck).flatMap((group) => group.cards.map((card) =>
-    `${card.quantity} ${card.name}${group.name === "Commander" ? " *CMDR*" : ""} #${group.name.replaceAll("#", "").replaceAll("\n", " ")}`,
-  )).join("\n") + (deck?.cards?.length ? "\n" : "");
+  const lines = getGeneratedDeckGroups(deck).flatMap((group) => group.cards.map((card) =>
+    `${card.quantity} ${card.name}${group.name === "Commander" ? " *CMDR*" : ""}`,
+  ));
+  return lines.join("\n") + (lines.length ? "\n" : "");
 }
 
 export function splitPrimerCardReferences(primer) {
