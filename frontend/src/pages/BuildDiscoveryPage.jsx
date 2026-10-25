@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
-import { getBuildCollectionProgress, getBuildSourceFreshness, getCurrentBuildDiscoveryCommanders } from "../lib/buildStyleUtils";
+import BuildDiscoveryCards from "../components/BuildDiscoveryCards";
+import CommanderName from "../components/CommanderName";
+import { loadCommanderIndex } from "../lib/api";
+import { getCommanderCards } from "../lib/commanderPreview";
+import { getBuildCollectionProgress, getBuildSourceFreshness, getCurrentBuildDiscoveryCommanders, getPackageBracketLabel, getSupportedThemes } from "../lib/buildStyleUtils";
 import { formatCollectionDuration, getBuildCollectorExecutionStatus, getBuildCollectorStatus } from "../lib/buildCollectionStatus";
 import { watchBuildDiscovery } from "../lib/buildDiscoveryRefresh";
 import {
@@ -51,9 +55,29 @@ function CountRange({ title, minKey, maxKey, filters, onChange }) {
   </fieldset>;
 }
 
+function PackageSummaries({ commander }) {
+  if (!Array.isArray(commander.packages)) {
+    return commander.package_count > 0 ? <p className="muted build-discovery-card__package-note">Package tags and brackets are unavailable in this summary. Open the report for details.</p> : null;
+  }
+  if (!commander.packages.length) return null;
+  return <div className="build-discovery-card__packages">
+    <p className="build-discovery-card__package-label">Auto-selected packages · suggested tags</p>
+    <ul>{commander.packages.map((pkg, index) => {
+      const tags = getSupportedThemes(pkg);
+      const bracket = getPackageBracketLabel(pkg.generated_deck);
+      return <li key={pkg.id ?? index}>
+        <div className="build-discovery-card__package-heading"><strong>Package {index + 1}</strong><span className={bracket ? "build-discovery-card__bracket" : "muted"}>{bracket || "Bracket unavailable"}</span></div>
+        <div className="build-discovery-card__tags">{tags.length ? tags.map((tag) => <span key={tag.tag_slug || tag.tag_name}>{tag.tag_name || tag.tag_slug}</span>) : <span className="muted">No supported tag label</span>}</div>
+      </li>;
+    })}</ul>
+  </div>;
+}
+
 export default function BuildDiscoveryPage() {
   const [state, setState] = useState({ loading: true, commanders: [], index: null, error: null });
   const [execution, setExecution] = useState(null);
+  const [cardCatalog, setCardCatalog] = useState(new Map());
+  const catalogRequest = useRef(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const filters = useMemo(() => readBuildDiscoveryFilters(searchParams), [searchParams]);
   const pendingFilters = useRef(filters);
@@ -66,6 +90,19 @@ export default function BuildDiscoveryPage() {
       ? { ...previous, refreshError: error.message }
       : { ...previous, loading: false, error: error.message }),
   }), []);
+  useEffect(() => {
+    // Older discovery indexes omit images. One local catalog request supplies
+    // all visible tiles without fetching a separate report for each commander.
+    if (!state.commanders.some((commander) =>
+      !getCommanderCards(commander).some((card) => card.faces.length))) return;
+    let active = true;
+    catalogRequest.current ||= loadCommanderIndex();
+    catalogRequest.current.then((data) => {
+      const rows = Array.isArray(data) ? data : data?.rows || [];
+      if (active) setCardCatalog(new Map(rows.map((row) => [row.commander_slug, row])));
+    }).catch(() => { /* Card previews can still resolve lazily when opened. */ });
+    return () => { active = false; };
+  }, [state.commanders]);
 
   const filterErrors = getBuildDiscoveryFilterErrors(filters);
   const matching = useMemo(() => filterBuildDiscoveryCommanders(state.commanders, filters), [state.commanders, filters]);
@@ -207,13 +244,16 @@ export default function BuildDiscoveryPage() {
       <div className="build-discovery-grid">{visible.map((commander) => {
         const freshness = getBuildSourceFreshness(commander.collection);
         const progress = getBuildCollectionProgress(commander.collection);
+        const cardDetails = { ...cardCatalog.get(commander.commander_slug), ...commander };
         return <article className="panel build-discovery-card" key={commander.commander_slug}>
-        <h2><Link to={`/commanders/${encodeURIComponent(commander.commander_slug)}`}>{commander.commander_name || commander.commander_slug}</Link></h2>
+        <h2><CommanderName commander={cardDetails} className="build-discovery-card__name" /></h2>
+        <BuildDiscoveryCards commander={cardDetails} />
         <div className="build-discovery-card__stats">
           <div><strong>{formatNumber(commander.package_count)}</strong><span>Auto-selected {commander.package_count === 1 ? "package" : "packages"}</span></div>
           <div><strong>{formatNumber(commander.profile_count)}</strong><span>tag profiles</span></div>
           <div><strong>{formatNumber(commander.unique_decks)}</strong><span>analyzed decks</span></div>
         </div>
+        <PackageSummaries commander={commander} />
         {commander.status !== "fitted" ? <p className="muted">{commander.profile_count > 0
           ? "Tag profile comparisons available; deck evidence is insufficient to fit packages."
           : "Insufficient data for tag comparisons or packages."}</p> : null}

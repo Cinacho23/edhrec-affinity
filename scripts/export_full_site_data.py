@@ -1368,6 +1368,49 @@ def current_build_discovery_slugs(directory: Path, reports: dict[str, dict[str, 
     return eligible
 
 
+def summarize_build_style_packages(analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose the selected model's package labels and bracket evidence only.
+
+    Discovery must not fetch every full report just to display these details.
+    Keep the rating timestamps so the frontend can age external verification in
+    exactly the same way as it does on the commander page.
+    """
+    if analysis.get("status") != "fitted":
+        return []
+    packages = []
+    for package in analysis["packages"]:
+        suggestions = package.get("tag_suggestions")
+        summary = {"id": package["id"], "tag_suggestions": [
+            {key: tag[key] for key in ("tag_name", "tag_slug", "similarity") if key in tag}
+            for tag in (suggestions if isinstance(suggestions, list) else [])
+            if isinstance(tag, dict) and isinstance(tag.get("tag_name"), str) and tag["tag_name"].strip()
+        ]}
+        if isinstance(package.get("name"), str):
+            summary["name"] = package["name"]
+        deck = package.get("generated_deck")
+        if isinstance(deck, dict) and isinstance(deck.get("status"), str):
+            generated = {"status": deck["status"]}
+            validation = deck.get("validation", {})
+            if isinstance(validation, dict):
+                compact_validation = {}
+                bracket = validation.get("bracket")
+                if isinstance(bracket, dict) and "recommended" in bracket:
+                    compact_validation["bracket"] = {"recommended": bracket["recommended"]}
+                external = validation.get("external_rating")
+                if isinstance(external, dict):
+                    compact_validation["external_rating"] = {key: external[key] for key in (
+                        "status", "checked_at", "playability_pct", "bracket",
+                    ) if key in external}
+                if compact_validation:
+                    generated["validation"] = compact_validation
+            statistics = deck.get("statistics")
+            if isinstance(statistics, dict) and "recommended_bracket" in statistics:
+                generated["statistics"] = {"recommended_bracket": statistics["recommended_bracket"]}
+            summary["generated_deck"] = generated
+        packages.append(summary)
+    return packages
+
+
 def export_build_style_files(
     df: pd.DataFrame,
     processed_dir: Path,
@@ -1401,6 +1444,11 @@ def export_build_style_files(
     known_slugs = set(df["commander_slug"].dropna().astype(str)) if "commander_slug" in df else set()
     catalog_counts = {str(row["commander_slug"]): valid_deck_count(row.get("total_decks"))
                       for row in df.to_dict("records") if row.get("commander_slug") is not None}
+    catalog_cards = {str(row["commander_slug"]): {key: row[key] for key in (
+        "commander_cards", "card_image_url", "partner_card_image_urls", "scryfall_uri",
+        "partner_scryfall_uris", "scryfall_card_names",
+    ) if key in row and has_value(row[key])}
+        for row in build_commander_index(df).to_dict("records")} if "commander_slug" in df else {}
     eligible_catalog = {slug for slug in known_slugs
                         if commander_is_eligible(catalog_counts.get(slug), policy["min_total_decks"])}
     if (output_dir / "build-styles").is_dir():
@@ -1432,7 +1480,9 @@ def export_build_style_files(
             "file": filename, "generated_at": report["generated_at"],
             "profile_count": len(report["profiles"]["profiles"]),
             "package_count": len(analysis["packages"]),
+            "packages": summarize_build_style_packages(analysis),
             "unique_decks": analysis["unique_decks"], "status": analysis["status"],
+            **catalog_cards.get(slug, {}),
         }
         collection = report.get("collection", {})
         if isinstance(collection, dict):
