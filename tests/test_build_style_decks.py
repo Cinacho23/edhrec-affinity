@@ -9,7 +9,7 @@ import pytest
 from edhrec_affinity.build_styles.deckbuilding import (
     functional_tags, generate_package_deck_candidates, generate_package_decks,
 )
-from edhrec_affinity.build_styles.sources import card_key
+from edhrec_affinity.build_styles.sources import card_key, enrich_commander_name_groups
 
 
 def metadata_card(name, *, types="Creature — Plant", text="", colors=None, cmc=2, **extra):
@@ -194,6 +194,117 @@ def test_partner_commanders_and_textual_singleton_exceptions_are_validated():
     for deck in data[1]:
         deck["cards"][1]["quantity"] = 8
         deck["cards"][-1]["quantity"] = 29
+    assert generate(data)["status"] == "unavailable"
+
+
+def renamed_partner_fixture():
+    data = fixture()
+    partner, original, alternate = "Kamahl, Heart of Krosa", "Yoshimaru, Ever Faithful", "Dogmeat, Constant Companion"
+    commander = data[4].pop("commander")
+    commander.update(name=partner, oracle_text="Partner", oracle_id="kamahl-oracle")
+    data[4][card_key(partner)] = commander
+    data[4][card_key(original)] = metadata_card(original, types="Legendary Creature — Dog", text="Partner",
+                                               colors=["W"], oracle_id="yoshimaru-oracle")
+    data[2]["commander_names"] = [partner, alternate]
+    data[2]["commander_name_groups"] = [[partner, alternate], [original, partner]]
+    for index, deck in enumerate(data[1]):
+        deck["commanders"] = [original, partner]
+        deck["cards"][-1]["quantity"] = 35
+        # Exports sometimes repeat command-zone cards in their card rows. Both
+        # the canonical and verified flavor names must stay out of the 98.
+        deck["cards"] += [{"name": partner, "quantity": 1},
+                          {"name": alternate if index == 1 else original, "quantity": 1}]
+    return data
+
+
+def test_verified_flavor_commander_uses_canonical_observed_partner_lists_without_double_counting():
+    result = generate(renamed_partner_fixture())
+    assert result["status"] == "generated" and result["validation"]["valid"]
+    assert result["card_count"] == 100
+    assert {card["name"] for card in result["commanders"]} == {"Kamahl, Heart of Krosa", "Yoshimaru, Ever Faithful"}
+    assert "Dogmeat, Constant Companion" not in result["export_text"]
+    assert result["export_text"].count("1 Yoshimaru, Ever Faithful *CMDR*") == 1
+    assert "#" not in result["export_text"]
+    assert all("tags" not in card for card in result["cards"])
+
+
+@pytest.mark.parametrize("actual", [
+    ["Yoshimaru, Ever Faithful", "Wrong Partner"],
+    ["Yoshimaru, Ever Faithful"],
+    ["Yoshimaru, Ever Faithful", "Kamahl, Heart of Krosa", "Dogmeat, Constant Companion"],
+    ["Yoshimaru, Ever Faithful", "Yoshimaru, Ever Faithful"],
+    ["Kamahl, Heart of Krosa", "Kamahl, Heart of Krosa", "Yoshimaru, Ever Faithful"],
+])
+def test_verified_flavor_configuration_does_not_relax_partner_membership_or_commander_count(actual):
+    data = renamed_partner_fixture()
+    for deck in data[1]:
+        deck["commanders"] = actual
+    assert generate(data)["status"] == "unavailable"
+
+
+def test_flavor_configuration_conflicting_with_an_actual_canonical_card_fails_closed():
+    data = renamed_partner_fixture()
+    data[4]["dogmeat, constant companion"] = metadata_card("Dogmeat, Constant Companion",
+        types="Legendary Creature — Dog", text="Partner", colors=["W"], oracle_id="different-real-card")
+    result = generate(data)
+    assert result["status"] == "unavailable" and "conflict" in result["reason"]
+    for deck in data[1]:
+        deck["commanders"] = list(data[2]["commander_names"])
+    assert generate(data)["status"] == "unavailable"  # A conflicting alias family never constructs a different card.
+    data = renamed_partner_fixture()
+    data[2].pop("commander_name_groups")
+    assert generate(data)["status"] == "unavailable"  # No unverified name substitutions.
+
+
+def flavor_alias_proof(card, alternate):
+    return {"name": alternate, "source_field": "flavor_name", "printing_id": "verified-printing-id",
+            "lang": "en", "oracle_id": card["oracle_id"], "canonical_name": card["name"]}
+
+
+def test_builder_keeps_verified_scryfall_flavor_aliases_through_metadata_reindexing():
+    data = fixture()
+    card = data[4].pop("core 0")
+    card.update(name="Original Engine", oracle_id="original-engine-oracle")
+    card["name_aliases"] = [flavor_alias_proof(card, "Core 0")]
+    data[4]["original engine"] = card
+    result = generate(data)
+    assert result["status"] == "generated" and result["validation"]["valid"]
+    assert "Original Engine" in {row["name"] for row in result["cards"]}
+    assert "Core 0" not in {row["name"] for row in result["cards"]}
+    # Two observed aliases of one Oracle card count as two copies, rather than
+    # overwriting one another and accidentally passing singleton validation.
+    for deck in data[1]:
+        deck["cards"][1]["name"] = "Original Engine"
+    assert generate(data)["status"] == "unavailable"
+
+
+def test_cold_printing_proof_can_add_the_full_canonical_configuration_before_construction():
+    data = fixture()
+    alternate, original = "Max, the Daredevil", "Elmar, Ulvenwald Informant"
+    commander = data[4].pop("commander")
+    commander.update(name=original, oracle_id="elmar-oracle")
+    commander["name_aliases"] = [{**flavor_alias_proof(commander, alternate), "source_field": "printed_name"}]
+    data[4][card_key(original)] = commander
+    data[2].update(commander_names=[alternate], commander_name_groups=[[alternate]])
+    for deck in data[1]:
+        deck["commanders"] = [original]
+    assert generate(deepcopy(data))["status"] == "unavailable"  # Full configuration is still required.
+    data[2]["commander_name_groups"] = enrich_commander_name_groups(data[2], data[4])
+    result = generate(data)
+    assert result["status"] == "generated" and result["validation"]["valid"]
+    assert result["card_count"] == 100
+    assert result["commanders"] == [{"name": original, "quantity": 1}]
+    assert f"1 {original} *CMDR*" in result["export_text"] and "#" not in result["export_text"]
+
+
+def test_builder_prefers_actual_names_and_rejects_ambiguous_flavor_aliases():
+    data = fixture()
+    for name in ("Other Engine", "Another Engine"):
+        card = metadata_card(name, oracle_id=f"oracle-{name}")
+        card["name_aliases"] = [flavor_alias_proof(card, "Core 0")]
+        data[4][card_key(name)] = card
+    assert "Core 0" in {row["name"] for row in generate(data)["cards"]}
+    del data[4]["core 0"]
     assert generate(data)["status"] == "unavailable"
 
 
@@ -404,8 +515,8 @@ def test_cached_card_roles_do_not_absorb_package_themes_and_match_uncached_expor
     original_metadata = deepcopy(data[4])
     cached = generate(deepcopy(data))
     original_index = deckbuilding._metadata_index
-    def uncached_index(metadata):
-        indexed = original_index(metadata)
+    def uncached_index(metadata, **options):
+        indexed = original_index(metadata, **options)
         for card in indexed.values():
             card.pop("_build_cache", None)
         return indexed

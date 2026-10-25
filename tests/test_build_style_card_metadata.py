@@ -81,6 +81,9 @@ def test_only_uncached_cards_are_fetched_and_negative_results_are_retried(tmp_pa
     requests = []
 
     def handler(request):
+        if request.method == "GET":
+            assert request.url.params["exact"] == "Unknown"
+            return httpx.Response(404, json={"object": "error"})
         names = [identifier["name"] for identifier in json.loads(request.content)["identifiers"]]
         requests.append(names)
         return httpx.Response(200, json=collection([card(name) for name in names if name != "Unknown"],
@@ -369,8 +372,236 @@ def test_split_first_name_resolution_cannot_substitute_another_full_card(tmp_pat
 
 
 def test_collection_not_found_first_name_is_reported_as_original_full_name(tmp_path, monkeypatch):
-    client(monkeypatch, lambda _: httpx.Response(200, json=collection([], ["Dusk"])))
+    client(monkeypatch, lambda request: httpx.Response(404, json={"object": "error"})
+           if request.method == "GET" else httpx.Response(200, json=collection([], ["Dusk"])))
     found, summary = metadata.load_card_metadata(["Dusk // Dawn"], tmp_path / "cache.json", fetch=True)
     assert not found
     assert summary["missing"] == summary["not_found"] == ["Dusk // Dawn"]
     assert not summary["failures"]
+
+
+def alternate(name, display, *, field="flavor_name", oracle_id="oracle-shared", **changes):
+    return card(name, **{"id": f"printing-{display}", "lang": "en", "oracle_id": oracle_id,
+                         field: display, **changes})
+
+
+def test_collection_accepts_verified_secret_lair_flavor_name_and_preserves_provenance(tmp_path, monkeypatch):
+    raw = alternate("Yoshimaru, Ever Faithful", "Dogmeat, Constant Companion")
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([raw])))
+    cache = tmp_path / "cards.json"
+    found, summary = metadata.load_card_metadata(["Dogmeat, Constant Companion"], cache, fetch=True)
+    dogmeat = found["dogmeat, constant companion"]
+    assert dogmeat is found["yoshimaru, ever faithful"]
+    assert dogmeat["flavor_name"] == "Dogmeat, Constant Companion"
+    assert dogmeat["id"] == "printing-Dogmeat, Constant Companion"
+    assert dogmeat["lang"] == "en"
+    assert dogmeat["name_aliases"] == [{
+        "name": "Dogmeat, Constant Companion", "source_field": "flavor_name",
+        "printing_id": "printing-Dogmeat, Constant Companion", "lang": "en",
+        "oracle_id": "oracle-shared", "canonical_name": "Yoshimaru, Ever Faithful",
+    }]
+    assert summary["requested"] == summary["resolved"] == summary["fetched"] == 1
+    assert summary["alias_resolutions"] == [{
+        "requested_name": "Dogmeat, Constant Companion", "canonical_name": "Yoshimaru, Ever Faithful",
+        "oracle_id": "oracle-shared", "source": "scryfall",
+    }]
+    offline, summary = metadata.load_card_metadata(["Dogmeat, Constant Companion"], cache)
+    assert offline == found
+    assert summary["cached"] == 1
+
+
+def test_collection_not_found_uses_paced_exact_named_fallback_without_fuzzy_lookup(tmp_path, monkeypatch):
+    attempts = []
+
+    def handler(request):
+        attempts.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json=collection([], ["Cecil Harvey"]))
+        assert str(request.url.copy_with(query=None)) == metadata.NAMED_URL
+        assert dict(request.url.params) == {"exact": "Cecil Harvey"}
+        return httpx.Response(200, json=alternate("Tymna the Weaver", "Cecil Harvey"))
+
+    delays = client(monkeypatch, handler)
+    found, summary = metadata.load_card_metadata(["Cecil Harvey"], tmp_path / "cards.json", fetch=True)
+    assert found["cecil harvey"]["name"] == "Tymna the Weaver"
+    assert summary["fetched"] == summary["resolved"] == 1
+    assert summary["requests"] == 2
+    assert not summary["missing"] and not summary["not_found"] and not summary["failures"]
+    assert delays == [.1, .1]
+
+
+def test_canonical_collection_response_without_alias_evidence_is_reverified_by_exact_named(tmp_path, monkeypatch):
+    def handler(request):
+        if request.method == "POST":
+            # Collection knows the alternate name but returns a normal printing
+            # without the display-name evidence needed for strict matching.
+            return httpx.Response(200, json=collection([card("Tymna the Weaver")]))
+        assert dict(request.url.params) == {"exact": "Cecil Harvey"}
+        return httpx.Response(200, json=alternate("Tymna the Weaver", "Cecil Harvey"))
+
+    client(monkeypatch, handler)
+    found, summary = metadata.load_card_metadata(["Cecil Harvey"], tmp_path / "cards.json", fetch=True)
+    assert found["cecil harvey"]["name"] == "Tymna the Weaver"
+    assert summary["requested"] == summary["resolved"] == summary["fetched"] == 1
+    assert summary["requests"] == 2
+    assert not summary["missing"] and not summary["failures"]
+    assert "does not exactly match" in summary["collection_rejections"][0]["error"]
+
+
+def test_verified_printed_name_survives_regular_printing_refresh_and_cache_reload(tmp_path, monkeypatch):
+    cache = tmp_path / "cards.json"
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([
+        alternate("Elmar, Ulvenwald Informant", "Max, the Daredevil", field="printed_name")
+    ])))
+    metadata.load_card_metadata(["Max, the Daredevil"], cache, fetch=True)
+    make_cache_stale(cache)
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([
+        card("Elmar, Ulvenwald Informant", oracle_id="oracle-shared", id="regular-printing", lang="en")
+    ])))
+    metadata.load_card_metadata(["Elmar, Ulvenwald Informant"], cache, fetch=True)
+    found, summary = metadata.load_card_metadata(["Max, the Daredevil"], cache)
+    assert found["max, the daredevil"]["id"] == "regular-printing"
+    assert found["max, the daredevil"]["name_aliases"][0]["printing_id"] == "printing-Max, the Daredevil"
+    assert summary["cached"] == 1
+    assert not summary["stale_names"]
+
+
+def test_named_fallback_cannot_accept_unrelated_card_or_cache_fuzzy_substitution(tmp_path, monkeypatch):
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200, json=collection([], ["Sol Rign"]))
+        assert dict(request.url.params) == {"exact": "Sol Rign"}
+        return httpx.Response(200, json=card("Sol Ring"))
+
+    client(monkeypatch, handler)
+    cache = tmp_path / "cards.json"
+    found, summary = metadata.load_card_metadata(["Sol Rign"], cache, fetch=True)
+    assert not found and not cache.exists()
+    assert summary["missing"] == ["Sol Rign"]
+    assert "does not exactly match" in summary["failures"][0]["error"]
+
+
+@pytest.mark.parametrize("changes", [{"lang": "ja"}, {"id": None}, {"oracle_id": None}])
+def test_unverified_or_non_english_printed_names_do_not_create_aliases(tmp_path, monkeypatch, changes):
+    raw = alternate("Actual Card", "Other Name")
+    for key, value in changes.items():
+        if value is None:
+            raw.pop(key)
+        else:
+            raw[key] = value
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([raw])))
+    found, summary = metadata.load_card_metadata(["Other Name"], tmp_path / "cards.json", fetch=True)
+    assert not found
+    assert summary["missing"] == ["Other Name"]
+
+
+def test_conflicting_printed_aliases_are_omitted_and_canonical_names_win(tmp_path, monkeypatch):
+    cards = [alternate("Card One", "Shared", oracle_id="one"),
+             alternate("Card Two", "Shared", oracle_id="two")]
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection(cards)))
+    cache = tmp_path / "cards.json"
+    found, _ = metadata.load_card_metadata(["Card One", "Card Two"], cache, fetch=True)
+    assert "shared" not in found
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([card("Shared")])))
+    found, _ = metadata.load_card_metadata(["Shared"], cache, fetch=True)
+    assert found["shared"]["name"] == "Shared"
+
+
+def test_old_alias_proof_is_not_retained_when_oracle_identity_changes(tmp_path, monkeypatch):
+    cache = tmp_path / "cards.json"
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([alternate("Actual", "Alternate")])))
+    metadata.load_card_metadata(["Alternate"], cache, fetch=True)
+    make_cache_stale(cache)
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([card("Actual", oracle_id="changed")])))
+    metadata.load_card_metadata(["Actual"], cache, fetch=True)
+    found, summary = metadata.load_card_metadata(["Alternate"], cache)
+    assert not found
+    assert summary["missing"] == ["Alternate"]
+
+
+def test_cached_alias_proof_with_conflicting_oracle_id_is_rejected(tmp_path):
+    cache = tmp_path / "cards.json"
+    checked = datetime.now(timezone.utc).isoformat()
+    cached = metadata._metadata(alternate("Actual", "Alternate"), checked)
+    cached["name_aliases"][0]["oracle_id"] = "different"
+    metadata._write_cache(cache, {"actual": cached})
+    found, summary = metadata.load_card_metadata(["Alternate"], cache)
+    assert not found
+    assert "different card identity" in summary["cache_error"]
+
+
+def test_cold_secret_lair_printing_lookup_resolves_unindexed_display_name_without_alias_groups(tmp_path, monkeypatch):
+    printing_id = "abb04ab1-2a74-432f-b3d3-d4f5b2534066"
+    attempts = []
+
+    def handler(request):
+        attempts.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json=collection([], ["Max, the Daredevil"]))
+        assert str(request.url) == f"{metadata.CARD_URL}/{printing_id}"
+        return httpx.Response(200, json=alternate(
+            "Elmar, Ulvenwald Informant", "Max, the Daredevil", field="printed_name", id=printing_id,
+        ))
+
+    delays = client(monkeypatch, handler)
+    cache = tmp_path / "cards.json"
+    found, summary = metadata.load_card_metadata(
+        ["Max, the Daredevil"], cache, fetch=True, printing_ids={"Max, the Daredevil": printing_id},
+    )
+    assert found["max, the daredevil"]["name"] == "Elmar, Ulvenwald Informant"
+    assert found["max, the daredevil"]["name_aliases"][0]["printing_id"] == printing_id
+    assert summary["requested"] == summary["resolved"] == summary["fetched"] == 1
+    assert summary["requests"] == 2 and summary["printing_requests"] == 1
+    assert not summary["missing"] and not summary["failures"]
+    assert delays == [.1, .1]
+    monkeypatch.setattr(metadata.httpx, "Client", lambda **_: pytest.fail("Verified printing alias should persist offline"))
+    offline, summary = metadata.load_card_metadata(["Max, the Daredevil"], cache)
+    assert offline == found
+    assert summary["cached"] == 1 and summary["requests"] == 0
+
+
+@pytest.mark.parametrize("mismatch", ["id", "name", "proof"])
+def test_printing_lookup_requires_both_exact_uuid_and_original_name_evidence(tmp_path, monkeypatch, mismatch):
+    printing_id = "abb04ab1-2a74-432f-b3d3-d4f5b2534066"
+
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200, json=collection([], ["Max, the Daredevil"]))
+        if str(request.url).startswith(metadata.NAMED_URL):
+            return httpx.Response(404, json={"object": "error"})
+        raw = alternate("Elmar, Ulvenwald Informant", "Max, the Daredevil", field="printed_name", id=printing_id)
+        if mismatch == "id":
+            raw["id"] = "114addfb-6fcb-47fc-a617-9e029d3e1ae5"
+        elif mismatch == "name":
+            raw["printed_name"] = "Different Name"
+        else:
+            raw.pop("printed_name")
+        return httpx.Response(200, json=raw)
+
+    client(monkeypatch, handler)
+    cache = tmp_path / "cards.json"
+    found, summary = metadata.load_card_metadata(
+        ["Max, the Daredevil"], cache, fetch=True, printing_ids={"Max, the Daredevil": printing_id},
+    )
+    assert not found and not cache.exists()
+    assert summary["missing"] == ["Max, the Daredevil"]
+    assert summary["failures"]
+    assert summary["requests"] == 3
+
+
+def test_unknown_printing_can_still_resolve_via_independent_exact_name_fallback(tmp_path, monkeypatch):
+    printing_id = "abb04ab1-2a74-432f-b3d3-d4f5b2534066"
+
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200, json=collection([], ["Cecil Harvey"]))
+        if str(request.url).startswith(metadata.NAMED_URL):
+            return httpx.Response(200, json=alternate("Tymna the Weaver", "Cecil Harvey"))
+        return httpx.Response(404, json={"object": "error"})
+
+    client(monkeypatch, handler)
+    found, summary = metadata.load_card_metadata(
+        ["Cecil Harvey"], tmp_path / "cards.json", fetch=True, printing_ids={"Cecil Harvey": printing_id},
+    )
+    assert found["cecil harvey"]["name"] == "Tymna the Weaver"
+    assert summary["requests"] == 3 and not summary["failures"]

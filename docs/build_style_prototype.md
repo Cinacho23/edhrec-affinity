@@ -130,7 +130,18 @@ qualifying external observation, selection uses native mana and role diagnostics
 and keeps the external target explicitly unverified or unmet.
 
 Scryfall supplies exact-name card rules, color identity and Commander legality
-in cached batches. Missing verified metadata or a complete legal anchor produces
+in cached batches. Unresolved names receive an exact named-card lookup. English
+alternate names from Scryfall's `flavor_name` and `printed_name` fields retain
+their printing and Oracle identity evidence in the shared cache. EDHREC's
+constituent commander printing IDs provide another fallback: the Scryfall
+response must match that ID and explicitly confirm the requested alternate name.
+Explicit EDHREC
+alternate commander configurations can also resolve an individual card when
+exactly one name differs; partner positions and card-page links alone do not
+establish an alias. Ambiguous identities stay unresolved. Deck construction
+uses the same verified identities to match sampled commanders and enforce
+singleton rules, including when a sampled list uses the regular printing's name.
+Missing verified metadata or a complete legal anchor produces
 an unavailable result. Functional buckets use Oracle-text heuristics: Card
 Advantage, Ramp, Removal, Wipe, Tutor, Recursion, Protection, Lands, Fast Mana
 and Leftover. Cards can have several internal roles for construction and primers;

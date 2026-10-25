@@ -16,7 +16,8 @@ import math
 import re
 from urllib.parse import quote_plus
 
-from .sources import card_key
+from .card_metadata import metadata_aliases
+from .sources import card_key, commander_card_alias_groups
 
 
 ROLES = ("Commander", "Lands", "Fast Mana", "Ramp", "Card Advantage", "Wipe",
@@ -46,26 +47,43 @@ def _oracle(card):
 
 @_cached_card
 def _aliases(card):
-    names = [card.get("name", "")]
-    if card.get("layout") in {"modal_dfc", "transform", "flip", "adventure", "prepare"}:
-        faces = card.get("card_faces", [])
-        names.append(faces[0].get("name", "") if faces else str(card.get("name", "")).split(" // ")[0])
-    return {card_key(name) for name in names if name}
+    return metadata_aliases({"layout": "normal", "card_faces": [], **card})
 
 
-def _metadata_index(metadata):
-    result = {}
+def _metadata_identity(card):
+    oracle_id = card.get("oracle_id")
+    return ("oracle", oracle_id) if isinstance(oracle_id, str) and oracle_id else ("name", card_key(card["name"]))
+
+
+def _metadata_index(metadata, *, commander_alias_groups=None):
     canonical = {}
-    for key, card in (metadata or {}).items():
+    for card in (metadata or {}).values():
         if not isinstance(card, dict) or not isinstance(card.get("name"), str):
             continue
-        card = {**card, "_build_cache": {}}
+        canonical.setdefault(card_key(card["name"]), {**card, "_build_cache": {}})
+    candidates = {}
+    for card in canonical.values():
         for alias in _aliases(card):
-            result[alias] = card
-        canonical[card_key(card["name"])] = card
-    # An actual single-faced card name always wins over a front-face alias,
-    # independent of record iteration order. Back/spell faces are never aliases.
-    result.update(canonical)
+            candidates.setdefault(alias, []).append(card)
+    # Actual canonical names always win. Ambiguous front/flavor aliases do not
+    # substitute one card for another, independent of input iteration order.
+    result = dict(canonical)
+    for alias, cards in candidates.items():
+        if alias not in result and len({_metadata_identity(card) for card in cards}) == 1:
+            result[alias] = min(cards, key=lambda card: card_key(card["name"]))
+    for group in commander_alias_groups or []:
+        if (not isinstance(group, list) or len(group) < 2
+                or any(not isinstance(name, str) or not name.strip() for name in group)):
+            continue
+        keys = {card_key(name) for name in group}
+        if len(keys) != len(group):
+            continue
+        resolved = [result[key] for key in keys if key in result]
+        if not resolved or len({_metadata_identity(card) for card in resolved}) != 1:
+            continue
+        card = min(resolved, key=lambda card: card_key(card["name"]))
+        for alias in keys:
+            result.setdefault(alias, card)
     return result
 
 
@@ -488,10 +506,30 @@ def _unavailable(reason, **extra):
 
 def _prepare_package(package, model_decks, source_decks, base, profiles, metadata):
     commander_names = base.get("commander_names", [])
-    if not commander_names or any(not _complete_metadata(metadata.get(card_key(name))) for name in commander_names):
+    if (not isinstance(commander_names, list) or not commander_names
+            or any(not isinstance(name, str) or not name.strip() for name in commander_names)
+            or any(not _complete_metadata(metadata.get(card_key(name))) for name in commander_names)):
         return _unavailable("Verified card metadata is required for every commander before constructing a deck.")
+    for group in commander_card_alias_groups(base.get("commander_name_groups", [])):
+        identities = {_metadata_identity(metadata[card_key(name)]) for name in group if card_key(name) in metadata}
+        if len(identities) > 1:
+            return _unavailable("Verified commander aliases conflict with distinct card identities.")
     commander_keys = sorted({card_key(metadata[card_key(name)]["name"]) for name in commander_names})
-    expected = {card_key(name) for name in commander_names}
+    expected_identities = {_metadata_identity(metadata[key]) for key in commander_keys}
+    if len(commander_keys) != len(commander_names) or len(expected_identities) != len(commander_names):
+        return _unavailable("The commander configuration contains duplicate card identities.")
+    allowed = set()
+    groups = base.get("commander_name_groups", [])
+    groups = groups if isinstance(groups, list) else []
+    for group in [commander_names, *groups]:
+        if (not isinstance(group, list) or len(group) != len(commander_names)
+                or any(not isinstance(name, str) or not name.strip() for name in group)):
+            continue
+        keys = frozenset(card_key(name) for name in group)
+        if (len(keys) == len(commander_names) and all(_complete_metadata(metadata.get(key)) for key in keys)
+                and {_metadata_identity(metadata[key]) for key in keys} == expected_identities):
+            allowed.add(keys)
+    commander_row_keys = set().union(*allowed)
     package_id = package.get("id", 0)
     weights = {row["id"]: float(row["weights"][package_id]) for row in model_decks
                if isinstance(row.get("weights"), list) and len(row["weights"]) > package_id
@@ -501,18 +539,27 @@ def _prepare_package(package, model_decks, source_decks, base, profiles, metadat
         return _unavailable("No positive learned memberships are available for this package.")
     pool, observed, by_id = set(commander_keys), [], {}
     for deck in sorted(source_decks, key=lambda row: str(row.get("id", ""))):
-        if {card_key(name) for name in deck.get("commanders", [])} != expected:
+        actual = deck.get("commanders", [])
+        if (not isinstance(actual, list) or len(actual) != len(commander_names)
+                or any(not isinstance(name, str) or not name.strip() for name in actual)
+                or frozenset(card_key(name) for name in actual) not in allowed):
             continue
         counts = Counter({key: 1 for key in commander_keys})
         malformed = False
         for card in deck.get("cards", []):
             name, quantity = card.get("name", ""), card.get("quantity", 1)
+            if not isinstance(name, str) or not name.strip():
+                malformed = True
+                break
             key = card_key(name)
-            if key in expected:
-                continue
             if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
                 malformed = True
                 break
+            if key in commander_row_keys or (key in metadata and _metadata_identity(metadata[key]) in expected_identities):
+                if quantity != 1:
+                    malformed = True
+                    break
+                continue
             if key in metadata:
                 key = card_key(metadata[key]["name"])
             counts[key] += quantity
@@ -678,7 +725,8 @@ def generate_package_decks(analysis, decks, base, profiles, card_metadata=None, 
     records. Missing metadata returns an unavailable result rather than an
     unverifiable generated list. The supplied analysis is updated and returned.
     """
-    metadata = _metadata_index(card_metadata)
+    metadata = _metadata_index(card_metadata,
+                               commander_alias_groups=commander_card_alias_groups(base.get("commander_name_groups", [])))
     models = [(analysis.get("packages", []),
                [{"id": row["id"], "weights": row.get("memberships", [])} for row in analysis.get("decks", [])], None)]
     models.extend((model.get("packages", []), model.get("memberships", []), model.get("components"))
@@ -798,7 +846,8 @@ def generate_package_deck_candidates(analysis, decks, base, profiles, card_metad
     package = next((package for package in packages if package.get("id") == package_id), None)
     if package is None:
         return []
-    metadata = _indexed_metadata if _indexed_metadata is not None else _metadata_index(card_metadata)
+    metadata = _indexed_metadata if _indexed_metadata is not None else _metadata_index(card_metadata,
+        commander_alias_groups=commander_card_alias_groups(base.get("commander_name_groups", [])))
     context = {} if _context is None else _context
     ranked = sorted((row for row in memberships if len(row.get("weights", [])) > package_id and row["weights"][package_id] > 0),
                     key=lambda row: (-row["weights"][package_id], str(row["id"])))

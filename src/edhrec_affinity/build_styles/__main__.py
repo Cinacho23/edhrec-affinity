@@ -14,7 +14,11 @@ import httpx
 from .analysis import analyze_decks, compare_profiles
 from .collection import collect_previews, parse_sample_decks
 from .eligibility import MIN_COMMANDER_DECKS, require_eligible_commander, validate_minimum
-from .sources import Cache, CommanderAliasCatalog, RequestLimiter, SourceBlocked, checked_identifier, import_decks, parse_profile
+from .sources import (
+    Cache, CommanderAliasCatalog, RequestLimiter, SourceBlocked, checked_identifier,
+    commander_card_alias_groups, commander_printing_ids, enrich_commander_name_groups,
+    import_decks, parse_profile,
+)
 
 
 def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transport=None, metadata_lock=None,
@@ -112,9 +116,15 @@ def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transpor
                     if cache.blocked:
                         break
             names = [*base["commander_names"], *[card["name"] for deck in decks for card in deck["cards"]]]
+            alias_groups = commander_card_alias_groups(base.get("commander_name_groups", []))
+            alias_options = {"commander_alias_groups": alias_groups} if alias_groups else {}
+            printing_ids = commander_printing_ids(card)
+            if printing_ids:
+                alias_options["printing_ids"] = printing_ids
             with metadata_lock or nullcontext():
-                metadata, metadata_summary = (metadata_provider.load(names, fetch=args.fetch) if metadata_provider else
-                                               load_card_metadata(names, args.card_metadata_cache, fetch=args.fetch))
+                metadata, metadata_summary = (metadata_provider.load(names, fetch=args.fetch, **alias_options) if metadata_provider else
+                                               load_card_metadata(names, args.card_metadata_cache, fetch=args.fetch, **alias_options))
+            base["commander_name_groups"] = enrich_commander_name_groups(base, metadata)
         return {"slug": slug, "card": card, "base": base, "profiles": profiles,
                 "ranking_profiles": ranking_profiles, "decks": decks, "collection": collection,
                 "metadata": metadata, "metadata_summary": metadata_summary,
