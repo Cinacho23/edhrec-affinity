@@ -1,8 +1,11 @@
 """Shared, exact-name Scryfall metadata for sampled deck card pools.
 
-The collection API accepts at most 75 identifiers in a POST. This module keeps
-successful Oracle metadata across commanders; it never substitutes fuzzy names
-or caches negative lookups. Source: https://scryfall.com/docs/api/cards/collection
+The collection API accepts at most 75 identifiers in a POST. Unresolved names
+fall back to an EDHREC-supplied printing UUID, Scryfall's exact named endpoint,
+then explicitly supplied EDHREC individual-card equivalents. This module keeps
+successful Oracle metadata and verified English alternate-printing names across
+commanders; it never uses fuzzy
+names or caches negative lookups. Source: https://scryfall.com/docs/api/cards/collection
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Iterable
+from uuid import UUID
 
 import httpx
 
@@ -25,6 +29,8 @@ from .sources import card_key
 
 
 COLLECTION_URL = "https://api.scryfall.com/cards/collection"
+NAMED_URL = "https://api.scryfall.com/cards/named"
+CARD_URL = "https://api.scryfall.com/cards"
 DEFAULT_CACHE_PATH = Path("data/raw/build-style-card-metadata.json")
 COLLECTION_BATCH_SIZE = 75
 REQUEST_DELAY_SECONDS = 0.1
@@ -33,6 +39,7 @@ _LEGALITIES = {"legal", "not_legal", "restricted", "banned"}
 # The front of these cards identifies the playable card. A split/aftermath half
 # is deliberately not accepted as an alias for its full card name.
 _FRONT_FACE_LAYOUTS = {"modal_dfc", "transform", "flip", "adventure", "prepare"}
+_PRINTED_NAME_FIELDS = {"flavor_name", "printed_name"}
 
 
 def _now() -> str:
@@ -104,6 +111,8 @@ def _metadata(raw: Any, checked_at: str) -> dict[str, Any]:
             "mana_cost": _string(face.get("mana_cost", ""), "face mana cost"),
             **{field: _string(face[field], f"face {field}")
                for field in ("power", "toughness") if field in face},
+            **{field: _string(face[field], f"face {field}", empty=False)
+               for field in _PRINTED_NAME_FIELDS if field in face},
         })
     game_changer = raw.get("game_changer")
     if game_changer is not None and not isinstance(game_changer, bool):
@@ -114,7 +123,7 @@ def _metadata(raw: Any, checked_at: str) -> dict[str, Any]:
         for symbol in produced_mana
     ):
         raise ValueError("Invalid Scryfall produced mana")
-    return {
+    result = {
         "name": _string(raw.get("name"), "name", empty=False),
         "type_line": _string(raw.get("type_line"), "type line", empty=False),
         "oracle_text": _string(raw.get("oracle_text", ""), "Oracle text"),
@@ -128,16 +137,139 @@ def _metadata(raw: Any, checked_at: str) -> dict[str, Any]:
         "game_changer": game_changer,
         "produced_mana": list(produced_mana),
         **{field: _string(raw[field], field, empty=False)
-           for field in ("oracle_id", "scryfall_uri", "power", "toughness") if field in raw},
+           for field in ("id", "lang", "oracle_id", "scryfall_uri", "power", "toughness",
+                         "flavor_name", "printed_name") if field in raw},
         "checked_at": _timestamp(checked_at),
     }
+    # A printing can have a different displayed name while sharing the same
+    # Oracle identity. Preserve the exact English printing evidence separately
+    # so refreshing to a regular printing cannot erase a verified alternate name.
+    proofs = raw.get("name_aliases", [])
+    if not isinstance(proofs, list):
+        raise ValueError("Invalid Scryfall name alias evidence")
+    validated = []
+    for proof in proofs:
+        if not isinstance(proof, dict) or set(proof) != {
+            "name", "source_field", "printing_id", "lang", "oracle_id", "canonical_name",
+        }:
+            raise ValueError("Invalid Scryfall name alias evidence")
+        if any(not isinstance(value, str) or not value.strip() for value in proof.values()):
+            raise ValueError("Invalid Scryfall name alias evidence")
+        if (proof["source_field"] not in _PRINTED_NAME_FIELDS or proof["lang"] != "en"
+                or proof["oracle_id"] != result.get("oracle_id")
+                or card_key(proof["canonical_name"]) != card_key(result["name"])):
+            raise ValueError("Scryfall name alias evidence has a different card identity")
+        if proof not in validated:
+            validated.append(dict(proof))
+    if result.get("id") and result.get("oracle_id") and result.get("lang") == "en":
+        sources = [result]
+        if result["layout"] in _FRONT_FACE_LAYOUTS and normalized_faces:
+            sources.append(normalized_faces[0])
+        for source in sources:
+            for field in sorted(_PRINTED_NAME_FIELDS):
+                if field in source:
+                    proof = {"name": source[field], "source_field": field,
+                             "printing_id": result["id"], "lang": "en",
+                             "oracle_id": result["oracle_id"], "canonical_name": result["name"]}
+                    if proof not in validated:
+                        validated.append(proof)
+    if validated:
+        result["name_aliases"] = validated
+    return result
 
 
-def _aliases(card: dict[str, Any]) -> set[str]:
+def metadata_aliases(card: dict[str, Any]) -> set[str]:
+    """Strict known names, including verified English alternate printings.
+
+    Callers supply normalized metadata, never arbitrary input-name mappings.
+    Split/Room halves and back faces are deliberately excluded.
+    """
     keys = {card_key(card["name"])}
     if card["layout"] in _FRONT_FACE_LAYOUTS and card["card_faces"]:
         keys.add(card_key(card["card_faces"][0]["name"]))
+    for proof in card.get("name_aliases", []):
+        if (proof.get("oracle_id") == card.get("oracle_id") and proof.get("lang") == "en"
+                and proof.get("source_field") in _PRINTED_NAME_FIELDS
+                and card_key(proof.get("canonical_name", "")) == card_key(card["name"])
+                and isinstance(proof.get("printing_id"), str) and proof["printing_id"]
+                and isinstance(proof.get("name"), str) and proof["name"].strip()):
+            keys.add(card_key(proof["name"]))
     return keys
+
+
+_aliases = metadata_aliases
+
+
+def _merge_cards(cards: dict[str, dict], fresh: dict[str, dict]) -> None:
+    for key, card in fresh.items():
+        old = cards.get(key)
+        if old and card.get("oracle_id") and old.get("oracle_id") == card["oracle_id"]:
+            proofs = copy.deepcopy(old.get("name_aliases", []))
+            proofs.extend(proof for proof in card.get("name_aliases", []) if proof not in proofs)
+            if proofs:
+                card = {**card, "name_aliases": proofs}
+        cards[key] = card
+
+
+def _alias_groups(groups: list[list[str]] | None) -> list[list[str]]:
+    if groups is None:
+        return []
+    if not isinstance(groups, list):
+        raise ValueError("Commander alias groups must be lists of equivalent individual-card names")
+    result = []
+    for group in groups:
+        if not isinstance(group, list):
+            raise ValueError("Commander alias groups must contain lists")
+        names = list(_requested_names(group).values())
+        if len(names) < 2:
+            raise ValueError("Commander alias groups require at least two different names")
+        result.append(names)
+    return result
+
+
+def _printing_identifiers(identifiers: dict[str, str] | None) -> dict[str, str]:
+    if identifiers is None:
+        return {}
+    if not isinstance(identifiers, dict):
+        raise ValueError("Printing identifiers must map card names to Scryfall UUIDs")
+    result = {}
+    for name, value in identifiers.items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(value, str):
+            raise ValueError("Printing identifiers must map card names to Scryfall UUIDs")
+        try:
+            identifier = str(UUID(value))
+        except (ValueError, AttributeError) as error:
+            raise ValueError("Printing identifiers require canonical Scryfall UUIDs") from error
+        if value.lower() != identifier:
+            raise ValueError("Printing identifiers require canonical Scryfall UUIDs")
+        key = card_key(name)
+        if key in result and result[key] != identifier:
+            raise ValueError("Conflicting Scryfall printing identifiers for the same card name")
+        result[key] = identifier
+    return result
+
+
+def _group_lookup(lookup: dict[str, dict], groups: list[list[str]]) -> tuple[dict[str, dict], list[list[str]]]:
+    """Apply explicit individual-card equivalences only to unambiguous identities."""
+    if not groups:
+        return lookup, []
+    candidates: dict[str, list[dict]] = {}
+    conflicts = []
+    for group in groups:
+        matches = [lookup[card_key(name)] for name in group if card_key(name) in lookup]
+        identities = {card.get("oracle_id") or card_key(card["name"]) for card in matches}
+        if len(identities) > 1:
+            conflicts.append(group)
+            continue
+        if matches:
+            for name in group:
+                candidates.setdefault(card_key(name), []).extend(matches)
+    result = dict(lookup)
+    for key, matches in candidates.items():
+        identities = {card.get("oracle_id") or card_key(card["name"]) for card in matches}
+        if key not in result and len(identities) == 1:
+            result[key] = matches[0]
+    return result, conflicts
 
 
 def _index(cards: dict[str, dict]) -> dict[str, dict]:
@@ -229,7 +361,11 @@ def _collection_cards(
             rejected.append({"returned_name": card["name"], "aliases": aliases,
                              "error": f"Returned card {card['name']!r} (aliases: {aliases!r}) does not exactly match any request"})
             continue
-        cards[card_key(card["name"])] = card
+        canonical = card_key(card["name"])
+        previous = cards.get(canonical)
+        if previous and previous.get("oracle_id") != card.get("oracle_id"):
+            raise ValueError("Scryfall returned conflicting identities for the same canonical name")
+        _merge_cards(cards, {canonical: card})
     resolved = _index(cards)
     missing_keys = {card_key(name) for name in missing}
     if any(key in resolved for key in missing_keys):
@@ -294,26 +430,49 @@ class MetadataRepository:
         self._lookup = _index(self._cards)
         self._loaded = True
 
-    def load(self, names: Iterable[str], *, fetch: bool = False) -> tuple[dict[str, dict], dict[str, Any]]:
+    def load(
+        self, names: Iterable[str], *, fetch: bool = False,
+        commander_alias_groups: list[list[str]] | None = None,
+        printing_ids: dict[str, str] | None = None,
+    ) -> tuple[dict[str, dict], dict[str, Any]]:
         requested = _requested_names(names)
+        groups = _alias_groups(commander_alias_groups)
+        identifiers = _printing_identifiers(printing_ids)
         with self._lock:
             self._read_once()
-            return self._load(requested, fetch=fetch)
+            return self._load(requested, fetch=fetch, groups=groups, identifiers=identifiers)
 
-    def _load(self, requested: dict[str, str], *, fetch: bool) -> tuple[dict[str, dict], dict[str, Any]]:
+    def _load(
+        self, requested: dict[str, str], *, fetch: bool, groups: list[list[str]],
+        identifiers: dict[str, str],
+    ) -> tuple[dict[str, dict], dict[str, Any]]:
         summary: dict[str, Any] = {
             "source_url": COLLECTION_URL, "checked_at": _now(), "network_enabled": fetch,
             "requested": len(requested), "cached": 0, "fetched": 0, "requests": 0,
             "resolved": 0, "missing": [], "not_found": [], "failures": [], "blocked": self.blocked,
             "cache_max_age_days": self.max_age_days, "stale_cached": 0,
             "stale_names": [], "oldest_checked_at": None,
+            "alias_resolutions": [], "alias_conflicts": [],
+            "collection_rejections": [],
+            "printing_requests": 0,
         }
         if self._cache_error is not None:
             summary["cache_error"] = self._cache_error
         now = datetime.now(timezone.utc)
+        lookup, _ = _group_lookup(self._lookup, groups)
         pending = [name for key, name in requested.items()
-                   if key not in self._lookup or _stale(self._lookup[key], now, self.max_age_days)]
-        refreshed_keys: set[str] = set()
+                   if key not in lookup or _stale(lookup[key], now, self.max_age_days)]
+        refreshed_cards: set[str] = set()
+
+        def save(fresh: dict[str, dict]) -> None:
+            if not fresh:
+                return
+            _merge_cards(self._cards, fresh)
+            self._lookup = _index(self._cards)
+            _write_cache(self.cache_path, self._cards)
+            self._cache_error = None
+            refreshed_cards.update(fresh)
+
         if fetch and pending and self.blocked:
             summary["failures"].append({
                 "names": pending, "status_code": self._blocked_status,
@@ -323,52 +482,135 @@ class MetadataRepository:
             with httpx.Client(headers={"User-Agent": DEFAULT_USER_AGENT,
                                        "Accept": "application/json"}, timeout=30,
                               follow_redirects=False) as client:
+                def request(method: str, url: str, names: list[str], **kwargs: Any) -> Any:
+                    # Collection and exact-name fallback share one paced stream
+                    # and the same repository-wide access stop.
+                    time.sleep(REQUEST_DELAY_SECONDS)
+                    summary["requests"] += 1
+                    response = client.request(method, url, **kwargs)
+                    if response.status_code in {401, 403, 429}:
+                        self._blocked_status = response.status_code
+                        summary["blocked"] = True
+                        summary["failures"].append({"names": names, "status_code": response.status_code,
+                                                    "error": "Access or rate limit response; collection stopped without retry"})
+                        return None
+                    if method == "GET" and response.status_code == 404:
+                        return None
+                    response.raise_for_status()
+                    return _strict_json(response.text)
+
+                missing_names: list[str] = []
+                fallback_names: list[str] = []
+                collection_rejections: list[dict] = []
                 for start in range(0, len(pending), COLLECTION_BATCH_SIZE):
                     # A previous batch can resolve an alias in a subsequent batch.
                     batch_now = datetime.now(timezone.utc)
+                    lookup, _ = _group_lookup(self._lookup, groups)
                     batch = [name for name in pending[start:start + COLLECTION_BATCH_SIZE]
-                             if card_key(name) not in self._lookup
-                             or _stale(self._lookup[card_key(name)], batch_now, self.max_age_days)]
+                             if card_key(name) not in lookup
+                             or _stale(lookup[card_key(name)], batch_now, self.max_age_days)]
                     if not batch:
                         continue
-                    # The lock keeps this delay global across repository users,
-                    # including the first request of the following commander.
-                    time.sleep(REQUEST_DELAY_SECONDS)
-                    summary["requests"] += 1
                     try:
-                        response = client.post(COLLECTION_URL,
-                                               json={"identifiers": [{"name": _identifier_name(name)} for name in batch]})
-                        if response.status_code in {401, 403, 429}:
-                            self._blocked_status = response.status_code
-                            summary["blocked"] = True
-                            summary["failures"].append({"names": batch, "status_code": response.status_code,
-                                                        "error": "Access or rate limit response; collection stopped without retry"})
+                        payload = request("POST", COLLECTION_URL, batch,
+                                          json={"identifiers": [{"name": _identifier_name(name)} for name in batch]})
+                        if payload is None:
                             break
-                        response.raise_for_status()
-                        fresh, missing, rejected = _collection_cards(_strict_json(response.text), batch, _now())
-                        if fresh:
-                            self._cards.update(fresh)
-                            self._lookup = _index(self._cards)
-                            # Preserve completed batches if a later request fails.
-                            _write_cache(self.cache_path, self._cards)
-                            self._cache_error = None
-                            refreshed_keys.update(key for key in _index(fresh) if key in requested)
-                        summary["not_found"].extend(missing)
-                        summary["failures"].extend(rejected)
+                        fresh, missing, rejected = _collection_cards(payload, batch, _now())
+                        save(fresh)
+                        missing_names.extend(name for name in missing if name not in missing_names)
+                        fallback_names.extend(name for name in missing if name not in fallback_names)
+                        for rejection in rejected:
+                            fallback_names.extend(name for name in rejection["names"] if name not in fallback_names)
+                        collection_rejections.extend(rejected)
                     except (httpx.HTTPError, ValueError, OSError, TypeError) as error:
                         summary["failures"].append({"names": batch, "error": str(error)})
                         break
+                # Collection identifiers can miss English alternate printings
+                # accepted by the exact named endpoint. Never use fuzzy search.
+                for name in fallback_names:
+                    if self.blocked:
+                        break
+                    lookup, conflicts = _group_lookup(self._lookup, groups)
+                    key = card_key(name)
+                    if key in lookup and not _stale(lookup[key], datetime.now(timezone.utc), self.max_age_days):
+                        continue
+                    # EDHREC may expose the exact Scryfall printing even when
+                    # name search does not index its Secret Lair display name.
+                    # The UUID is only a lookup hint: both the returned printing
+                    # and its exact English name evidence must independently agree.
+                    if key in identifiers:
+                        try:
+                            summary["printing_requests"] += 1
+                            payload = request("GET", f"{CARD_URL}/{identifiers[key]}", [name])
+                            if payload is not None:
+                                card = _metadata(payload, _now())
+                                if card.get("id") != identifiers[key]:
+                                    raise ValueError("Returned Scryfall printing does not match the requested UUID")
+                                if key not in metadata_aliases(card):
+                                    raise ValueError(f"Scryfall printing does not exactly identify {name!r}")
+                                save({card_key(card["name"]): card})
+                                continue
+                        except (httpx.HTTPError, ValueError, OSError, TypeError) as error:
+                            summary["failures"].append({"names": [name], "error": str(error)})
+                    # Explicit EDHREC per-card equivalences are a second fallback,
+                    # not positional guesses from partner configurations.
+                    alternatives = [name]
+                    for group in groups:
+                        if key in {card_key(alias) for alias in group} and group not in conflicts:
+                            alternatives.extend(alias for alias in group if alias not in alternatives)
+                    for exact in alternatives:
+                        if self.blocked:
+                            break
+                        try:
+                            payload = request("GET", NAMED_URL, [name], params={"exact": exact})
+                            if payload is None:
+                                continue
+                            card = _metadata(payload, _now())
+                            if card_key(exact) not in metadata_aliases(card):
+                                raise ValueError(f"Returned card {card['name']!r} does not exactly match {exact!r}")
+                            # Do not overwrite a known canonical identity through
+                            # an alternate name whose Oracle identity conflicts.
+                            known = [self._lookup[card_key(alias)] for group in groups
+                                     if key in {card_key(item) for item in group}
+                                     for alias in group if card_key(alias) in self._lookup]
+                            if any((match.get("oracle_id") or card_key(match["name"])) !=
+                                   (card.get("oracle_id") or card_key(card["name"])) for match in known):
+                                raise ValueError("Commander alias group has conflicting Oracle identities")
+                            save({card_key(card["name"]): card})
+                            break
+                        except (httpx.HTTPError, ValueError, OSError, TypeError) as error:
+                            summary["failures"].append({"names": [name], "error": str(error)})
+                            break
+                lookup, _ = _group_lookup(self._lookup, groups)
+                summary["not_found"] = [name for name in missing_names if card_key(name) not in lookup]
+                summary["collection_rejections"] = collection_rejections
+                unresolved_rejections = []
+                for rejection in collection_rejections:
+                    unresolved = [name for name in rejection["names"] if card_key(name) not in lookup]
+                    if unresolved or not rejection["names"]:
+                        unresolved_rejections.append({**rejection, "names": unresolved})
+                summary["failures"] = unresolved_rejections + summary["failures"]
         # Resolve just this pool, without scanning the complete shared cache
         # again for every commander. Preserve safe full/front-name aliases.
         result = {}
+        lookup, conflicts = _group_lookup(self._lookup, groups)
+        summary["alias_conflicts"] = conflicts
         for key in requested:
-            card = self._lookup.get(key)
+            card = lookup.get(key)
             if card is not None:
                 for alias in _aliases(card):
                     if self._lookup.get(alias) is card:
                         result[alias] = card
+                result[key] = card
+                if key != card_key(card["name"]):
+                    summary["alias_resolutions"].append({
+                        "requested_name": requested[key], "canonical_name": card["name"],
+                        "oracle_id": card.get("oracle_id"),
+                        "source": "scryfall" if key in self._lookup else "edhrec_commander_equivalence",
+                    })
         summary["resolved"] = sum(key in result for key in requested)
-        summary["fetched"] = sum(key in result for key in refreshed_keys)
+        summary["fetched"] = sum(key in result and card_key(result[key]["name"]) in refreshed_cards for key in requested)
         summary["cached"] = summary["resolved"] - summary["fetched"]
         summary["missing"] = [name for key, name in requested.items() if key not in result]
         final_now = datetime.now(timezone.utc)
@@ -383,6 +625,8 @@ class MetadataRepository:
 
 def load_card_metadata(
     names: Iterable[str], cache_path: Path | str = DEFAULT_CACHE_PATH, *, fetch: bool = False,
+    commander_alias_groups: list[list[str]] | None = None,
+    printing_ids: dict[str, str] | None = None,
 ) -> tuple[dict[str, dict], dict[str, Any]]:
     """Resolve one pool with the legacy seven-day freshness policy.
 
@@ -390,4 +634,7 @@ def load_card_metadata(
     Offline lookups and failed refreshes retain their original dated metadata;
     unresolved and stale input names remain explicit in the summary.
     """
-    return MetadataRepository(cache_path, max_age_days=CACHE_MAX_AGE_DAYS).load(names, fetch=fetch)
+    return MetadataRepository(cache_path, max_age_days=CACHE_MAX_AGE_DAYS).load(
+        names, fetch=fetch, commander_alias_groups=commander_alias_groups,
+        printing_ids=printing_ids,
+    )

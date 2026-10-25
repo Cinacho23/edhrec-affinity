@@ -53,6 +53,149 @@ def _commander_name_groups(card: dict) -> list[list[str]]:
     return groups
 
 
+def commander_card_alias_groups(full_configuration_groups: list[list[str]]) -> list[list[str]]:
+    """Derive individual aliases from explicit equivalent configurations.
+
+    Commander order is not an identity mapping. Only configurations that differ
+    by exactly one name establish a per-card equivalence; overlapping links may
+    then establish transitive aliases. A component that would collapse two
+    commanders occurring together is ambiguous and is never returned.
+    """
+    if not isinstance(full_configuration_groups, list) or not full_configuration_groups:
+        return []
+    first = full_configuration_groups[0]
+    if (not isinstance(first, list) or not first
+            or any(not isinstance(name, str) or not name.strip() for name in first)
+            or len({card_key(name) for name in first}) != len(first)):
+        return []
+    names, configurations = {}, set()
+    for group in full_configuration_groups:
+        if (not isinstance(group, list) or len(group) != len(first)
+                or any(not isinstance(name, str) or not name.strip() for name in group)):
+            continue
+        keys = frozenset(card_key(name) for name in group)
+        if len(keys) != len(first):
+            continue
+        configurations.add(keys)
+        for name in group:
+            names.setdefault(card_key(name), name.strip())
+    links = {}
+    ordered = sorted(configurations, key=lambda keys: sorted(keys))
+    for position, left in enumerate(ordered):
+        for right in ordered[position + 1:]:
+            removed, added = left - right, right - left
+            if len(removed) == len(added) == 1:
+                before, after = next(iter(removed)), next(iter(added))
+                links.setdefault(before, set()).add(after)
+                links.setdefault(after, set()).add(before)
+    groups, visited = [], set()
+    for key in sorted(links):
+        if key in visited:
+            continue
+        component, pending = {key}, [key]
+        while pending:
+            for other in links[pending.pop()] - component:
+                component.add(other)
+                pending.append(other)
+        visited.update(component)
+        if any(len(component & configuration) > 1 for configuration in configurations):
+            continue
+        groups.append([names[alias] for alias in sorted(component)])
+    return groups
+
+
+def commander_printing_ids(card: dict) -> dict[str, str]:
+    """Read exact constituent printing IDs without interpreting partner order.
+
+    These are lookup hints, not identity proof: Scryfall must still return that
+    printing ID and independently establish the requested English card name.
+    """
+    groups = _commander_name_groups(card) if isinstance(card, dict) else []
+    if not groups:
+        return {}
+    names = {card_key(name): name for name in groups[0]}
+    constituents = card.get("cards", [])
+    constituents = list(constituents) if isinstance(constituents, list) else []
+    if len(names) == 1:
+        constituents.append(card)
+    identifiers = {}
+    for constituent in constituents:
+        if not isinstance(constituent, dict) or not isinstance(constituent.get("name"), str):
+            continue
+        key, identifier = card_key(constituent["name"]), constituent.get("id")
+        if key in names and isinstance(identifier, str) and re.fullmatch(
+                r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", identifier):
+            identifiers.setdefault(key, set()).add(identifier.lower())
+    return {names[key]: next(iter(values)) for key, values in identifiers.items() if len(values) == 1}
+
+
+def enrich_commander_name_groups(base: dict, metadata: dict) -> list[list[str]]:
+    """Add only a complete, independently verified canonical configuration.
+
+    An input dictionary key alone never proves a rename. Each display name
+    must be a strict Scryfall metadata alias or have an existing unambiguous
+    per-card EDHREC equivalence, and the resulting commanders must be distinct.
+    """
+    # card_metadata imports card_key from this module.
+    from .card_metadata import metadata_aliases
+
+    names = base.get("commander_names") if isinstance(base, dict) else None
+    if (not isinstance(names, list) or not names
+            or any(not isinstance(name, str) or not name.strip() for name in names)
+            or len({card_key(name) for name in names}) != len(names)):
+        return []
+    configurations = base.get("commander_name_groups", [])
+    configurations = configurations if isinstance(configurations, list) else []
+    groups, seen = [], set()
+    for group in [names, *configurations]:
+        if (not isinstance(group, list) or len(group) != len(names)
+                or any(not isinstance(name, str) or not name.strip() for name in group)):
+            continue
+        keys = frozenset(card_key(name) for name in group)
+        if len(keys) == len(names) and keys not in seen:
+            groups.append(list(group))
+            seen.add(keys)
+    if not isinstance(metadata, dict):
+        return groups
+    canonical, aliases = {}, {}
+    for card in metadata.values():
+        if not isinstance(card, dict) or not isinstance(card.get("name"), str) or not card["name"].strip():
+            continue
+        try:
+            known_names = metadata_aliases({"layout": "normal", "card_faces": [], **card})
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+        key, oracle_id = card_key(card["name"]), card.get("oracle_id")
+        identity = ("oracle", oracle_id) if isinstance(oracle_id, str) and oracle_id else ("name", key)
+        canonical.setdefault(key, {})[identity] = card
+        for alias in known_names:
+            aliases.setdefault(alias, {})[identity] = card
+    equivalents = {}
+    for group in commander_card_alias_groups(groups):
+        keys = {card_key(name) for name in group}
+        matches = {}
+        for key in keys:
+            matches.update(canonical.get(key) or aliases.get(key) or {})
+        if len(matches) > 1:
+            return groups  # Existing actual names disagree about this identity.
+        for key in keys:
+            equivalents[key] = matches
+    resolved = []
+    for name in names:
+        key = card_key(name)
+        matches = canonical.get(key) or aliases.get(key) or equivalents.get(key) or {}
+        if len(matches) != 1:
+            return groups
+        identity, card = next(iter(matches.items()))
+        resolved.append((identity, card["name"]))
+    canonical_names = [name for _, name in resolved]
+    if (len({identity for identity, _ in resolved}) == len(names)
+            and len({card_key(name) for name in canonical_names}) == len(names)
+            and frozenset(card_key(name) for name in canonical_names) not in seen):
+        groups.append(canonical_names)
+    return groups
+
+
 class CommanderAliasCatalog:
     """Index explicit flavor-name equivalents from already saved base pages.
 

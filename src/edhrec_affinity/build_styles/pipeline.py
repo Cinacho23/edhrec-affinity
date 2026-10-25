@@ -45,7 +45,9 @@ def evidence_version(evidence: dict, options: argparse.Namespace | None = None) 
                 for key, card in evidence.get("metadata", {}).items()}
     contents = {"deck_dataset_sha256": evidence["collection"].get("dataset_sha256"),
                 "base": evidence["base"], "profiles": evidence["ranking_profiles"], "metadata": metadata,
-                "model_version": 4, "options": {key: getattr(options, key, None) for key in
+                # Version 5 also accepts verified alternate commander identities
+                # during deck construction, even when source inputs are unchanged.
+                "model_version": 5, "options": {key: getattr(options, key, None) for key in
                     ("seed", "components", "max_components", "min_deck_cards", "min_card_support", "membership", "similarity")}}
     return hashlib.sha256(json.dumps(contents, sort_keys=True, ensure_ascii=False, allow_nan=False,
                                     separators=(",", ":")).encode()).hexdigest()
