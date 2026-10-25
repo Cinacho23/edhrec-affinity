@@ -227,7 +227,80 @@ def test_empty_insufficient_report_is_counted_without_inventing_packages(tmp_pat
     index = json.loads((site / "build-styles/index.json").read_text())
     assert (index["total_catalog"], index["total_pending"], index["total_insufficient"], index["total_fitted"]) == (2, 1, 1, 0)
     assert index["commanders"][0]["package_count"] == 0
+    assert index["commanders"][0]["packages"] == []
     assert not (site / "build-styles/pending.json").exists()
+
+
+def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_path):
+    source = report(packages=4)
+    packages = source["deck_analysis"]["packages"]
+    rating = {"status": "verified", "checked_at": "2026-10-24T10:00:00Z",
+              "playability_pct": 75.2, "bracket": 4, "deck_sha256": "large-rating-detail"}
+    packages[0].update(name="Package 1", tag_suggestions=[
+        {"tag_slug": "tokens", "tag_name": "Tokens", "similarity": 0.8, "compared_cards": 81},
+        {"tag_slug": "counters", "tag_name": "Counters", "similarity": 0.6},
+    ], generated_deck={"status": "generated", "cards": [{"name": "Do not embed full decks", "quantity": 100}],
+        "primer": "Long primer content", "export_text": "100 Do not embed full decks",
+        "validation": {"valid": True, "bracket": {"recommended": 3, "rule_checks": {"expensive": True}},
+                       "external_rating": rating},
+        "statistics": {"recommended_bracket": 3, "swap_details": [{"in": "Large card detail"}]}})
+    packages[1].update(generated_deck={"status": "generated", "statistics": {"recommended_bracket": 2}})
+    packages[2].update(tag_suggestions=[], generated_deck={"status": "unavailable", "reason": "Metadata missing"})
+    # Older packages can lack generation and labels; alternative model packages
+    # are deliberately excluded from this summary of the selected model.
+    packages[3]["tag_suggestions"] = None
+    source["deck_analysis"]["alternative_models"] = [{"components": 8, "packages": [
+        {"id": 9, "name": "Alternative only", "tag_suggestions": [{"tag_name": "Alternative tag"}]}]}]
+    write_json(tmp_path / "processed/build-styles/commander-a.json", source)
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"], "total_decks": 200}),
+                                     tmp_path / "processed", tmp_path / "site", seed_dir=tmp_path / "none")
+    index = json.loads((tmp_path / "site/build-styles/index.json").read_text())
+    assert index["commanders"][0]["packages"] == [
+        {"id": 0, "name": "Package 1", "tag_suggestions": [
+            {"tag_slug": "tokens", "tag_name": "Tokens", "similarity": 0.8},
+            {"tag_slug": "counters", "tag_name": "Counters", "similarity": 0.6}],
+         "generated_deck": {"status": "generated", "validation": {
+             "bracket": {"recommended": 3}, "external_rating": {
+                 key: value for key, value in rating.items() if key != "deck_sha256"}},
+             "statistics": {"recommended_bracket": 3}}},
+        {"id": 1, "tag_suggestions": [], "generated_deck": {
+            "status": "generated", "statistics": {"recommended_bracket": 2}}},
+        {"id": 2, "tag_suggestions": [], "generated_deck": {"status": "unavailable"}},
+        {"id": 3, "tag_suggestions": []},
+    ]
+    assert "Long primer content" not in json.dumps(index)
+    assert "Do not embed full decks" not in json.dumps(index)
+    assert "Alternative tag" not in json.dumps(index)
+
+
+@pytest.mark.parametrize("cards", [
+    [{"name": "Commander", "scryfall_uri": "https://scryfall.com/card/tst/1/commander", "faces": [
+        {"name": "Commander", "image_url": "commander.jpg"}]}],
+    [{"name": "Front // Back", "scryfall_uri": "https://scryfall.com/card/tst/2/front", "faces": [
+        {"name": "Front", "image_url": "front.jpg"}, {"name": "Back", "image_url": "back.jpg"}]},
+     {"name": "Partner", "scryfall_uri": "https://scryfall.com/card/tst/3/partner", "faces": [
+        {"name": "Partner", "image_url": "partner.jpg"}]}],
+])
+def test_discovery_index_includes_catalog_card_faces_and_legacy_images(tmp_path, cards):
+    source = report()
+    source["commander_name"] = "EDHREC display name"
+    images = {"commander_cards": cards, "card_image_url": cards[0]["faces"][0]["image_url"],
+              "partner_card_image_urls": [card["faces"][0]["image_url"] for card in cards],
+              "scryfall_uri": cards[0]["scryfall_uri"],
+              "partner_scryfall_uris": [card["scryfall_uri"] for card in cards],
+              "scryfall_card_names": [card["name"] for card in cards]}
+    row = {"commander_slug": "commander-a", "commander_name": "Canonical catalog name", "total_decks": 200,
+           "unrelated_tag_detail": "not needed in discovery", **images}
+    # Affinity data has one row per tag, while discovery has one per commander.
+    frame = pd.DataFrame([row, {**row, "unrelated_tag_detail": "second tag"}])
+    write_json(tmp_path / "processed/build-styles/commander-a.json", source)
+    exporter.export_build_style_files(frame, tmp_path / "processed", tmp_path / "site", seed_dir=tmp_path / "none")
+    index = json.loads((tmp_path / "site/build-styles/index.json").read_text())
+    assert len(index["commanders"]) == 1
+    entry = index["commanders"][0]
+    assert entry["commander_name"] == "EDHREC display name"
+    assert {key: entry[key] for key in images} == images
+    assert "unrelated_tag_detail" not in entry
 
 
 def test_export_preserves_source_age_and_partial_coverage_without_using_analysis_date(tmp_path):

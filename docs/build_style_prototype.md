@@ -13,6 +13,15 @@ Each sampled commander has two views:
 
 The Build Discovery catalog defaults to most Auto-selected packages, with analyzed deck count breaking ties. Visitors can sort either direction by package count, analyzed decks, total EDHREC decks, tag-profile count, index coverage, analysis date or commander name. Inclusive count ranges, commander search, analysis status, coverage and source-check age filters combine across every current collector report before pagination. Filter state is preserved in the URL; unknown metrics remain distinct from zero and sort last. The catalog's existing 200-deck eligibility and fresh-start scope still apply before these display filters.
 
+Discovery cards include commander thumbnails, name hover/focus previews and a
+keyboard/touch disclosure for reading full card images. Partners and all card
+faces remain separate and readable. The index includes compact summaries of
+each selected package's suggested tags and generated-deck bracket. Current
+external bracket observations retain their dated verification; native guidance
+is labeled estimated. Missing labels and brackets remain explicitly unavailable.
+These summaries use saved reports and catalog images, so publishing them does
+not require recollecting decklists or fetching every full report in the browser.
+
 Coverage, sample size and collection date are shown. The collection queue includes every commander in the current index, including commanders with few decks. Missing reports produce an explanatory unavailable state without interrupting the commander’s tag table. Low-data results are recorded instead of forcing packages. Reports are sampled evidence, not estimates of every build’s population share.
 
 ## Automatic package count: 1–N
