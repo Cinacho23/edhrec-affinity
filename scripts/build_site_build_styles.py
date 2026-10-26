@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from edhrec_affinity.build_styles.analysis import tag_label_policy
 from edhrec_affinity.build_styles.collection import parse_sample_decks
 from edhrec_affinity.build_styles.eligibility import (
     MIN_COMMANDER_DECKS, commander_is_eligible, valid_deck_count, validate_minimum,
@@ -122,15 +123,25 @@ def preview_expansion_needed(args: argparse.Namespace, slug: str) -> bool:
     return False
 
 
+def label_policy_upgrade_needed(args: argparse.Namespace, slug: str) -> bool:
+    policy = tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags)
+    for directory in [args.output_dir, args.seed_dir]:
+        path = directory / f"{slug}.json"
+        if sample_date(path, slug) is not None:
+            return json.loads(path.read_text(encoding="utf-8")).get("tag_label_policy") != policy
+    return False
+
+
 def select_commanders(args: argparse.Namespace) -> list[dict]:
     minimum = validate_minimum(args.min_total_decks)
+    tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags)
     rows = read_index(args.commander_index)
     requested = set(args.commanders or [])
     known = {row["commander_slug"] for row in rows}
     if requested - known:
         raise ValueError(f"Commanders not in the index: {', '.join(sorted(requested - known))}")
     state = read_checkpoint(args)
-    selected, expanding, refreshable = [], [], []
+    selected, expanding, upgrades, refreshable = [], [], [], []
     snapshot = datetime.strptime(args.snapshot_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     for row in sorted(rows, key=lambda row: (-(valid_deck_count(row.get("total_decks")) or 0), row["commander_slug"])):
         slug = row["commander_slug"]
@@ -143,6 +154,9 @@ def select_commanders(args: argparse.Namespace) -> list[dict]:
             continue
         if not args.refresh and (attempt.get("status") == "collecting" or preview_expansion_needed(args, slug)):
             expanding.append(row)
+            continue
+        if not args.refresh and label_policy_upgrade_needed(args, slug):
+            upgrades.append(row)
             continue
         existing_dates = [date for directory in [args.output_dir, args.seed_dir]
                           if (date := sample_date(directory / f"{slug}.json", slug)) is not None]
@@ -162,7 +176,7 @@ def select_commanders(args: argparse.Namespace) -> list[dict]:
             queue.append(expanding[index])
         if index < len(selected):
             queue.append(selected[index])
-    selected = queue
+    selected = upgrades + queue
     selected.extend(row for _, row in sorted(refreshable, key=lambda item: (item[0], item[1]["commander_slug"])))
     return selected[:args.max_commanders] if args.max_commanders else selected
 
@@ -217,13 +231,15 @@ def run_batch(args: argparse.Namespace, *, runner: Callable | None = None, monot
         }
         atomic_json(checkpoint_path(args), state)
         preview_state = args.output_dir / "_collection" / "previews" / f"{slug}.json.gz"
-        if args.refresh or (previous_attempt.get("cache_snapshot") not in {None, cache_snapshot}
+        if args.refresh or (not label_policy_upgrade_needed(args, slug)
+                            and previous_attempt.get("cache_snapshot") not in {None, cache_snapshot}
                             and previous_attempt.get("status") not in
                             {"running", "blocked", "failed", "generation_partial", "collecting"}):
             preview_state.unlink(missing_ok=True)
         argv = ["--commander", slug, "--components", "auto", "--max-components", str(args.max_components),
                 "--min-total-decks", str(args.min_total_decks),
                 "--max-tags", str(args.max_tags), "--min-tag-decks", str(args.min_tag_decks),
+                "--main-tag-decks", str(tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags)["main_minimum_decks"]),
                 "--sample-decks", "all" if args.sample_decks is None else str(args.sample_decks), "--seed", str(args.seed),
                 "--collection-state", str(preview_state),
                 "--max-preview-seconds", str(min(args.max_preview_seconds, max(1, args.max_runtime_seconds - elapsed))
@@ -317,7 +333,10 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--max-preview-seconds", type=float, default=300,
                      help="Preview collection time slice per commander (default 300 seconds); progress resumes next run")
     cli.add_argument("--max-tags", type=int, default=12)
-    cli.add_argument("--min-tag-decks", type=int, default=25)
+    cli.add_argument("--min-tag-decks", type=int, default=5,
+                     help="Minimum reported decks for supporting theme profiles (default 5)")
+    cli.add_argument("--main-tag-decks", type=int,
+                     help="Minimum reported decks for main theme profiles (default 15, or a higher --min-tag-decks)")
     cli.add_argument("--max-components", type=int, default=8, help="Automatic package-count search: 1 through this ceiling")
     cli.add_argument("--seed", type=int, default=42)
     cli.add_argument("--request-delay", type=float, default=1)
@@ -354,6 +373,7 @@ def main() -> int:
     args = cli.parse_args()
     try:
         validate_minimum(args.min_total_decks)
+        tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags)
     except ValueError as error:
         cli.error(str(error))
     if args.max_commanders < 0 or not 1 <= args.max_tags <= 16:

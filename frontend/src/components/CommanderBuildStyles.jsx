@@ -10,6 +10,7 @@ import {
   getBuildModel,
   getBuildModelOptions,
   getBuildSourceFreshness,
+  getBuildThemeEvidence,
   getComparableProfilePairs,
   getDeckMixtureRows,
   getExternalDeckRating,
@@ -185,12 +186,14 @@ function PackageCard({ pkg, index, decks }) {
       </div>
       <p className="build-small-label">Suggested themes</p>
       <div className="build-theme-list">
-        {themes.length ? themes.map((theme) => (
-          <span className="build-theme" key={theme.tag_slug || theme.tag_name}
-            title={`Card-profile similarity: ${formatDecimal(theme.similarity)}. These are suggested labels, not observed deck tags.`}>
+        {themes.length ? themes.map((theme) => {
+          const evidence = getBuildThemeEvidence(theme);
+          return <span className="build-theme" key={theme.tag_slug || theme.tag_name}
+            data-support-tier={evidence.tier || undefined} title={evidence.tooltip}>
             {theme.tag_name || theme.tag_slug}
-          </span>
-        )) : <span className="muted">No supported theme label</span>}
+            {evidence.note ? <small> · {evidence.note}</small> : null}
+          </span>;
+        }) : <span className="muted">No supported theme label</span>}
       </div>
       <GeneratedPackageDeck key={pkg.generated_deck?.name || pkg.id} deck={pkg.generated_deck} packageNumber={index + 1} />
       <details className="build-evidence">

@@ -73,6 +73,19 @@ test("package tags filter by exact supported slug or display name across all Aut
   assert.equal(slugs(reports, { packageTag: "" }).length, reports.length);
 });
 
+test("main and supporting package tags both remain searchable and count toward tag options", () => {
+  const reports = [
+    report("main", { packages: [{ tag_suggestions: [{
+      tag_slug: "tokens", tag_name: "Tokens", support_tier: "main", deck_count: 20,
+    }] }] }),
+    report("supporting", { packages: [{ tag_suggestions: [{
+      tag_slug: "tokens", tag_name: "Tokens", support_tier: "supporting", deck_count: 5,
+    }] }] }),
+  ];
+  assert.deepEqual(slugs(reports, { packageTag: "tokens" }).sort(), ["main", "supporting"]);
+  assert.deepEqual(getBuildDiscoveryPackageTags(reports), [{ value: "tokens", label: "Tokens", count: 2 }]);
+});
+
 test("package tag equality normalizes accents, apostrophes, spacing and case without substring matching", () => {
   const tag = { tag_slug: "dragons-approach", tag_name: "Drágon’s Approach" };
   for (const value of ["dragons-approach", "DRAGONS-APPROACH", "Dragon's Approach", "  DRÁGON’S   APPROACH  "]) {

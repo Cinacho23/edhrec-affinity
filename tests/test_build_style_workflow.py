@@ -54,6 +54,8 @@ def test_scheduled_collection_uses_source_freshness_without_a_completion_deadlin
     assert args[args.index("--workers") + 1] == "1"
     assert args[args.index("--preview-workers") + 1] == "16"
     assert args[args.index("--min-total-decks") + 1] == "200"
+    assert args[args.index("--main-tag-decks") + 1] == "15"
+    assert args[args.index("--min-tag-decks") + 1] == "5"
     assert "--target-completion-hours" not in args
     assert "reset_target" not in COLLECTOR.read_text()
 

@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from .capacity import plan_capacity
+from .analysis import tag_label_policy
 from .eligibility import CommanderBelowMinimum, commander_is_eligible, valid_deck_count, validate_minimum
 from .sources import CommanderAliasCatalog, PreviewTransport, RequestLimiter, SourceBlocked, source_time
 
@@ -45,10 +46,11 @@ def evidence_version(evidence: dict, options: argparse.Namespace | None = None) 
                 for key, card in evidence.get("metadata", {}).items()}
     contents = {"deck_dataset_sha256": evidence["collection"].get("dataset_sha256"),
                 "base": evidence["base"], "profiles": evidence["ranking_profiles"], "metadata": metadata,
-                # Version 5 also accepts verified alternate commander identities
-                # during deck construction, even when source inputs are unchanged.
-                "model_version": 5, "options": {key: getattr(options, key, None) for key in
-                    ("seed", "components", "max_components", "min_deck_cards", "min_card_support", "membership", "similarity")}}
+                # Version 6 adds count-based main/supporting label evidence.
+                "model_version": 6, "tag_label_policy": evidence.get("tag_label_policy"),
+                "options": {key: getattr(options, key, None) for key in
+                    ("seed", "components", "max_components", "min_deck_cards", "min_card_support", "membership", "similarity",
+                     "min_tag_decks", "main_tag_decks", "max_tags")}}
     return hashlib.sha256(json.dumps(contents, sort_keys=True, ensure_ascii=False, allow_nan=False,
                                     separators=(",", ":")).encode()).hexdigest()
 
@@ -105,6 +107,8 @@ def collection_options(args, slug: str, remaining_seconds: float):
     options.card_metadata_cache = args.card_metadata_cache
     options.fetch, options.sample_decks, options.seed = args.fetch, args.sample_decks, args.seed
     options.max_components, options.max_tags, options.min_tag_decks = args.max_components, args.max_tags, args.min_tag_decks
+    options.main_tag_decks = tag_label_policy(options.min_tag_decks, getattr(args, "main_tag_decks", None),
+                                             options.max_tags)["main_minimum_decks"]
     options.min_total_decks = validate_minimum(args.min_total_decks)
     options.request_delay, options.preview_workers = args.request_delay, args.preview_workers
     options.source_max_age_hours, options.index_max_age_hours = args.source_max_age_hours, args.index_max_age_hours
@@ -149,6 +153,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     if requested - known:
         raise ValueError("Requested commanders not found in catalog")
     minimum = validate_minimum(args.min_total_decks)
+    label_policy = tag_label_policy(args.min_tag_decks, getattr(args, "main_tag_decks", None), args.max_tags)
     if any(row["commander_slug"] in requested and not commander_is_eligible(row.get("total_decks"), minimum)
            for row in rows):
         raise ValueError(f"Requested commanders must each have at least {minimum} total decks")
@@ -164,6 +169,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     if upstream_date:
         cycle["upstream_snapshot_date"] = upstream_date
     cycle_complete = all(state["commanders"].get(slug, {}).get("status") in {"fitted", "insufficient_data"}
+                         and state["commanders"][slug].get("tag_label_policy") == label_policy
                          and state["commanders"][slug].get("coverage_complete")
                          and not state["commanders"][slug].get("unavailable_previews")
                          and (verified := source_time(state["commanders"][slug].get("verified_at"))) is not None
@@ -179,7 +185,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                          "sample_decks": args.sample_decks, "refresh": args.refresh},
                "automatic_continuation_allowed": (not args.commanders and not args.max_commanders
                                                    and args.sample_decks is None and not args.refresh),
-               "min_total_decks": minimum, "skipped": [],
+               "min_total_decks": minimum, "tag_label_policy": label_policy, "skipped": [],
                "completed": [], "collected": [], "failures": [], "blocked": False,
                "dry_run": args.dry_run, "publish_needed": False, "continuation_needed": False,
                "no_progress": True, "time_budget_reached": False, "new_previews_attempted": 0,
@@ -193,6 +199,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
             return False
         verified = source_time(record.get("verified_at"))
         return (args.refresh or record.get("status") not in {"fitted", "insufficient_data"}
+                or record.get("tag_label_policy") != label_policy
                 or not record.get("coverage_complete") or verified is None
                 or not (args.output_dir / f"{slug}.json").exists()
                 or (verified - now()).total_seconds() > 300
@@ -201,12 +208,11 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     def collection_priority(slug):
         record = state["commanders"].get(slug, {})
         published = (args.output_dir / f"{slug}.json").exists()
-        # Finish current inputs before refreshing already published reports.
-        # Inside that backlog, the smallest remaining frame can produce a full
-        # report soonest. A started frame wins ties without letting a huge
-        # partial displace every untouched, much smaller commander.
+        # Finish queued models and upgrade existing reports before expanding
+        # the catalog. Policy upgrades reuse their saved preview checkpoints.
         phase = (0 if record.get("status") == "analysis_pending" else
-                 2 if record.get("coverage_complete") and published else 1)
+                 1 if record.get("coverage_complete") and published and record.get("tag_label_policy") != label_policy else
+                 3 if record.get("coverage_complete") and published else 2)
         frame = valid_deck_count(record.get("frame_decks")) or valid_deck_count(rows_by_slug[slug].get("total_decks"))
         loaded = valid_deck_count(record.get("current_previews")) or 0
         remaining = max(0, frame - loaded)
@@ -319,8 +325,14 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         record = state["commanders"].get(slug, {})
         evidence_path = root / "evidence" / f"{slug}.json.gz"
         if record.get("status") == "analysis_pending" and evidence_path.exists():
-            analysis_queue.append((slug, evidence_path, collection_options(args, slug, args.max_preview_seconds)))
-            queue.remove(slug)
+            try:
+                with gzip.open(evidence_path, "rt", encoding="utf-8") as handle:
+                    pending_policy = json.load(handle).get("tag_label_policy")
+            except (OSError, EOFError, ValueError, TypeError, AttributeError):
+                pending_policy = None
+            if pending_policy == label_policy:
+                analysis_queue.append((slug, evidence_path, collection_options(args, slug, args.max_preview_seconds)))
+                queue.remove(slug)
     visits, visited_count = {}, 0
     with ThreadPoolExecutor(max_workers=args.workers) as network_pool, analysis_executor_factory() as model_pool:
         try:
@@ -374,6 +386,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                 current_previews=collection.get("fresh_previews", collection.get("previews_loaded", 0)),
                                 unavailable_previews=collection.get("unavailable_previews", 0),
                                 coverage_complete=collection.get("complete") is True and collection.get("target_mode") == "all",
+                                tag_label_policy=result.get("tag_label_policy"),
                                 last_collection_at=now().isoformat())
                             freshness = collection.get("freshness", {})
                             record["verified_at"] = (freshness.get("oldest_verified_at") or freshness.get("oldest_source_at")
@@ -424,6 +437,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                 item.pop("cache_file", None)
                             atomic_json(args.output_dir / f"{slug}.json", report)
                             record.update(status=result["status"], analysis_version=result["version"], analyzed_at=now().isoformat())
+                            record["tag_label_policy"] = report.get("tag_label_policy")
                             summary["completed"].append(slug)
                             summary.update(publish_needed=True, no_progress=False)
                             context.unlink(missing_ok=True)

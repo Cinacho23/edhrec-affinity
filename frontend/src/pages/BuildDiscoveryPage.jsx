@@ -5,7 +5,7 @@ import BuildDiscoveryCards from "../components/BuildDiscoveryCards";
 import CommanderName from "../components/CommanderName";
 import { loadCommanderIndex } from "../lib/api";
 import { getCommanderCards } from "../lib/commanderPreview";
-import { getBuildCollectionProgress, getBuildSourceFreshness, getCurrentBuildDiscoveryCommanders, getPackageBracketLabel, getSupportedThemes } from "../lib/buildStyleUtils";
+import { getBuildCollectionProgress, getBuildSourceFreshness, getBuildThemeEvidence, getCurrentBuildDiscoveryCommanders, getPackageBracketLabel, getSupportedThemes } from "../lib/buildStyleUtils";
 import { formatCollectionDuration, getBuildCollectorExecutionStatus, getBuildCollectorStatus } from "../lib/buildCollectionStatus";
 import { watchBuildDiscovery } from "../lib/buildDiscoveryRefresh";
 import {
@@ -71,8 +71,11 @@ function PackageSummaries({ commander, selectedTag }) {
         <div className="build-discovery-card__package-heading"><strong>Package {index + 1}</strong><span className={bracket ? "build-discovery-card__bracket" : "muted"}>{bracket || "Bracket unavailable"}</span></div>
         <div className="build-discovery-card__tags">{tags.length ? tags.map((tag) => {
           const matched = selectedTag && matchesBuildDiscoveryPackageTag(tag, selectedTag);
+          const evidence = getBuildThemeEvidence(tag);
           return <span key={tag.tag_slug || tag.tag_name} className={matched ? "build-discovery-card__tag--matched" : undefined}
-            title={matched ? "Matches selected package tag" : undefined}>{tag.tag_name || tag.tag_slug}</span>;
+            data-support-tier={evidence.tier || undefined} title={`${matched ? "Matches selected package tag. " : ""}${evidence.tooltip}`}>
+            {tag.tag_name || tag.tag_slug}{evidence.note ? <small> · {evidence.note}</small> : null}
+          </span>;
         }) : <span className="muted">No supported tag label</span>}</div>
       </li>;
     })}</ul>
