@@ -176,3 +176,59 @@ def test_cooldown_dispatch_uses_the_token_exception_after_both_durable_uploads()
     assert "workflow_run:" not in waiter and "workflow_dispatch:" in waiter
     assert "SOURCE_RUN_ID: ${{ inputs.source_run_id }}" in waiter
     assert "Resume collector #{0} after cooldown (attempt {1})" in waiter
+
+
+def test_saved_deck_upgrade_is_bounded_to_current_reports_and_uploaded_before_publication(tmp_path):
+    body, script = step(COLLECTOR, "Rebuild package decks from saved collections")
+    stub(tmp_path, "python", """\
+        import json, sys
+        print(json.dumps(sys.argv[1:]))
+    """)
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], text=True, capture_output=True,
+        env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+             "STYLES_DIR": "saved/styles", "RUNNER_TEMP": "scratch"})
+    assert result.returncode == 0, result.stderr
+    args = json.loads(result.stdout)
+    assert args[0] == "scripts/rebuild_generated_decks.py"
+    assert args[args.index("--build-styles-dir") + 1] == "saved/styles"
+    assert args[args.index("--max-runtime-seconds") + 1] == "1200"
+    assert args[args.index("--backup-dir") + 1].startswith("scratch/")
+    assert {"--only-outdated", "--current-discovery-only", "--fetch-metadata"} <= set(args)
+    assert "--fetch" not in args
+    assert "continue-on-error: true" in body
+    workflow = COLLECTOR.read_text()
+    assert workflow.index("      - name: Continue the resumable catalog queue") < workflow.index(
+        "      - name: Rebuild package decks from saved collections") < workflow.index(
+        "      - name: Upload cumulative build-style samples")
+    assert "data/build-style-artifact/deck-rebuild-summary.json" in workflow
+
+
+@pytest.mark.parametrize("blocked, automatic, pending, expected_continuation", [
+    (False, True, 5, True), (True, True, 5, False),
+    (False, False, 5, False), (False, True, 0, False),
+])
+def test_successful_deck_rebuilds_publish_without_erasing_collection_controls(
+    tmp_path, blocked, automatic, pending, expected_continuation,
+):
+    _, script = step(COLLECTOR, "Include rebuilt decks in publication progress")
+    root = tmp_path / "data/build-style-artifact"
+    root.mkdir(parents=True)
+    source = {"blocked": blocked, "blocked_until": "2026-10-25T23:00:00Z", "no_progress": True,
+              "automatic_continuation_allowed": automatic, "publish_needed": False,
+              "continuation_needed": False, "measured_request_rate": {"successful_responses": 12}}
+    path = root / "build_style_batch.json"
+    path.write_text(json.dumps(source))
+    rebuild = {"generation_version": 2, "regenerated": 3, "pending": pending, "blocked": 1,
+               "changed_deck_lists": 30, "distinctive_omissions_before": 70,
+               "distinctive_omissions_after": 2, "time_budget_reached": bool(pending)}
+    (root / "deck-rebuild-summary.json").write_text(json.dumps(rebuild))
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path,
+        text=True, capture_output=True,
+        env={**os.environ, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]})
+    assert result.returncode == 0, result.stderr
+    output = json.loads(path.read_text())
+    assert output["publish_needed"] is True and output["no_progress"] is False
+    assert output["continuation_needed"] is expected_continuation
+    assert output["deck_rebuild"] == rebuild
+    for field in ("blocked", "blocked_until", "automatic_continuation_allowed", "measured_request_rate"):
+        assert output[field] == source[field]

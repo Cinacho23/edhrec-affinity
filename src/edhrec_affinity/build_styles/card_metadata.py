@@ -6,6 +6,11 @@ then explicitly supplied EDHREC individual-card equivalents. This module keeps
 successful Oracle metadata and verified English alternate-printing names across
 commanders; it never uses fuzzy
 names or caches negative lookups. Source: https://scryfall.com/docs/api/cards/collection
+
+Non-deck objects such as Planes can share an exact name with a main-deck card.
+Only those intrinsically non-deck layouts trigger a complete, exact-name
+search for a unique physical Oracle identity. Normal banned cards remain
+authoritative banned observations. Search: https://scryfall.com/docs/api/cards/search
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from .sources import card_key
 
 COLLECTION_URL = "https://api.scryfall.com/cards/collection"
 NAMED_URL = "https://api.scryfall.com/cards/named"
+SEARCH_URL = "https://api.scryfall.com/cards/search"
 CARD_URL = "https://api.scryfall.com/cards"
 DEFAULT_CACHE_PATH = Path("data/raw/build-style-card-metadata.json")
 COLLECTION_BATCH_SIZE = 75
@@ -40,6 +46,12 @@ _LEGALITIES = {"legal", "not_legal", "restricted", "banned"}
 # is deliberately not accepted as an alias for its full card name.
 _FRONT_FACE_LAYOUTS = {"modal_dfc", "transform", "flip", "adventure", "prepare"}
 _PRINTED_NAME_FIELDS = {"flavor_name", "printed_name"}
+# These objects cannot be cards in a Commander main deck, irrespective of
+# their reported format legality. Normal banned/not-legal cards remain valid
+# metadata observations and must never trigger a search for a legal substitute.
+_NON_DECK_LAYOUTS = frozenset({
+    "token", "double_faced_token", "emblem", "art_series", "planar", "scheme", "vanguard", "front_card",
+})
 
 
 def _now() -> str:
@@ -274,15 +286,47 @@ def _group_lookup(lookup: dict[str, dict], groups: list[list[str]]) -> tuple[dic
 
 def _index(cards: dict[str, dict]) -> dict[str, dict]:
     """Prefer full card names, and omit aliases shared by different cards."""
-    result = dict(cards)
+    result = {key: card for key, card in cards.items() if card["layout"] not in _NON_DECK_LAYOUTS}
     candidates: dict[str, list[dict]] = {}
-    for canonical, card in cards.items():
+    for canonical, card in result.items():
         for alias in _aliases(card) - {canonical}:
             candidates.setdefault(alias, []).append(card)
     for alias, matches in candidates.items():
         if alias not in result and len(matches) == 1:
             result[alias] = matches[0]
     return result
+
+
+def _exact_deck_card(payload: Any, name: str, checked_at: str) -> dict:
+    """Resolve a non-deck namesake only from one complete exact Oracle result.
+
+    Scryfall's unique=cards search separates Oracle identities, including
+    distinct funny/playtest cards with identical names. Never choose whichever
+    result happens to be legal, newest, or first in the returned list.
+    """
+    if (not isinstance(payload, dict) or payload.get("object") != "list"
+            or not isinstance(payload.get("data"), list) or payload.get("has_more") is not False
+            or payload.get("next_page")):
+        raise ValueError("Exact physical-card search must return a complete unpaginated list")
+    rows = payload["data"]
+    total = payload.get("total_cards", len(rows))
+    if type(total) is not int or total != len(rows) or not rows:
+        raise ValueError("Exact physical-card search returned an incomplete or empty list")
+    cards = []
+    identities = set()
+    for raw in rows:
+        card = _metadata(raw, checked_at)
+        if card["layout"] in _NON_DECK_LAYOUTS or card_key(name) not in metadata_aliases(card):
+            raise ValueError(f"Exact physical-card search does not exactly identify a playable card named {name!r}")
+        try:
+            identity = str(UUID(card.get("oracle_id", "")))
+        except (ValueError, AttributeError) as error:
+            raise ValueError("Exact physical-card search requires a verified Oracle UUID") from error
+        identities.add(identity)
+        cards.append(card)
+    if len(identities) != 1:
+        raise ValueError("Exact physical-card search returned multiple distinct Oracle identities")
+    return min(cards, key=lambda card: (card_key(card["name"]) != card_key(name), card.get("id", ""), card["name"]))
 
 
 def _identifier_name(name: str) -> str:
@@ -360,6 +404,11 @@ def _collection_cards(
             aliases = sorted(_aliases(card))
             rejected.append({"returned_name": card["name"], "aliases": aliases,
                              "error": f"Returned card {card['name']!r} (aliases: {aliases!r}) does not exactly match any request"})
+            continue
+        if card["layout"] in _NON_DECK_LAYOUTS:
+            rejected.append({"returned_name": card["name"], "aliases": sorted(_aliases(card)),
+                             "layout": card["layout"],
+                             "error": f"Returned card {card['name']!r} uses non-deck layout {card['layout']!r}"})
             continue
         canonical = card_key(card["name"])
         previous = cards.get(canonical)
@@ -455,10 +504,13 @@ class MetadataRepository:
             "alias_resolutions": [], "alias_conflicts": [],
             "collection_rejections": [],
             "printing_requests": 0,
+            "physical_name_searches": 0, "non_deck_resolutions": [],
         }
         if self._cache_error is not None:
             summary["cache_error"] = self._cache_error
         now = datetime.now(timezone.utc)
+        non_deck_names = {key: card for key in requested
+                          if (card := self._cards.get(key)) is not None and card["layout"] in _NON_DECK_LAYOUTS}
         lookup, _ = _group_lookup(self._lookup, groups)
         pending = [name for key, name in requested.items()
                    if key not in lookup or _stale(lookup[key], now, self.max_age_days)]
@@ -499,6 +551,30 @@ class MetadataRepository:
                     response.raise_for_status()
                     return _strict_json(response.text)
 
+                def physical_namesake(card: dict, exact: str, requested_name: str) -> dict | None:
+                    if card["layout"] not in _NON_DECK_LAYOUTS:
+                        return card
+                    # include_extras retains funny/playtest identities so they
+                    # cannot disappear and make an ambiguous name look unique.
+                    # Exclude only intrinsically non-deck layouts, not banned
+                    # cards or particular sets. Strict alias checks below still
+                    # validate every result rather than trusting the query.
+                    query = "!" + json.dumps(exact, ensure_ascii=False)
+                    query += " " + " ".join(f"-layout:{layout}" for layout in sorted(_NON_DECK_LAYOUTS))
+                    summary["physical_name_searches"] += 1
+                    payload = request("GET", SEARCH_URL, [requested_name], params={
+                        "q": query, "unique": "cards", "include_extras": "true",
+                    })
+                    if payload is None:
+                        return None
+                    replacement = _exact_deck_card(payload, exact, _now())
+                    summary["non_deck_resolutions"].append({
+                        "requested_name": requested_name, "canonical_name": replacement["name"],
+                        "oracle_id": replacement["oracle_id"], "excluded_layout": card["layout"],
+                        "source_url": SEARCH_URL,
+                    })
+                    return replacement
+
                 missing_names: list[str] = []
                 fallback_names: list[str] = []
                 collection_rejections: list[dict] = []
@@ -522,6 +598,12 @@ class MetadataRepository:
                         fallback_names.extend(name for name in missing if name not in fallback_names)
                         for rejection in rejected:
                             fallback_names.extend(name for name in rejection["names"] if name not in fallback_names)
+                            for returned in rejection.get("returned_cards", []):
+                                if returned.get("layout") in _NON_DECK_LAYOUTS:
+                                    for name in rejection["names"]:
+                                        key = card_key(name)
+                                        if key in returned.get("aliases", []):
+                                            non_deck_names[key] = returned
                         collection_rejections.extend(rejected)
                     except (httpx.HTTPError, ValueError, OSError, TypeError) as error:
                         summary["failures"].append({"names": batch, "error": str(error)})
@@ -549,6 +631,9 @@ class MetadataRepository:
                                     raise ValueError("Returned Scryfall printing does not match the requested UUID")
                                 if key not in metadata_aliases(card):
                                     raise ValueError(f"Scryfall printing does not exactly identify {name!r}")
+                                card = physical_namesake(card, name, name)
+                                if card is None:
+                                    continue
                                 save({card_key(card["name"]): card})
                                 continue
                         except (httpx.HTTPError, ValueError, OSError, TypeError) as error:
@@ -565,10 +650,16 @@ class MetadataRepository:
                         try:
                             payload = request("GET", NAMED_URL, [name], params={"exact": exact})
                             if payload is None:
+                                card = non_deck_names.get(card_key(exact))
+                                if card is None or self.blocked:
+                                    continue
+                            else:
+                                card = _metadata(payload, _now())
+                                if card_key(exact) not in metadata_aliases(card):
+                                    raise ValueError(f"Returned card {card['name']!r} does not exactly match {exact!r}")
+                            card = physical_namesake(card, exact, name)
+                            if card is None:
                                 continue
-                            card = _metadata(payload, _now())
-                            if card_key(exact) not in metadata_aliases(card):
-                                raise ValueError(f"Returned card {card['name']!r} does not exactly match {exact!r}")
                             # Do not overwrite a known canonical identity through
                             # an alternate name whose Oracle identity conflicts.
                             known = [self._lookup[card_key(alias)] for group in groups

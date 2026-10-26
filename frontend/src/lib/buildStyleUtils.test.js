@@ -3,7 +3,7 @@ import test from "node:test";
 
 import {
   formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildCollectionProgress, getBuildModel, getBuildModelOptions, getBuildSourceFreshness, getComparableProfilePairs,
-  getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckExport, getGeneratedDeckGroups, getPackageBracketLabel, getSupportedThemes, hasBuildStylePopulation, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
+  getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckColorChoices, getGeneratedDeckDistinctiveCards, getGeneratedDeckExport, getGeneratedDeckGroups, getPackageBracketLabel, getSupportedThemes, hasBuildStylePopulation, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
 } from "./buildStyleUtils.js";
 
 test("discovery lists only explicitly approved current collector reports", () => {
@@ -131,6 +131,57 @@ test("shares distinguish missing evidence from a measured zero; external links d
   assert.equal(safeExternalUrl("data:text/html,test"), null);
   assert.equal(safeExternalUrl("/relative"), null);
   assert.equal(safeExternalUrl("https://edhrec.com/deckpreview/abc"), "https://edhrec.com/deckpreview/abc");
+});
+
+test("distinctive-card coverage preserves explicit omissions and their explanations", () => {
+  const deck = { status: "generated", generation_version: 2, distinctive_cards: {
+    total: 3, included_count: 2, coverage: 2 / 3,
+    included: [{ name: "Core card" }, { name: "Alternate name", canonical_name: "Rules name" }],
+    omitted: [{ name: "Third card", reason_code: "color_identity", reason: "Outside the commander’s color identity." }],
+  } };
+  assert.deepEqual(getGeneratedDeckDistinctiveCards(deck), {
+    total: 3, includedCount: 2, omitted: deck.distinctive_cards.omitted,
+  });
+  const result = getGeneratedDeckDistinctiveCards(deck);
+  assert.notEqual(result.omitted, deck.distinctive_cards.omitted);
+  assert.notEqual(result.omitted[0], deck.distinctive_cards.omitted[0]);
+  deck.distinctive_cards.omitted[0].reason = "";
+  assert.equal(getGeneratedDeckDistinctiveCards(deck).omitted[0].reason,
+    "The saved report does not include an omission explanation.");
+  deck.distinctive_cards.included.push({ name: "Third card" });
+  deck.distinctive_cards.included_count = 3;
+  deck.distinctive_cards.omitted = [];
+  assert.deepEqual(getGeneratedDeckDistinctiveCards(deck), { total: 3, includedCount: 3, omitted: [] });
+});
+
+test("legacy, unavailable, and inconsistent deck evidence never claims distinctive-card coverage", () => {
+  const evidence = { total: 1, included_count: 1, included: [{ name: "Core card" }], omitted: [] };
+  for (const deck of [null, {}, { status: "generated" },
+    { status: "unavailable", generation_version: 2, distinctive_cards: evidence },
+    { status: "generated", generation_version: 1, distinctive_cards: evidence },
+    ...[
+      { ...evidence, included_count: 0 }, { ...evidence, total: 2 },
+      { ...evidence, total: "1" }, { ...evidence, included: [{ name: "" }] },
+      { ...evidence, omitted: null },
+    ].map((distinctive_cards) => ({ status: "generated", generation_version: 2, distinctive_cards })),
+  ]) assert.equal(getGeneratedDeckDistinctiveCards(deck), null);
+});
+
+test("generated decks explain only valid choices for their own commanders", () => {
+  const deck = { status: "generated", commanders: [{ name: "Clara Oswald" }], validation: {} };
+  assert.deepEqual(getGeneratedDeckColorChoices(deck), []);
+  for (const [color, colorName] of Object.entries({ W: "White", U: "Blue", B: "Black", R: "Red", G: "Green" })) {
+    deck.validation.commander_color_choices = [{ commander_name: "Clara Oswald", color }];
+    assert.deepEqual(getGeneratedDeckColorChoices(deck), [{ commanderName: "Clara Oswald", colorName }]);
+  }
+  for (const choices of [null, [{ commander_name: "Clara Oswald", color: "C" }],
+    [{ commander_name: "Other commander", color: "R" }],
+    [{ commander_name: "Clara Oswald", color: "R" }, { commander_name: "Clara Oswald", color: "G" }],
+    [null],
+  ]) {
+    deck.validation.commander_color_choices = choices;
+    assert.deepEqual(getGeneratedDeckColorChoices(deck), []);
+  }
 });
 
 test("legacy decks display and export plain card lists without category tags", () => {

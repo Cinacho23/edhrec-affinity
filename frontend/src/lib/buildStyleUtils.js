@@ -175,6 +175,40 @@ export function getPackageBracketLabel(deck, now = Date.now()) {
   return validBracket(estimated) ? `Estimated bracket ${estimated}` : null;
 }
 
+export function getGeneratedDeckDistinctiveCards(deck) {
+  const evidence = deck?.distinctive_cards;
+  if (deck?.status !== "generated" || !Number.isInteger(deck.generation_version) || deck.generation_version < 2
+      || !Number.isInteger(evidence?.total) || evidence.total < 0
+      || !Number.isInteger(evidence.included_count) || evidence.included_count < 0
+      || !Array.isArray(evidence.included) || !Array.isArray(evidence.omitted)
+      || evidence.included_count !== evidence.included.length
+      || evidence.total !== evidence.included_count + evidence.omitted.length
+      || [...evidence.included, ...evidence.omitted].some((card) => typeof card?.name !== "string" || !card.name.trim())) return null;
+  return {
+    total: evidence.total,
+    includedCount: evidence.included_count,
+    omitted: evidence.omitted.map((card) => ({
+      ...card,
+      reason: typeof card.reason === "string" && card.reason.trim()
+        ? card.reason : "The saved report does not include an omission explanation.",
+    })),
+  };
+}
+
+export function getGeneratedDeckColorChoices(deck) {
+  const names = { W: "White", U: "Blue", B: "Black", R: "Red", G: "Green" };
+  const choices = deck?.validation?.commander_color_choices;
+  if (deck?.status !== "generated" || !Array.isArray(choices) || !Array.isArray(deck.commanders)) return [];
+  const commanders = new Set(deck.commanders.map((card) => card?.name).filter((name) => typeof name === "string" && name.trim()));
+  const seen = new Set();
+  for (const choice of choices) {
+    if (!commanders.has(choice?.commander_name) || !Object.hasOwn(names, choice?.color)
+        || seen.has(choice.commander_name)) return [];
+    seen.add(choice.commander_name);
+  }
+  return choices.map((choice) => ({ commanderName: choice.commander_name, colorName: names[choice.color] }));
+}
+
 export function isBuildMetadataFresh(metadata, now = Date.now()) {
   const oldest = typeof metadata?.oldest_checked_at === "string" ? Date.parse(metadata.oldest_checked_at) : NaN;
   return !metadata?.stale_cached && Number.isFinite(oldest) && Number.isFinite(now)

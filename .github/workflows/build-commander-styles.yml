@@ -203,6 +203,49 @@ jobs:
         if: steps.collect_styles.outcome == 'failure'
         run: echo "::notice::Collection stopped; reports and the source cooldown are retained. The outcome check distinguishes a rate-limit pause from a failure."
 
+      - name: Rebuild package decks from saved collections
+        id: rebuild_decks
+        if: always() && steps.collect_styles.outcome != 'skipped'
+        continue-on-error: true
+        run: |
+          python scripts/rebuild_generated_decks.py \
+            --build-styles-dir "${STYLES_DIR}" \
+            --card-metadata-cache data/raw/build-style-card-metadata.json \
+            --workers 2 --only-outdated --current-discovery-only --fetch-metadata \
+            --max-runtime-seconds 1200 \
+            --summary data/build-style-artifact/deck-rebuild-summary.json \
+            --backup-dir "${RUNNER_TEMP}/build-style-deck-backups"
+
+      - name: Include rebuilt decks in publication progress
+        if: always() && steps.collect_styles.outcome != 'skipped'
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("data/build-style-artifact/build_style_batch.json")
+          rebuild_path = path.parent / "deck-rebuild-summary.json"
+          if not path.exists() or not rebuild_path.exists():
+              print("::warning::No deck rebuild summary; keeping the collection outcome and saved reports.")
+              raise SystemExit(0)
+          summary = json.loads(path.read_text())
+          rebuild = json.loads(rebuild_path.read_text())
+          summary["deck_rebuild"] = {key: rebuild[key] for key in (
+              "generation_version", "regenerated", "pending", "blocked", "changed_deck_lists",
+              "distinctive_omissions_before", "distinctive_omissions_after", "time_budget_reached",
+          ) if key in rebuild}
+          if rebuild.get("regenerated", 0) > 0:
+              summary.update(publish_needed=True, no_progress=False)
+              if (rebuild.get("pending", 0) > 0 and not summary.get("blocked")
+                      and not summary.get("resource_limit") and summary.get("automatic_continuation_allowed") is True):
+                  summary["continuation_needed"] = True
+          if rebuild.get("blocked", 0):
+              print(f"::warning::{rebuild['blocked']} saved reports could not be rebuilt; their previous decks were preserved.")
+          temporary = path.with_suffix(".json.tmp")
+          temporary.write_text(json.dumps(summary, separators=(",", ":")))
+          temporary.replace(path)
+          PY
+
       - name: Upload cumulative build-style samples
         id: checkpoint
         if: always()
@@ -225,7 +268,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-style-summary-${{ github.run_id }}
-          path: data/build-style-artifact/build_style_batch.json
+          path: |
+            data/build-style-artifact/build_style_batch.json
+            data/build-style-artifact/deck-rebuild-summary.json
           if-no-files-found: ignore
           retention-days: 7
 

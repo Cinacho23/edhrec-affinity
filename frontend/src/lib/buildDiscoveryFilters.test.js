@@ -3,7 +3,8 @@ import test from "node:test";
 
 import {
   BUILD_DISCOVERY_SORT_OPTIONS, DEFAULT_BUILD_DISCOVERY_FILTERS,
-  buildDiscoverySearchParams, filterBuildDiscoveryCommanders, getBuildDiscoveryFilterErrors, readBuildDiscoveryFilters,
+  buildDiscoverySearchParams, filterBuildDiscoveryCommanders, getBuildDiscoveryFilterErrors,
+  getBuildDiscoveryPackageTags, matchesBuildDiscoveryPackageTag, readBuildDiscoveryFilters,
 } from "./buildDiscoveryFilters.js";
 
 const NOW = Date.parse("2026-10-24T12:00:00Z");
@@ -52,6 +53,122 @@ test("word search ignores case and accents and matches name and slug together", 
     assert.deepEqual(slugs(reports, { query }), ["commander-hope"]);
   }
   assert.deepEqual(slugs(reports, { query: "hope missing" }), []);
+});
+
+test("package tags filter by exact supported slug or display name across all Auto packages", () => {
+  const reports = [
+    report("multiple", { packages: [
+      { tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] },
+      { tag_suggestions: [{ tag_slug: "p1-p1-counters", tag_name: "+1/+1 Counters" }] },
+    ] }),
+    report("general", { packages: [{ tag_suggestions: [{ tag_slug: "counters", tag_name: "Counters" }] }] }),
+    report("negative", { packages: [{ tag_suggestions: [{ tag_slug: "m1-m1-counters", tag_name: "-1/-1 Counters" }] }] }),
+    report("untagged"),
+  ];
+  assert.deepEqual(slugs(reports, { packageTag: "p1-p1-counters" }), ["multiple"]);
+  assert.deepEqual(slugs(reports, { packageTag: " +1/+1 COUNTERS " }), ["multiple"]);
+  assert.deepEqual(slugs(reports, { packageTag: "Counters" }), ["general"]);
+  assert.deepEqual(slugs(reports, { packageTag: "counter" }), []);
+  assert.deepEqual(slugs(reports, { packageTag: "unknown-tag" }), []);
+  assert.equal(slugs(reports, { packageTag: "" }).length, reports.length);
+});
+
+test("package tag equality normalizes accents, apostrophes, spacing and case without substring matching", () => {
+  const tag = { tag_slug: "dragons-approach", tag_name: "Drágon’s Approach" };
+  for (const value of ["dragons-approach", "DRAGONS-APPROACH", "Dragon's Approach", "  DRÁGON’S   APPROACH  "]) {
+    assert.equal(matchesBuildDiscoveryPackageTag(tag, value), true, value);
+  }
+  for (const value of ["Dragon", "Approach", "dragons", "dragons-approach-more"]) {
+    assert.equal(matchesBuildDiscoveryPackageTag(tag, value), false, value);
+  }
+  for (const malformed of [undefined, null, "Tokens", 2, [], {}, { tag_slug: 3, tag_name: false }]) {
+    assert.equal(matchesBuildDiscoveryPackageTag(malformed, "tokens"), false);
+    assert.equal(matchesBuildDiscoveryPackageTag(malformed, ""), true);
+  }
+});
+
+test("package tag options count distinct commanders, deduplicate package labels and prefer slug values", () => {
+  const reports = [
+    report("first", { packages: [
+      { tag_suggestions: [{ tag_name: "Tokens" }, { tag_slug: "tokens", tag_name: "Tokens" }] },
+      { tag_suggestions: [{ tag_slug: "TOKENS", tag_name: "Tókens" }, { tag_slug: "aristocrats", tag_name: "Aristocrats" }] },
+    ] }),
+    report("second", { packages: [{ tag_suggestions: [
+      { tag_slug: "tokens", tag_name: "Tokens" }, { tag_name: "Dragon's Approach" },
+    ] }] }),
+    report("second", { packages: [{ tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] }] }),
+    report("third", { packages: [{ tag_suggestions: [{ tag_name: "Dragon’s Approach" }, { tag_slug: "unnamed" }] }] }),
+  ];
+  const original = structuredClone(reports);
+  assert.deepEqual(getBuildDiscoveryPackageTags(reports), [
+    { value: "aristocrats", label: "Aristocrats", count: 1 },
+    { value: "Dragon's Approach", label: "Dragon's Approach", count: 2 },
+    { value: "tokens", label: "Tokens", count: 2 },
+    { value: "unnamed", label: "unnamed", count: 1 },
+  ]);
+  assert.deepEqual(reports, original);
+});
+
+test("package tag options retain distinct slug identities even when their display names collide", () => {
+  const reports = [report("a", { packages: [{ tag_suggestions: [
+    { tag_slug: "one", tag_name: "Shared label" }, { tag_slug: "two", tag_name: "Shared label" },
+  ] }] })];
+  assert.deepEqual(getBuildDiscoveryPackageTags(reports), [
+    { value: "one", label: "Shared label", count: 1 },
+    { value: "two", label: "Shared label", count: 1 },
+  ]);
+});
+
+test("every package tag option count equals its exact filter result for incomplete and colliding labels", () => {
+  const reports = [
+    report("slugged", { packages: [{ tag_suggestions: [{ tag_slug: "p1-p1-counters", tag_name: "+1/+1 Counters" }] }] }),
+    report("name-only", { packages: [{ tag_suggestions: [{ tag_name: "+1/+1 Counters" }] }] }),
+    report("collision", { packages: [{ tag_suggestions: [{ tag_slug: "another-counters", tag_name: "+1/+1 Counters" }] }] }),
+    report("slug-only", { packages: [{ tag_suggestions: [{ tag_slug: "tokens" }] }] }),
+    report("label-later", { packages: [{ tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] }] }),
+  ];
+  const options = getBuildDiscoveryPackageTags(reports);
+  for (const option of options) {
+    assert.equal(option.count, new Set(slugs(reports, { packageTag: option.value })).size, option.value);
+  }
+  assert.deepEqual(options.find((option) => option.value === "+1/+1 Counters"), {
+    value: "+1/+1 Counters", label: "+1/+1 Counters", count: 3,
+  });
+  assert.equal(options.find((option) => option.value === "p1-p1-counters").count, 1);
+  assert.deepEqual(options.find((option) => option.value === "tokens"), { value: "tokens", label: "Tokens", count: 2 });
+});
+
+test("package tag filters ignore profile, source, alternative-model and malformed metadata", () => {
+  const reports = [
+    report("other-fields", {
+      profiles: [{ tag_slug: "tokens", tag_name: "Tokens" }],
+      tag_profiles: [{ tag_slug: "tokens", tag_name: "Tokens" }],
+      sources: [{ tag_slug: "tokens", tag_name: "Tokens" }],
+      alternative_models: [{ packages: [{ tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] }] }],
+      packages: [{ closest_profiles: [{ tag_slug: "tokens", tag_name: "Tokens" }] }],
+    }),
+    ...[null, {}, "tokens", 1, [null, {}, { tag_suggestions: {} }, { tag_suggestions: [null, "tokens", [], { tag_name: 4 }] }]]
+      .map((packages, index) => report(`malformed-${index}`, { packages })),
+    report("valid", { packages: [{ tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] }] }),
+  ];
+  assert.deepEqual(slugs(reports, { packageTag: "tokens" }), ["valid"]);
+  assert.deepEqual(getBuildDiscoveryPackageTags([null, [], ...reports]), [{ value: "tokens", label: "Tokens", count: 1 }]);
+  assert.deepEqual(getBuildDiscoveryPackageTags(undefined), []);
+});
+
+test("package tag combines with search, ranges, statuses and sorting without changing source records", () => {
+  const tagged = { packages: [{ tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] }] };
+  const reports = [
+    report("lower", { ...tagged, commander_name: "Ghave", unique_decks: 250 }),
+    report("higher", { ...tagged, commander_name: "Ghave", unique_decks: 400 }),
+    report("small", { ...tagged, commander_name: "Ghave", unique_decks: 100 }),
+    report("different", { ...tagged, commander_name: "Other" }),
+    report("untagged", { commander_name: "Ghave" }),
+  ];
+  const filters = { packageTag: "tokens", query: "ghave", minAnalyzed: "200", status: "fitted", coverage: "complete", sortBy: "unique_decks" };
+  const original = structuredClone({ reports, filters });
+  assert.deepEqual(slugs(reports, filters), ["higher", "lower"]);
+  assert.deepEqual({ reports, filters }, original);
 });
 
 test("combines inclusive count ranges and search without imposing the eligibility threshold", () => {
@@ -190,7 +307,7 @@ test("exports all supported sort choices and handles absent inputs", () => {
 test("URL filters round trip count ranges, accented search, statuses and sorting without unknown fields", () => {
   const filters = {
     ...DEFAULT_BUILD_DISCOVERY_FILTERS,
-    query: "Dánitha & counters", minPackages: "2", maxPackages: "8", minAnalyzed: "200", maxAnalyzed: "3000",
+    query: "Dánitha & counters", packageTag: "+1/+1 Counters", minPackages: "2", maxPackages: "8", minAnalyzed: "200", maxAnalyzed: "3000",
     minTotalDecks: "250", maxTotalDecks: "10000", minProfiles: "0", maxProfiles: "12",
     status: "fitted", coverage: "complete", freshness: "needs_refresh", sortBy: "unique_decks", direction: "asc",
   };
@@ -199,6 +316,14 @@ test("URL filters round trip count ranges, accented search, statuses and sorting
   assert.deepEqual(readBuildDiscoveryFilters(new URLSearchParams(params.toString())), filters);
   assert.equal(buildDiscoverySearchParams(DEFAULT_BUILD_DISCOVERY_FILTERS).toString(), "");
   assert.deepEqual(readBuildDiscoveryFilters(), DEFAULT_BUILD_DISCOVERY_FILTERS);
+});
+
+test("unknown package tag links retain the chosen value and reset with the default filters", () => {
+  const filters = readBuildDiscoveryFilters("packageTag=not-yet-analyzed&query=Ghave");
+  assert.equal(filters.packageTag, "not-yet-analyzed");
+  assert.equal(buildDiscoverySearchParams(filters).get("packageTag"), "not-yet-analyzed");
+  assert.deepEqual(slugs([report("ghave")], filters), []);
+  assert.equal(buildDiscoverySearchParams({ ...filters, ...DEFAULT_BUILD_DISCOVERY_FILTERS }).toString(), "");
 });
 
 test("URL helpers default invalid enum values but retain invalid count text for visible errors", () => {
