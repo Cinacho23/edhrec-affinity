@@ -34,6 +34,7 @@ def report(slug="commander-a", *, date="2026-10-01T00:00:00+00:00", packages=3, 
     return {
         "schema_version": 1, "commander_slug": slug, "commander_name": slug.title(),
         "generated_at": date, "total_edhrec_decks": total_decks,
+        "tag_label_policy": batch.tag_label_policy(),
         "profiles": {"profiles": [{"tag_slug": "tokens", "tag_name": "Tokens"}]},
         "deck_analysis": {
             "status": "fitted" if packages else "insufficient_data", "unique_decks": 60,
@@ -237,8 +238,11 @@ def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_
     rating = {"status": "verified", "checked_at": "2026-10-24T10:00:00Z",
               "playability_pct": 75.2, "bracket": 4, "deck_sha256": "large-rating-detail"}
     packages[0].update(name="Package 1", tag_suggestions=[
-        {"tag_slug": "tokens", "tag_name": "Tokens", "similarity": 0.8, "compared_cards": 81},
-        {"tag_slug": "counters", "tag_name": "Counters", "similarity": 0.6},
+        {"tag_slug": "tokens", "tag_name": "Tokens", "similarity": 0.8, "compared_cards": 81,
+         "support_tier": "main", "deck_count": 15},
+        {"tag_slug": "counters", "tag_name": "Counters", "similarity": 0.6,
+         "support_tier": "supporting", "deck_count": 5},
+        {"tag_slug": "legacy", "tag_name": "Legacy", "similarity": 0.5},
     ], generated_deck={"status": "generated", "cards": [{"name": "Do not embed full decks", "quantity": 100}],
         "primer": "Long primer content", "export_text": "100 Do not embed full decks",
         "validation": {"valid": True, "bracket": {"recommended": 3, "rule_checks": {"expensive": True}},
@@ -257,8 +261,11 @@ def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_
     index = json.loads((tmp_path / "site/build-styles/index.json").read_text())
     assert index["commanders"][0]["packages"] == [
         {"id": 0, "name": "Package 1", "tag_suggestions": [
-            {"tag_slug": "tokens", "tag_name": "Tokens", "similarity": 0.8},
-            {"tag_slug": "counters", "tag_name": "Counters", "similarity": 0.6}],
+            {"tag_slug": "tokens", "tag_name": "Tokens", "similarity": 0.8,
+             "support_tier": "main", "deck_count": 15},
+            {"tag_slug": "counters", "tag_name": "Counters", "similarity": 0.6,
+             "support_tier": "supporting", "deck_count": 5},
+            {"tag_slug": "legacy", "tag_name": "Legacy", "similarity": 0.5}],
          "generated_deck": {"status": "generated", "validation": {
              "bracket": {"recommended": 3}, "external_rating": {
                  key: value for key, value in rating.items() if key != "deck_sha256"}},
@@ -498,11 +505,31 @@ def test_batch_passes_automatic_model_and_dated_cache_then_resumes(tmp_path):
     assert summary["completed"] == ["commander-a"]
     assert calls[0].components is None
     assert calls[0].max_components == 6
+    assert calls[0].min_tag_decks == 5 and calls[0].main_tag_decks == 15
     assert calls[0].sample_decks == 40
     assert calls[0].no_html and not calls[0].fetch
     assert calls[0].cache_dir == args.cache_root / "2026-10-19/commander-a"
     saved = json.loads((args.output_dir / "commander-a.json").read_text())
     assert "cache_file" not in saved["collection"]["provenance"][0]
+    assert batch.select_commanders(args)[0]["commander_slug"] == "commander-b"
+
+
+def test_batch_upgrades_old_tag_policy_before_new_coverage_and_retains_preview_checkpoint(tmp_path):
+    args = batch_args(tmp_path, "--max-commanders", "1")
+    old = report(date="2026-10-18T00:00:00+00:00")
+    old.pop("tag_label_policy")
+    write_json(args.output_dir / "commander-a.json", old)
+    write_json(batch.checkpoint_path(args), {"schema_version": 1, "commanders": {"commander-a": {
+        "status": "fitted", "cache_snapshot": "2026-10-18"}}})
+    preview = args.output_dir / "_collection/previews/commander-a.json.gz"
+    preview.parent.mkdir(parents=True, exist_ok=True)
+    preview.write_bytes(b"existing deck evidence")
+
+    def runner(parsed):
+        assert parsed.collection_state.read_bytes() == b"existing deck evidence"
+        return report(parsed.commander, date="2026-10-19T00:00:00+00:00")
+
+    assert batch.run_batch(args, runner=runner)["completed"] == ["commander-a"]
     assert batch.select_commanders(args)[0]["commander_slug"] == "commander-b"
 
 

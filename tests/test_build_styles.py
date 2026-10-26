@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from edhrec_affinity.build_styles.analysis import (
-    analyze_decks, compare_profiles, overlapping_groups, prepare_decks,
+    analyze_decks, compare_profiles, overlapping_groups, prepare_decks, supported_tag_profiles, tag_label_policy,
 )
 from edhrec_affinity.build_styles.__main__ import parser, run
 from edhrec_affinity.build_styles.report import render_report
@@ -45,6 +45,22 @@ def test_omitted_cards_are_unknown_and_reduce_comparable_evidence():
     assert result["pairs"][0]["shared_observed_cards"] == 4
     assert result["pairs"][0]["similarity"] is None
     assert len(result["profiles"][1]["signature_cards"]) == 4
+
+
+def test_profile_summaries_preserve_reported_tag_counts_and_tiers():
+    baseline = profile("all", {f"card {i}": .1 for i in range(30)})
+    profiles = [{**profile(f"theme-{count}", {key: .5 for key in baseline["cards"]}), "reported_tag_decks": count}
+                for count in (4, 5, 14, 15)]
+    summaries = compare_profiles(baseline, profiles)["profiles"]
+    assert [(row["reported_tag_decks"], row["support_tier"]) for row in summaries] == [
+        (5, "supporting"), (14, "supporting"), (15, "main")]
+    assert all(row["deck_count"] == 1000 for row in summaries)  # Page denominator is retained separately.
+    assert tag_label_policy(10, 20)["main_minimum_decks"] == 20
+    assert tag_label_policy(25)["main_minimum_decks"] == 25  # Older single-threshold commands remain valid.
+    stricter = supported_tag_profiles([{**profile(str(count), {}), "reported_tag_decks": count}
+                                       for count in (9, 10, 19, 20)], min_tag_decks=10, main_tag_decks=20)
+    assert [(row["reported_tag_decks"], row["support_tier"]) for row in stricter] == [
+        (10, "supporting"), (19, "supporting"), (20, "main")]
 
 
 def test_tag_can_belong_to_two_groups_without_merging_unrelated_endpoints():

@@ -53,6 +53,22 @@ export function getSupportedThemes(pkg) {
   });
 }
 
+export function getBuildThemeEvidence(theme) {
+  const tier = ["main", "supporting"].includes(theme?.support_tier) ? theme.support_tier : null;
+  const deckCount = Number.isSafeInteger(theme?.deck_count) && theme.deck_count >= 0 ? theme.deck_count : null;
+  const tierLabel = tier === "main" ? "Main" : tier === "supporting" ? "Supporting" : "";
+  const countLabel = deckCount === null ? "" : `${deckCount.toLocaleString("en-US")} tag ${deckCount === 1 ? "deck" : "decks"}`;
+  const similarity = Number.isFinite(theme?.similarity) ? ` Card-profile similarity: ${theme.similarity.toFixed(2)}.` : "";
+  return {
+    tier,
+    note: [tierLabel, countLabel].filter(Boolean).join(" · "),
+    tooltip: `${tierLabel ? `${tierLabel} tag. This tier describes the source sample size. ` : ""}${deckCount === null
+      ? "Tag-profile deck count unavailable."
+      : `EDHREC lists ${countLabel} for this commander.`}${tier === "supporting"
+      ? " Small sample; treat this suggested theme as tentative." : ""}${similarity} Suggested labels describe card-profile matches, not observed tags on the analyzed decks.`,
+  };
+}
+
 export function getComparableProfilePairs(profiles) {
   const known = new Set((profiles?.profiles || []).map((profile) => profile.tag_slug));
   return (profiles?.pairs || [])

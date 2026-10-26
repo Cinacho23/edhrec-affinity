@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from edhrec_affinity.build_styles.pipeline import atomic_json, evidence_version, run_pipeline, save_evidence
+from edhrec_affinity.build_styles.analysis import tag_label_policy
 from edhrec_affinity.build_styles.sources import SourceBlocked
 from edhrec_affinity.build_styles.eligibility import CommanderBelowMinimum
 
@@ -24,7 +25,7 @@ def options(tmp_path, **changes):
         min_total_decks=200, refresh_after_days=3, refresh=False, max_commanders=0, max_runtime_seconds=30,
         requests_per_second=40, workers=1, analysis_workers=1, preview_workers=1, max_preview_seconds=10,
         card_metadata_cache=tmp_path / "cards.json", fetch=False, sample_decks=None, seed=42,
-        max_components=8, max_tags=12, min_tag_decks=25, request_delay=1, source_max_age_hours=72,
+        max_components=8, max_tags=12, min_tag_decks=5, main_tag_decks=15, request_delay=1, source_max_age_hours=72,
         index_max_age_hours=24, target_completion_hours=96, dry_run=False, min_free_disk_gb=0,
         prune_completed_cache=False)
     return argparse.Namespace(**(defaults | changes))
@@ -39,6 +40,7 @@ def evidence(slug, *, frame=5, loaded=5, attempted=None, new_attempts=None, comp
     attempted = loaded if attempted is None else attempted
     return {"slug": slug, "card": {"name": slug}, "base": {"commander_names": [slug], "deck_count": 200},
         "profiles": [], "ranking_profiles": [], "decks": [], "metadata": {}, "metadata_summary": {},
+        "tag_label_policy": tag_label_policy(),
         "failures": [], "imported_count": 0, "blocked": False, "provenance": [],
         "collection": {"target_mode": mode, "frame_decks": frame, "previews_attempted": attempted,
             "previews_loaded": loaded, "fresh_previews": loaded, "unavailable_previews": 0,
@@ -62,6 +64,7 @@ def saved_analyzer(calls, on_start=None):
         destination = Path(settings["output_dir"]) / "report.json"
         report = {"schema_version": 1, "commander_slug": slug, "commander_name": slug,
             "generated_at": NOW.isoformat(), "total_edhrec_decks": source["base"]["deck_count"], "collection": source["collection"],
+            "tag_label_policy": source.get("tag_label_policy"),
             "deck_analysis": {"status": "fitted", "unique_decks": source["collection"]["previews_loaded"],
                 "packages": [{"id": 0, "top_cards": []}]}}
         atomic_json(destination, report)
@@ -170,6 +173,7 @@ def test_completed_report_refresh_waits_for_the_unfinished_backlog(tmp_path):
     old = NOW - timedelta(days=2)
     atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": {
         "a-refresh": {"status": "fitted", "coverage_complete": True, "frame_decks": 200,
+                      "tag_label_policy": tag_label_policy(),
                       "current_previews": 200, "verified_at": old.isoformat()},
     }})
     atomic_json(args.output_dir / "a-refresh.json", {"commander_slug": "a-refresh"})
@@ -363,6 +367,66 @@ def test_model_configuration_change_reanalyzes_even_when_source_content_is_ident
     assert analyzed == ["a", "a"]
 
 
+def test_label_policy_upgrade_is_collected_before_new_commanders_without_resetting_previews(tmp_path):
+    args = options(tmp_path)
+    analyzed = []
+    execute(args, rows("existing"), lambda *_, **__: evidence("existing"), saved_analyzer(analyzed))
+    source_state = checkpoint(args)
+    source_state["commanders"]["existing"].pop("tag_label_policy")
+    atomic_json(args.output_dir / "_collection/state.json", source_state)
+    preview = args.output_dir / "_collection/previews/existing.json.gz"
+    preview.parent.mkdir(parents=True, exist_ok=True)
+    preview.write_bytes(b"retained preview checkpoint")
+    args.max_commanders = 1
+    calls = []
+
+    def collect(settings, **_):
+        calls.append(settings.commander)
+        assert settings.min_tag_decks == 5 and settings.main_tag_decks == 15
+        assert settings.collection_state.read_bytes() == b"retained preview checkpoint"
+        return evidence(settings.commander, new_attempts=0)
+
+    result = execute(args, rows("untouched", "existing"), collect, saved_analyzer(analyzed))
+    assert result["selected"] == calls == ["existing"]
+    assert result["completed"] == ["existing"]
+    assert checkpoint(args)["commanders"]["existing"]["tag_label_policy"] == tag_label_policy()
+    assert checkpoint(args)["commanders"]["existing"]["verified_at"] == NOW.isoformat()
+
+
+@pytest.mark.parametrize("pending", ["legacy", "corrupt"])
+def test_old_or_broken_pending_evidence_is_recollected_before_analysis(tmp_path, pending):
+    args = options(tmp_path)
+    source = evidence("a", new_attempts=0)
+    source.pop("tag_label_policy")
+    source["analysis_version"] = evidence_version(source)
+    pending_path = args.output_dir / "_collection/evidence/a.json.gz"
+    save_evidence(pending_path, source)
+    if pending == "corrupt":
+        pending_path.write_bytes(b"truncated gzip")
+    atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": {"a": {
+        "status": "analysis_pending", "coverage_complete": True, "frame_decks": 5,
+        "current_previews": 5, "verified_at": NOW.isoformat()}}})
+    calls, analyzed = [], []
+
+    def collect(settings, **_):
+        calls.append(settings.commander)
+        return evidence(settings.commander, new_attempts=0)
+
+    result = execute(args, rows("a"), collect, saved_analyzer(analyzed))
+    assert result["completed"] == calls == analyzed == ["a"]
+    assert json.loads((args.output_dir / "a.json").read_text())["tag_label_policy"] == tag_label_policy()
+
+
+def test_label_threshold_options_invalidate_the_evidence_version(tmp_path):
+    args = options(tmp_path)
+    source = evidence("a")
+    original = evidence_version(source, args)
+    args.main_tag_decks = 20
+    assert evidence_version(source, args) != original
+    args.main_tag_decks, args.min_tag_decks = 15, 10
+    assert evidence_version(source, args) != original
+
+
 def test_shared_access_block_stops_new_collection_and_automatic_continuation(tmp_path):
     args = options(tmp_path)
     calls = []
@@ -518,6 +582,7 @@ def test_completion_estimates_preserve_fresh_evidence_without_a_deadline(tmp_pat
     args = options(tmp_path, target_completion_hours=None)
     observed = (NOW - timedelta(hours=4)).isoformat()
     record = {"status": "fitted", "coverage_complete": True, "frame_decks": 5,
+              "tag_label_policy": tag_label_policy(),
               "current_previews": 5, "verified_at": observed, "analyzed_at": observed, "last_collection_at": observed}
     atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": {"a": record},
         "pipeline": {"version": 1, "cycle_started_at": (NOW - timedelta(days=2)).isoformat(),

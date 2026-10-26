@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildCollectionProgress, getBuildModel, getBuildModelOptions, getBuildSourceFreshness, getComparableProfilePairs,
+  formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildCollectionProgress, getBuildModel, getBuildModelOptions, getBuildSourceFreshness, getBuildThemeEvidence, getComparableProfilePairs,
   getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckColorChoices, getGeneratedDeckDistinctiveCards, getGeneratedDeckExport, getGeneratedDeckGroups, getPackageBracketLabel, getSupportedThemes, hasBuildStylePopulation, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
 } from "./buildStyleUtils.js";
 
@@ -94,6 +94,36 @@ test("all supported suggested themes survive, including single themes and more t
     assert.deepEqual(getSupportedThemes({ tag_suggestions: [...themes, ...themes] }), themes);
   }
   assert.deepEqual(getSupportedThemes({}), []);
+});
+
+test("tag evidence distinguishes main and supporting profiles without treating deck count as package membership", () => {
+  const main = getBuildThemeEvidence({ support_tier: "main", deck_count: 15, similarity: 0.4 });
+  assert.equal(main.tier, "main");
+  assert.equal(main.note, "Main · 15 tag decks");
+  assert.match(main.tooltip, /EDHREC lists 15 tag decks for this commander/);
+  assert.match(main.tooltip, /Card-profile similarity: 0.40/);
+  assert.match(main.tooltip, /not observed tags on the analyzed decks/);
+  assert.doesNotMatch(main.tooltip, /tentative/);
+  const supporting = getBuildThemeEvidence({ support_tier: "supporting", deck_count: 5, similarity: 0.71 });
+  assert.equal(supporting.tier, "supporting");
+  assert.equal(supporting.note, "Supporting · 5 tag decks");
+  assert.match(supporting.tooltip, /Small sample; treat this suggested theme as tentative/);
+  assert.equal(getBuildThemeEvidence({ support_tier: "main", deck_count: 1234 }).note, "Main · 1,234 tag decks");
+});
+
+test("legacy or malformed tag evidence never invents a support tier or deck count", () => {
+  for (const theme of [undefined, null, {}, { support_tier: "unexpected" }, { deck_count: null },
+    { deck_count: "20" }, { deck_count: NaN }, { deck_count: Infinity }, { deck_count: -1 }, { deck_count: 5.5 }]) {
+    const result = getBuildThemeEvidence(theme);
+    assert.equal(result.tier, null);
+    assert.equal(result.note, "");
+    assert.match(result.tooltip, /deck count unavailable/);
+    assert.doesNotMatch(result.tooltip, /Main tag|Supporting tag|NaN|Infinity/);
+  }
+  assert.equal(getBuildThemeEvidence({ deck_count: 25 }).note, "25 tag decks");
+  assert.equal(getBuildThemeEvidence({ deck_count: 5 }).tier, null);
+  assert.equal(getBuildThemeEvidence({ support_tier: "supporting" }).note, "Supporting");
+  assert.match(getBuildThemeEvidence({ support_tier: "supporting" }).tooltip, /deck count unavailable/);
 });
 
 test("mixture filtering uses the selected package and preserves untagged decks", () => {

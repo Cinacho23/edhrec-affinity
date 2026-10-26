@@ -98,6 +98,7 @@ def test_profile_suggestions_can_include_more_than_three_supported_tags():
     baseline = {**BASE, "cards": {f"engine {package} {card}": {"name": f"Engine {package} {card}", "rate": 0.1}
                                   for package in range(2) for card in range(24)}}
     profiles = [{"tag_slug": f"theme-{theme}", "tag_name": f"Theme {theme}",
+                 "deck_count": 1000,
                  "cards": {key: {"name": card["name"], "rate": 0.5 if key.startswith("engine 0") else 0.1,
                                   "count": 500 if key.startswith("engine 0") else 100, "denominator": 1000}
                            for key, card in baseline["cards"].items()}}
@@ -108,6 +109,35 @@ def test_profile_suggestions_can_include_more_than_three_supported_tags():
     other = next(package for package in result["packages"] if package is not matching)
     assert other["tag_suggestions"] == []
     assert result["tag_suggestion_rule"]["minimum_cosine"] == 0.2
+
+
+def test_small_tag_profiles_have_tiers_without_bypassing_card_match_checks():
+    decks = package_decks(packages=2, cards_per_package=24)
+    baseline = {**BASE, "cards": {f"engine {package} {card}": {"name": f"Engine {package} {card}", "rate": 0.1}
+                                  for package in range(2) for card in range(24)}}
+    profiles = [{"tag_slug": f"theme-{count}", "tag_name": f"Theme {count}", "deck_count": count,
+                 "cards": {key: {"name": card["name"], "rate": 1 if key.startswith("engine 0") else 0,
+                                  "count": count if key.startswith("engine 0") else 0, "denominator": count}
+                           for key, card in baseline["cards"].items()}}
+                for count in (4, 5, 14, 15)]
+    weak = copy.deepcopy(profiles[1])
+    weak.update(tag_slug="weak", tag_name="Weak")
+    for key, card in weak["cards"].items():
+        if key not in {"engine 0 0", "engine 0 1"}:
+            card.update(count=0, rate=0)
+    result = analyze(decks, baseline, [*profiles, weak], components=2)
+    matching = next(package for package in result["packages"] if package["top_cards"][0]["name"].startswith("Engine 0"))
+    assert {tag["tag_slug"]: (tag["deck_count"], tag["support_tier"]) for tag in matching["tag_suggestions"]} == {
+        "theme-5": (5, "supporting"), "theme-14": (14, "supporting"), "theme-15": (15, "main")}
+    assert next(package for package in result["packages"] if package is not matching)["tag_suggestions"] == []
+    assert result["tag_suggestion_rule"]["supporting_minimum_decks"] == 5
+    assert result["tag_suggestion_rule"]["main_minimum_decks"] == 15
+
+
+@pytest.mark.parametrize("minimum,main", [(0, 15), (16, 15), (True, 15), (5, 14.5)])
+def test_invalid_tag_tier_thresholds_are_rejected_before_fitting(minimum, main):
+    with pytest.raises(ValueError, match="Tag thresholds"):
+        analyze_decks([], BASE, [], min_tag_decks=minimum, main_tag_decks=main)
 
 
 @pytest.mark.parametrize("components", [0, -1, 1.5, True, "auto"])
