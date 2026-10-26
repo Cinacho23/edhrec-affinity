@@ -56,16 +56,26 @@ export function getSupportedThemes(pkg) {
 export function getBuildThemeEvidence(theme) {
   const tier = ["main", "supporting"].includes(theme?.support_tier) ? theme.support_tier : null;
   const deckCount = Number.isSafeInteger(theme?.deck_count) && theme.deck_count >= 0 ? theme.deck_count : null;
+  const commanderDeckCount = Number.isSafeInteger(theme?.commander_deck_count) && theme.commander_deck_count > 0
+    ? theme.commander_deck_count : null;
+  // A report's analyzed sample is not the population used for tag prevalence.
+  // Older reports keep their counts until explicit population evidence exists.
+  const fraction = deckCount !== null && commanderDeckCount !== null && deckCount <= commanderDeckCount
+      && Number.isFinite(theme?.deck_fraction) && theme.deck_fraction >= 0 && theme.deck_fraction <= 1
+      && Math.abs(theme.deck_fraction - deckCount / commanderDeckCount) <= 0.00001
+    ? theme.deck_fraction : null;
   const tierLabel = tier === "main" ? "Main" : tier === "supporting" ? "Supporting" : "";
   const countLabel = deckCount === null ? "" : `${deckCount.toLocaleString("en-US")} tag ${deckCount === 1 ? "deck" : "decks"}`;
+  const shareLabel = fraction === null ? "" : fraction.toLocaleString("en-US", { style: "percent", maximumFractionDigits: 1 });
   const similarity = Number.isFinite(theme?.similarity) ? ` Card-profile similarity: ${theme.similarity.toFixed(2)}.` : "";
   return {
     tier,
-    note: [tierLabel, countLabel].filter(Boolean).join(" · "),
-    tooltip: `${tierLabel ? `${tierLabel} tag. This tier describes the source sample size. ` : ""}${deckCount === null
+    note: [tierLabel, shareLabel || countLabel].filter(Boolean).join(" · "),
+    tooltip: `${tierLabel ? `${tierLabel} tag. ` : ""}${deckCount === null
       ? "Tag-profile deck count unavailable."
-      : `EDHREC lists ${countLabel} for this commander.`}${tier === "supporting"
-      ? " Small sample; treat this suggested theme as tentative." : ""}${similarity} Suggested labels describe card-profile matches, not observed tags on the analyzed decks.`,
+      : fraction === null ? `EDHREC lists ${countLabel} for this commander. Commander-wide tag percentage unavailable.`
+        : `EDHREC lists ${countLabel} out of ${commanderDeckCount.toLocaleString("en-US")} total decks for this commander (${shareLabel}). Tiers use reported tag prevalence and minimum deck-count evidence, not model confidence or package membership.`}${tier === "supporting"
+      ? " Supporting matches may have lower prevalence or less source evidence; treat the suggested label as tentative." : ""}${similarity} Suggested labels describe card-profile matches, not confirmed tags on every analyzed deck. Tags can overlap, so percentages need not sum to 100%.`,
   };
 }
 

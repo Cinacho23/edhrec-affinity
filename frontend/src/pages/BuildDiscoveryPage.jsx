@@ -167,6 +167,7 @@ export default function BuildDiscoveryPage() {
       <p>These reports use decklists collected since the fresh start. The list grows as eligible commanders finish collection and analysis. The package count adapts to the evidence, and a package can suggest one or several themes.</p>
       <p>Collection continues through every available deck preview and adapts its operating rate when EDHREC throttles requests. Source-check age and full-index coverage are shown separately.</p>
       <p>A package describes a recurring card pattern across decks; the generated deck under it is one 100-card example of that pattern. Changing the package count fits a different model.</p>
+      <p>Tag percentages use the commander’s total EDHREC decks. Main and supporting tiers describe reported tag prevalence with minimum sample sizes, rather than model confidence or the share of package members. Tags can overlap, so percentages need not sum to 100%.</p>
       {!state.loading && !state.error ? <>
         <strong>{totalCatalog === null
           ? `${formatNumber(state.commanders.length)} ${state.commanders.length === 1 ? "current collector report" : "current collector reports"}`

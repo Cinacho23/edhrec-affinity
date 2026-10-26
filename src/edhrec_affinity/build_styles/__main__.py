@@ -11,7 +11,7 @@ import math
 
 import httpx
 
-from .analysis import analyze_decks, compare_profiles, tag_label_policy
+from .analysis import analyze_decks, compare_profiles, tag_label_policy, tag_label_thresholds
 from .collection import collect_previews, parse_sample_decks
 from .eligibility import MIN_COMMANDER_DECKS, require_eligible_commander, validate_minimum
 from .sources import (
@@ -24,7 +24,8 @@ from .sources import (
 def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transport=None, metadata_lock=None,
                      metadata_provider=None, commander_alias_provider=None) -> dict:
     minimum = validate_minimum(getattr(args, "min_total_decks", MIN_COMMANDER_DECKS))
-    label_policy = tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags)
+    label_policy = tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags,
+                                   min_tag_fraction=args.min_tag_fraction, main_tag_fraction=args.main_tag_fraction)
     slug = checked_identifier(args.commander)
     root = args.cache_dir or Path("data/raw/build-style-prototype") / slug
     if limiter is None and args.preview_workers > 1:
@@ -43,6 +44,7 @@ def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transpor
         # A valid commander page can contain no mature card measurements. Deck
         # analysis can still proceed, or record an honest insufficient sample.
         base = parse_profile(payload, "all", "All builds", allow_empty=True)
+        label_thresholds = tag_label_thresholds(base.get("deck_count"), label_policy)
         base["commander_names"] = card.get("names") or [card["name"]]
         aliases = commander_alias_provider or CommanderAliasCatalog(root.parent)
         base["commander_name_groups"] = aliases.groups(card)
@@ -53,13 +55,14 @@ def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transpor
         if not isinstance(taglinks, list):
             raise ValueError("Commander taglinks must be a list when present")
         tags = sorted((tag for tag in taglinks
-                       if tag["count"] >= args.min_tag_decks), key=lambda tag: (-tag["count"], tag["slug"]))
+                       if label_thresholds["supporting_minimum_decks"] <= tag["count"] <= base["deck_count"]),
+                      key=lambda tag: (-tag["count"], tag["slug"]))
         if args.tags:
             requested = {checked_identifier(tag) for tag in args.tags}
             tags = [tag for tag in tags if tag["slug"] in requested]
             missing = requested - {tag["slug"] for tag in tags}
             if missing:
-                raise ValueError(f"Requested tags not reported or below --min-tag-decks: {sorted(missing)}")
+                raise ValueError(f"Requested tags not reported or below the supporting tag threshold: {sorted(missing)}")
         tags = tags[:args.max_tags]
         profiles = []
         for tag in tags:
@@ -68,7 +71,8 @@ def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transpor
                 page = cache.get(tag_slug + ".json", f"{url}/{tag_slug}.json")
                 profile = parse_profile(page, tag_slug, tag["value"])
                 profile.update(reported_tag_decks=tag["count"],
-                               support_tier="main" if tag["count"] >= label_policy["main_minimum_decks"] else "supporting")
+                               commander_deck_count=base["deck_count"], deck_fraction=tag["count"] / base["deck_count"],
+                               support_tier="main" if tag["count"] >= label_thresholds["main_minimum_decks"] else "supporting")
                 profiles.append(profile)
             except (FileNotFoundError, ValueError, KeyError, httpx.HTTPError, SourceBlocked) as error:
                 failures.append({"tag": tag_slug, "error": str(error)})
@@ -130,6 +134,7 @@ def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transpor
                                                load_card_metadata(names, args.card_metadata_cache, fetch=args.fetch, **alias_options))
             base["commander_name_groups"] = enrich_commander_name_groups(base, metadata)
         return {"slug": slug, "card": card, "base": base, "profiles": profiles, "tag_label_policy": label_policy,
+                "tag_label_thresholds": label_thresholds,
                 "ranking_profiles": ranking_profiles, "decks": decks, "collection": collection,
                 "metadata": metadata, "metadata_summary": metadata_summary,
                 "failures": failures, "imported_count": imported_count,
@@ -142,7 +147,8 @@ def analyze_evidence(args: argparse.Namespace, evidence: dict) -> dict:
     """CPU work over a saved input; no EDHREC or Scryfall requests in this phase."""
     slug, card, base = evidence["slug"], evidence["card"], evidence["base"]
     require_eligible_commander(base.get("deck_count"), getattr(args, "min_total_decks", MIN_COMMANDER_DECKS))
-    label_policy = tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags)
+    label_policy = tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags,
+                                   min_tag_fraction=args.min_tag_fraction, main_tag_fraction=args.main_tag_fraction)
     profiles, decks, collection = evidence["profiles"], evidence["decks"], evidence["collection"]
     failures, imported_count = list(evidence["failures"]), evidence["imported_count"]
     ranking_profiles, metadata = evidence["ranking_profiles"], evidence["metadata"]
@@ -152,7 +158,8 @@ def analyze_evidence(args: argparse.Namespace, evidence: dict) -> dict:
                              seed=args.seed, min_cards=args.min_deck_cards,
                              min_support=args.min_card_support,
                              membership_threshold=args.membership, min_tag_decks=args.min_tag_decks,
-                             main_tag_decks=label_policy["main_minimum_decks"])
+                             main_tag_decks=label_policy["main_minimum_decks"],
+                             min_tag_fraction=args.min_tag_fraction, main_tag_fraction=args.main_tag_fraction)
     from .deckbuilding import DECK_GENERATION_VERSION
 
     deck_generation = {"version": DECK_GENERATION_VERSION, "status": "insufficient_data", "metadata": {}, "ranking_pages": []}
@@ -202,6 +209,7 @@ def analyze_evidence(args: argparse.Namespace, evidence: dict) -> dict:
         # Preserve the collection policy, including its absence on legacy saved
         # evidence. New options alone cannot certify profiles never collected.
         "tag_label_policy": evidence.get("tag_label_policy"),
+        "tag_label_thresholds": tag_label_thresholds(base.get("deck_count"), label_policy),
         "collection": {**collection, "network_enabled": args.fetch,
                        "blocked": evidence["blocked"] or bool(deck_generation.get("metadata", {}).get("blocked")),
                        "sampling": ("All unique IDs in the available EDHREC deck index, collected in seeded order across resumable runs"
@@ -209,7 +217,8 @@ def analyze_evidence(args: argparse.Namespace, evidence: dict) -> dict:
                        "seed": args.seed, "local_imports": imported_count,
                        "failures": failures, "provenance": evidence["provenance"]},
         "profiles": compare_profiles(base, profiles, threshold=args.similarity,
-                                     min_tag_decks=args.min_tag_decks, main_tag_decks=label_policy["main_minimum_decks"]),
+                                     min_tag_decks=args.min_tag_decks, main_tag_decks=label_policy["main_minimum_decks"],
+                                     min_tag_fraction=args.min_tag_fraction, main_tag_fraction=args.main_tag_fraction),
         "deck_analysis": analysis, "deck_generation": deck_generation,
         "limits": [
             "Tag profile similarity does not measure shared decks or imply compatible strategies.",
@@ -266,9 +275,13 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--min-total-decks", type=validate_minimum, default=MIN_COMMANDER_DECKS,
                      help=f"Minimum EDHREC commander deck count; must be at least {MIN_COMMANDER_DECKS}")
     cli.add_argument("--min-tag-decks", type=int, default=5,
-                     help="Minimum reported tag decks for a supporting label profile (default 5)")
+                     help="Evidence floor for supporting tag profiles, in addition to the population fraction (default 5)")
     cli.add_argument("--main-tag-decks", type=int,
-                     help="Minimum reported tag decks for a main label profile (default 15, or a higher --min-tag-decks)")
+                     help="Evidence floor for main tag profiles, in addition to the population fraction (default 15)")
+    cli.add_argument("--min-tag-fraction", type=float, default=0.01,
+                     help="Minimum fraction of all commander EDHREC decks for supporting tags (default 0.01)")
+    cli.add_argument("--main-tag-fraction", type=float, default=0.03,
+                     help="Minimum fraction of all commander EDHREC decks for main tags (default 0.03)")
     cli.add_argument("--max-tags", type=int, default=12)
     cli.add_argument("--tags", nargs="+", help="Optional explicit tag slugs, still subject to the deck minimum")
     cli.add_argument("--sample-decks", type=parse_sample_decks, default=None,
@@ -303,7 +316,8 @@ def main() -> None:
     cli = parser()
     args = cli.parse_args()
     try:
-        tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags)
+        tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags,
+                         min_tag_fraction=args.min_tag_fraction, main_tag_fraction=args.main_tag_fraction)
     except ValueError as error:
         cli.error(str(error))
     if not 1 <= args.max_tags <= 16:

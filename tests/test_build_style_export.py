@@ -239,9 +239,9 @@ def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_
               "playability_pct": 75.2, "bracket": 4, "deck_sha256": "large-rating-detail"}
     packages[0].update(name="Package 1", tag_suggestions=[
         {"tag_slug": "tokens", "tag_name": "Tokens", "similarity": 0.8, "compared_cards": 81,
-         "support_tier": "main", "deck_count": 15},
+         "support_tier": "main", "deck_count": 15, "commander_deck_count": 300, "deck_fraction": 0.05},
         {"tag_slug": "counters", "tag_name": "Counters", "similarity": 0.6,
-         "support_tier": "supporting", "deck_count": 5},
+         "support_tier": "supporting", "deck_count": 5, "commander_deck_count": 300, "deck_fraction": 5 / 300},
         {"tag_slug": "legacy", "tag_name": "Legacy", "similarity": 0.5},
     ], generated_deck={"status": "generated", "cards": [{"name": "Do not embed full decks", "quantity": 100}],
         "primer": "Long primer content", "export_text": "100 Do not embed full decks",
@@ -262,9 +262,9 @@ def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_
     assert index["commanders"][0]["packages"] == [
         {"id": 0, "name": "Package 1", "tag_suggestions": [
             {"tag_slug": "tokens", "tag_name": "Tokens", "similarity": 0.8,
-             "support_tier": "main", "deck_count": 15},
+             "support_tier": "main", "deck_count": 15, "commander_deck_count": 300, "deck_fraction": 0.05},
             {"tag_slug": "counters", "tag_name": "Counters", "similarity": 0.6,
-             "support_tier": "supporting", "deck_count": 5},
+             "support_tier": "supporting", "deck_count": 5, "commander_deck_count": 300, "deck_fraction": 5 / 300},
             {"tag_slug": "legacy", "tag_name": "Legacy", "similarity": 0.5}],
          "generated_deck": {"status": "generated", "validation": {
              "bracket": {"recommended": 3}, "external_rating": {

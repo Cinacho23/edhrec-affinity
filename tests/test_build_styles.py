@@ -49,6 +49,7 @@ def test_omitted_cards_are_unknown_and_reduce_comparable_evidence():
 
 def test_profile_summaries_preserve_reported_tag_counts_and_tiers():
     baseline = profile("all", {f"card {i}": .1 for i in range(30)})
+    baseline["deck_count"] = 500
     profiles = [{**profile(f"theme-{count}", {key: .5 for key in baseline["cards"]}), "reported_tag_decks": count}
                 for count in (4, 5, 14, 15)]
     summaries = compare_profiles(baseline, profiles)["profiles"]
@@ -58,7 +59,8 @@ def test_profile_summaries_preserve_reported_tag_counts_and_tiers():
     assert tag_label_policy(10, 20)["main_minimum_decks"] == 20
     assert tag_label_policy(25)["main_minimum_decks"] == 25  # Older single-threshold commands remain valid.
     stricter = supported_tag_profiles([{**profile(str(count), {}), "reported_tag_decks": count}
-                                       for count in (9, 10, 19, 20)], min_tag_decks=10, main_tag_decks=20)
+                                       for count in (9, 10, 19, 20)], min_tag_decks=10, main_tag_decks=20,
+                                       commander_deck_count=500)
     assert [(row["reported_tag_decks"], row["support_tier"]) for row in stricter] == [
         (10, "supporting"), (19, "supporting"), (20, "main")]
 
@@ -244,6 +246,9 @@ def test_offline_cli_writes_an_honest_report_with_insufficient_deck_data(tmp_pat
     report = run(args)
     assert report["profiles"]["profiles"] == []
     assert report["deck_analysis"]["status"] == "insufficient_data"
+    assert report["tag_label_policy"] == tag_label_policy()
+    assert report["tag_label_thresholds"] == {"commander_deck_count": 200,
+                                              "supporting_minimum_decks": 5, "main_minimum_decks": 15}
     assert report["collection"]["network_enabled"] is False
     assert json.loads((output / "report.json").read_text())["commander_name"] == "Ghave"
     assert (output / "index.html").is_file()

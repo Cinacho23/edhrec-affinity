@@ -425,6 +425,34 @@ def test_label_threshold_options_invalidate_the_evidence_version(tmp_path):
     assert evidence_version(source, args) != original
     args.main_tag_decks, args.min_tag_decks = 15, 10
     assert evidence_version(source, args) != original
+    args.min_tag_decks, args.main_tag_fraction = 5, .05
+    assert evidence_version(source, args) != original
+    args.main_tag_fraction, args.min_tag_fraction = .03, .02
+    assert evidence_version(source, args) != original
+
+
+def test_fixed_count_policy_refreshes_existing_reports_without_discarding_decks(tmp_path):
+    args = options(tmp_path)
+    analyzed = []
+    execute(args, rows("existing"), lambda *_, **__: evidence("existing"), saved_analyzer(analyzed))
+    state = checkpoint(args)
+    state["commanders"]["existing"]["tag_label_policy"] = {
+        "version": 1, "supporting_minimum_decks": 5, "main_minimum_decks": 15, "max_profiles": 12}
+    atomic_json(args.output_dir / "_collection/state.json", state)
+    preview = args.output_dir / "_collection/previews/existing.json.gz"
+    preview.parent.mkdir(parents=True, exist_ok=True)
+    preview.write_bytes(b"already collected decks")
+    calls = []
+
+    def collect(settings, **_):
+        calls.append(settings.commander)
+        assert settings.min_tag_fraction == .01 and settings.main_tag_fraction == .03
+        assert settings.collection_state.read_bytes() == b"already collected decks"
+        return evidence(settings.commander, new_attempts=0)
+
+    result = execute(args, rows("existing"), collect, saved_analyzer(analyzed))
+    assert result["completed"] == calls == ["existing"]
+    assert checkpoint(args)["commanders"]["existing"]["tag_label_policy"]["version"] == 2
 
 
 def test_shared_access_block_stops_new_collection_and_automatic_continuation(tmp_path):

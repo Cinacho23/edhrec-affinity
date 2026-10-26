@@ -95,7 +95,7 @@ def test_source_tags_cannot_determine_auto_package_count_or_weights():
 
 def test_profile_suggestions_can_include_more_than_three_supported_tags():
     decks = package_decks(packages=2, cards_per_package=24)
-    baseline = {**BASE, "cards": {f"engine {package} {card}": {"name": f"Engine {package} {card}", "rate": 0.1}
+    baseline = {**BASE, "deck_count": 1000, "cards": {f"engine {package} {card}": {"name": f"Engine {package} {card}", "rate": 0.1}
                                   for package in range(2) for card in range(24)}}
     profiles = [{"tag_slug": f"theme-{theme}", "tag_name": f"Theme {theme}",
                  "deck_count": 1000,
@@ -113,7 +113,7 @@ def test_profile_suggestions_can_include_more_than_three_supported_tags():
 
 def test_small_tag_profiles_have_tiers_without_bypassing_card_match_checks():
     decks = package_decks(packages=2, cards_per_package=24)
-    baseline = {**BASE, "cards": {f"engine {package} {card}": {"name": f"Engine {package} {card}", "rate": 0.1}
+    baseline = {**BASE, "deck_count": 500, "cards": {f"engine {package} {card}": {"name": f"Engine {package} {card}", "rate": 0.1}
                                   for package in range(2) for card in range(24)}}
     profiles = [{"tag_slug": f"theme-{count}", "tag_name": f"Theme {count}", "deck_count": count,
                  "cards": {key: {"name": card["name"], "rate": 1 if key.startswith("engine 0") else 0,
@@ -132,6 +132,16 @@ def test_small_tag_profiles_have_tiers_without_bypassing_card_match_checks():
     assert next(package for package in result["packages"] if package is not matching)["tag_suggestions"] == []
     assert result["tag_suggestion_rule"]["supporting_minimum_decks"] == 5
     assert result["tag_suggestion_rule"]["main_minimum_decks"] == 15
+    assert all(tag["commander_deck_count"] == 500 and tag["deck_fraction"] == tag["deck_count"] / 500
+               for tag in matching["tag_suggestions"])
+    assert result["tag_label_thresholds"] == {"commander_deck_count": 500,
+                                              "supporting_minimum_decks": 5, "main_minimum_decks": 15}
+    # More commander-wide decks change the labeling cohort, never the learned model.
+    larger_population = analyze(decks, {**baseline, "deck_count": 2000}, [*profiles, weak], components=2)
+    assert all(not package["tag_suggestions"] for package in larger_population["packages"])
+    assert [package["top_cards"] for package in result["packages"]] == [
+        package["top_cards"] for package in larger_population["packages"]]
+    assert result["decks"] == larger_population["decks"]
 
 
 @pytest.mark.parametrize("minimum,main", [(0, 15), (16, 15), (True, 15), (5, 14.5)])

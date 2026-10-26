@@ -124,7 +124,8 @@ def preview_expansion_needed(args: argparse.Namespace, slug: str) -> bool:
 
 
 def label_policy_upgrade_needed(args: argparse.Namespace, slug: str) -> bool:
-    policy = tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags)
+    policy = tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags,
+                              min_tag_fraction=args.min_tag_fraction, main_tag_fraction=args.main_tag_fraction)
     for directory in [args.output_dir, args.seed_dir]:
         path = directory / f"{slug}.json"
         if sample_date(path, slug) is not None:
@@ -134,7 +135,8 @@ def label_policy_upgrade_needed(args: argparse.Namespace, slug: str) -> bool:
 
 def select_commanders(args: argparse.Namespace) -> list[dict]:
     minimum = validate_minimum(args.min_total_decks)
-    tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags)
+    tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags,
+                     min_tag_fraction=args.min_tag_fraction, main_tag_fraction=args.main_tag_fraction)
     rows = read_index(args.commander_index)
     requested = set(args.commanders or [])
     known = {row["commander_slug"] for row in rows}
@@ -236,10 +238,13 @@ def run_batch(args: argparse.Namespace, *, runner: Callable | None = None, monot
                             and previous_attempt.get("status") not in
                             {"running", "blocked", "failed", "generation_partial", "collecting"}):
             preview_state.unlink(missing_ok=True)
+        policy = tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags,
+                                  min_tag_fraction=args.min_tag_fraction, main_tag_fraction=args.main_tag_fraction)
         argv = ["--commander", slug, "--components", "auto", "--max-components", str(args.max_components),
                 "--min-total-decks", str(args.min_total_decks),
                 "--max-tags", str(args.max_tags), "--min-tag-decks", str(args.min_tag_decks),
-                "--main-tag-decks", str(tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags)["main_minimum_decks"]),
+                "--min-tag-fraction", str(args.min_tag_fraction), "--main-tag-fraction", str(args.main_tag_fraction),
+                "--main-tag-decks", str(policy["main_minimum_decks"]),
                 "--sample-decks", "all" if args.sample_decks is None else str(args.sample_decks), "--seed", str(args.seed),
                 "--collection-state", str(preview_state),
                 "--max-preview-seconds", str(min(args.max_preview_seconds, max(1, args.max_runtime_seconds - elapsed))
@@ -334,9 +339,13 @@ def parser() -> argparse.ArgumentParser:
                      help="Preview collection time slice per commander (default 300 seconds); progress resumes next run")
     cli.add_argument("--max-tags", type=int, default=12)
     cli.add_argument("--min-tag-decks", type=int, default=5,
-                     help="Minimum reported decks for supporting theme profiles (default 5)")
+                     help="Evidence floor for supporting tags, in addition to the population fraction (default 5)")
     cli.add_argument("--main-tag-decks", type=int,
-                     help="Minimum reported decks for main theme profiles (default 15, or a higher --min-tag-decks)")
+                     help="Evidence floor for main tags, in addition to the population fraction (default 15)")
+    cli.add_argument("--min-tag-fraction", type=float, default=0.01,
+                     help="Minimum fraction of all commander EDHREC decks for supporting tags (default 0.01)")
+    cli.add_argument("--main-tag-fraction", type=float, default=0.03,
+                     help="Minimum fraction of all commander EDHREC decks for main tags (default 0.03)")
     cli.add_argument("--max-components", type=int, default=8, help="Automatic package-count search: 1 through this ceiling")
     cli.add_argument("--seed", type=int, default=42)
     cli.add_argument("--request-delay", type=float, default=1)
@@ -373,7 +382,8 @@ def main() -> int:
     args = cli.parse_args()
     try:
         validate_minimum(args.min_total_decks)
-        tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags)
+        tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags,
+                         min_tag_fraction=args.min_tag_fraction, main_tag_fraction=args.main_tag_fraction)
     except ValueError as error:
         cli.error(str(error))
     if args.max_commanders < 0 or not 1 <= args.max_tags <= 16:
