@@ -184,6 +184,7 @@ jobs:
                 --max-commanders "${MAX_COMMANDERS}" --sample-decks "${SAMPLE_DECKS}"
                 --max-components "${MAX_COMPONENTS}" --min-total-decks 200
                 --main-tag-decks 15 --min-tag-decks 5
+                --main-tag-fraction 0.03 --min-tag-fraction 0.01
                 --max-runtime-seconds 1800 --pipeline --workers 1 --preview-workers 16 --analysis-workers 2
                 --requests-per-second "${REQUESTS_PER_SECOND}"
                 --source-max-age-hours 72 --refresh-after-days 3

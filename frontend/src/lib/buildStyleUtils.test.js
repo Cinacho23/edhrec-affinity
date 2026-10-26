@@ -97,18 +97,56 @@ test("all supported suggested themes survive, including single themes and more t
 });
 
 test("tag evidence distinguishes main and supporting profiles without treating deck count as package membership", () => {
-  const main = getBuildThemeEvidence({ support_tier: "main", deck_count: 15, similarity: 0.4 });
+  const main = getBuildThemeEvidence({ support_tier: "main", deck_count: 15,
+    commander_deck_count: 300, deck_fraction: 0.05, similarity: 0.4 });
   assert.equal(main.tier, "main");
-  assert.equal(main.note, "Main · 15 tag decks");
-  assert.match(main.tooltip, /EDHREC lists 15 tag decks for this commander/);
+  assert.equal(main.note, "Main · 5%");
+  assert.match(main.tooltip, /EDHREC lists 15 tag decks out of 300 total decks for this commander \(5%\)/);
   assert.match(main.tooltip, /Card-profile similarity: 0.40/);
-  assert.match(main.tooltip, /not observed tags on the analyzed decks/);
+  assert.match(main.tooltip, /not model confidence or package membership/);
+  assert.match(main.tooltip, /not confirmed tags on every analyzed deck/);
+  assert.match(main.tooltip, /Tags can overlap, so percentages need not sum to 100%/);
   assert.doesNotMatch(main.tooltip, /tentative/);
-  const supporting = getBuildThemeEvidence({ support_tier: "supporting", deck_count: 5, similarity: 0.71 });
+  const supporting = getBuildThemeEvidence({ support_tier: "supporting", deck_count: 5,
+    commander_deck_count: 300, deck_fraction: 5 / 300, similarity: 0.71 });
   assert.equal(supporting.tier, "supporting");
-  assert.equal(supporting.note, "Supporting · 5 tag decks");
-  assert.match(supporting.tooltip, /Small sample; treat this suggested theme as tentative/);
+  assert.equal(supporting.note, "Supporting · 1.7%");
+  assert.match(supporting.tooltip, /EDHREC lists 5 tag decks out of 300 total decks/);
+  assert.match(supporting.tooltip, /Supporting matches may have lower prevalence or less source evidence/);
+  assert.match(supporting.tooltip, /Tiers use reported tag prevalence and minimum deck-count evidence/);
+  const largeSupporting = getBuildThemeEvidence({ support_tier: "supporting", deck_count: 1000,
+    commander_deck_count: 100000, deck_fraction: 0.01 });
+  assert.equal(largeSupporting.note, "Supporting · 1%");
+  assert.doesNotMatch(largeSupporting.tooltip, /[Ss]mall sample/);
+  assert.equal(getBuildThemeEvidence({ support_tier: "supporting", deck_count: 9,
+    commander_deck_count: 220, deck_fraction: 9 / 220 }).note, "Supporting · 4.1%");
   assert.equal(getBuildThemeEvidence({ support_tier: "main", deck_count: 1234 }).note, "Main · 1,234 tag decks");
+});
+
+test("tag percentages use their explicit commander population rather than analyzed sample counts", () => {
+  const evidence = { support_tier: "main", deck_count: 500, commander_deck_count: 10000,
+    deck_fraction: 0.05, unique_decks: 60, member_count: 15 };
+  assert.equal(getBuildThemeEvidence(evidence).note, "Main · 5%");
+  assert.match(getBuildThemeEvidence(evidence).tooltip, /500 tag decks out of 10,000 total decks/);
+  assert.equal(getBuildThemeEvidence({ ...evidence, unique_decks: 5000, member_count: 2000 }).note, "Main · 5%");
+  assert.equal(getBuildThemeEvidence({ deck_count: 500, commander_deck_count: 10000, deck_fraction: 0.05 }).note, "5%");
+});
+
+test("legacy and malformed population evidence falls back to raw counts without inventing a percentage", () => {
+  const theme = { support_tier: "supporting", deck_count: 5, commander_deck_count: 500, deck_fraction: 0.01 };
+  for (const invalid of [
+    { commander_deck_count: undefined }, { commander_deck_count: null }, { commander_deck_count: 0 },
+    { commander_deck_count: "500" }, { commander_deck_count: 1.5 }, { commander_deck_count: 4 },
+    { deck_fraction: undefined }, { deck_fraction: null }, { deck_fraction: "0.01" },
+    { deck_fraction: NaN }, { deck_fraction: Infinity }, { deck_fraction: -0.01 },
+    { deck_fraction: 1.01 }, { deck_fraction: 0.5 },
+  ]) {
+    const result = getBuildThemeEvidence({ ...theme, ...invalid, unique_decks: 500 });
+    assert.equal(result.note, "Supporting · 5 tag decks");
+    assert.match(result.tooltip, /Commander-wide tag percentage unavailable/);
+    assert.doesNotMatch(result.note, /%|NaN|Infinity/);
+  }
+  assert.equal(getBuildThemeEvidence({ ...theme, deck_fraction: 0.0100001 }).note, "Supporting · 1%");
 });
 
 test("legacy or malformed tag evidence never invents a support tier or deck count", () => {

@@ -46,11 +46,11 @@ def evidence_version(evidence: dict, options: argparse.Namespace | None = None) 
                 for key, card in evidence.get("metadata", {}).items()}
     contents = {"deck_dataset_sha256": evidence["collection"].get("dataset_sha256"),
                 "base": evidence["base"], "profiles": evidence["ranking_profiles"], "metadata": metadata,
-                # Version 6 adds count-based main/supporting label evidence.
-                "model_version": 6, "tag_label_policy": evidence.get("tag_label_policy"),
+                # Version 7 adds commander-population shares to tag evidence.
+                "model_version": 7, "tag_label_policy": evidence.get("tag_label_policy"),
                 "options": {key: getattr(options, key, None) for key in
                     ("seed", "components", "max_components", "min_deck_cards", "min_card_support", "membership", "similarity",
-                     "min_tag_decks", "main_tag_decks", "max_tags")}}
+                     "min_tag_decks", "main_tag_decks", "min_tag_fraction", "main_tag_fraction", "max_tags")}}
     return hashlib.sha256(json.dumps(contents, sort_keys=True, ensure_ascii=False, allow_nan=False,
                                     separators=(",", ":")).encode()).hexdigest()
 
@@ -107,8 +107,11 @@ def collection_options(args, slug: str, remaining_seconds: float):
     options.card_metadata_cache = args.card_metadata_cache
     options.fetch, options.sample_decks, options.seed = args.fetch, args.sample_decks, args.seed
     options.max_components, options.max_tags, options.min_tag_decks = args.max_components, args.max_tags, args.min_tag_decks
+    options.min_tag_fraction = getattr(args, "min_tag_fraction", 0.01)
+    options.main_tag_fraction = getattr(args, "main_tag_fraction", 0.03)
     options.main_tag_decks = tag_label_policy(options.min_tag_decks, getattr(args, "main_tag_decks", None),
-                                             options.max_tags)["main_minimum_decks"]
+                                             options.max_tags, min_tag_fraction=options.min_tag_fraction,
+                                             main_tag_fraction=options.main_tag_fraction)["main_minimum_decks"]
     options.min_total_decks = validate_minimum(args.min_total_decks)
     options.request_delay, options.preview_workers = args.request_delay, args.preview_workers
     options.source_max_age_hours, options.index_max_age_hours = args.source_max_age_hours, args.index_max_age_hours
@@ -153,7 +156,9 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     if requested - known:
         raise ValueError("Requested commanders not found in catalog")
     minimum = validate_minimum(args.min_total_decks)
-    label_policy = tag_label_policy(args.min_tag_decks, getattr(args, "main_tag_decks", None), args.max_tags)
+    label_policy = tag_label_policy(args.min_tag_decks, getattr(args, "main_tag_decks", None), args.max_tags,
+                                   min_tag_fraction=getattr(args, "min_tag_fraction", 0.01),
+                                   main_tag_fraction=getattr(args, "main_tag_fraction", 0.03))
     if any(row["commander_slug"] in requested and not commander_is_eligible(row.get("total_decks"), minimum)
            for row in rows):
         raise ValueError(f"Requested commanders must each have at least {minimum} total decks")

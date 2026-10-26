@@ -56,6 +56,8 @@ def test_scheduled_collection_uses_source_freshness_without_a_completion_deadlin
     assert args[args.index("--min-total-decks") + 1] == "200"
     assert args[args.index("--main-tag-decks") + 1] == "15"
     assert args[args.index("--min-tag-decks") + 1] == "5"
+    assert args[args.index("--main-tag-fraction") + 1] == "0.03"
+    assert args[args.index("--min-tag-fraction") + 1] == "0.01"
     assert "--target-completion-hours" not in args
     assert "reset_target" not in COLLECTOR.read_text()
 

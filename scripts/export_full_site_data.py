@@ -1381,7 +1381,8 @@ def summarize_build_style_packages(analysis: dict[str, Any]) -> list[dict[str, A
     for package in analysis["packages"]:
         suggestions = package.get("tag_suggestions")
         summary = {"id": package["id"], "tag_suggestions": [
-            {key: tag[key] for key in ("tag_name", "tag_slug", "similarity", "support_tier", "deck_count") if key in tag}
+            {key: tag[key] for key in ("tag_name", "tag_slug", "similarity", "support_tier", "deck_count",
+                                       "commander_deck_count", "deck_fraction") if key in tag}
             for tag in (suggestions if isinstance(suggestions, list) else [])
             if isinstance(tag, dict) and isinstance(tag.get("tag_name"), str) and tag["tag_name"].strip()
         ]}

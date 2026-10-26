@@ -281,7 +281,7 @@ function DeckPackages({ analysis }) {
           <div><strong>{formatNumber(model.unique_decks)}</strong><span>unique sampled decks</span></div>
           <div><strong>{formatBuildShare(model.weighted_reconstruction_captured)}</strong><span>weighted card signal captured</span></div>
         </div>
-        <p className="build-note">Package membership can overlap, so counts need not add up to the sample size. Card percentages describe this sample. Captured card signal measures model fit, not confidence or the share of decks explained.</p>
+        <p className="build-note">Package membership can overlap, so counts need not add up to the sample size. Distinctive-card percentages describe sampled decks. Tag percentages use the commander’s total EDHREC decks; tags can overlap. Main and supporting tiers describe reported tag prevalence with minimum sample sizes. Captured card signal measures model fit, not confidence or the share of decks explained.</p>
         <div className="build-package-grid">{packages.map((pkg, index) => <PackageCard key={pkg.id ?? index} pkg={pkg} index={index} decks={model.decks || []} />)}</div>
         <DeckMixtures key={selectedCount} model={model} />
       </> : <p className="muted">{analysis.reason || analysis.interpretation || "There are not enough usable decklists to discover card packages yet. Tag-profile comparisons are available in the other view."}</p>}

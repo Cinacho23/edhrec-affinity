@@ -7,6 +7,7 @@ They are unrelated to the project's specialization z-scores.
 from __future__ import annotations
 
 from collections import Counter
+from decimal import Decimal, ROUND_CEILING
 from itertools import combinations
 import math
 from urllib.parse import urlsplit
@@ -19,27 +20,55 @@ from .sources import card_key
 from .eligibility import valid_deck_count
 
 
-def tag_label_policy(min_tag_decks: int = 5, main_tag_decks: int | None = None, max_tags: int = 12) -> dict:
+def tag_label_policy(min_tag_decks: int = 5, main_tag_decks: int | None = None, max_tags: int = 12,
+                     *, min_tag_fraction: float = 0.01, main_tag_fraction: float = 0.03) -> dict:
     """Declared source cohort for package labels, separate from NMF fitting."""
     # Preserve historical single-threshold commands such as --min-tag-decks 25.
     if main_tag_decks is None and isinstance(min_tag_decks, int) and not isinstance(min_tag_decks, bool):
         main_tag_decks = max(15, min_tag_decks)
     if any(isinstance(value, bool) or not isinstance(value, int) for value in (min_tag_decks, main_tag_decks)) or not 1 <= min_tag_decks <= main_tag_decks:
         raise ValueError("Tag thresholds must be integers with 1 <= min_tag_decks <= main_tag_decks")
-    return {"version": 1, "supporting_minimum_decks": min_tag_decks,
-            "main_minimum_decks": main_tag_decks, "max_profiles": max_tags}
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+           for value in (min_tag_fraction, main_tag_fraction)) or not 0 <= min_tag_fraction <= main_tag_fraction <= 1:
+        raise ValueError("Tag fractions must be finite numbers with 0 <= min_tag_fraction <= main_tag_fraction <= 1")
+    return {"version": 2, "supporting_minimum_decks": min_tag_decks,
+            "main_minimum_decks": main_tag_decks, "supporting_minimum_fraction": min_tag_fraction,
+            "main_minimum_fraction": main_tag_fraction, "max_profiles": max_tags}
+
+
+def tag_label_thresholds(commander_deck_count, policy: dict) -> dict:
+    """Convert population shares to counts, never using the collected sample size."""
+    total = valid_deck_count(commander_deck_count)
+    total = total if total else None
+
+    def threshold(tier):
+        if total is None:
+            return None
+        population_minimum = (Decimal(total) * Decimal(str(policy[f"{tier}_minimum_fraction"]))).to_integral_value(
+            rounding=ROUND_CEILING)
+        return max(policy[f"{tier}_minimum_decks"], int(population_minimum))
+
+    return {"commander_deck_count": total,
+            "supporting_minimum_decks": threshold("supporting"), "main_minimum_decks": threshold("main")}
 
 
 def supported_tag_profiles(profiles: list[dict], *, min_tag_decks: int = 5,
-                           main_tag_decks: int | None = None) -> list[dict]:
+                           main_tag_decks: int | None = None, commander_deck_count=None,
+                           min_tag_fraction: float = 0.01, main_tag_fraction: float = 0.03) -> list[dict]:
     """A low-count profile is eligible evidence, never a forced package label."""
-    main_tag_decks = tag_label_policy(min_tag_decks, main_tag_decks)["main_minimum_decks"]
+    policy = tag_label_policy(min_tag_decks, main_tag_decks, min_tag_fraction=min_tag_fraction,
+                             main_tag_fraction=main_tag_fraction)
+    thresholds = tag_label_thresholds(commander_deck_count, policy)
+    total = thresholds["commander_deck_count"]
+    if total is None:
+        return []  # A missing population denominator cannot establish relative support.
     supported = []
     for profile in profiles:
         count = valid_deck_count(profile.get("reported_tag_decks", profile.get("deck_count")))
-        if count is not None and count >= min_tag_decks:
+        if count is not None and thresholds["supporting_minimum_decks"] <= count <= total:
             supported.append({**profile, "reported_tag_decks": count,
-                              "support_tier": "main" if count >= main_tag_decks else "supporting"})
+                              "commander_deck_count": total, "deck_fraction": count / total,
+                              "support_tier": "main" if count >= thresholds["main_minimum_decks"] else "supporting"})
     return supported
 
 
@@ -92,8 +121,11 @@ def overlapping_groups(slugs: list[str], pairs: list[dict], threshold: float) ->
 
 
 def compare_profiles(base: dict, profiles: list[dict], *, threshold: float = 0.6,
-                     min_shared: int = 20, min_tag_decks: int = 5, main_tag_decks: int | None = None) -> dict:
-    profiles = supported_tag_profiles(profiles, min_tag_decks=min_tag_decks, main_tag_decks=main_tag_decks)
+                     min_shared: int = 20, min_tag_decks: int = 5, main_tag_decks: int | None = None,
+                     min_tag_fraction: float = 0.01, main_tag_fraction: float = 0.03) -> dict:
+    profiles = supported_tag_profiles(profiles, min_tag_decks=min_tag_decks, main_tag_decks=main_tag_decks,
+                                     commander_deck_count=base.get("deck_count"),
+                                     min_tag_fraction=min_tag_fraction, main_tag_fraction=main_tag_fraction)
     vectors = enriched_vectors(base, profiles)
     summaries = []
     for profile in profiles:
@@ -103,6 +135,7 @@ def compare_profiles(base: dict, profiles: list[dict], *, threshold: float = 0.6
             "tag_slug": profile["tag_slug"], "tag_name": profile["tag_name"],
             "deck_count": profile["deck_count"], "observed_cards": len(profile["cards"]),
             "reported_tag_decks": profile["reported_tag_decks"], "support_tier": profile["support_tier"],
+            "commander_deck_count": profile["commander_deck_count"], "deck_fraction": profile["deck_fraction"],
             "comparable_cards": len(vector), "ignored": profile["ignored"],
             "signature_cards": [{"name": profile["cards"][key]["name"], "excess": vector[key],
                                  "tag_rate": profile["cards"][key]["rate"],
@@ -291,6 +324,8 @@ def _package_summary(fit: dict, kept: list[dict], vocabulary: list[str], presenc
                 continue
             annotations.append({"tag_name": profile["tag_name"], "tag_slug": profile["tag_slug"],
                                 "deck_count": profile["reported_tag_decks"], "support_tier": profile["support_tier"],
+                                "commander_deck_count": profile["commander_deck_count"],
+                                "deck_fraction": profile["deck_fraction"],
                                 "similarity": cosine(component[common], [vector[vocabulary[i]] * idf[i] for i in common]),
                                 "compared_cards": len(common)})
         annotations.sort(key=lambda row: (-row["similarity"], row["tag_slug"]))
@@ -332,7 +367,8 @@ def _package_summary(fit: dict, kept: list[dict], vocabulary: list[str], presenc
 
 def analyze_decks(decks: list[dict], base: dict, profiles: list[dict], *, components: int | None = None,
                   max_components: int = 8, seed: int = 42, min_cards: int = 90, min_support: int = 2,
-                  membership_threshold: float = 0.25, min_tag_decks: int = 5, main_tag_decks: int | None = None) -> dict:
+                  membership_threshold: float = 0.25, min_tag_decks: int = 5, main_tag_decks: int | None = None,
+                  min_tag_fraction: float = 0.01, main_tag_fraction: float = 0.03) -> dict:
     """Learn flexible card packages, never source tags; weights are not probabilities.
 
     ``components=None`` chooses a conservative count from 1 through a data-supported
@@ -345,8 +381,13 @@ def analyze_decks(decks: list[dict], base: dict, profiles: list[dict], *, compon
         raise ValueError("max_components must be a positive integer")
     if not 0 < membership_threshold <= 1:
         raise ValueError("membership_threshold must be greater than zero and at most one")
-    main_tag_decks = tag_label_policy(min_tag_decks, main_tag_decks)["main_minimum_decks"]
-    profiles = supported_tag_profiles(profiles, min_tag_decks=min_tag_decks, main_tag_decks=main_tag_decks)
+    label_policy = tag_label_policy(min_tag_decks, main_tag_decks, min_tag_fraction=min_tag_fraction,
+                                   main_tag_fraction=main_tag_fraction)
+    main_tag_decks = label_policy["main_minimum_decks"]
+    label_thresholds = tag_label_thresholds(base.get("deck_count"), label_policy)
+    profiles = supported_tag_profiles(profiles, min_tag_decks=min_tag_decks, main_tag_decks=main_tag_decks,
+                                     commander_deck_count=base.get("deck_count"),
+                                     min_tag_fraction=min_tag_fraction, main_tag_fraction=main_tag_fraction)
     selection = {
         "mode": "automatic" if components is None else "manual", "selected_components": None,
         "max_components": 0, "requested_max_components": max_components, "candidates": [],
@@ -361,7 +402,7 @@ def analyze_decks(decks: list[dict], base: dict, profiles: list[dict], *, compon
               "exact_duplicates_removed": duplicates, "rejected": rejected, "packages": [],
               "decks": [], "components_requested": components, "package_count": 0,
               "alternative_models": [], "model_selection": selection,
-              "membership_threshold": membership_threshold}
+              "membership_threshold": membership_threshold, "tag_label_thresholds": label_thresholds}
     required_decks = max(8, 2 * (components or 1))
     if len(kept) < required_decks:
         result["reason"] = f"Need at least {required_decks} usable unique decks"
@@ -480,6 +521,7 @@ def analyze_decks(decks: list[dict], base: dict, profiles: list[dict], *, compon
         "package_count": chosen, "alternative_models": list(summaries.values()),
         "tag_suggestion_rule": {"minimum_cosine": 0.2, "minimum_fraction_of_best": 0.5,
                                 "supporting_minimum_decks": min_tag_decks, "main_minimum_decks": main_tag_decks,
+                                "supporting_minimum_fraction": min_tag_fraction, "main_minimum_fraction": main_tag_fraction,
                                 "note": "All profiles above both heuristic similarity floors; no fixed tag count or calibrated tag confidence."},
         "consistency_note": "Matched component cosine across four initializations and three 80% training subsets; not a confidence probability.",
         "near_duplicate_pairs": near_duplicates, "decks_with_source_tags": len(labeled),
