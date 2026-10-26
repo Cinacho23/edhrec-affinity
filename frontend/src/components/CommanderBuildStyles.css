@@ -55,6 +55,12 @@
 .build-generated-deck > summary::before { content: "+"; }
 .build-generated-deck[open] > summary::before { content: "−"; }
 .build-generated-deck__summary-note { flex-basis: 100%; margin-left: 1.1rem; color: var(--muted); font-size: .72rem; font-weight: 400; }
+.build-distinctive-exception-count { color: var(--warning); font-size: .76rem; font-weight: 500; }
+.build-distinctive-exceptions { margin-top: .75rem; font-size: .78rem; color: var(--muted-strong); }
+.build-distinctive-exceptions > p { margin: 0 0 .5rem; }
+.build-distinctive-exceptions ul { margin: 0; padding-left: 1.15rem; }
+.build-distinctive-exceptions li { margin-top: .55rem; }
+.build-distinctive-exceptions li > span:last-child { display: block; margin-top: .2rem; line-height: 1.5; }
 .build-generated-deck__content { min-width: 0; margin-top: 1rem; }
 .build-generated-deck h5 { margin: 0; font-size: .95rem; line-height: 1.4; }
 .build-generated-unavailable { font-size: .8rem; }

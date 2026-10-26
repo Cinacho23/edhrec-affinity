@@ -13,6 +13,8 @@ import {
   getComparableProfilePairs,
   getDeckMixtureRows,
   getExternalDeckRating,
+  getGeneratedDeckColorChoices,
+  getGeneratedDeckDistinctiveCards,
   getGeneratedDeckExport,
   getGeneratedDeckGroups,
   getPackageBracketLabel,
@@ -48,6 +50,7 @@ function downloadDeckText(text, name, extension) {
 
 const VALIDATION_LABELS = {
   card_count: "100 cards", commander_identity: "Correct commander", color_identity: "Color identity",
+  commander_color_choices: "Chosen commander colors",
   singleton: "Singleton", commander_legality: "Commander legality", sampled_pool: "Sampled card pool",
   metadata_complete: "Card metadata", metadata_fresh: "Recent card rules cache",
 };
@@ -93,6 +96,8 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
   const highestLift = stats.highest_average_lift;
   const exportText = getGeneratedDeckExport(deck);
   const primer = typeof deck.primer === "string" ? deck.primer : "";
+  const distinctiveCards = getGeneratedDeckDistinctiveCards(deck);
+  const colorChoices = getGeneratedDeckColorChoices(deck);
   async function copyText(text, label) {
     try {
       if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
@@ -103,10 +108,11 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
     }
   }
   return <details className="build-generated-deck" onToggle={(event) => setExpanded(event.currentTarget.open)}>
-    <summary><span>Generated {formatNumber(deck.card_count)}-card deck</span><span className="build-generated-deck__summary-note">Cards, export & primer</span></summary>
+    <summary><span>Generated {formatNumber(deck.card_count)}-card deck</span><span className="build-generated-deck__summary-note">{distinctiveCards ? `Distinctive cards: ${formatNumber(distinctiveCards.includedCount)}/${formatNumber(distinctiveCards.total)} included · ` : ""}Cards, export & primer</span></summary>
     {expanded ? <div className="build-generated-deck__content">
       <h5>{deck.name || `Package ${packageNumber} deck`}</h5>
       <p className="build-note">A suggested deck assembled from the sampled card pool for this package. Card names support hover and keyboard previews.</p>
+      {colorChoices.map((choice) => <p className="build-note" key={choice.commanderName}>Chosen color for <DeckCardName name={choice.commanderName} />: <strong>{choice.colorName}</strong>. Reveal this choice before the game begins.</p>)}
       <div className="build-generated-deck__metrics">
         <span><strong>{formatNumber(deck.card_count)}</strong> cards including commanders</span>
         {Number.isFinite(stats.land_count) ? <span><strong>{formatNumber(stats.land_count)}</strong> lands</span> : null}
@@ -167,6 +173,7 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
 function PackageCard({ pkg, index, decks }) {
   const themes = getSupportedThemes(pkg);
   const bracketLabel = getPackageBracketLabel(pkg.generated_deck);
+  const distinctiveCards = getGeneratedDeckDistinctiveCards(pkg.generated_deck);
   const representatives = (pkg.representative_deck_ids || []).map(
     (id) => decks.find((deck) => deck.id === id)
   ).filter(Boolean);
@@ -187,7 +194,7 @@ function PackageCard({ pkg, index, decks }) {
       </div>
       <GeneratedPackageDeck key={pkg.generated_deck?.name || pkg.id} deck={pkg.generated_deck} packageNumber={index + 1} />
       <details className="build-evidence">
-        <summary>Distinctive cards</summary>
+        <summary>Distinctive cards{distinctiveCards?.omitted.length ? <span className="build-distinctive-exception-count"> · {formatNumber(distinctiveCards.omitted.length)} omitted from generated deck</span> : null}</summary>
         <div className="build-table-scroll" tabIndex="0" role="region" aria-label={`Package ${index + 1} card evidence`}>
           <table>
             <thead><tr><th scope="col">Card</th><th scope="col">In package decks</th><th scope="col">Other decks</th></tr></thead>
@@ -196,6 +203,10 @@ function PackageCard({ pkg, index, decks }) {
             ))}</tbody>
           </table>
         </div>
+        {distinctiveCards?.omitted.length ? <div className="build-distinctive-exceptions">
+          <p><strong>Not included in the generated deck</strong></p>
+          <ul>{distinctiveCards.omitted.map((card) => <li key={card.name}><DeckCardName name={card.name} /><span>{card.reason}</span></li>)}</ul>
+        </div> : null}
       </details>
       {representatives.length ? <p className="build-source-links">
         Examples: {representatives.map((deck, deckIndex) => (

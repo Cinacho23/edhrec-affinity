@@ -624,3 +624,541 @@ def test_feedback_repair_stops_at_40_lands_and_cannot_remove_all_protected_suppo
     assert len(repairs) == 1 and repairs[0]["statistics"]["land_count"] == 40
     data[0]["packages"][0]["top_cards"] = [{"name": card["name"]} for deck in data[1] for card in deck["cards"] if card["name"] != "Forest"]
     assert not any(candidate["statistics"].get("playability_repair") for candidate in generate_package_deck_candidates(*data))
+
+
+def add_observed_core(data, cards, *, include_in_package=True):
+    """A partial observed list supplies candidates but cannot become an anchor."""
+    for card in cards:
+        data[4][card_key(card["name"])] = card
+    data[1].append({"id": "observed-core", "commanders": data[2]["commander_names"],
+                    "cards": [{"name": card["name"], "quantity": 1} for card in cards], "source_bracket": 3})
+    data[0]["decks"].append({"id": "observed-core", "memberships": [.01]})
+    if include_in_package:
+        data[0]["packages"][0]["top_cards"] = [
+            {"name": card["name"], "relative_weight": 1 - index / max(1, len(cards))}
+            for index, card in enumerate(cards)]
+
+
+def test_all_twelve_distinctive_cards_are_inserted_despite_lower_consensus_and_different_signatures():
+    data = fixture()
+    distinctive = [metadata_card(f"Distinctive {index}", types="Enchantment" if index % 2 else "Artifact",
+                                  cmc=4 + index % 3, text="Draw a card." if index % 3 else "")
+                   for index in range(12)]
+    add_observed_core(data, distinctive)
+    result = generate(data)
+    names = {card["name"] for card in result["cards"]}
+    assert {card["name"] for card in distinctive} <= names
+    assert result["generation_version"] == data[0]["deck_generation"]["version"] == 2
+    assert result["statistics"]["anchor_deck_id"] == "a"
+    assert result["statistics"]["distinctive_swaps"] == 12
+    assert result["distinctive_cards"] == {"total": 12, "included_count": 12, "coverage": 1,
+                                           "included": [{"name": card["name"]} for card in distinctive], "omitted": []}
+    assert result["validation"]["valid"] and result["card_count"] == 100
+    assert result["statistics"]["land_count"] == 36
+    assert "includes 12 of the 12" in result["primer"]
+    assert "#" not in result["export_text"]
+    # An alternative with identical memberships but another core cannot reuse
+    # the primary package's cached deck and its coverage claims.
+    assert data[0]["alternative_models"][0]["packages"][0]["generated_deck"]["distinctive_cards"]["total"] == 1
+
+
+def test_distinctive_omissions_explain_metadata_legality_pool_color_and_bracket_failures():
+    data = fixture()
+    cards = [metadata_card("Present Core"), metadata_card("Banned Core", legalities={"commander": "banned"}),
+             metadata_card("Red Core", colors=["R"]), metadata_card("Extra Turn Core", text="Take an extra turn after this one."),
+             metadata_card("Incomplete Core")]
+    add_observed_core(data, cards)
+    del data[4]["incomplete core"]["type_line"]
+    data[4]["outside core"] = metadata_card("Outside Core")
+    data[0]["packages"][0]["top_cards"] += [{"name": "Missing Core"}, {"name": "Outside Core"}]
+    result = generate(data)
+    coverage = result["distinctive_cards"]
+    assert coverage["total"] == 7 and coverage["included_count"] == 1
+    assert coverage["coverage"] == pytest.approx(1 / 7)
+    assert {row["name"]: row["reason_code"] for row in coverage["omitted"]} == {
+        "Banned Core": "illegal_in_commander", "Red Core": "color_identity_conflict",
+        "Extra Turn Core": "bracket_conflict", "Incomplete Core": "metadata_incomplete",
+        "Missing Core": "metadata_missing", "Outside Core": "not_in_sampled_pool"}
+    assert result["validation"]["valid"] and result["validation"]["bracket"]["recommended"] == 3
+    for row in coverage["omitted"]:
+        assert row["reason"] and f"[[{row['name']}]] is omitted: {row['reason']}" in result["primer"]
+
+
+@pytest.mark.parametrize("lowest", [0, 1, 2])
+def test_higher_nmf_priority_wins_when_only_three_distinctive_game_changers_fit(lowest):
+    data = fixture()
+    for index in range(3):
+        data[4][f"core {index}"]["game_changer"] = True
+    add_observed_core(data, [metadata_card("Leading Core", game_changer=True)])
+    data[0]["packages"][0]["top_cards"] = [{"name": "Leading Core", "relative_weight": 1},
+        *[{"name": f"Core {index}", "relative_weight": .1 if index == lowest else .2 + index / 10}
+          for index in range(3)]]
+    result = generate(data)
+    names = {row["name"] for row in result["cards"]}
+    assert {"Leading Core", *[f"Core {index}" for index in range(3) if index != lowest]} <= names
+    assert f"Core {lowest}" not in names
+    assert result["distinctive_cards"]["included_count"] == 3
+    assert result["distinctive_cards"]["omitted"][0]["name"] == f"Core {lowest}"
+    assert result["distinctive_cards"]["omitted"][0]["reason_code"] == "bracket_conflict"
+    assert result["validation"]["bracket"]["game_changer_count"] == 3
+    assert result["validation"]["valid"]
+
+
+def test_distinctive_core_does_not_remove_last_required_support_roles():
+    data = fixture()
+    roles = [("Ramp", "{T}: Add {G}.", 8), ("Draw", "Draw a card.", 8),
+             ("Removal", "Destroy target creature.", 4), ("Wipe", "Destroy all artifacts.", 2),
+             ("Tutor", "Search your library for a card, put it into your hand, then shuffle.", 1),
+             ("Recursion", "Return target card from your graveyard to your hand.", 1),
+             ("Protection", "Creatures you control have hexproof.", 2)]
+    cards = []
+    for role, text, quantity in roles:
+        for index in range(quantity):
+            card = metadata_card(f"{role} Support {index}", text=text)
+            cards.append({"name": card["name"], "quantity": 1})
+            data[4][card_key(card["name"])] = card
+    for deck in data[1]:
+        deck["cards"] = [*deepcopy(cards), {"name": "Forest", "quantity": 73}]
+    add_observed_core(data, [metadata_card("Unsupported Core")])
+    result = generate(data)
+    assert result["validation"]["valid"] and result["card_count"] == 100
+    assert result["distinctive_cards"]["included_count"] == 0
+    assert result["distinctive_cards"]["omitted"][0]["reason_code"] == "essential_role_conflict"
+    assert {row["name"] for row in cards} <= {row["name"] for row in result["cards"]}
+
+
+def test_distinctive_land_preserves_colored_sources_and_uses_a_land_slot():
+    data = fixture()
+    data[4]["commander"]["color_identity"] = ["G", "W"]
+    data[4]["plains"] = metadata_card("Plains", types="Basic Land — Plains", colors=["W"], cmc=0)
+    for deck in data[1]:
+        deck["cards"][-1]["quantity"] = 18
+        deck["cards"].append({"name": "Plains", "quantity": 18})
+    add_observed_core(data, [metadata_card("Core Utility Land", types="Land", colors=[], text="{T}: Add {C}.", cmc=0)])
+    result = generate(data)
+    assert result["distinctive_cards"]["omitted"][0]["reason_code"] == "mana_base_conflict"
+    assert result["statistics"]["mana_quality"]["colored_land_sources"] == {"G": 18, "W": 18}
+    data[4]["core utility land"].update(oracle_text="{T}: Add {G} or {W}.", produced_mana=["G", "W"])
+    result = generate(data)
+    assert result["distinctive_cards"]["included_count"] == 1
+    assert result["statistics"]["land_count"] == 36
+    assert result["validation"]["valid"]
+
+
+def test_distinctive_alias_rows_are_covered_by_one_oracle_card_not_extra_copies():
+    data = fixture()
+    card = data[4]["core 0"]
+    card["oracle_id"] = "shared-core-oracle"
+    card["name_aliases"] = [flavor_alias_proof(card, "Flavor Core")]
+    duplicate = metadata_card("Other Canonical Core", oracle_id="shared-core-oracle")
+    add_observed_core(data, [duplicate])
+    data[0]["packages"][0]["top_cards"] = [{"name": "Flavor Core"}, {"name": "Other Canonical Core"}]
+    result = generate(data)
+    assert result["distinctive_cards"] == {"total": 2, "included_count": 2, "coverage": 1,
+        "included": [{"name": "Flavor Core", "canonical_name": "Core 0"},
+                     {"name": "Other Canonical Core", "canonical_name": "Core 0"}], "omitted": []}
+    assert "Other Canonical Core" not in {row["name"] for row in result["cards"]}
+    assert next(row for row in result["cards"] if row["name"] == "Core 0")["quantity"] == 1
+    assert result["validation"]["valid"]
+
+
+def test_all_mana_and_feedback_variants_keep_the_inserted_distinctive_core():
+    data = sparse_fixture()
+    distinctive = [metadata_card(f"Inserted Core {index}", cmc=6, types="Enchantment") for index in range(12)]
+    add_observed_core(data, distinctive)
+    candidates = generate_package_deck_candidates(*data, max_candidates=8)
+    assert candidates and any(candidate["statistics"]["land_adjustments"] for candidate in candidates)
+    for candidate in candidates:
+        assert candidate["distinctive_cards"]["included_count"] == 12
+        assert {card["name"] for card in distinctive} <= {row["name"] for row in candidate["cards"]}
+        assert candidate["validation"]["valid"] and candidate["card_count"] == 100
+
+
+def test_full_core_candidate_beats_current_external_rating_of_a_lower_coverage_list(monkeypatch, tmp_path):
+    from edhrec_affinity.build_styles import deckbuilding, external_validation
+
+    data = fixture()
+    memberships = data[0]["alternative_models"][0]["memberships"]
+    package = {"id": 0, "name": "Package 1", "top_cards": [{"name": "Weak Card"}]}
+    indexed = deckbuilding._metadata_index(data[4])
+    high = deckbuilding._generate_one(package, memberships, data[1], data[2], data[3], indexed)
+    low = deckbuilding._generate_one({**package, "top_cards": []}, memberships, data[1], data[2], data[3], indexed)
+    assert "Weak Card" in {row["name"] for row in high["cards"]}
+    assert "Weak Card" not in {row["name"] for row in low["cards"]}
+    low["distinctive_cards"] = {"total": 1, "included_count": 0, "coverage": 0, "included": [], "omitted": []}
+    external_validation.record_external_validation(low, {"source": "edhpowerlevel.com",
+        "source_url": low["validation"]["external_url"], "card_count": 100,
+        "checked_at": datetime.now(timezone.utc).isoformat(), "playability_pct": 75, "bracket": 3}, tmp_path)
+    real_attach = external_validation.attach_external_validation
+    monkeypatch.setattr(external_validation, "attach_external_validation", lambda deck: real_attach(deck, tmp_path))
+    chosen = deckbuilding._prefer_playability([low, high])
+    assert chosen is high
+    assert chosen["validation"]["external_rating"]["status"] == "unverified"
+    assert "Prioritized distinctive-card coverage" in chosen["statistics"]["selection_reason"]
+
+
+def test_zero_core_and_unavailable_packages_have_honest_versioned_coverage():
+    data = fixture()
+    data[0]["packages"][0]["top_cards"] = []
+    assert generate(data)["distinctive_cards"] == {"total": 0, "included_count": 0, "coverage": 0,
+                                                   "included": [], "omitted": []}
+    data = fixture()
+    del data[4]["commander"]
+    result = generate(data)
+    assert result["generation_version"] == 2 and result["status"] == "unavailable"
+    assert result["distinctive_cards"]["total"] == 1 and result["distinctive_cards"]["included_count"] == 0
+    assert result["distinctive_cards"]["omitted"][0]["reason_code"] == "construction_unavailable"
+
+
+def test_candidate_search_prefers_an_anchor_that_can_fit_more_core_over_membership():
+    data = fixture()
+    roles = [("Ramp", "{T}: Add {G}.", 8), ("Draw", "Draw a card.", 8),
+             ("Removal", "Destroy target creature.", 4), ("Wipe", "Destroy all artifacts.", 2),
+             ("Tutor", "Search your library for a card, put it into your hand, then shuffle.", 1),
+             ("Recursion", "Return target card from your graveyard to your hand.", 1),
+             ("Protection", "Creatures you control have hexproof.", 2)]
+    support = []
+    for role, text, quantity in roles:
+        for index in range(quantity):
+            name = f"{role} Support {index}"
+            data[4][card_key(name)] = metadata_card(name, text=text)
+            support.append({"name": name, "quantity": 1})
+    for deck in data[1]:
+        deck["cards"] = [*deepcopy(support), {"name": "Forest", "quantity": 73}]
+    data[1][1]["cards"][-1]["quantity"] = 72
+    data[1][1]["cards"].append({"name": "Core 0", "quantity": 1})
+    add_observed_core(data, [metadata_card("Desired Core")])
+    result = generate(data)
+    assert result["statistics"]["anchor_deck_id"] == "b"
+    assert result["distinctive_cards"]["included_count"] == 1
+    candidates = generate_package_deck_candidates(*data, max_candidates=1)
+    assert len(candidates) == 1
+    assert candidates[0]["statistics"]["anchor_deck_id"] == "b"
+    assert candidates[0]["distinctive_cards"]["included_count"] == 1
+    assert candidates[0]["validation"]["valid"]
+
+
+def test_distinctive_changer_replaces_a_changer_when_anchor_already_exceeds_target_cap():
+    data = fixture()
+    for index in range(4):
+        data[4][f"core {index}"]["game_changer"] = True
+    add_observed_core(data, [metadata_card("Extra Core Changer", game_changer=True)])
+    result = generate(data)
+    names = {row["name"] for row in result["cards"]}
+    assert "Extra Core Changer" in names
+    assert len({f"Core {index}" for index in range(4)} & names) == 3
+    assert result["validation"]["bracket"]["game_changer_count"] == 4
+    assert result["validation"]["bracket"]["recommended"] == 4
+    assert result["distinctive_cards"]["included_count"] == 1
+    assert result["validation"]["valid"]
+
+
+def test_distinctive_changer_is_explicitly_omitted_when_existing_over_cap_core_is_protected():
+    data = fixture()
+    for index in range(4):
+        data[4][f"core {index}"]["game_changer"] = True
+    add_observed_core(data, [metadata_card("Extra Core Changer", game_changer=True)])
+    data[0]["packages"][0]["top_cards"] = [
+        *[{"name": f"Core {index}", "relative_weight": 1 - index / 10} for index in range(4)],
+        {"name": "Extra Core Changer", "relative_weight": .1}]
+    result = generate(data)
+    assert result["validation"]["bracket"]["game_changer_count"] == 4
+    assert result["distinctive_cards"]["included_count"] == 4
+    assert result["distinctive_cards"]["omitted"][0]["name"] == "Extra Core Changer"
+    assert result["distinctive_cards"]["omitted"][0]["reason_code"] == "bracket_conflict"
+    assert result["validation"]["valid"]
+
+
+@pytest.mark.parametrize(("text", "count_key"), [
+    ("Take an extra turn after this one.", "extra_turn_count"),
+    ("Destroy all lands.", "mass_land_denial_count"),
+])
+def test_distinctive_restricted_effects_replace_like_for_like_without_increasing_existing_violations(text, count_key):
+    data = fixture()
+    data[4]["core 0"]["oracle_text"] = text
+    add_observed_core(data, [metadata_card("Restricted Core", text=text)])
+    result = generate(data)
+    names = {row["name"] for row in result["cards"]}
+    assert "Restricted Core" in names and "Core 0" not in names
+    assert result["validation"]["bracket"][count_key] == 1
+    assert result["validation"]["bracket"]["recommended"] == 4
+    assert result["distinctive_cards"]["included_count"] == 1
+    assert result["validation"]["valid"]
+
+
+@pytest.mark.parametrize("restriction", ["game_changer", "extra_turns", "mass_land_denial"])
+def test_consensus_does_not_add_more_restricted_cards_to_an_already_over_target_anchor(restriction):
+    data = fixture()
+    if restriction == "game_changer":
+        for index in range(4):
+            data[4][f"core {index}"]["game_changer"] = True
+        data[4]["consensus card"]["game_changer"] = True
+        count_key, expected = "game_changer_count", 4
+    else:
+        text = "Take an extra turn after this one." if restriction == "extra_turns" else "Destroy all lands."
+        # Give the outgoing ordinary slot the same functional roles without the
+        # restricted effect so the exact-signature consensus swap is eligible.
+        data[4]["core 0"]["oracle_text"] = text
+        data[4]["consensus card"]["oracle_text"] = text
+        if restriction == "mass_land_denial":
+            data[4]["weak card"]["oracle_text"] = "Destroy all artifacts."
+        count_key = "extra_turn_count" if restriction == "extra_turns" else "mass_land_denial_count"
+        expected = 1
+    result = generate(data)
+    assert "Weak Card" in {row["name"] for row in result["cards"]}
+    assert "Consensus Card" not in {row["name"] for row in result["cards"]}
+    assert result["validation"]["bracket"][count_key] == expected
+    assert result["validation"]["valid"]
+
+
+def test_mana_upgrades_do_not_add_a_game_changer_when_anchor_is_already_over_target():
+    data = fixture()
+    data[4]["commander"]["color_identity"] = ["G", "W"]
+    for index in range(4):
+        data[4][f"core {index}"]["game_changer"] = True
+    add_observed_core(data, [metadata_card("Restricted Dual", types="Land — Forest Plains", text="{T}: Add {G} or {W}.",
+                                         colors=["G", "W"], produced_mana=["G", "W"], cmc=0, game_changer=True)],
+                      include_in_package=False)
+    candidates = generate_package_deck_candidates(*data, max_candidates=8)
+    assert candidates
+    for candidate in candidates:
+        assert "Restricted Dual" not in {row["name"] for row in candidate["cards"]}
+        assert candidate["validation"]["bracket"]["game_changer_count"] == 4
+        assert candidate["validation"]["valid"]
+
+
+def test_shared_source_preparation_keeps_primary_alternatives_and_candidates_identical(monkeypatch):
+    from edhrec_affinity.build_styles import deckbuilding
+
+    data = sparse_fixture()
+    add_observed_core(data, [metadata_card(f"New Core {index}", types="Enchantment", cmc=4 + index)
+                             for index in range(3)])
+    data[0]["alternative_models"].append({
+        "components": 2,
+        "packages": [{"id": 0, "name": "Different core", "top_cards": [{"name": "Weak Card"}]},
+                     {"id": 1, "name": "Other core", "top_cards": [{"name": "New Core 1"}]}],
+        "memberships": [{"id": deck["id"], "weights": [1, .1] if deck["id"] == "a" else [.1, .8]}
+                        for deck in data[1]]})
+    original = deepcopy(data)
+    prepare_sources = deckbuilding._prepare_sources
+    source_calls = []
+    def observed_sources(*args):
+        source_calls.append(None)
+        return prepare_sources(*args)
+    monkeypatch.setattr(deckbuilding, "_prepare_sources", observed_sources)
+    cached_data = deepcopy(data)
+    generate_package_decks(*cached_data, prefer_playability=True)
+    assert len(source_calls) == 1
+    cached_candidates = generate_package_deck_candidates(*data, components=2, package_id=1, max_candidates=8)
+    source_calls.clear()
+    prepare_package = deckbuilding._prepare_package
+    def uncached_package(*args, **options):
+        options["_source_context"] = None
+        return prepare_package(*args, **options)
+    monkeypatch.setattr(deckbuilding, "_prepare_package", uncached_package)
+    uncached_data = deepcopy(data)
+    generate_package_decks(*uncached_data, prefer_playability=True)
+    assert len(source_calls) == 4
+    assert cached_data == uncached_data
+    assert cached_candidates == generate_package_deck_candidates(*data, components=2, package_id=1, max_candidates=8)
+    assert data == original
+
+
+def test_presence_index_preserves_original_float_addition_order_and_model_weights():
+    from edhrec_affinity.build_styles import deckbuilding
+
+    data = fixture()
+    # Deliberately uneven magnitudes and a repeated source ID expose reordered
+    # or deduplicated sums. Production collectors deduplicate IDs, but the
+    # builder preserves its supplied observations rather than altering them.
+    data[1].append({**deepcopy(data[1][0]), "cards": deepcopy(data[1][0]["cards"])})
+    memberships = [{"id": "a", "weights": [1e-9, 1]}, {"id": "b", "weights": [1, 1e-9]},
+                   {"id": "c", "weights": [1e-5, .3]}]
+    indexed = deckbuilding._metadata_index(data[4])
+    shared = {}
+    first = deckbuilding._prepare_package(data[0]["packages"][0], memberships, data[1], data[2], data[3], indexed,
+                                          _source_context=shared)
+    second = deckbuilding._prepare_package({"id": 1}, memberships, data[1], data[2], data[3], indexed,
+                                           _source_context=shared)
+    observed = shared["prepared"]["observed"]
+    for package_index, prepared in enumerate((first, second)):
+        weights = {row["id"]: float(row["weights"][package_index]) for row in memberships}
+        learned = [deck for deck in observed if deck["id"] in weights]
+        total = sum(weights[deck["id"]] for deck in learned)
+        expected = {key: sum(weights[deck["id"]] for deck in learned if key in deck["counts"]) / total
+                    for key in shared["prepared"]["pool"]}
+        assert prepared["support"] == expected
+    assert first["support"] != second["support"]
+
+
+def test_anchor_bracket_cache_stays_immutable_while_generated_variants_recompute_counts(monkeypatch):
+    from edhrec_affinity.build_styles import deckbuilding
+
+    data = fixture()
+    data[4]["weak card"]["game_changer"] = True
+    add_observed_core(data, [metadata_card("Ordinary Distinctive")])
+    indexed = deckbuilding._metadata_index(data[4])
+    context = {"source_context": {}}
+    package = data[0]["packages"][0]
+    memberships = [{"id": row["id"], "weights": row["memberships"]} for row in data[0]["decks"]]
+    first = deckbuilding._generate_one(package, memberships, data[1], data[2], data[3], indexed,
+                                       anchor_id="a", _context=context)
+    sources = context["source_context"]["prepared"]
+    anchor = next(deck for deck in sources["anchors"] if deck["id"] == "a")
+    assert sources["anchor_bracket_counts"][id(anchor)] == (1, 0, 0)
+    assert anchor["counts"]["weak card"] == 1 and "ordinary distinctive" not in anchor["counts"]
+    assert first["validation"]["bracket"]["game_changer_count"] == 0
+    original_counters = {id(deck["counts"]) for deck in sources["anchors"]}
+    counts = deckbuilding._bracket_counts
+    scanned_originals = []
+    def observed_counts(cards, metadata):
+        if id(cards) in original_counters:
+            scanned_originals.append(id(cards))
+        return counts(cards, metadata)
+    monkeypatch.setattr(deckbuilding, "_bracket_counts", observed_counts)
+    second = deckbuilding._generate_one(package, memberships, data[1], data[2], data[3], indexed,
+                                        anchor_id="a", land_adjustment=3, mana_base_optimization=True, _context=context)
+    assert not scanned_originals
+    assert second["validation"]["bracket"]["game_changer_count"] == 0
+    assert second["validation"]["valid"] and second["card_count"] == 100
+    assert sources["anchor_bracket_counts"][id(anchor)] == (1, 0, 0)
+    assert anchor["counts"]["weak card"] == 1
+
+
+COLOR_SETTING_TEXT = "If {name} is your commander, choose a color before the game begins. {name} is the chosen color."
+
+
+def clara_fixture():
+    data = fixture()
+    doctor = data[4].pop("commander")
+    doctor.update(name="The Fifth Doctor", type_line="Legendary Creature — Time Lord Doctor", color_identity=["W", "U"])
+    data[4]["the fifth doctor"] = doctor
+    data[4]["clara oswald"] = metadata_card("Clara Oswald", types="Legendary Creature — Human Advisor", colors=[],
+        text="Impossible Girl — " + COLOR_SETTING_TEXT.format(name="Clara Oswald") +
+             "\nIf a triggered ability of a Doctor you control triggers, that ability triggers an additional time.\nDoctor's companion")
+    data[4]["plains"] = metadata_card("Plains", types="Basic Land — Plains", colors=["W"], cmc=0)
+    for card in data[4].values():
+        if card["type_line"] == "Creature — Plant":
+            card["color_identity"] = []
+    data[4]["green core"] = metadata_card("Green Core", colors=["G"])
+    data[4]["red core"] = metadata_card("Red Core", colors=["R"])
+    data[2]["commander_names"] = ["The Fifth Doctor", "Clara Oswald"]
+    for deck in data[1]:
+        deck["commanders"] = ["The Fifth Doctor", "Clara Oswald"]
+        deck["cards"][-1] = {"name": "Plains", "quantity": 35}
+        if deck["id"] in {"b", "c"}:
+            deck["cards"][-2]["name"] = "Green Core" if deck["id"] == "b" else "Red Core"
+    data[0]["packages"][0]["top_cards"] = [{"name": "Green Core", "relative_weight": 1},
+                                            {"name": "Red Core", "relative_weight": .1}]
+    data[0]["alternative_models"][0]["packages"][0]["top_cards"] = [
+        {"name": "Green Core", "relative_weight": .1}, {"name": "Red Core", "relative_weight": 1}]
+    return data
+
+
+def test_clara_color_choice_is_selected_per_package_without_refitting_or_mutating_metadata():
+    data = clara_fixture()
+    original = deepcopy(data)
+    primary = generate(data)
+    alternate = data[0]["alternative_models"][0]["packages"][0]["generated_deck"]
+    for result, color, identity, included, excluded in (
+            (primary, "G", ["W", "U", "G"], "Green Core", "Red Core"),
+            (alternate, "R", ["W", "U", "R"], "Red Core", "Green Core")):
+        assert result["status"] == "generated" and result["validation"]["valid"] and result["card_count"] == 100
+        assert result["validation"]["checks"]["commander_color_choices"]
+        assert result["validation"]["commander_color_choices"] == [{"commander_name": "Clara Oswald", "color": color}]
+        assert result["validation"]["effective_color_identity"] == identity
+        names = {row["name"] for row in result["cards"]}
+        assert included in names and excluded not in names
+        assert result["distinctive_cards"]["included_count"] == 1
+        assert result["distinctive_cards"]["omitted"][0]["name"] == excluded
+        assert result["distinctive_cards"]["omitted"][0]["reason_code"] == "color_identity_conflict"
+        assert "Pregame commander color" in result["primer"] and "for [[Clara Oswald]] before the game begins" in result["primer"]
+        assert "#" not in result["export_text"] and "chooses" not in result["export_text"]
+    assert data[4] == original[4] and data[1:] == original[1:]
+    assert data[0]["decks"] == original[0]["decks"]
+    assert data[0]["alternative_models"][0]["memberships"] == original[0]["alternative_models"][0]["memberships"]
+
+
+def test_clara_adds_exactly_one_chosen_color_and_rejects_an_anchor_requiring_two_extra_colors():
+    from edhrec_affinity.build_styles import deckbuilding
+
+    data = clara_fixture()
+    data[2]["commander_color_choices"] = [{"commander_name": "Clara Oswald", "color": "G"}]
+    indexed = deckbuilding._metadata_index(data[4])
+    prepared = deckbuilding._prepare_sources(data[1], data[2], indexed)
+    assert {deck["id"] for deck in prepared["anchors"]} == {"a", "b"}
+    green_anchor = next(deck for deck in prepared["anchors"] if deck["id"] == "b")
+    mixed = green_anchor["counts"].copy()
+    del mixed["core 0"]
+    mixed["red core"] = 1
+    checked = deckbuilding._validate(mixed, prepared["commander_keys"], indexed, prepared["pool"],
+                                     commander_color_choices=data[2]["commander_color_choices"])
+    assert not checked["valid"] and not checked["checks"]["color_identity"]
+    assert checked["checks"]["commander_color_choices"]
+    assert data[4]["clara oswald"]["color_identity"] == []
+
+
+@pytest.mark.parametrize("choices", [[], [{"commander_name": "Clara Oswald", "color": "GR"}],
+    [{"commander_name": "Clara Oswald", "color": "C"}], [{"commander_name": "Green Core", "color": "G"}],
+    [{"commander_name": "Clara Oswald", "color": "G"}, {"commander_name": "Clara Oswald", "color": "R"}]])
+def test_invalid_or_arbitrary_commander_color_choices_fail_closed(choices):
+    data = clara_fixture()
+    data[2]["commander_color_choices"] = choices
+    assert generate(data)["status"] == "unavailable"
+    data = fixture()
+    data[2]["commander_color_choices"] = [{"commander_name": "Commander", "color": "R"}]
+    assert generate(data)["status"] == "unavailable"
+
+
+@pytest.mark.parametrize("name", ["The Prismatic Piper", "Faceless One", "Clara Oswald"])
+def test_exact_actual_color_setting_ability_supports_single_commanders(name):
+    data = fixture()
+    commander = data[4].pop("commander")
+    commander.update(name=name, color_identity=[], oracle_text=COLOR_SETTING_TEXT.format(name=name))
+    data[4][card_key(name)] = commander
+    data[2]["commander_names"] = [name]
+    for deck in data[1]:
+        deck["commanders"] = [name]
+    result = generate(data)
+    assert result["status"] == "generated" and result["validation"]["valid"]
+    assert result["validation"]["commander_color_choices"] == [{"commander_name": name, "color": "G"}]
+    assert result["validation"]["effective_color_identity"] == ["G"]
+    assert commander["color_identity"] == []
+
+
+def test_chosen_color_candidates_cover_legal_choices_and_preserve_analysis_and_bracket_checks():
+    data = clara_fixture()
+    before = deepcopy(data)
+    candidates = generate_package_deck_candidates(*data, max_candidates=8)
+    assert candidates
+    assert any(candidate["validation"]["commander_color_choices"][0]["color"] == "G" for candidate in candidates)
+    for candidate in candidates:
+        colors = set(candidate["validation"]["effective_color_identity"])
+        assert len(colors - {"W", "U"}) <= 1
+        assert all(set(data[4][card_key(row["name"])]["color_identity"]) <= colors for row in candidate["cards"])
+        assert candidate["validation"]["valid"] and candidate["card_count"] == 100
+    assert data == before
+    data[4]["green core"]["oracle_text"] = "Take an extra turn after this one."
+    result = generate(data)
+    assert result["validation"]["commander_color_choices"] == [{"commander_name": "Clara Oswald", "color": "R"}]
+    assert result["validation"]["bracket"]["recommended"] == 3
+
+
+def test_identical_lists_keep_the_best_native_color_choice_before_external_rating_deduplication():
+    data = clara_fixture()
+    doctor = data[4].pop("the fifth doctor")
+    doctor.update(name="The Sixth Doctor", color_identity=["G", "U"])
+    data[4]["the sixth doctor"] = doctor
+    data[2]["commander_names"] = ["The Sixth Doctor", "Clara Oswald"]
+    for deck in data[1]:
+        deck["commanders"] = data[2]["commander_names"].copy()
+        deck["cards"][-1] = {"name": "Forest", "quantity": 35}
+    for package in [data[0]["packages"][0], data[0]["alternative_models"][0]["packages"][0]]:
+        package["top_cards"] = [{"name": "Core 0"}]
+    generate_package_decks(*data, prefer_playability=True)
+    for package in [data[0]["packages"][0], data[0]["alternative_models"][0]["packages"][0]]:
+        result = package["generated_deck"]
+        assert result["validation"]["valid"] and result["distinctive_cards"]["included_count"] == 1
+        assert result["validation"]["commander_color_choices"][0]["color"] in {"U", "G"}
+        assert result["validation"]["effective_color_identity"] == ["U", "G"]
+        assert "W" not in result["statistics"]["mana_quality"]["colored_source_targets"]

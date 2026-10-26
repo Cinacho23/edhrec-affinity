@@ -605,3 +605,149 @@ def test_unknown_printing_can_still_resolve_via_independent_exact_name_fallback(
     )
     assert found["cecil harvey"]["name"] == "Tymna the Weaver"
     assert summary["requests"] == 3 and not summary["failures"]
+
+
+NO_WAY_OUT_ORACLE = "8cbbb1f4-4654-4865-a14c-0c94cd5d8b19"
+OTHER_ORACLE = "8cbbb1f4-4654-4865-a14c-0c94cd5d8b10"
+
+
+def no_way_out(*, layout="normal", **changes):
+    return card("No Way Out", type_line="Sorcery" if layout == "normal" else "Plane",
+                oracle_id=NO_WAY_OUT_ORACLE if layout == "normal" else OTHER_ORACLE,
+                layout=layout, **changes)
+
+
+def search_result(cards, **changes):
+    return {"object": "list", "has_more": False, "total_cards": len(cards), "data": cards, **changes}
+
+
+@pytest.mark.parametrize("layout", sorted(metadata._NON_DECK_LAYOUTS))
+def test_non_deck_namesake_uses_unique_exact_physical_search_with_same_pacing(tmp_path, monkeypatch, layout):
+    plane = no_way_out(layout=layout, legalities={"commander": "not_legal"})
+    requests = []
+    def handler(request):
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json=collection([plane]))
+        if str(request.url.copy_with(query=None)) == metadata.NAMED_URL:
+            assert dict(request.url.params) == {"exact": "No Way Out"}
+            return httpx.Response(200, json=plane)
+        assert str(request.url.copy_with(query=None)) == metadata.SEARCH_URL
+        assert request.url.params["q"].startswith('!"No Way Out" ')
+        assert all(f"-layout:{value}" in request.url.params["q"] for value in metadata._NON_DECK_LAYOUTS)
+        assert request.url.params["unique"] == "cards"
+        assert request.url.params["include_extras"] == "true"
+        assert "legal:" not in request.url.params["q"] and "fuzzy" not in request.url.params
+        return httpx.Response(200, json=search_result([no_way_out()]))
+    delays = client(monkeypatch, handler)
+    cache = tmp_path / "cards.json"
+    found, summary = metadata.load_card_metadata(["No Way Out"], cache, fetch=True)
+    assert found["no way out"]["layout"] == "normal"
+    assert found["no way out"]["oracle_id"] == NO_WAY_OUT_ORACLE
+    assert summary["requested"] == summary["resolved"] == summary["fetched"] == 1
+    assert summary["requests"] == len(requests) == 3
+    assert summary["physical_name_searches"] == 1
+    assert summary["non_deck_resolutions"][0]["excluded_layout"] == layout
+    assert not summary["failures"] and not summary["missing"]
+    assert delays == [.1, .1, .1]
+    assert json.loads(cache.read_text())["cards"]["no way out"]["oracle_id"] == NO_WAY_OUT_ORACLE
+
+
+def test_fresh_cached_plane_is_not_returned_offline_and_is_repaired_online(tmp_path, monkeypatch):
+    cache = tmp_path / "cards.json"
+    plane = no_way_out(layout="planar", legalities={"commander": "not_legal"})
+    metadata._write_cache(cache, {"no way out": metadata._metadata(plane, metadata._now())})
+    before = cache.read_bytes()
+    monkeypatch.setattr(metadata.httpx, "Client", lambda **_: pytest.fail("Offline lookup started HTTP"))
+    found, summary = metadata.load_card_metadata(["No Way Out"], cache)
+    assert not found and summary["missing"] == ["No Way Out"]
+    assert cache.read_bytes() == before
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200, json=collection([plane]))
+        return httpx.Response(200, json=search_result([no_way_out()])) if "/search" in request.url.path else httpx.Response(200, json=plane)
+    client(monkeypatch, handler)
+    found, summary = metadata.load_card_metadata(["No Way Out"], cache, fetch=True)
+    assert found["no way out"]["oracle_id"] == NO_WAY_OUT_ORACLE
+    assert summary["requests"] == 3
+    monkeypatch.setattr(metadata.httpx, "Client", lambda **_: pytest.fail("Corrected cache started HTTP"))
+    found, summary = metadata.load_card_metadata(["No Way Out"], cache, fetch=True)
+    assert summary["cached"] == 1 and summary["requests"] == 0
+    assert found["no way out"]["layout"] == "normal"
+
+
+@pytest.mark.parametrize("legality", ["banned", "not_legal", "restricted"])
+def test_normal_illegal_cards_are_retained_without_seeking_a_legal_namesake(tmp_path, monkeypatch, legality):
+    def handler(request):
+        assert request.method == "POST", "A normal illegal card must not cause a namesake search"
+        return httpx.Response(200, json=collection([no_way_out(legalities={"commander": legality})]))
+    client(monkeypatch, handler)
+    found, summary = metadata.load_card_metadata(["No Way Out"], tmp_path / "cards.json", fetch=True)
+    assert found["no way out"]["legalities"]["commander"] == legality
+    assert summary["requests"] == 1 and summary["physical_name_searches"] == 0
+
+
+@pytest.mark.parametrize("failure", ["wrong_name", "multiple_oracles", "paginated", "missing_oracle", "non_deck", "incomplete_total"])
+def test_non_deck_search_fails_closed_without_unique_complete_strict_identity(tmp_path, monkeypatch, failure):
+    plane = no_way_out(layout="planar", legalities={"commander": "not_legal"})
+    rows = [no_way_out()]
+    payload = search_result(rows)
+    if failure == "wrong_name":
+        rows[0]["name"] = "Other Card"
+    elif failure == "multiple_oracles":
+        # Even a normal/playtest namesake must not be hidden by choosing the
+        # Commander-legal result or sorting by a preferred edition.
+        rows.append({**no_way_out(), "oracle_id": OTHER_ORACLE, "legalities": {"commander": "not_legal"}})
+        payload["total_cards"] = len(rows)
+    elif failure == "paginated":
+        payload["has_more"] = True
+    elif failure == "missing_oracle":
+        rows[0].pop("oracle_id")
+    elif failure == "non_deck":
+        rows[0] = plane
+    else:
+        payload["total_cards"] = 2
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200, json=collection([plane]))
+        return httpx.Response(200, json=payload if "/search" in request.url.path else plane)
+    client(monkeypatch, handler)
+    cache = tmp_path / "cards.json"
+    found, summary = metadata.load_card_metadata(["No Way Out"], cache, fetch=True)
+    assert not found and not cache.exists()
+    assert summary["missing"] == ["No Way Out"]
+    assert summary["failures"] and summary["physical_name_searches"] == 1
+
+
+@pytest.mark.parametrize("status", [401, 403, 429])
+def test_non_deck_search_uses_repository_wide_access_stop(tmp_path, monkeypatch, status):
+    plane = no_way_out(layout="planar", legalities={"commander": "not_legal"})
+    attempts = []
+    def handler(request):
+        attempts.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json=collection([plane]))
+        return httpx.Response(status, json={"object": "error"}) if "/search" in request.url.path else httpx.Response(200, json=plane)
+    delays = client(monkeypatch, handler)
+    repository = metadata.MetadataRepository(tmp_path / "cards.json")
+    found, summary = repository.load(["No Way Out"], fetch=True)
+    assert not found and summary["blocked"]
+    assert summary["requests"] == len(attempts) == 3
+    assert delays == [.1, .1, .1]
+    _, again = repository.load(["Other Card"], fetch=True)
+    assert again["blocked"] and again["requests"] == 0
+    assert len(attempts) == 3
+
+
+def test_collection_non_deck_evidence_allows_exact_search_when_named_endpoint_misses(tmp_path, monkeypatch):
+    plane = no_way_out(layout="planar", legalities={"commander": "not_legal"})
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200, json=collection([plane]))
+        if "/search" in request.url.path:
+            return httpx.Response(200, json=search_result([no_way_out()]))
+        return httpx.Response(404, json={"object": "error"})
+    client(monkeypatch, handler)
+    found, summary = metadata.load_card_metadata(["No Way Out"], tmp_path / "cards.json", fetch=True)
+    assert found["no way out"]["oracle_id"] == NO_WAY_OUT_ORACLE
+    assert summary["requests"] == 3 and not summary["failures"]

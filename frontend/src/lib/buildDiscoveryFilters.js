@@ -2,6 +2,7 @@ import { getBuildCollectionProgress, getBuildSourceFreshness } from "./buildStyl
 
 export const DEFAULT_BUILD_DISCOVERY_FILTERS = Object.freeze({
   query: "",
+  packageTag: "",
   minPackages: "", maxPackages: "",
   minAnalyzed: "", maxAnalyzed: "",
   minTotalDecks: "", maxTotalDecks: "",
@@ -83,6 +84,68 @@ function searchable(value) {
   return String(value ?? "").normalize("NFKD").replace(/\p{M}/gu, "").replace(/['‘’ʼ]/g, "").toLowerCase();
 }
 
+function tagText(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function tagKey(value) {
+  return searchable(tagText(value)).replace(/\s+/g, " ");
+}
+
+function packageTags(commander) {
+  if (!Array.isArray(commander?.packages)) return [];
+  return commander.packages.flatMap((pkg) => Array.isArray(pkg?.tag_suggestions) ? pkg.tag_suggestions : [])
+    .filter((tag) => tag && typeof tag === "object" && !Array.isArray(tag)
+      && (tagText(tag.tag_slug) || tagText(tag.tag_name)));
+}
+
+/** Match a complete supported package tag, keeping nearby themes such as Counters distinct. */
+export function matchesBuildDiscoveryPackageTag(tag, selectedTag) {
+  const selected = tagKey(selectedTag);
+  if (!selected) return true;
+  return Boolean(tag && typeof tag === "object" && !Array.isArray(tag)
+    && [tag.tag_slug, tag.tag_name].some((value) => tagKey(value) === selected));
+}
+
+/** List primary-model package tags and the number of distinct commanders carrying each tag. */
+export function getBuildDiscoveryPackageTags(commanders) {
+  const occurrences = (Array.isArray(commanders) ? commanders : [])
+    .filter((commander) => commander && typeof commander === "object" && !Array.isArray(commander))
+    .flatMap((commander) => {
+      const identity = tagKey(commander.commander_slug) ? `slug:${tagKey(commander.commander_slug)}`
+        : tagKey(commander.commander_name) ? `name:${tagKey(commander.commander_name)}` : commander;
+      return packageTags(commander).map((tag) => ({
+        commander: identity,
+        slug: tagText(tag.tag_slug),
+        name: tagText(tag.tag_name),
+      }));
+    });
+  const options = new Map();
+  const matchesByValue = new Map();
+  // Slugged records supply the option value even when a name-only record was encountered first.
+  for (const { commander, slug, name } of occurrences.toSorted((left, right) => Number(Boolean(right.slug)) - Number(Boolean(left.slug)))) {
+    const identity = tagKey(slug || name);
+    if (!options.has(identity)) options.set(identity, {
+      value: slug || name, label: name || slug, hasName: Boolean(name),
+    });
+    const option = options.get(identity);
+    if (name && !option.hasName) {
+      option.label = name;
+      option.hasName = true;
+    }
+    for (const key of new Set([slug, name].map(tagKey).filter(Boolean))) {
+      if (!matchesByValue.has(key)) matchesByValue.set(key, new Set());
+      matchesByValue.get(key).add(commander);
+    }
+  }
+  // Match the option's actual value so counts stay consistent for incomplete or colliding labels.
+  return [...options.values()].map(({ value, label }) => ({
+    value, label, count: matchesByValue.get(tagKey(value)).size,
+  }))
+    .sort((left, right) => left.label.localeCompare(right.label, "en", { sensitivity: "base" })
+      || left.value.localeCompare(right.value, "en"));
+}
+
 function commanderName(commander) {
   return String(commander.commander_name || commander.commander_slug || "");
 }
@@ -127,6 +190,7 @@ export function filterBuildDiscoveryCommanders(commanders, filters = {}, now = D
     })).filter(({ commander, progress, freshness }) => {
       const search = searchable(`${commander.commander_name || ""} ${commander.commander_slug || ""}`);
       if (!words.every((word) => search.includes(word))) return false;
+      if (tagKey(settings.packageTag) && !packageTags(commander).some((tag) => matchesBuildDiscoveryPackageTag(tag, settings.packageTag))) return false;
       for (const range of ranges) {
         const value = count(commander[range.field]);
         if (value === null || (range.minimum !== null && value < range.minimum)

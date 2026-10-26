@@ -147,7 +147,9 @@ def analyze_evidence(args: argparse.Namespace, evidence: dict) -> dict:
                              seed=args.seed, min_cards=args.min_deck_cards,
                              min_support=args.min_card_support,
                              membership_threshold=args.membership)
-    deck_generation = {"version": 1, "status": "insufficient_data", "metadata": {}, "ranking_pages": []}
+    from .deckbuilding import DECK_GENERATION_VERSION
+
+    deck_generation = {"version": DECK_GENERATION_VERSION, "status": "insufficient_data", "metadata": {}, "ranking_pages": []}
     if analysis["status"] == "fitted":
         from .deckbuilding import generate_package_decks
         from .external_validation import attach_external_validation

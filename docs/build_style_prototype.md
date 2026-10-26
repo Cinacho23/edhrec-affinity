@@ -13,6 +13,13 @@ Each sampled commander has two views:
 
 The Build Discovery catalog defaults to most Auto-selected packages, with analyzed deck count breaking ties. Visitors can sort either direction by package count, analyzed decks, total EDHREC decks, tag-profile count, index coverage, analysis date or commander name. Inclusive count ranges, commander search, analysis status, coverage and source-check age filters combine across every current collector report before pagination. Filter state is preserved in the URL; unknown metrics remain distinct from zero and sort last. The catalog's existing 200-deck eligibility and fresh-start scope still apply before these display filters.
 
+The package-tag filter matches a suggested tag on any package in the selected
+automatic model. Options count distinct commanders across all current reports;
+general commander profiles, source deck tags and alternative models do not
+qualify a match. A selected tag combines with the other filters and stays in
+the URL. Matching tags are highlighted while all packages for each matching
+commander remain visible.
+
 Discovery cards include commander thumbnails, name hover/focus previews and a
 keyboard/touch disclosure for reading full card images. Partners and all card
 faces remain separate and readable. The index includes compact summaries of
@@ -119,28 +126,69 @@ Weighted reconstruction capture is `1 - relative training error²`; it measures 
 
 ## Static-site generation and deployment
 
-Each primary package and supported alternative contains a generated 100-card
-deck, including its commander or commander pair. Sampled lists are the card pool:
+The builder attempts a 100-card deck for each primary package and supported
+alternative, including its commander or commander pair. Sampled lists are the card pool:
 generation never adds an outside card name. A verified complete sampled deck
 supplies the land base, functional roles and curve.
-NMF memberships learn card preferences; deterministic swaps toward those
-preferences preserve roles, types and curve buckets. Bounded candidate search
+Displayed distinctive cards form a priority core. The builder first attempts to
+include every verified, legal distinctive card from the sampled pool, trying
+other observed anchors when needed. These substitutions preserve land slots,
+essential ramp/draw/interaction floors, singleton identity and checked bracket
+restrictions; role, type and curve similarity are preferences at this stage.
+If constraints force a choice, higher learned distinctive weight takes priority.
+Every displayed card is accounted for as included or omitted with a specific
+reason. Included core cards remain protected during later optimization.
+When verified commander text permits choosing a color before the game, the
+builder evaluates the legal color choices for each package and records the
+selected choice and effective deck identity. The deck view and primer explain
+that choice. This supports Clara Oswald's additional color without changing
+Scryfall's static card identity or admitting multiple unchosen colors.
+NMF memberships then guide ordinary consensus swaps that preserve roles,
+types and curve buckets. Bounded candidate search
 also compares other high-membership anchors and can replace up to three low-signal
 nonessential spells with basics whose names already occur in the sample. A
 verified below-target result can trigger up to three more land experiments,
 capped at 40 lands and six total basic additions. Sampled duals and fetches can
 upgrade the mana base using color demand and conditional untapped heuristics.
 Price does not enter scoring.
-Distinctive package cards already in the anchor are protected. This is
-constrained construction from unsupervised evidence, not a separate text model.
-Among reviewed candidates, a current external rating in the 72.5–77.5% target
-takes precedence, then learned package consensus. When no candidate has a
+This is constrained construction from unsupervised evidence, not a separate
+text model. Candidate selection first maximizes distinctive-card coverage and
+learned core weight. Within that tier, a current external rating in the
+72.5–77.5% target takes precedence, then learned package consensus.
+When no candidate in that tier has a
 qualifying external observation, selection uses native mana and role diagnostics
 and keeps the external target explicitly unverified or unmet.
 
+Generation version 2 records core coverage, omission explanations and primer
+references for both the selected model and alternative package counts. The
+collector runs a bounded upgrade after collection for the same current reports
+eligible for Build Discovery. Saved parsed lists and profiles rebuild older
+generated decks without EDHREC requests, refitting NMF or changing source-check
+dates. One paced Scryfall stream refreshes required card metadata before CPU
+workers start; a missing input or stale rule for a selected card preserves the
+previous report for retry. Successful upgrades request publication even if
+collection itself produced no new reports. Originals are backed up, missing
+required inputs leave existing reports intact, and remaining work resumes in
+later batches. For a restored checkpoint, the same operation is available as:
+
+```bash
+python scripts/rebuild_generated_decks.py \
+  --build-styles-dir data/processed/build-styles-current \
+  --card-metadata-cache data/raw/build-style-card-metadata.json \
+  --workers 2 --only-outdated --current-discovery-only --fetch-metadata
+```
+
+Omit `--fetch-metadata` for a fully offline rebuild using verified cached rules.
+The runtime bound includes metadata preparation, and unresolved unused cards
+do not prevent rebuilding a deck whose selected cards have current rules.
+
 Scryfall supplies exact-name card rules, color identity and Commander legality
-in cached batches. Unresolved names receive an exact named-card lookup. English
-alternate names from Scryfall's `flavor_name` and `printed_name` fields retain
+in cached batches. Unresolved names receive an exact named-card lookup. Names
+that resolve to a token, Plane, art card or other non-deck object receive
+an exact search excluding those layouts. Only a complete response with one
+verified Oracle identity is accepted; ambiguous identities stay unresolved,
+and normal banned cards retain their actual legality.
+English alternate names from Scryfall's `flavor_name` and `printed_name` fields retain
 their printing and Oracle identity evidence in the shared cache. EDHREC's
 constituent commander printing IDs provide another fallback: the Scryfall
 response must match that ID and explicitly confirm the requested alternate name.

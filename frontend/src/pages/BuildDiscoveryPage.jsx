@@ -14,6 +14,8 @@ import {
   buildDiscoverySearchParams,
   filterBuildDiscoveryCommanders,
   getBuildDiscoveryFilterErrors,
+  getBuildDiscoveryPackageTags,
+  matchesBuildDiscoveryPackageTag,
   readBuildDiscoveryFilters,
 } from "../lib/buildDiscoveryFilters";
 import { formatNumber } from "../lib/formatters";
@@ -55,7 +57,7 @@ function CountRange({ title, minKey, maxKey, filters, onChange }) {
   </fieldset>;
 }
 
-function PackageSummaries({ commander }) {
+function PackageSummaries({ commander, selectedTag }) {
   if (!Array.isArray(commander.packages)) {
     return commander.package_count > 0 ? <p className="muted build-discovery-card__package-note">Package tags and brackets are unavailable in this summary. Open the report for details.</p> : null;
   }
@@ -67,7 +69,11 @@ function PackageSummaries({ commander }) {
       const bracket = getPackageBracketLabel(pkg.generated_deck);
       return <li key={pkg.id ?? index}>
         <div className="build-discovery-card__package-heading"><strong>Package {index + 1}</strong><span className={bracket ? "build-discovery-card__bracket" : "muted"}>{bracket || "Bracket unavailable"}</span></div>
-        <div className="build-discovery-card__tags">{tags.length ? tags.map((tag) => <span key={tag.tag_slug || tag.tag_name}>{tag.tag_name || tag.tag_slug}</span>) : <span className="muted">No supported tag label</span>}</div>
+        <div className="build-discovery-card__tags">{tags.length ? tags.map((tag) => {
+          const matched = selectedTag && matchesBuildDiscoveryPackageTag(tag, selectedTag);
+          return <span key={tag.tag_slug || tag.tag_name} className={matched ? "build-discovery-card__tag--matched" : undefined}
+            title={matched ? "Matches selected package tag" : undefined}>{tag.tag_name || tag.tag_slug}</span>;
+        }) : <span className="muted">No supported tag label</span>}</div>
       </li>;
     })}</ul>
   </div>;
@@ -105,6 +111,9 @@ export default function BuildDiscoveryPage() {
   }, [state.commanders]);
 
   const filterErrors = getBuildDiscoveryFilterErrors(filters);
+  const packageTags = useMemo(() => getBuildDiscoveryPackageTags(state.commanders), [state.commanders]);
+  const selectedPackageTag = filters.packageTag && (packageTags.find((tag) => tag.value === filters.packageTag)
+    || packageTags.find((tag) => matchesBuildDiscoveryPackageTag({ tag_slug: tag.value, tag_name: tag.label }, filters.packageTag)));
   const matching = useMemo(() => filterBuildDiscoveryCommanders(state.commanders, filters), [state.commanders, filters]);
   const pageCount = Math.max(1, Math.ceil(matching.length / PAGE_SIZE));
   const currentPage = Math.min(page, pageCount);
@@ -210,6 +219,16 @@ export default function BuildDiscoveryPage() {
             </select>
           </label>
         </div>
+        <div className="build-discovery-filters__package-tag">
+          <label htmlFor="build-discovery-package-tag">Package tag
+            <select id="build-discovery-package-tag" aria-describedby="build-discovery-package-tag-note" value={selectedPackageTag?.value || filters.packageTag} onChange={(event) => updateFilter("packageTag", event.target.value)}>
+              <option value="">All package tags</option>
+              {filters.packageTag && !selectedPackageTag ? <option value={filters.packageTag}>{filters.packageTag} · unavailable in current reports</option> : null}
+              {packageTags.map((tag) => <option key={tag.value} value={tag.value}>{tag.label} ({formatNumber(tag.count)} {tag.count === 1 ? "commander" : "commanders"})</option>)}
+            </select>
+          </label>
+          <p id="build-discovery-package-tag-note" className="muted">Show commanders with this suggested tag on at least one auto-selected package. Their other packages remain visible.</p>
+        </div>
         <div className="build-discovery-filters__ranges">
           {COUNT_FILTERS.map((range) => <CountRange key={range.minKey} {...range} filters={filters} onChange={updateFilter} />)}
         </div>
@@ -253,7 +272,7 @@ export default function BuildDiscoveryPage() {
           <div><strong>{formatNumber(commander.profile_count)}</strong><span>tag profiles</span></div>
           <div><strong>{formatNumber(commander.unique_decks)}</strong><span>analyzed decks</span></div>
         </div>
-        <PackageSummaries commander={commander} />
+        <PackageSummaries commander={commander} selectedTag={filters.packageTag} />
         {commander.status !== "fitted" ? <p className="muted">{commander.profile_count > 0
           ? "Tag profile comparisons available; deck evidence is insufficient to fit packages."
           : "Insufficient data for tag comparisons or packages."}</p> : null}
@@ -269,7 +288,7 @@ export default function BuildDiscoveryPage() {
         </div>
         <div className="build-discovery-card__footer"><span>Analysis built {reportDate(commander.generated_at)}</span><Link to={`/commanders/${encodeURIComponent(commander.commander_slug)}`}>Explore report →</Link></div>
       </article>; })}</div>
-      {!matching.length ? <div className="panel build-discovery-empty"><p className="muted">{filterErrors.length ? "Correct the filter ranges to see matching reports." : "No current reports match these filters. Try widening a range or clearing the search."}</p><button type="button" onClick={resetFilters}>Reset filters</button></div> : null}
+      {!matching.length ? <div className="panel build-discovery-empty"><p className="muted">{filterErrors.length ? "Correct the filter ranges to see matching reports." : "No current reports match these filters. Try another package tag, widen a range, or clear the search."}</p><button type="button" onClick={resetFilters}>Reset filters</button></div> : null}
     </> : <div className="panel"><p className="muted">Waiting for the first completed report since the fresh start from a commander with at least {formatNumber(minimumDecks)} total EDHREC decks. New reports will appear as collection and analysis finish.</p><Link className="build-discovery-all-commanders" to="/commanders">Browse all commanders →</Link></div>}
   </section>;
 }
