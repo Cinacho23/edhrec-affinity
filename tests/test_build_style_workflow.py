@@ -4,6 +4,7 @@ import json
 import glob
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -36,8 +37,21 @@ def stub(tmp_path, name, program):
     path.chmod(0o755)
 
 
+def stub_timeout(tmp_path):
+    # macOS has no GNU timeout. Exercise the enclosed command while the
+    # watchdog's signal, duration and step ceilings are checked separately.
+    stub(tmp_path, "timeout", """\
+        import os, sys
+        args = sys.argv[1:]
+        assert args[:2] == ["--signal=INT", "--kill-after=30s"]
+        assert args[2] in {"35m", "21m"}
+        os.execvp(args[3], args[3:])
+    """)
+
+
 def test_scheduled_collection_uses_source_freshness_without_a_completion_deadline(tmp_path):
     _, script = step(COLLECTOR, "Continue the resumable catalog queue")
+    stub_timeout(tmp_path)
     stub(tmp_path, "python", """\
         import json, sys
         print(json.dumps(sys.argv[1:]))
@@ -51,6 +65,7 @@ def test_scheduled_collection_uses_source_freshness_without_a_completion_deadlin
     args = json.loads(result.stdout)
     assert args[args.index("--freshness-target-hours") + 1] == "96"
     assert args[args.index("--max-runtime-seconds") + 1] == "1800"
+    assert args[args.index("--worker-grace-seconds") + 1] == "120"
     assert args[args.index("--workers") + 1] == "1"
     assert args[args.index("--preview-workers") + 1] == "16"
     assert args[args.index("--min-total-decks") + 1] == "200"
@@ -184,6 +199,7 @@ def test_cooldown_dispatch_uses_the_token_exception_after_both_durable_uploads()
 
 def test_saved_deck_upgrade_is_bounded_to_current_reports_and_uploaded_before_publication(tmp_path):
     body, script = step(COLLECTOR, "Rebuild package decks from saved collections")
+    stub_timeout(tmp_path)
     stub(tmp_path, "python", """\
         import json, sys
         print(json.dumps(sys.argv[1:]))
@@ -205,6 +221,25 @@ def test_saved_deck_upgrade_is_bounded_to_current_reports_and_uploaded_before_pu
         "      - name: Rebuild package decks from saved collections") < workflow.index(
         "      - name: Upload cumulative build-style samples")
     assert "data/build-style-artifact/deck-rebuild-summary.json" in workflow
+
+
+def test_work_stages_leave_time_for_checkpoint_upload_before_the_job_deadline():
+    workflow = COLLECTOR.read_text()
+    build = workflow.split("  build:\n", 1)[1]
+    job_minutes = int(re.search(r"^    timeout-minutes: (\d+)$", build, re.M)[1])
+    collect, collect_script = step(COLLECTOR, "Continue the resumable catalog queue")
+    rebuild, rebuild_script = step(COLLECTOR, "Rebuild package decks from saved collections")
+    work_minutes = sum(int(re.search(r"^        timeout-minutes: (\d+)$", body, re.M)[1])
+                       for body in (collect, rebuild))
+    assert job_minutes - work_minutes >= 30
+    assert "timeout --signal=INT --kill-after=30s 35m python" in collect_script
+    assert "timeout --signal=INT --kill-after=30s 21m python" in rebuild_script
+    assert all("continue-on-error: true" in body for body in (collect, rebuild))
+    checkpoint = workflow.split("      - name: Upload cumulative build-style samples\n", 1)[1].split(
+        "      - name: Upload collection summary", 1)[0]
+    assert "if: always()" in checkpoint
+    assert "timeout-minutes: 15" in checkpoint
+    assert "compression-level: 1" in checkpoint
 
 
 @pytest.mark.parametrize("blocked, automatic, pending, expected_continuation", [

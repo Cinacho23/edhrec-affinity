@@ -85,8 +85,8 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.run == 'true'
     runs-on: ubuntu-latest
-    # Leave time after the half-hour collection window to drain analysis and
-    # durably upload the checkpoint before dispatching the following batch.
+    # Each work stage has a bounded shutdown and a shorter shell watchdog.
+    # Reserve the rest of the job for restoring and uploading durable progress.
     timeout-minutes: 90
     steps:
       - name: Check out repository
@@ -170,6 +170,7 @@ jobs:
       - name: Continue the resumable catalog queue
         id: collect_styles
         continue-on-error: true
+        timeout-minutes: 36
         shell: bash
         env:
           COMMANDER_SLUGS: ${{ inputs.commanders }}
@@ -185,7 +186,8 @@ jobs:
                 --max-components "${MAX_COMPONENTS}" --min-total-decks 200
                 --main-tag-decks 15 --min-tag-decks 5
                 --main-tag-fraction 0.03 --min-tag-fraction 0.01
-                --max-runtime-seconds 1800 --pipeline --workers 1 --preview-workers 16 --analysis-workers 2
+                --max-runtime-seconds 1800 --worker-grace-seconds 120
+                --pipeline --workers 1 --preview-workers 16 --analysis-workers 2
                 --requests-per-second "${REQUESTS_PER_SECOND}"
                 --source-max-age-hours 72 --refresh-after-days 3
                 --freshness-target-hours 96 --prune-completed-cache)
@@ -199,7 +201,7 @@ jobs:
           if [[ "${REFRESH_REPORTS}" == "true" ]]; then
             args+=(--refresh)
           fi
-          python scripts/build_site_build_styles.py "${args[@]}"
+          timeout --signal=INT --kill-after=30s 35m python scripts/build_site_build_styles.py "${args[@]}"
 
       - name: Report the retained collection checkpoint
         if: steps.collect_styles.outcome == 'failure'
@@ -209,8 +211,9 @@ jobs:
         id: rebuild_decks
         if: always() && steps.collect_styles.outcome != 'skipped'
         continue-on-error: true
+        timeout-minutes: 22
         run: |
-          python scripts/rebuild_generated_decks.py \
+          timeout --signal=INT --kill-after=30s 21m python scripts/rebuild_generated_decks.py \
             --build-styles-dir "${STYLES_DIR}" \
             --card-metadata-cache data/raw/build-style-card-metadata.json \
             --workers 2 --only-outdated --current-discovery-only --fetch-metadata \
@@ -251,6 +254,7 @@ jobs:
       - name: Upload cumulative build-style samples
         id: checkpoint
         if: always()
+        timeout-minutes: 15
         uses: actions/upload-artifact@v4
         with:
           name: build-styles-${{ env.SAMPLE_DATE }}-${{ github.run_id }}
@@ -263,6 +267,7 @@ jobs:
             !${{ env.STYLES_DIR }}/**/*.tmp
           if-no-files-found: warn
           retention-days: 2
+          compression-level: 1
 
       - name: Upload collection summary
         id: collection_summary

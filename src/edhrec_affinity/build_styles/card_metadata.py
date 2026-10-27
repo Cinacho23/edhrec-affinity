@@ -30,7 +30,7 @@ from uuid import UUID
 import httpx
 
 from edhrec_affinity.tag_scraper import DEFAULT_USER_AGENT
-from .sources import card_key
+from .sources import BudgetExpired, card_key
 
 
 COLLECTION_URL = "https://api.scryfall.com/cards/collection"
@@ -449,10 +449,14 @@ class MetadataRepository:
     so deck analysis cannot contaminate another commander's metadata.
     """
 
-    def __init__(self, cache_path: Path | str = DEFAULT_CACHE_PATH, *, max_age_days: float = 3):
+    def __init__(self, cache_path: Path | str = DEFAULT_CACHE_PATH, *, max_age_days: float = 3,
+                 deadline: float | None = None, monotonic=time.monotonic):
         if (isinstance(max_age_days, bool) or not isinstance(max_age_days, (int, float))
                 or not math.isfinite(max_age_days) or max_age_days <= 0):
             raise ValueError("Metadata maximum age must be a positive finite number of days")
+        if deadline is not None and not math.isfinite(deadline):
+            raise ValueError("Metadata request deadline must be finite")
+        self.deadline, self.monotonic = deadline, monotonic
         self.cache_path = Path(cache_path)
         self.max_age_days = max_age_days
         self._lock = threading.RLock()
@@ -537,7 +541,16 @@ class MetadataRepository:
                 def request(method: str, url: str, names: list[str], **kwargs: Any) -> Any:
                     # Collection and exact-name fallback share one paced stream
                     # and the same repository-wide access stop.
-                    time.sleep(REQUEST_DELAY_SECONDS)
+                    def check_budget():
+                        if self.deadline is not None and self.monotonic() >= self.deadline:
+                            raise BudgetExpired("Metadata run time budget reached; cached batches are retained")
+
+                    check_budget()
+                    delay = REQUEST_DELAY_SECONDS
+                    if self.deadline is not None:
+                        delay = min(delay, max(0, self.deadline - self.monotonic()))
+                    time.sleep(delay)
+                    check_budget()
                     summary["requests"] += 1
                     response = client.request(method, url, **kwargs)
                     if response.status_code in {401, 403, 429}:
