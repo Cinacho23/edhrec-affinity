@@ -7,19 +7,22 @@ source profiles after discarding their temporary analysis evidence. This tool
 uses either representation, checks that it matches the published model's
 dataset, and leaves source freshness and learned package membership unchanged.
 It is offline by default; ``--fetch-metadata`` refreshes only Scryfall rules in
-one paced parent-process stream before starting deck-generation workers.
+one paced stream before starting deck-generation workers. A finite runtime
+also bounds in-flight CPU and metadata work, retaining interrupted reports
+for the next run.
 """
 
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, TimeoutError, wait
 from copy import deepcopy
 from datetime import datetime, timezone
 import gzip
 import importlib.util
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import tempfile
@@ -32,6 +35,7 @@ from edhrec_affinity.build_styles.collection import deck_dataset_sha256
 from edhrec_affinity.build_styles.deckbuilding import DECK_GENERATION_VERSION, generate_package_decks
 from edhrec_affinity.build_styles.eligibility import commander_is_eligible
 from edhrec_affinity.build_styles.external_validation import attach_external_validation, cardlist_hash
+from edhrec_affinity.build_styles.pipeline import shutdown_executor
 from edhrec_affinity.build_styles.sources import (
     CommanderAliasCatalog, card_key, checked_identifier, commander_card_alias_groups,
     commander_printing_ids, enrich_commander_name_groups, parse_profile,
@@ -409,6 +413,31 @@ def prefetch_metadata(root: Path, paths: list[Path], repository: MetadataReposit
     checkpoint()
 
 
+def commit_report(job: dict, result: dict) -> dict:
+    """Commit completed CPU work in the parent, outside terminable workers."""
+    rebuilt = result.pop("_rebuilt_report", None)
+    contents = result.pop("_original_contents", None)
+    if rebuilt is None:
+        return result
+    path = Path(job["path"])
+    try:
+        # A live collector must not have replaced the report while CPU work
+        # was running. The operator should restore artifacts separately.
+        if path.read_bytes() != contents:
+            raise RebuildBlocked("Report changed during regeneration; refusing to overwrite concurrent work")
+        backup = Path(job["backup_dir"]) / path.name
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        with backup.open("xb") as handle:
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        result["backup"] = str(backup.resolve())
+        atomic_json(path, rebuilt)
+        return result
+    except (OSError, ValueError, TypeError) as error:
+        return {"commander_slug": path.stem, "status": "blocked", "reason": str(error)}
+
+
 def process_report(job: dict) -> dict:
     path, root = Path(job["path"]), Path(job["root"])
     try:
@@ -432,21 +461,36 @@ def process_report(job: dict) -> dict:
         result["source_analysis_generated_at"] = report.get("generated_at")
         result["dry_run"] = job["dry_run"]
         if not job["dry_run"]:
-            # A live collector must not have replaced the report while CPU work
-            # was running. The operator should restore artifacts separately.
-            if path.read_bytes() != contents:
-                raise RebuildBlocked("Report changed during regeneration; refusing to overwrite concurrent work")
-            backup = Path(job["backup_dir"]) / path.name
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            with backup.open("xb") as handle:
-                handle.write(contents)
-                handle.flush()
-                os.fsync(handle.fileno())
-            result["backup"] = str(backup.resolve())
-            atomic_json(path, rebuilt)
+            result.update(_rebuilt_report=rebuilt, _original_contents=contents)
+            if not job.get("prepare_only"):
+                return commit_report(job, result)
         return result
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
         return {"commander_slug": path.stem, "status": "blocked", "reason": str(error)}
+
+
+def prefetch_metadata_job(job: dict) -> dict:
+    """The sole HTTP stream is isolated so a stalled request can be stopped.
+
+    CPU workers are started only after this process has exited. Cache saves
+    and progress checkpoints are atomic, so a deadline retains completed
+    batches and never makes a partially written cache authoritative.
+    """
+    summary = job["summary"]
+
+    def checkpoint():
+        atomic_json(Path(job["summary_path"]), summary)
+
+    def time_remains():
+        if time.monotonic() >= job["deadline"]:
+            summary["time_budget_reached"] = True
+            return False
+        return True
+
+    prefetch_metadata(Path(job["root"]), [Path(path) for path in job["paths"]],
+                      MetadataRepository(job["cache"], max_age_days=job["max_age_days"]), summary,
+                      only_outdated=job["only_outdated"], time_remains=time_remains, checkpoint=checkpoint)
+    return summary["metadata_prefetch"]
 
 
 def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None, workers: int = 1,
@@ -503,7 +547,9 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
     for path in paths:
         try:
             report = read_json(path)
-            if needs_rebuild(report):
+            if (needs_rebuild(report) or not only_outdated and commander_is_eligible(report.get("total_edhrec_decks"))
+                    and report.get("deck_analysis", {}).get("status") == "fitted"
+                    and report.get("deck_analysis", {}).get("packages")):
                 pending.add(path.stem)
         except (OSError, ValueError, TypeError):
             pending.add(path.stem)
@@ -522,6 +568,9 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
             summary["time_budget_reached"] = True
             return False
         return True
+
+    def remaining_seconds():
+        return max(0, max_runtime_seconds - (time.monotonic() - started)) if max_runtime_seconds else None
 
     def record(result):
         summary["reports"].append(result)
@@ -542,31 +591,72 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
 
     checkpoint()
     if fetch_metadata and not dry_run:
-        repository = MetadataRepository(cache, max_age_days=max_age_days)
-        prefetch_metadata(root, paths, repository, summary, only_outdated=only_outdated,
-                          time_remains=time_remains, checkpoint=checkpoint)
-    if workers == 1:
+        if max_runtime_seconds and time_remains():
+            # Even one batch can contain many exact-name fallbacks. An HTTP
+            # timeout per request cannot bound that batch or a stuck library.
+            # Keep one serialized HTTP stream in an independently stoppable
+            # process, and never overlap it with CPU workers.
+            pool = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+            expired = False
+            try:
+                future = pool.submit(prefetch_metadata_job, {
+                    "root": str(root), "paths": [str(path) for path in paths], "cache": str(cache),
+                    "max_age_days": max_age_days, "summary": summary, "summary_path": str(summary_path),
+                    "only_outdated": only_outdated, "deadline": started + max_runtime_seconds})
+                try:
+                    summary["metadata_prefetch"] = future.result(timeout=remaining_seconds())
+                except TimeoutError:
+                    expired = True
+                    summary["time_budget_reached"] = True
+            finally:
+                shutdown_executor(pool, terminate=expired)
+            if expired:
+                # Read only the last fully completed checkpoint after the
+                # child has stopped. Successful cache batches remain usable.
+                summary["metadata_prefetch"] = read_json(summary_path)["metadata_prefetch"]
+                summary["metadata_prefetch"]["status"] = "time_budget_reached"
+                checkpoint()
+        elif not max_runtime_seconds:
+            repository = MetadataRepository(cache, max_age_days=max_age_days)
+            prefetch_metadata(root, paths, repository, summary, only_outdated=only_outdated,
+                              time_remains=time_remains, checkpoint=checkpoint)
+    if workers == 1 and not max_runtime_seconds:
         initialize_worker(str(root), str(cache), max_age_days)
         for job in jobs:
             if not time_remains():
                 break
             record(process_report(job))
-    else:
-        with ProcessPoolExecutor(max_workers=workers, initializer=initialize_worker,
-                                 initargs=(str(root), str(cache), max_age_days)) as pool:
+    elif time_remains():
+        pool = ProcessPoolExecutor(max_workers=workers, initializer=initialize_worker,
+                                   initargs=(str(root), str(cache), max_age_days),
+                                   mp_context=multiprocessing.get_context("spawn"))
+        expired = False
+        running = {}
+        try:
             unscheduled = iter(jobs)
-            running = set()
-            while running or time_remains():
+            while True:
                 while len(running) < workers and time_remains():
                     job = next(unscheduled, None)
                     if job is None:
                         break
-                    running.add(pool.submit(process_report, job))
+                    running[pool.submit(process_report, {**job, "prepare_only": True})] = job
                 if not running:
                     break
-                done, running = wait(running, return_when=FIRST_COMPLETED)
+                if not time_remains():
+                    expired = True
+                    break
+                done, _ = wait(running, timeout=remaining_seconds(), return_when=FIRST_COMPLETED)
+                if not done:
+                    summary["time_budget_reached"] = expired = True
+                    break
                 for completed in done:
-                    record(completed.result())
+                    job = running.pop(completed)
+                    record(commit_report(job, completed.result()))
+        finally:
+            # A context manager performs shutdown(wait=True), which lets one
+            # stuck analysis consume the entire GitHub Actions job timeout.
+            # Timed-out children never own report or backup writes.
+            shutdown_executor(pool, terminate=expired or bool(running))
     summary["completed_at"] = datetime.now(timezone.utc).isoformat()
     checkpoint()
     return summary
@@ -586,9 +676,9 @@ def main() -> None:
     parser.add_argument("--single-anchor", action="store_true", help="Skip optional playability/mana candidate exploration")
     parser.add_argument("--only-outdated", action="store_true", help="Skip reports already rebuilt by this generation version")
     parser.add_argument("--max-runtime-seconds", type=float, default=0,
-                        help="Stop scheduling after this time; finish atomic in-flight rebuilds (0 means unlimited)")
+                        help="Stop work at this deadline, retaining interrupted reports for retry (0 means unlimited)")
     parser.add_argument("--fetch-metadata", action="store_true",
-                        help="Refresh missing/stale Scryfall metadata in one paced parent stream before workers; disabled for --dry-run")
+                        help="Refresh missing/stale Scryfall metadata in one paced stream before workers; disabled for --dry-run")
     parser.add_argument("--current-discovery-only", action="store_true",
                         help="Use the website export's current-collector discovery scope, excluding archival reports")
     args = parser.parse_args()

@@ -14,7 +14,7 @@ import time
 
 import httpx
 
-from .sources import SourceBlocked, SourceFormatError, card_key, checked_identifier, parse_preview, source_is_stale, source_time
+from .sources import BudgetExpired, SourceBlocked, SourceFormatError, card_key, checked_identifier, parse_preview, source_is_stale, source_time
 
 
 def parse_sample_decks(value: str) -> int | None:
@@ -192,6 +192,8 @@ def collect_previews(cache, slug: str, *, limit: int | None, seed: int, progress
                 if previous_record and offline_unavailable else _row_fingerprint(row),
             }
             return identifier, record, None, False
+        except BudgetExpired:
+            return identifier, None, None, True
         except (SourceBlocked, httpx.HTTPError, FileNotFoundError, ValueError, KeyError, TypeError) as error:
             permanent = (isinstance(error, (ValueError, KeyError, TypeError))
                          and not isinstance(error, SourceFormatError)) or (
@@ -215,7 +217,9 @@ def collect_previews(cache, slug: str, *, limit: int | None, seed: int, progress
         return stop
 
     def out_of_time():
-        return getattr(cache, "blocked", False) or (max_seconds and monotonic() - started >= max_seconds)
+        return (getattr(cache, "blocked", False)
+                or getattr(getattr(cache, "limiter", None), "budget_expired", False)
+                or (max_seconds and monotonic() - started >= max_seconds))
 
     try:
         if preview_workers == 1:

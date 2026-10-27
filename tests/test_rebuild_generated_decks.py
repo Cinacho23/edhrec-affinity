@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import pytest
 import httpx
@@ -19,8 +20,12 @@ from edhrec_affinity.build_styles.sources import CommanderAliasCatalog, card_key
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Finite runs use spawn even for one CPU worker. Make the script importable in
+# those real child interpreters, just as it is when launched through its CLI.
+sys.path.insert(0, str(ROOT / "scripts"))
 spec = importlib.util.spec_from_file_location("rebuild_generated_decks", ROOT / "scripts/rebuild_generated_decks.py")
 rebuild = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = rebuild
 spec.loader.exec_module(rebuild)
 
 
@@ -82,6 +87,21 @@ def save_evidence(root, report, inputs):
     write(root / "_collection/evidence" / f"{report['commander_slug']}.json.gz", {
         "slug": report["commander_slug"], "base": inputs["base"], "ranking_profiles": inputs["profiles"],
         "decks": inputs["decks"], "metadata": inputs["metadata"]})
+
+
+def hanging_report(job):
+    """An actual child that never finishes its CPU work within the budget."""
+    root = Path(job["root"])
+    (root / f"{Path(job['path']).stem}.started").write_text(str(os.getpid()))
+    time.sleep(60)
+    raise AssertionError("Hung child should have been stopped")
+
+
+def hanging_prefetch(job):
+    """Represent a stalled HTTP library in the sole metadata process."""
+    (Path(job["root"]) / "metadata.started").write_text(str(os.getpid()))
+    time.sleep(60)
+    raise AssertionError("Hung metadata child should have been stopped")
 
 
 def test_rebuild_all_models_keeps_learned_inputs_and_invalidates_changed_list_rating(tmp_path, monkeypatch):
@@ -231,6 +251,76 @@ def test_runtime_limit_leaves_unscheduled_eligible_reports_pending(tmp_path, mon
     assert result["rebuilt"] == 0
     assert result["time_budget_reached"]
     assert result["pending"] == 1
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_runtime_stops_real_hung_cpu_children_preserves_reports_and_resumes(tmp_path, monkeypatch, workers):
+    report, inputs, cache = fixture(tmp_path, "commander-a")
+    root = tmp_path / "build-styles"
+    save_evidence(root, report, inputs)
+    report["commander_slug"] = "commander-b"
+    save_evidence(root, report, inputs)
+    originals = {path.name: path.read_bytes() for path in root.glob("*.json")}
+    process = rebuild.process_report
+    monkeypatch.setattr(rebuild, "process_report", hanging_report)
+    started = time.monotonic()
+    result = rebuild.rebuild_all(root, cache, workers=workers, max_runtime_seconds=3,
+                                 only_outdated=True, prefer_playability=False)
+    assert time.monotonic() - started < 8
+    assert result["time_budget_reached"] and result["pending"] == 2
+    assert result["blocked"] == result["regenerated"] == 0
+    assert {path.name: path.read_bytes() for path in root.glob("*.json")} == originals
+    assert not Path(result["backup_dir"]).exists()
+    markers = list(root.glob("*.started"))
+    assert markers, "The deadline must stop running CPU work, not just skip submission"
+    for marker in markers:
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(marker.read_text()), 0)
+    monkeypatch.setattr(rebuild, "process_report", process)
+    resumed = rebuild.rebuild_all(root, cache, only_outdated=True, prefer_playability=False)
+    assert resumed["regenerated"] == 2
+    assert resumed["pending"] == resumed["blocked"] == 0
+    assert all(rebuild.read_json(root / name)["collection"] == report["collection"] for name in originals)
+
+
+def test_runtime_stops_real_hung_metadata_stream_without_starting_cpu_work(tmp_path, monkeypatch):
+    report, inputs, cache = fixture(tmp_path)
+    root = tmp_path / "build-styles"
+    save_evidence(root, report, inputs)
+    original, original_cache = (root / "commander.json").read_bytes(), cache.read_bytes()
+    monkeypatch.setattr(rebuild, "prefetch_metadata_job", hanging_prefetch)
+    started = time.monotonic()
+    result = rebuild.rebuild_all(root, cache, workers=2, fetch_metadata=True,
+                                 max_runtime_seconds=3, only_outdated=True)
+    assert time.monotonic() - started < 8
+    assert result["time_budget_reached"] and result["pending"] == 1
+    assert result["metadata_prefetch"]["status"] == "time_budget_reached"
+    assert result["blocked"] == result["regenerated"] == 0
+    assert (root / "commander.json").read_bytes() == original
+    assert cache.read_bytes() == original_cache
+    marker = root / "metadata.started"
+    assert marker.exists()
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(marker.read_text()), 0)
+
+
+def test_bounded_metadata_prefetch_completes_then_commits_offline_worker_output(tmp_path):
+    report, inputs, cache = fixture(tmp_path)
+    root = tmp_path / "build-styles"
+    save_evidence(root, report, inputs)
+    original_cache = cache.read_bytes()
+    result = rebuild.rebuild_all(root, cache, workers=1, fetch_metadata=True,
+                                 max_runtime_seconds=15, only_outdated=True, prefer_playability=False)
+    assert not result["time_budget_reached"]
+    assert result["pending"] == result["blocked"] == 0
+    assert result["regenerated"] == 1
+    assert result["metadata_prefetch"]["status"] == "complete"
+    assert result["metadata_prefetch"]["requests"] == 0
+    assert cache.read_bytes() == original_cache
+    generated = rebuild.read_json(root / "commander.json")
+    assert generated["collection"] == report["collection"]
+    assert rebuild.learned_analysis(generated["deck_analysis"]) == rebuild.learned_analysis(report["deck_analysis"])
+    assert generated["deck_generation"]["version"] == 2
 
 
 def test_below_threshold_and_insufficient_reports_are_not_pending(tmp_path):

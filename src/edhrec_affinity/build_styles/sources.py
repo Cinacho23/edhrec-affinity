@@ -266,6 +266,10 @@ class SourceBlocked(RuntimeError):
     """Stop the collection session on an access challenge or rate limit."""
 
 
+class BudgetExpired(RuntimeError):
+    """Stop new work for this run while retaining inputs for immediate resume."""
+
+
 class SourceFormatError(ValueError):
     """A source response could not be read; preserve the item for a later retry."""
 
@@ -281,6 +285,7 @@ class RequestLimiter:
     def __init__(self, delay: float = 1.0, *, max_rate: float | None = None,
                  start_rate: float = 2.0, ramp_after: int = 100,
                  learned_rate: float | None = None,
+                 deadline: float | None = None,
                  monotonic=time.monotonic, sleep=time.sleep):
         if not math.isfinite(delay) or delay <= 0:
             raise ValueError("Shared request delay must be finite and positive")
@@ -292,6 +297,9 @@ class RequestLimiter:
             raise ValueError("Learned request rate must be finite and positive")
         if not math.isfinite(start_rate) or start_rate <= 0 or ramp_after < 1:
             raise ValueError("Starting rate and ramp interval must be positive")
+        if deadline is not None and not math.isfinite(deadline):
+            raise ValueError("Request deadline must be finite")
+        self.deadline = deadline
         self.configured_maximum_rate = max_rate if max_rate is not None else 1 / delay
         self.learned_rate = min(learned_rate, self.configured_maximum_rate) if learned_rate is not None else None
         self.minimum_delay = 1 / (self.learned_rate or self.configured_maximum_rate)
@@ -320,6 +328,14 @@ class RequestLimiter:
     @property
     def blocked(self) -> bool:
         return self._blocked_event.is_set()
+
+    @property
+    def budget_expired(self) -> bool:
+        return self.deadline is not None and self.monotonic() >= self.deadline
+
+    def check_budget(self) -> None:
+        if self.budget_expired:
+            raise BudgetExpired("Collection run time budget reached; resume from saved inputs")
 
     @property
     def stats(self) -> dict:
@@ -353,9 +369,14 @@ class RequestLimiter:
         with self._lock:
             if self.blocked:
                 raise SourceBlocked("Collection stopped: " + self._blocked_reason)
-            self.sleep(max(0.0, self._next_request - self.monotonic()))
+            self.check_budget()
+            delay = max(0.0, self._next_request - self.monotonic())
+            if self.deadline is not None:
+                delay = min(delay, max(0, self.deadline - self.monotonic()))
+            self.sleep(delay)
             if self.blocked:
                 raise SourceBlocked("Collection stopped: " + self._blocked_reason)
+            self.check_budget()
             current = self.monotonic()
             if self._started_at is None:
                 self._started_at = current

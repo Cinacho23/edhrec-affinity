@@ -5,15 +5,17 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import gzip
 import json
+import multiprocessing
 from pathlib import Path
 import threading
+import time
 
 import httpx
 import pytest
 
 from edhrec_affinity.build_styles.pipeline import atomic_json, evidence_version, run_pipeline, save_evidence
 from edhrec_affinity.build_styles.analysis import tag_label_policy
-from edhrec_affinity.build_styles.sources import SourceBlocked
+from edhrec_affinity.build_styles.sources import BudgetExpired, SourceBlocked
 from edhrec_affinity.build_styles.eligibility import CommanderBelowMinimum
 
 
@@ -146,9 +148,14 @@ def test_saved_partial_finishes_before_a_new_equal_sized_frame_on_the_next_job(t
     ticks[0] = 0
     second = execute(args, rows("a-new", "partial"), collect, saved_analyzer(analyzed),
                      checked=NOW + timedelta(minutes=31), monotonic=lambda: ticks[0])
-    assert second["completed"] == ["partial"]
+    assert second["completed"] == []
+    assert second["deferred_analyses"] == ["partial"]
     assert "a-new" not in calls
     assert checkpoint(args)["commanders"]["partial"]["coverage_complete"] is True
+    ticks[0] = 0
+    third = execute(args, rows("partial"), lambda *_: pytest.fail("Saved evidence should resume without collection"),
+                    saved_analyzer(analyzed), monotonic=lambda: ticks[0])
+    assert third["completed"] == ["partial"]
 
 
 def test_two_large_frames_do_not_monopolize_a_small_queued_commander(tmp_path):
@@ -180,7 +187,8 @@ def test_completed_report_refresh_waits_for_the_unfinished_backlog(tmp_path):
     ticks, progress, calls, analyzed = [0], {}, [], []
     result = execute(args, rows("a-refresh", "new"), chunked_collector(ticks, progress, calls),
                      saved_analyzer(analyzed), monotonic=lambda: ticks[0])
-    assert result["completed"] == ["new"]
+    assert result["completed"] == []
+    assert result["deferred_analyses"] == ["new"]
     assert "a-refresh" not in calls
 
 
@@ -275,6 +283,115 @@ def test_analysis_pending_evidence_resumes_without_another_network_collection(tm
     assert result["collected"] == []
     assert result["completed"] == ["a"]
     assert checkpoint(args)["commanders"]["a"]["status"] == "fitted"
+
+
+def seed_pending_inputs(args, slugs):
+    records = {}
+    for slug in slugs:
+        source = evidence(slug, new_attempts=0)
+        source["analysis_version"] = evidence_version(source)
+        save_evidence(args.output_dir / f"_collection/evidence/{slug}.json.gz", source)
+        records[slug] = {"status": "analysis_pending", "coverage_complete": True, "frame_decks": 5,
+                         "current_previews": 5, "verified_at": NOW.isoformat()}
+    atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": records})
+
+
+def test_pending_model_backlog_stops_at_budget_and_resumes_without_collection(tmp_path):
+    args = options(tmp_path, max_runtime_seconds=3)
+    slugs = [f"queued-{index:02}" for index in range(12)]
+    seed_pending_inputs(args, slugs)
+    ticks, calls = [0], []
+
+    def analyze(path, settings):
+        ticks[0] += 1
+        return saved_analyzer(calls)(path, settings)
+
+    def no_collection(*_, **__):
+        pytest.fail("Pending analysis must reuse saved inputs")
+
+    first = execute(args, rows(*slugs), no_collection, analyze, monotonic=lambda: ticks[0])
+    assert calls == slugs[:3]
+    assert first["completed"] == slugs[:3]
+    assert first["deferred_analyses"] == slugs[3:]
+    assert first["time_budget_reached"] and first["continuation_needed"]
+    assert first["failures"] == [] and not first["blocked"]
+    for slug in slugs[3:]:
+        assert (args.output_dir / f"_collection/evidence/{slug}.json.gz").exists()
+        assert "retry_after" not in checkpoint(args)["commanders"][slug]
+    args.max_runtime_seconds = 30
+    second = execute(args, rows(*slugs), no_collection, saved_analyzer(calls))
+    assert second["completed"] == slugs[3:]
+    assert second["deferred_analyses"] == []
+
+
+def slow_and_fast_process_analyzer(path, settings):
+    """Spawnable test worker, with one deliberately stuck CPU process."""
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        source = json.load(handle)
+    if source["slug"] in {"b-slow", "c-finished-receipt"}:
+        marker = Path(settings["output_dir"]) / "worker-started"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(multiprocessing.current_process().pid))
+        if source["slug"] == "c-finished-receipt":
+            result = saved_analyzer([])(path, settings)
+            atomic_json(Path(settings["output_dir"]) / "result.json", result)
+        time.sleep(60)
+    return saved_analyzer([])(path, settings)
+
+
+def test_hung_process_is_reaped_after_grace_while_finished_peer_is_published(tmp_path):
+    args = options(tmp_path, max_runtime_seconds=4, worker_grace_seconds=.15, analysis_workers=3)
+    seed_pending_inputs(args, ["a-fast", "b-slow", "c-finished-receipt"])
+    before_children = {process.pid for process in multiprocessing.active_children()}
+    started = time.monotonic()
+    first = run_pipeline(args, rows("a-fast", "b-slow", "c-finished-receipt"),
+        collector=lambda *_: pytest.fail("Pending evidence must not be recollected"),
+        analyzer=slow_and_fast_process_analyzer, now=lambda: NOW)
+    assert time.monotonic() - started < 10
+    assert (args.output_dir / "_collection/analyzed/b-slow/worker-started").exists()
+    assert first["completed"] == ["a-fast", "c-finished-receipt"]
+    assert first["deferred_analyses"] == ["b-slow"]
+    assert first["analysis_workers_stopped"] is True
+    assert first["failures"] == [] and not first["blocked"]
+    assert (args.output_dir / "a-fast.json").exists()
+    assert (args.output_dir / "c-finished-receipt.json").exists()
+    assert not (args.output_dir / "b-slow.json").exists()
+    assert (args.output_dir / "_collection/evidence/b-slow.json.gz").exists()
+    assert "retry_after" not in checkpoint(args)["commanders"]["b-slow"]
+    assert {process.pid for process in multiprocessing.active_children()} <= before_children
+    second = execute(args, rows("b-slow"), lambda *_: pytest.fail("Resume must use saved input"), saved_analyzer([]))
+    assert second["completed"] == ["b-slow"]
+
+
+def test_collection_budget_expiration_is_neither_failure_nor_source_cooldown(tmp_path):
+    args = options(tmp_path)
+
+    def expired(*_, **__):
+        raise BudgetExpired("run budget")
+
+    result = execute(args, rows("a"), expired, saved_analyzer([]))
+    assert result["time_budget_reached"]
+    assert result["failures"] == [] and not result["blocked"]
+    record = checkpoint(args)["commanders"]["a"]
+    assert record["status"] == "collecting"
+    assert "retry_after" not in record
+    assert "blocked_until" not in checkpoint(args)
+
+
+def test_empty_partial_collection_at_budget_is_resumable_without_backoff(tmp_path):
+    args = options(tmp_path, max_runtime_seconds=1)
+    ticks = [0]
+
+    def expired_partial(*_, **__):
+        ticks[0] = 1
+        return evidence("a", loaded=0, new_attempts=0, complete=False)
+
+    result = execute(args, rows("a"), expired_partial, saved_analyzer([]), monotonic=lambda: ticks[0])
+    assert result["time_budget_reached"]
+    assert result["failures"] == [] and not result["blocked"]
+    record = checkpoint(args)["commanders"]["a"]
+    assert record["status"] == "collecting"
+    assert "retry_after" not in record
 
 
 def test_partial_failure_keeps_the_old_model_and_retries_after_backoff(tmp_path):

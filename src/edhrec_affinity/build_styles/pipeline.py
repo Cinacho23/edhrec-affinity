@@ -21,7 +21,7 @@ import httpx
 from .capacity import plan_capacity
 from .analysis import tag_label_policy
 from .eligibility import CommanderBelowMinimum, commander_is_eligible, valid_deck_count, validate_minimum
-from .sources import CommanderAliasCatalog, PreviewTransport, RequestLimiter, SourceBlocked, source_time
+from .sources import BudgetExpired, CommanderAliasCatalog, PreviewTransport, RequestLimiter, SourceBlocked, source_time
 
 
 def atomic_json(path: Path, value: dict) -> None:
@@ -93,8 +93,38 @@ def analyze_saved_evidence(path: Path, options: dict) -> dict:
         evidence = json.load(handle)
     with threadpool_limits(limits=1):
         report = analyze_evidence(argparse.Namespace(**options), evidence)
-    return {"slug": report["commander_slug"], "report": str(Path(options["output_dir"]) / "report.json"),
-            "status": report["deck_analysis"]["status"], "version": evidence["analysis_version"]}
+    result = {"slug": report["commander_slug"], "report": str(Path(options["output_dir"]) / "report.json"),
+              "status": report["deck_analysis"]["status"], "version": evidence["analysis_version"]}
+    # A finished report can precede delivery of its Future result. This receipt
+    # lets the parent publish that work even when it must stop the CPU pool.
+    atomic_json(Path(options["output_dir"]) / "result.json", result)
+    return result
+
+
+def shutdown_executor(executor, *, terminate: bool = False) -> None:
+    """Reap CPU children without letting executor shutdown outlive a run budget.
+
+    Python 3.12 has no public ProcessPoolExecutor.terminate_workers(). Capture
+    its children before shutdown clears the mapping, then use the public
+    multiprocessing Process lifecycle methods. Ordinary completion still uses
+    the executor's normal, waiting shutdown.
+    """
+    if not terminate:
+        executor.shutdown(wait=True)
+        return
+    processes = list((getattr(executor, "_processes", None) or {}).values())
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    executor.shutdown(wait=False, cancel_futures=True)
+    join_until = time.monotonic() + 2
+    for process in processes:
+        process.join(timeout=max(0, join_until - time.monotonic()))
+    for process in processes:
+        if process.is_alive():
+            process.kill()
+    for process in processes:
+        process.join(timeout=1)
 
 
 def collection_options(args, slug: str, remaining_seconds: float):
@@ -195,6 +225,8 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                "dry_run": args.dry_run, "publish_needed": False, "continuation_needed": False,
                "no_progress": True, "time_budget_reached": False, "new_previews_attempted": 0,
                "time_budget_seconds": args.max_runtime_seconds, "max_preview_attempts": None,
+               "worker_grace_seconds": getattr(args, "worker_grace_seconds", 120),
+               "deferred_analyses": [], "analysis_workers_stopped": False,
                "request_ceiling_per_second": args.requests_per_second}
 
     def eligible(slug):
@@ -315,11 +347,14 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         return summary
     if args.dry_run:
         return summary
+    deadline = started + args.max_runtime_seconds if args.max_runtime_seconds else None
     limiter = RequestLimiter(max_rate=args.requests_per_second, learned_rate=learned_rate,
-                             start_rate=min(2, args.requests_per_second), ramp_after=100)
+                             start_rate=min(2, args.requests_per_second), ramp_after=100,
+                             deadline=deadline, monotonic=monotonic)
     limiter_holder[0] = limiter
     transport, metadata_lock = PreviewTransport(), threading.Lock()
-    repository = MetadataRepository(args.card_metadata_cache, max_age_days=args.source_max_age_hours / 24)
+    repository = MetadataRepository(args.card_metadata_cache, max_age_days=args.source_max_age_hours / 24,
+                                    deadline=deadline, monotonic=monotonic)
     commander_aliases = CommanderAliasCatalog(root / "sources")
     collector, analyzer = collector or collect_evidence, analyzer or analyze_saved_evidence
     analysis_executor_factory = analysis_executor_factory or (lambda: ProcessPoolExecutor(
@@ -327,6 +362,9 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     network_jobs, model_jobs = {}, {}
     analysis_queue = []
     for slug in queue[:]:
+        if args.max_runtime_seconds and monotonic() - started >= args.max_runtime_seconds:
+            summary["time_budget_reached"] = True
+            break
         record = state["commanders"].get(slug, {})
         evidence_path = root / "evidence" / f"{slug}.json.gz"
         if record.get("status") == "analysis_pending" and evidence_path.exists():
@@ -339,7 +377,24 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                 analysis_queue.append((slug, evidence_path, collection_options(args, slug, args.max_preview_seconds)))
                 queue.remove(slug)
     visits, visited_count = {}, 0
-    with ThreadPoolExecutor(max_workers=args.workers) as network_pool, analysis_executor_factory() as model_pool:
+
+    def publish_analysis(slug, evidence_path, result):
+        report = json.loads(Path(result["report"]).read_text())
+        for item in report.get("collection", {}).get("provenance", []):
+            item.pop("cache_file", None)
+        atomic_json(args.output_dir / f"{slug}.json", report)
+        record = state["commanders"][slug]
+        record.update(status=result["status"], analysis_version=result["version"], analyzed_at=now().isoformat())
+        record.pop("analysis_deferred_reason", None)
+        record.pop("retry_after", None)
+        record["tag_label_policy"] = report.get("tag_label_policy")
+        summary["completed"].append(slug)
+        summary.update(publish_needed=True, no_progress=False)
+        evidence_path.unlink(missing_ok=True)
+        shutil.rmtree(root / "analyzed" / slug, ignore_errors=True)
+
+    model_pool = analysis_executor_factory()
+    with ThreadPoolExecutor(max_workers=args.workers) as network_pool:
         try:
             while queue or network_jobs or analysis_queue or model_jobs:
                 elapsed = monotonic() - started
@@ -350,7 +405,8 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                     accepting = False
                 if remaining_time <= 0:
                     summary["time_budget_reached"] = True
-                while accepting and queue and len(network_jobs) < args.workers:
+                while (accepting and queue and len(network_jobs) < args.workers
+                       and (deadline is None or monotonic() < deadline)):
                     slug = queue.pop(0)
                     if args.max_commanders and visited_count >= args.max_commanders and slug not in visits:
                         continue
@@ -364,13 +420,17 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                                  metadata_lock=metadata_lock, metadata_provider=repository,
                                                  commander_alias_provider=commander_aliases)
                     network_jobs[future] = (slug, options)
-                while analysis_queue and len(model_jobs) < args.analysis_workers:
+                while (analysis_queue and len(model_jobs) < args.analysis_workers
+                       and (deadline is None or monotonic() < deadline)):
                     slug, evidence_path, options = analysis_queue.pop(0)
+                    (options.output_dir / "result.json").unlink(missing_ok=True)
                     model_jobs[model_pool.submit(analyzer, evidence_path, vars(options))] = (slug, evidence_path)
                 futures = [*network_jobs, *model_jobs]
                 if not futures:
                     break
-                done, _ = wait(futures, timeout=1, return_when=FIRST_COMPLETED)
+                grace_left = remaining_time + summary["worker_grace_seconds"]
+                timeout = min(1, max(0, grace_left)) if model_jobs else 1
+                done, _ = wait(futures, timeout=timeout, return_when=FIRST_COMPLETED)
                 for future in done:
                     slug, context = (network_jobs.pop(future) if future in network_jobs else model_jobs.pop(future))
                     is_collection = isinstance(context, argparse.Namespace)
@@ -430,6 +490,10 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                     # other small frames can still outrank a giant.
                                     queue.append(slug)
                                     queue.sort(key=collection_priority)
+                                elif limiter.budget_expired:
+                                    summary["time_budget_reached"] = True
+                                    record["status"] = "collecting"
+                                    record.pop("retry_after", None)
                                 else:
                                     record.update(status="failed", retry_after=(now() + timedelta(minutes=30)).isoformat())
                             if args.prune_completed_cache:
@@ -437,16 +501,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                 if previews.is_dir() and not previews.is_symlink():
                                     shutil.rmtree(previews)
                         else:
-                            report = json.loads(Path(result["report"]).read_text())
-                            for item in report.get("collection", {}).get("provenance", []):
-                                item.pop("cache_file", None)
-                            atomic_json(args.output_dir / f"{slug}.json", report)
-                            record.update(status=result["status"], analysis_version=result["version"], analyzed_at=now().isoformat())
-                            record["tag_label_policy"] = report.get("tag_label_policy")
-                            summary["completed"].append(slug)
-                            summary.update(publish_needed=True, no_progress=False)
-                            context.unlink(missing_ok=True)
-                            shutil.rmtree(root / "analyzed" / slug, ignore_errors=True)
+                            publish_analysis(slug, context, result)
                     except CommanderBelowMinimum as error:
                         record.update(status="ineligible", observed_total_decks=error.count,
                                       eligibility_checked_at=now().isoformat(),
@@ -462,6 +517,10 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                             summary["publish_needed"] = True
                         if not is_collection:
                             context.unlink(missing_ok=True)
+                    except BudgetExpired:
+                        summary["time_budget_reached"] = True
+                        record.update(status="collecting" if is_collection else "analysis_pending")
+                        record.pop("retry_after", None)
                     except SourceBlocked as error:
                         summary["blocked"] = True
                         limiter.block(str(error))
@@ -475,9 +534,41 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                       retry_after=(now() + timedelta(minutes=30)).isoformat())
                         summary["failures"].append({"commander_slug": slug, "error": str(error)})
                     checkpoint()
-                if not accepting and not network_jobs and not model_jobs and not analysis_queue:
+                if (args.max_runtime_seconds and monotonic() - started
+                        >= args.max_runtime_seconds + summary["worker_grace_seconds"] and model_jobs):
+                    # Inputs were durably saved before submission. A deadline
+                    # is scheduling, not a source failure or a retry cooldown.
+                    for future in model_jobs:
+                        future.cancel()
+                    shutdown_executor(model_pool, terminate=True)
+                    summary["analysis_workers_stopped"] = True
+                    for future, (slug, evidence_path) in model_jobs.items():
+                        receipt = root / "analyzed" / slug / "result.json"
+                        try:
+                            result = future.result() if future.done() and not future.cancelled() else None
+                        except (OSError, ValueError, KeyError, TypeError, RuntimeError, httpx.HTTPError):
+                            result = None  # The forced pool stop breaks unfinished Futures.
+                        try:
+                            result = result or (json.loads(receipt.read_text()) if receipt.exists() else None)
+                            if result is not None:
+                                publish_analysis(slug, evidence_path, result)
+                                continue
+                        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                            # A partial staging report is not a published result.
+                            # Keep its original evidence for the next attempt.
+                            pass
+                        record = state["commanders"][slug]
+                        record.update(status="analysis_pending", analysis_deferred_reason="run_time_budget")
+                        record.pop("retry_after", None)
+                    model_jobs.clear()
+                    checkpoint()
+                if not accepting and not network_jobs and not model_jobs:
                     break
         finally:
+            if not summary["analysis_workers_stopped"]:
+                shutdown_executor(model_pool, terminate=bool(model_jobs))
+            summary["deferred_analyses"] = sorted(slug for slug in rows_by_slug
+                if state["commanders"].get(slug, {}).get("status") == "analysis_pending")
             checkpoint()
     summary["continuation_needed"] = (not summary["blocked"] and not summary["no_progress"]
                                       and not summary.get("resource_limit") and summary["remaining_in_batch"] > 0

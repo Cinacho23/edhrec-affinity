@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from edhrec_affinity.build_styles import card_metadata as metadata
+from edhrec_affinity.build_styles.sources import BudgetExpired
 
 
 HTTPX_CLIENT = httpx.Client
@@ -38,6 +39,28 @@ def seed_cache(path, names, age_days=0):
     checked = (datetime.now(timezone.utc) - timedelta(days=age_days)).isoformat()
     metadata._write_cache(path, {metadata.card_key(name): metadata._metadata(card(name), checked) for name in names})
     return checked
+
+
+def test_metadata_budget_stops_fallback_requests_and_preserves_completed_batches(tmp_path, monkeypatch):
+    ticks, attempts = [0.0], []
+
+    def handler(request):
+        names = [item["name"] for item in json.loads(request.content)["identifiers"]]
+        attempts.append(names)
+        ticks[0] = 2
+        return httpx.Response(200, json={"object": "list", "has_more": False,
+            "data": [card("Forest")], "not_found": [{"name": "Missing"}]})
+
+    mock_client(monkeypatch, handler)
+    cache = tmp_path / "cards.json"
+    repository = metadata.MetadataRepository(cache, deadline=1, monotonic=lambda: ticks[0])
+    with pytest.raises(BudgetExpired):
+        repository.load(["Forest", "Missing"], fetch=True)
+    assert attempts == [["Forest", "Missing"]]
+    assert not repository.blocked
+    found, summary = metadata.MetadataRepository(cache).load(["Forest"])
+    assert found["forest"]["name"] == "Forest"
+    assert summary["cached"] == 1
 
 
 def test_repository_reads_and_indexes_the_shared_cache_once(tmp_path, monkeypatch):

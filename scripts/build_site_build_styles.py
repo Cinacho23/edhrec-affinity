@@ -330,7 +330,9 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--commanders", nargs="+", help="Optional indexed slugs; otherwise choose unsampled commanders by deck count")
     cli.add_argument("--max-commanders", type=int, default=0, help="Optional count limit; 0 processes the entire pending catalog (default)")
     cli.add_argument("--max-runtime-seconds", type=float, default=2700,
-                     help="Stop before starting another commander after this budget; 0 disables the budget (default 2700)")
+                     help="Stop starting collection and analysis at this budget; 0 disables it (default 2700)")
+    cli.add_argument("--worker-grace-seconds", type=float, default=120,
+                     help="Allow running pipeline workers this long after the budget before stopping CPU workers (default 120)")
     cli.add_argument("--min-total-decks", type=int, default=MIN_COMMANDER_DECKS,
                      help="Minimum commander deck count; at least 200 (default 200)")
     cli.add_argument("--sample-decks", type=parse_sample_decks, default=None,
@@ -391,6 +393,7 @@ def main() -> int:
     if (not 1 <= args.max_components <= 32 or args.min_tag_decks < 1 or args.min_total_decks < 0
             or not math.isfinite(args.request_delay) or args.request_delay < 1 or args.refresh_after_days < 1
             or not math.isfinite(args.max_runtime_seconds) or args.max_runtime_seconds < 0
+            or not math.isfinite(args.worker_grace_seconds) or args.worker_grace_seconds < 0
             or not math.isfinite(args.max_preview_seconds) or args.max_preview_seconds <= 0):
         cli.error("Invalid package ceiling, deck minimum, or request delay (minimum one second)")
     if (not 1 <= args.workers <= 32 or not 1 <= args.preview_workers <= 64 or not 1 <= args.analysis_workers <= 16

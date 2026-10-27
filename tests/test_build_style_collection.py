@@ -11,7 +11,7 @@ from scipy import sparse
 from edhrec_affinity.build_styles.__main__ import parser
 from edhrec_affinity.build_styles.analysis import _reconstruction_ratio, analyze_decks
 from edhrec_affinity.build_styles.collection import collect_previews
-from edhrec_affinity.build_styles.sources import SourceBlocked, SourceFormatError
+from edhrec_affinity.build_styles.sources import BudgetExpired, SourceBlocked, SourceFormatError
 
 
 class PreviewCache:
@@ -57,6 +57,28 @@ def test_time_slice_resumes_frozen_frame_and_lists_without_refetch(tmp_path):
     assert "decks.json" not in resumed.calls
     assert len(resumed.provenance) == 12
     assert all(deck["source_bracket"] == 3 for deck in decks)
+
+
+def test_shared_request_budget_retains_previews_without_marking_unavailable(tmp_path):
+    path = tmp_path / "state.gz"
+    cache = PreviewCache(3)
+    original_get = cache.get
+
+    def bounded_get(relative, url, **kwargs):
+        if relative.startswith("previews/") and len(cache.calls) == 2:
+            raise BudgetExpired("run budget")
+        return original_get(relative, url, **kwargs)
+
+    cache.get = bounded_get
+    decks, status = collect_previews(cache, "ghave", limit=None, seed=42, progress_path=path)
+    assert len(decks) == 1
+    assert status["complete"] is False
+    assert status["failures"] == []
+    state = json.loads(gzip.decompress(path.read_bytes()))
+    assert len(state["results"]) == 1
+    assert all("deck" in result for result in state["results"].values())
+    resumed, status = collect_previews(PreviewCache(0), "ghave", limit=None, seed=42, progress_path=path)
+    assert len(resumed) == 3 and status["complete"]
 
 
 @pytest.mark.parametrize("error", [SourceBlocked("challenge"), SourceFormatError("new response format"),

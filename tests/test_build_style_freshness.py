@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from edhrec_affinity.build_styles.collection import collect_previews, deck_dataset_sha256
-from edhrec_affinity.build_styles.sources import Cache, PreviewTransport, RequestLimiter, SourceBlocked, SourceFormatError
+from edhrec_affinity.build_styles.sources import BudgetExpired, Cache, PreviewTransport, RequestLimiter, SourceBlocked, SourceFormatError
 
 
 START = datetime(2026, 10, 21, 12, tzinfo=timezone.utc)
@@ -30,6 +30,25 @@ def fake_limiter():
 def attach_transport(cache, handler):
     cache.client.close()
     cache.client = httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_request_budget_interrupts_pacing_without_learning_a_source_throttle():
+    ticks, waits = [0.0], []
+
+    def sleep(seconds):
+        waits.append(seconds)
+        ticks[0] += seconds
+
+    limiter = RequestLimiter(delay=10, deadline=2, monotonic=lambda: ticks[0], sleep=sleep)
+    limiter.wait()
+    with pytest.raises(BudgetExpired):
+        limiter.wait()
+    assert ticks == [2]
+    assert waits == [0, 2]
+    assert limiter.stats["requests_started"] == 1
+    assert limiter.stats["failures"] == 0
+    assert not limiter.blocked
+    assert limiter.learning_state == {"learned_rate": None, "throttles": 0, "last_throttle": None}
 
 
 def test_cache_ttl_rechecks_source_without_refreshing_offline_observations(tmp_path):
