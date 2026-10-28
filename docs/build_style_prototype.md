@@ -154,15 +154,17 @@ capped at 40 lands and six total basic additions. Sampled duals and fetches can
 upgrade the mana base using color demand and conditional untapped heuristics.
 Price does not enter scoring.
 This is constrained construction from unsupervised evidence, not a separate
-text model. Candidate selection first maximizes distinctive-card coverage and
+text model. Candidate selection prioritizes a successful score-based bracket
+repair when a current exact-list observation requires one, then maximizes distinctive-card coverage and
 learned core weight. Within that tier, a current external rating in the
 72.5–77.5% target takes precedence, then learned package consensus.
 When no candidate in that tier has a
 qualifying external observation, selection uses native mana and role diagnostics
 and keeps the external target explicitly unverified or unmet.
 
-Generation version 2 records core coverage, omission explanations and primer
-references for both the selected model and alternative package counts. The
+Generation version 3 adds score-based bracket repairs to the core coverage,
+omission explanations and primer references recorded by version 2, for both the
+selected model and alternative package counts. The
 collector runs a bounded upgrade after collection for the same current reports
 eligible for Build Discovery. Saved parsed lists and profiles rebuild older
 generated decks without EDHREC requests, refitting NMF or changing source-check
@@ -227,6 +229,42 @@ matched by a hash of all card names and quantities, and marked stale after seven
 days. A changed card list cannot inherit a previous list's rating. The scheduled
 collector does not claim to have run a live external check merely by generating
 the list or its validation link.
+
+Numeric power scores use a centralized policy in `power_brackets.py`: below
+4.7 is Bracket 1; 4.7–<6.7 is Bracket 2; 6.7–<7.7 is Bracket 3;
+7.7–<9.25 is Bracket 4; and 9.25 or above is Bracket 5. The repository owner
+provided these EDHPowerLevel thresholds on October 27, 2026; the official
+[public client script](https://edhpowerlevel.com/js/main-C1lbqCDd.js) was checked
+that day and contains `bracketCurve:[0,4.7,6.7,7.7,9.25,10]`. This is separate
+from the site's reported bracket and its playability percentage. For example,
+6.09 maps to Bracket 2 even if a mass land denial card raises the reported
+bracket to 4. Only a current exact-list observation with an unambiguous numeric
+score may drive score-based deck repairs. Missing scores, ranges and labels
+such as `10+` remain available as observations but do not supply an exact score.
+An exact-list observation may also record `bracket_restrictions`: lists of full
+card names under `game_changers`, `extra_turns` and `mass_land_denial`, and lists
+of groups of at least two distinct card names under `early_combos` and
+`late_combos`. All named cards must belong to the exact checked list. These are
+observed results, not an inferred complete combo search.
+
+When a verified numeric score maps below the deck's restriction-driven bracket,
+the builder attempts replacements from the sampled package pool. It checks
+Game Changer limits, extra turns, mass land denial and any recorded early/late
+two-card combos. Mass land denial detection includes Restore Balance's
+sacrifice-down-to-the-fewest-lands wording. A bounded search breaks prohibited
+combos while preserving the commander, 100-card count, Oracle singleton and
+color legality, land slots, colored sources and essential functional roles.
+Distinctive cards remain priorities; an unavoidable omission explicitly says
+which score/bracket restriction required it. If the restrictions cannot all be
+resolved, the existing list is retained with a blocked explanation.
+
+Each successful repair records the original exact card list and rating, swaps
+and construction checks. The changed list receives only its own exact-list
+external observation; the old score is never transferred. Subsequent rebuilds
+reuse the original scored seed while that observation is current. Once it is
+stale, the builder can retain the unchanged repaired list only after rechecking
+its current pool, metadata, legality and bracket restrictions; it labels the repair
+historical and does not make new score-driven swaps from stale evidence.
 
 Export the lists, primers and per-card inclusion/lift CSVs locally:
 

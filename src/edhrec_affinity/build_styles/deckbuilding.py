@@ -25,7 +25,7 @@ from .sources import card_key, commander_card_alias_groups
 
 ROLES = ("Commander", "Lands", "Fast Mana", "Ramp", "Card Advantage", "Wipe",
          "Removal", "Tutor", "Recursion", "Protection", "Leftover")
-DECK_GENERATION_VERSION = 2
+DECK_GENERATION_VERSION = 3
 _BASIC_COLORS = {"plains": "W", "island": "U", "swamp": "B", "mountain": "R", "forest": "G"}
 _COLOR_NAMES = dict(zip("WUBRG", ("white", "blue", "black", "red", "green")))
 _NUMBER_WORDS = {word: number for number, word in enumerate(
@@ -295,7 +295,8 @@ def _bracket_flags(card):
     extra = bool(re.search(r"take(?:s)? (?:an? |\w+ )?extra turn|take (?:two|three|\d+) turns after", text))
     mass_land = bool(re.search(r"(?:destroy|exile) all [^.\n]*\blands\b", text)
                      or re.search(r"each player sacrifices? (?:all|\d+|half)[^.\n]*lands", text)
-                     or re.search(r"return all [^.\n]*\blands\b[^.\n]*hands", text))
+                     or re.search(r"return all [^.\n]*\blands\b[^.\n]*hands", text)
+                     or re.search(r"each player chooses?[^.\n]*lands?[^.\n]*sacrifices? the rest", text))
     return bool(card.get("game_changer")), extra, mass_land
 
 
@@ -610,6 +611,7 @@ _CORE_REASONS = {
     "color_identity_conflict": "This card is outside the commander's permitted color identity.",
     "essential_role_conflict": "No replacement retained the deck's required ramp, card advantage, and interaction support.",
     "bracket_conflict": "No replacement retained the package's checked bracket restrictions.",
+    "score_bracket_conflict": "Replaced because its checked restrictions forced a higher bracket than the original list's verified power score supports.",
     "mana_base_conflict": "No land replacement retained the mana base's required colored sources.",
     "no_safe_replacement": "No replacement retained the commander, land slots, and higher-priority distinctive cards.",
     "construction_unavailable": "A verified 100-card deck could not be constructed for this package.",
@@ -1017,6 +1019,24 @@ def _generate_one(package, model_decks, source_decks, base, profiles, metadata, 
     if not validation["valid"]:
         return _unavailable("Construction did not pass the final deck checks.",
                             distinctive_cards=_distinctive_coverage(targets, {}, metadata, unavailable=True))
+    result = _assemble_generated_deck(package, counts, prepared, metadata, anchor=anchor,
+        core_swaps=core_swaps, core_failures=core_failures, swaps=swaps,
+        land_changes=land_changes, land_swaps=land_swaps)
+    return _repair_score_bracket(result, package, counts, prepared, profiles, metadata, anchor=anchor,
+        core_swaps=core_swaps, core_failures=core_failures, swaps=swaps,
+        land_changes=land_changes, land_swaps=land_swaps)
+
+
+def _assemble_generated_deck(package, counts, prepared, metadata, *, anchor, core_swaps, core_failures,
+                             swaps, land_changes, land_swaps):
+    """Render all derived fields together so repaired lists never retain stale rows."""
+    commander_keys, pool = prepared["commander_keys"], prepared["pool"]
+    target, bracket_source = prepared["target"], prepared["bracket_source"]
+    colors, support, weights = prepared["colors"], prepared["support"], prepared["weights"]
+    metrics, metric_profiles = prepared["metrics"], prepared["metric_profiles"]
+    targets, package_id = prepared["distinctive_targets"], prepared["package_id"]
+    color_choices = prepared["commander_color_choices"] or None
+    validation = _validate(counts, commander_keys, metadata, pool, commander_color_choices=color_choices)
     bracket = _bracket_validation(counts, metadata, target, bracket_source)
     distinctive = _distinctive_coverage(targets, counts, metadata, core_failures)
     rows = []
@@ -1058,11 +1078,376 @@ def _generate_one(package, model_decks, source_decks, base, profiles, metadata, 
     if color_choices:
         validation.update(commander_color_choices=deepcopy(color_choices),
                           effective_color_identity=[color for color in "WUBRG" if color in colors])
-    return {"status": "generated", "generation_version": DECK_GENERATION_VERSION, "distinctive_cards": distinctive,
+    result = {"status": "generated", "generation_version": DECK_GENERATION_VERSION, "distinctive_cards": distinctive,
             "name": name, "commanders": commander_rows, "cards": rows,
             "card_count": sum(counts.values()), "export_text": export,
             "primer": _primer(name, commander_rows, rows, package, statistics, bracket, distinctive, color_choices),
             "validation": validation, "statistics": statistics}
+
+    return result
+
+
+def _bracket_excess(counts, target):
+    limits = (0 if target <= 2 else 3 if target == 3 else None,
+              0 if target < 4 else None, 0 if target < 4 else None,
+              0 if target < 4 else None, 0 if target < 3 else None)
+    return tuple(max(0, value - limit) if limit is not None else 0
+                 for value, limit in zip(counts, limits))
+
+
+_SCORE_RESTRICTION_NAMES = ("game_changers", "extra_turns", "mass_land_denial", "early_combos", "late_combos")
+
+
+def _observed_bracket_restrictions(rating, metadata):
+    """Use only named restrictions observed for this exact external card list."""
+    observed = rating.get("bracket_restrictions", {})
+    canonical = lambda name: card_key(metadata.get(card_key(name), {}).get("name", name))
+    return {name: ({canonical(card) for card in observed.get(name, [])} if index < 3 else
+                   [frozenset(canonical(card) for card in group) for group in observed.get(name, [])])
+            for index, name in enumerate(_SCORE_RESTRICTION_NAMES)}
+
+
+def _score_restriction_counts(counts, metadata, restrictions):
+    values = [0, 0, 0]
+    for key, quantity in counts.items():
+        for index, flag in enumerate(_bracket_flags(metadata[key])):
+            values[index] += quantity * (flag or key in restrictions[_SCORE_RESTRICTION_NAMES[index]])
+    return (*values, *[sum(group <= counts.keys() for group in restrictions[name])
+                       for name in _SCORE_RESTRICTION_NAMES[3:]])
+
+
+def _score_restriction_checks(counts, target):
+    return {name: not excess for name, excess in zip(_SCORE_RESTRICTION_NAMES, _bracket_excess(counts, target))}
+
+
+def _strict_bracket_replacements(counts, prepared, metadata, target, restrictions):
+    """Bounded search for a complete repair, never an incremental partial fix.
+
+    Each edge removes at least one excess restriction and introduces none.
+    Whole-list role and mana floors remain those of the original generated list.
+    A small beam can explore alternative Game Changer omissions and substitutes
+    without an unbounded combination search over a large observed card pool.
+    """
+    commanders, colors = prepared["commander_keys"], prepared["colors"]
+    targets, support = prepared["distinctive_targets"], prepared["support"]
+    color_choices = prepared["commander_color_choices"] or None
+    initial_roles = Counter(role for key, quantity in counts.items() if key not in commanders
+                            for role in functional_tags(metadata[key]) for _ in range(quantity))
+    role_floors = {role: min(initial_roles[role], floor) for role, floor in _CORE_ROLE_FLOORS.items()}
+    initial_mana = _mana_diagnostics(counts, metadata, commanders, color_choices)
+    source_floors = {color: min(value, initial_mana["colored_source_targets"][color])
+                     for color, value in initial_mana["colored_land_sources"].items()}
+    incoming_pool = [key for key in prepared["pool"] if _complete_metadata(metadata.get(key))
+                     and metadata[key]["legalities"].get("commander") == "legal"
+                     and set(metadata[key]["color_identity"]) <= colors and key not in commanders
+                     and (not _is_land(metadata[key]) or all(color in colors for land, color in _BASIC_COLORS.items()
+                          if land in metadata[key]["type_line"].casefold().split()))]
+    incoming_pool.sort(key=lambda key: (-support.get(key, 0), key))
+    initial_core = _distinctive_score(targets, counts, metadata)
+    core_counts = Counter(row.get("identity") for row in targets)
+    core_weights = Counter()
+    for row in targets:
+        core_weights[row.get("identity")] += row["weight"]
+    card_flags = {key: tuple(flag or key in restrictions[name] for flag, name in
+                            zip(_bracket_flags(metadata[key]), _SCORE_RESTRICTION_NAMES))
+                  for key in set(incoming_pool) | counts.keys()}
+    beam = [(counts.copy(), [], 0.0)]
+    seen = {tuple(sorted(counts.items()))}
+    for _ in range(sum(counts.values()) - len(commanders)):
+        following = []
+        for current, swaps, shape_cost in beam:
+            current_flags = _score_restriction_counts(current, metadata, restrictions)
+            excess = _bracket_excess(current_flags, target)
+            if not any(excess):
+                return current, swaps
+            identities = Counter(_metadata_identity(metadata[key]) for key in current for _ in range(current[key]))
+            current_core = _distinctive_score(targets, current, metadata)
+            roles = Counter(role for key, quantity in current.items() if key not in commanders
+                            for role in functional_tags(metadata[key]) for _ in range(quantity))
+            for outgoing in sorted(current):
+                if outgoing in commanders:
+                    continue
+                old = metadata[outgoing]
+                without = current.copy()
+                without[outgoing] -= 1
+                if not without[outgoing]:
+                    del without[outgoing]
+                if sum(_bracket_excess(_score_restriction_counts(without, metadata, restrictions), target)) >= sum(excess):
+                    continue
+                old_roles = set(functional_tags(old))
+                local = []
+                for incoming in incoming_pool:
+                    card = metadata[incoming]
+                    if outgoing == incoming or _is_land(card) != _is_land(old):
+                        continue
+                    identity = _metadata_identity(card)
+                    if identities[identity] - (_metadata_identity(old) == identity) >= _copy_limit(card):
+                        continue
+                    incoming_roles = set(functional_tags(card))
+                    if any(roles[role] - (role in old_roles) + (role in incoming_roles) < floor
+                           for role, floor in role_floors.items()):
+                        continue
+                    candidate = current.copy()
+                    candidate[outgoing] -= 1
+                    if not candidate[outgoing]:
+                        del candidate[outgoing]
+                    candidate[incoming] += 1
+                    next_flags = (*[value - old + new for value, old, new in
+                                    zip(current_flags[:3], card_flags[outgoing], card_flags[incoming])],
+                                  *[sum(group <= candidate.keys() for group in restrictions[name])
+                                    for name in _SCORE_RESTRICTION_NAMES[3:]])
+                    next_excess = _bracket_excess(next_flags, target)
+                    if (sum(next_excess) >= sum(excess)
+                            or any(after > before for before, after in zip(excess, next_excess))):
+                        continue
+                    identity_counts = tuple(sorted(candidate.items()))
+                    if identity_counts in seen:
+                        continue
+                    if _is_land(old):
+                        mana = _mana_diagnostics(candidate, metadata, commanders, color_choices)
+                        if any(mana["colored_land_sources"].get(color, 0) < floor for color, floor in source_floors.items()):
+                            continue
+                    outgoing_identity = _metadata_identity(old)
+                    lost = outgoing_identity != identity and identities[outgoing_identity] == 1
+                    gained = outgoing_identity != identity and identities[identity] == 0
+                    core = (current_core[0] - lost * core_counts[outgoing_identity] + gained * core_counts[identity],
+                            current_core[1] - lost * core_weights[outgoing_identity] + gained * core_weights[identity])
+                    distance = (len(old_roles ^ incoming_roles) + (_type_bucket(old) != _type_bucket(card))
+                                + abs(_curve_bucket(old) - _curve_bucket(card)))
+                    rank = (initial_core[0] - core[0], initial_core[1] - core[1], sum(next_excess),
+                            shape_cost + distance, -support.get(incoming, 0), incoming)
+                    removed_restrictions = [name for name, before, after in zip(
+                        _SCORE_RESTRICTION_NAMES, excess, next_excess) if after < before]
+                    swap = {"out": old["name"], "in": card["name"], "reason": "score_bracket_repair",
+                            "restrictions": removed_restrictions}
+                    local.append((rank, candidate, [*swaps, swap], shape_cost + distance, identity_counts))
+                for row in sorted(local, key=lambda row: row[0])[:4]:
+                    following.append(row)
+        if not following:
+            return None
+        following.sort(key=lambda row: row[0])
+        completed = [row for row in following if all(_score_restriction_checks(
+            _score_restriction_counts(row[1], metadata, restrictions), target).values())]
+        if completed:
+            _, repaired, swaps, _, _ = min(completed, key=lambda row: row[0])
+            return repaired, swaps
+        beam = []
+        for _, candidate, swaps, shape_cost, identity_counts in following:
+            if identity_counts in seen:
+                continue
+            seen.add(identity_counts)
+            beam.append((candidate, swaps, shape_cost))
+            if len(beam) == 8:
+                break
+    return None
+
+
+def _score_target_context(prepared, profiles, metadata, target, source):
+    metric_profiles = [profile for profile in profiles if
+                       (profile.get("tag_slug") in prepared["suggested"] and profile.get("bracket") is None)
+                       or profile.get("bracket") == target]
+    return {**prepared, "target": target, "bracket_source": source, "metric_profiles": metric_profiles,
+            "metrics": {key: _profile_metrics(key, metric_profiles, metadata) for key in prepared["pool"]}}
+
+
+def _repair_score_bracket(option, package, counts, prepared, profiles, metadata, *, anchor,
+                          core_swaps, core_failures, swaps, land_changes, land_swaps):
+    from .external_validation import attach_external_validation, cardlist_hash
+    from .power_brackets import verified_score_bracket
+
+    rating = attach_external_validation(option)
+    score_target = verified_score_bracket(rating)
+    current_bracket = max(rating.get("bracket", 0), option["validation"]["bracket"]["recommended"])
+    if score_target is None or score_target >= current_bracket:
+        return option
+    repair = {"status": "blocked", "from_deck_sha256": cardlist_hash(option["cards"]),
+              "from_power_level": rating["power_level"], "from_bracket": current_bracket,
+              "score_bracket": score_target, "checked_at": rating["checked_at"],
+              "source": rating["source"], "source_url": rating["source_url"], "swap_details": [],
+              "from_cards": [{"name": row["name"], "quantity": row["quantity"]} for row in option["cards"]]}
+    restrictions = _observed_bracket_restrictions(rating, metadata)
+    flags = _score_restriction_counts(counts, metadata, restrictions)
+    repair["observed_restrictions"] = deepcopy(rating.get("bracket_restrictions", {}))
+    repair["original_rule_checks"] = _score_restriction_checks(flags, score_target)
+    if not any(_bracket_excess(flags, score_target)):
+        repair["reason"] = "The external bracket is higher than the score, but no excess checked card restriction identifies a safe card to remove."
+        option["statistics"]["score_bracket_repair"] = repair
+        option["primer"] += "\n\nScore and bracket review\n" + repair["reason"]
+        return option
+    outcome = _strict_bracket_replacements(counts, prepared, metadata, score_target, restrictions)
+    if outcome is None:
+        repair["reason"] = "No complete in-pool replacement retained the commander, 100-card legality, land slots, colored mana sources and required support roles while meeting the score bracket's checked restrictions."
+        option["statistics"]["score_bracket_repair"] = repair
+        option["primer"] += "\n\nScore and bracket review\n" + repair["reason"]
+        return option
+    repaired_counts, repair_swaps = outcome
+    repaired_prepared = _score_target_context(prepared, profiles, metadata, score_target, "verified_power_score_repair")
+    removed_identities = {_metadata_identity(metadata[card_key(row["out"])]) for row in repair_swaps
+                          if card_key(row["out"]) not in repaired_counts}
+    failures = {**core_failures, **{identity: "score_bracket_conflict" for identity in removed_identities}}
+    repaired = _assemble_generated_deck(package, repaired_counts, repaired_prepared, metadata,
+        anchor=anchor, core_swaps=core_swaps, core_failures=failures, swaps=swaps,
+        land_changes=land_changes, land_swaps=land_swaps)
+    repaired_flags = _score_restriction_counts(repaired_counts, metadata, restrictions)
+    strict_checks = _score_restriction_checks(repaired_flags, score_target)
+    repaired["validation"]["bracket"]["rule_checks"].update(strict_checks)
+    repaired["validation"]["bracket"].update(
+        game_changer_count=repaired_flags[0], extra_turn_count=repaired_flags[1], mass_land_denial_count=repaired_flags[2],
+        extra_turns_present=repaired_flags[1] > 0, mass_land_denial_present=repaired_flags[2] > 0,
+        observed_early_combo_count=repaired_flags[3], observed_late_combo_count=repaired_flags[4])
+    if (not repaired["validation"]["valid"]
+            or not all(repaired["validation"]["bracket"]["rule_checks"].values())):
+        raise RuntimeError("Score bracket repair did not pass its final strict checks")
+    repair.update(status="repaired", swap_details=repair_swaps, rule_checks=strict_checks,
+                  note="The original exact-list power score selected the construction target. Replacements change the card list; the new score and bracket require a separate external check.")
+    repaired["statistics"]["score_bracket_repair"] = repair
+    repaired["validation"]["bracket"]["notes"].append(repair["note"])
+    repaired["primer"] += "\n\nScore and bracket adjustment\n" + repair["note"]
+    for swap in repair_swaps:
+        repaired["primer"] += f"\nReplaced [[{swap['out']}]] with [[{swap['in']}]] to remove {', '.join(swap['restrictions']).replace('_', ' ')}."
+    attach_external_validation(repaired)
+    return repaired
+
+
+def _successful_score_repair(option):
+    return option.get("statistics", {}).get("score_bracket_repair", {}).get("status") in {"repaired", "retained"}
+
+
+def _score_repair_priority(option):
+    if _successful_score_repair(option):
+        return 0
+    repair = option.get("statistics", {}).get("score_bracket_repair", {})
+    return 1 if repair.get("retention_blocked") else 2
+
+
+def _repair_existing_package_deck(existing, package, memberships, decks, base, profiles, metadata, context):
+    """Repair a rated old list, or retain a still-legal previously applied fix.
+
+    A detector or source refresh can change anchors before an old rated hash is
+    regenerated. Preserve that exact-list evidence, and never undo a completed
+    repair merely because its original observation has since expired.
+    """
+    if not isinstance(existing, dict) or existing.get("status") != "generated":
+        return None
+    from .external_validation import attach_external_validation, cardlist_hash
+    from .power_brackets import bracket_for_power_score, verified_score_bracket
+
+    current = deepcopy(existing)
+    current_rating = attach_external_validation(current)
+    history = deepcopy(current.get("statistics", {}).get("score_bracket_repair", {}))
+    successful_history = history.get("status") in {"repaired", "retained"}
+    seed = deepcopy(current)
+    original_cards = history.get("from_cards")
+    if original_cards is not None:
+        try:
+            if cardlist_hash(original_cards) != history.get("from_deck_sha256"):
+                return None
+        except (ValueError, TypeError):
+            return None
+        seed["cards"] = deepcopy(original_cards)
+        seed["card_count"] = sum(row["quantity"] for row in original_cards)
+    original_rating = attach_external_validation(seed)
+    current_target, original_target = verified_score_bracket(current_rating), verified_score_bracket(original_rating)
+    if current_target is not None:
+        seed = current
+    elif original_target is None:
+        if not successful_history or bracket_for_power_score(history.get("from_power_level")) != history.get("score_bracket"):
+            return None
+        seed = current
+    prepared = context.get("prepared")
+    if prepared is None:
+        prepared = _prepare_package(package, memberships, decks, base, profiles, metadata,
+            _source_context=context.get("source_context"))
+        context["prepared"] = prepared
+    if prepared.get("status") == "unavailable":
+        return None
+    prepared.setdefault("distinctive_targets", _distinctive_targets(package, prepared, metadata))
+
+    def counts_for(value):
+        result = Counter()
+        for row in value.get("cards", []):
+            card = metadata.get(card_key(row.get("name", "")))
+            quantity = row.get("quantity", 1)
+            if card is None or isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
+                return None
+            result[card_key(card["name"])] += quantity
+        return result if _validate(result, prepared["commander_keys"], metadata, prepared["pool"],
+            commander_color_choices=prepared["commander_color_choices"] or None)["valid"] else None
+
+    counts = counts_for(seed)
+    if counts is None:
+        return None
+    anchor_id = seed.get("statistics", {}).get("anchor_deck_id")
+    anchor = next((row for row in prepared["anchors"] if row["id"] == anchor_id), None)
+    if anchor is None:
+        return None
+    statistics = seed.get("statistics", {})
+    old_swaps = deepcopy(statistics.get("swap_details", []))
+    core_swaps = [row for row in old_swaps if row.get("reason") == "distinctive_core"]
+    failures = {target.get("identity"): row["reason_code"] for target in prepared["distinctive_targets"]
+                for row in seed.get("distinctive_cards", {}).get("omitted", [])
+                if target["name"] == row.get("name") and row.get("reason_code") in _CORE_REASONS}
+    seed.get("statistics", {}).pop("score_bracket_repair", None)
+    seed.setdefault("validation", {})["bracket"] = _bracket_validation(
+        counts, metadata, prepared["target"], prepared["bracket_source"])
+    if current_target is not None or original_target is not None:
+        result = _repair_score_bracket(seed, package, counts, prepared, profiles, metadata, anchor=anchor,
+            core_swaps=core_swaps, core_failures=failures, swaps=old_swaps,
+            land_changes=statistics.get("land_adjustments", []), land_swaps=statistics.get("land_swaps", []))
+        if "score_bracket_repair" in result.get("statistics", {}):
+            # A fresh current check that agrees with its numeric bracket can
+            # still supersede an unnecessarily high old source-anchor target.
+            if not (successful_history and current_target is not None
+                    and current_rating.get("bracket", 0) <= current_target
+                    and result["statistics"]["score_bracket_repair"].get("status") == "blocked"):
+                return result
+        if not successful_history or current_target is None:
+            return None
+    # This branch makes no new card swaps from an expired score. It retains the
+    # existing applied construction only when today's metadata and pool pass.
+    target = current_target if current_target is not None else history["score_bracket"]
+    counts = counts_for(current)
+    if counts is None:
+        return None
+    observations = deepcopy(current_rating if current_target is not None else history)
+    observations["bracket_restrictions"] = (current_rating.get("bracket_restrictions", {})
+        if current_target is not None else history.get("observed_restrictions", {}))
+    restrictions = _observed_bracket_restrictions(observations, metadata)
+    flags = _score_restriction_counts(counts, metadata, restrictions)
+    checks = _score_restriction_checks(flags, target)
+    if not all(checks.values()):
+        # Preserve honest guidance when changed metadata invalidates an old fix.
+        current["validation"]["bracket"] = _bracket_validation(
+            counts, metadata, target, "previous_score_bracket_repair")
+        current["validation"]["bracket"]["rule_checks"].update(checks)
+        current["validation"]["bracket"].update(
+            recommended=max(target, 4), game_changer_count=flags[0], extra_turn_count=flags[1],
+            mass_land_denial_count=flags[2], extra_turns_present=flags[1] > 0, mass_land_denial_present=flags[2] > 0,
+            observed_early_combo_count=flags[3], observed_late_combo_count=flags[4])
+        current["statistics"].update(target_bracket=target, recommended_bracket=max(target, 4))
+        current["statistics"]["score_bracket_repair"] = {**history, "status": "blocked", "rule_checks": checks,
+            "retention_blocked": True,
+            "reason": "Current checked restrictions no longer allow the previous score-bracket repair to be retained. A new exact-list external check and complete repair are required."}
+        return current
+    retained_context = _score_target_context(prepared, profiles, metadata, target, "previous_score_bracket_repair")
+    retained = _assemble_generated_deck(package, counts, retained_context, metadata, anchor=anchor,
+        core_swaps=core_swaps, core_failures=failures, swaps=old_swaps,
+        land_changes=statistics.get("land_adjustments", []), land_swaps=statistics.get("land_swaps", []))
+    retained["validation"]["bracket"]["rule_checks"].update(checks)
+    retained["validation"]["bracket"].update(
+        game_changer_count=flags[0], extra_turn_count=flags[1], mass_land_denial_count=flags[2],
+        extra_turns_present=flags[1] > 0, mass_land_denial_present=flags[2] > 0,
+        observed_early_combo_count=flags[3], observed_late_combo_count=flags[4])
+    note = ("Retained the already-applied score/bracket adjustment after checking its unchanged card list against current metadata and sampled cards. "
+            "The original score is historical evidence; it is not a current rating of this list.")
+    retained["statistics"]["score_bracket_repair"] = {**history, "status": "retained", "rule_checks": checks,
+        "original_rating_status": original_rating.get("status", "unverified"), "note": note}
+    retained["validation"]["bracket"]["notes"].append(note)
+    retained["primer"] += "\n\nRetained score and bracket adjustment\n" + note
+    for swap in history.get("swap_details", []):
+        retained["primer"] += f"\nPreviously replaced [[{swap['out']}]] with [[{swap['in']}]]."
+    attach_external_validation(retained)
+    return retained
 
 
 def _generate_package_decks(analysis, decks, base, profiles, card_metadata=None, *, prefer_playability=False,
@@ -1088,7 +1473,11 @@ def _generate_package_decks(analysis, decks, base, profiles, card_metadata=None,
                         tuple((row.get("id"), tuple(row.get("weights", []))) for row in memberships))
             if identity not in cache:
                 context = {"source_context": source_context}
+                seed = _repair_existing_package_deck(package.get("generated_deck"), package, memberships,
+                    decks, base, profiles, metadata, context)
                 cache[identity] = _generate_one(package, memberships, decks, base, profiles, metadata, _context=context)
+                if seed is not None and _score_repair_priority(seed) < 2:
+                    cache[identity] = seed
                 if prefer_playability and cache[identity].get("status") == "generated":
                     candidates = generate_package_deck_candidates(analysis, decks, base, profiles, card_metadata,
                                      package_id=package.get("id", 0), components=components, max_candidates=8,
@@ -1109,7 +1498,7 @@ def _all_packages(analysis):
 
 
 def _native_preference(option):
-    return (*(-value for value in _core_preference(option)),
+    return (_score_repair_priority(option), *(-value for value in _core_preference(option)),
             option["statistics"]["mana_quality"]["structural_risk_score"],
             -option["statistics"]["anchor_membership"], -option["statistics"]["weighted_consensus_score"])
 
@@ -1160,8 +1549,15 @@ def _prefer_playability(options):
     unique = {}
     for option in options:
         if option.get("status") == "generated":
-            unique.setdefault(cardlist_hash(option["cards"]), option)
+            identity = cardlist_hash(option["cards"])
+            if identity not in unique or _successful_score_repair(option) and not _successful_score_repair(unique[identity]):
+                unique[identity] = option
     options = list(unique.values())
+    # A measured bracket mismatch takes precedence over restoring an offending
+    # distinctive card through an unmeasured alternate observed anchor.
+    repair_priority = min(_score_repair_priority(option) for option in options)
+    if repair_priority < 2:
+        options = [option for option in options if _score_repair_priority(option) == repair_priority]
     strongest_core = max(_core_preference(option) for option in options)
     options = [option for option in options if _core_preference(option) == strongest_core]
     verified = []
@@ -1172,11 +1568,15 @@ def _prefer_playability(options):
     if verified:
         chosen = max(verified, key=lambda option: (option["statistics"]["weighted_consensus_score"],
                          option["statistics"]["anchor_membership"], -option["statistics"]["mana_quality"]["structural_risk_score"]))
-        reason = "Prioritized distinctive-card coverage, then selected an exact card list with a current externally observed 72.5–77.5% playability rating; preferred learned package consensus among qualifying candidates."
+        reason = ("Prioritized resolving the observed score/bracket mismatch, with explained distinctive-card exceptions. "
+                  if _successful_score_repair(chosen) else "Prioritized distinctive-card coverage. ")
+        reason += "Selected an exact card list with a current externally observed 72.5–77.5% playability rating; preferred learned package consensus among qualifying candidates."
     else:
         chosen = min(options, key=lambda option: (option["statistics"]["mana_quality"]["structural_risk_score"],
                          -option["statistics"]["anchor_membership"], -option["statistics"]["weighted_consensus_score"]))
-        reason = "Prioritized distinctive-card coverage. No qualifying candidate has a current externally observed rating in the 72.5–77.5% target; selected native mana/role structure, not a verified playability percentage."
+        reason = ("Prioritized resolving the observed score/bracket mismatch, with explained distinctive-card exceptions. "
+                  if _successful_score_repair(chosen) else "Prioritized distinctive-card coverage. ")
+        reason += "No qualifying candidate has a current externally observed rating in the 72.5–77.5% target; selected native mana/role structure, not a verified playability percentage."
     chosen["statistics"]["selection_reason"] = reason
     chosen["statistics"]["selection_candidate_count"] = len(options)
     return chosen
@@ -1286,7 +1686,7 @@ def _generate_package_deck_candidates(analysis, decks, base, profiles, card_meta
             if option["status"] == "generated" and identity not in seen:
                 candidates.append(option)
                 seen.add(identity)
-    candidates.sort(key=lambda option: (*(-value for value in _core_preference(option)),
+    candidates.sort(key=lambda option: (_score_repair_priority(option), *(-value for value in _core_preference(option)),
                                        option["statistics"]["mana_quality"]["structural_risk_score"],
                                        -option["statistics"]["anchor_membership"],
                                        -option["statistics"]["weighted_consensus_score"], option["statistics"]["anchor_deck_id"]))

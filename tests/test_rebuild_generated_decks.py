@@ -113,7 +113,7 @@ def test_rebuild_all_models_keeps_learned_inputs_and_invalidates_changed_list_ra
     assert result["collection"] == report["collection"]
     assert result["profiles"] == report["profiles"]
     assert rebuild.learned_analysis(result["deck_analysis"]) == rebuild.learned_analysis(report["deck_analysis"])
-    assert result["deck_generation"]["version"] == 2
+    assert result["deck_generation"]["version"] == rebuild.GENERATION_VERSION
     assert result["deck_generation"]["refitted"] is False
     assert len(summary["packages"]) == 2
     assert all(package["before"]["omitted_count"] == 1 for package in summary["packages"])
@@ -178,7 +178,7 @@ def test_rebuild_writes_atomic_report_backup_and_complete_audit_summary(tmp_path
     assert summary["distinctive_omissions_before"] == 2
     assert summary["distinctive_omissions_after"] == 0
     assert Path(summary["reports"][0]["backup"]).read_bytes() == original
-    assert rebuild.read_json(root / "commander.json")["deck_generation"]["version"] == 2
+    assert rebuild.read_json(root / "commander.json")["deck_generation"]["version"] == rebuild.GENERATION_VERSION
     assert rebuild.read_json(root / "_collection/deck-rebuild-summary.json")["completed_at"]
     assert not list(root.rglob("*.tmp"))
     again = rebuild.rebuild_all(root, cache, only_outdated=True)
@@ -320,7 +320,7 @@ def test_bounded_metadata_prefetch_completes_then_commits_offline_worker_output(
     generated = rebuild.read_json(root / "commander.json")
     assert generated["collection"] == report["collection"]
     assert rebuild.learned_analysis(generated["deck_analysis"]) == rebuild.learned_analysis(report["deck_analysis"])
-    assert generated["deck_generation"]["version"] == 2
+    assert generated["deck_generation"]["version"] == rebuild.GENERATION_VERSION
 
 
 def test_below_threshold_and_insufficient_reports_are_not_pending(tmp_path):
@@ -441,7 +441,7 @@ def test_prefetch_deadline_is_checked_between_small_paced_batches(tmp_path, monk
 def test_current_version_with_failed_freshness_remains_retryable(tmp_path):
     report, inputs, cache = fixture(tmp_path)
     root = tmp_path / "build-styles"
-    report["deck_generation"]["version"] = 2
+    report["deck_generation"]["version"] = rebuild.GENERATION_VERSION
     for _, package in rebuild.packages(report):
         package["generated_deck"]["validation"]["checks"] = {"metadata_fresh": False}
     save_evidence(root, report, inputs)

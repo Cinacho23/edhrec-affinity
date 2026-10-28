@@ -3,8 +3,25 @@ import test from "node:test";
 
 import {
   formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildCollectionProgress, getBuildModel, getBuildModelOptions, getBuildSourceFreshness, getBuildThemeEvidence, getComparableProfilePairs,
-  getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckColorChoices, getGeneratedDeckDistinctiveCards, getGeneratedDeckExport, getGeneratedDeckGroups, getPackageBracketLabel, getSupportedThemes, hasBuildStylePopulation, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
+  getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckBracketRepair, getGeneratedDeckColorChoices, getGeneratedDeckDistinctiveCards, getGeneratedDeckExport, getGeneratedDeckGroups, getPackageBracketLabel, getSupportedThemes, hasBuildStylePopulation, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
 } from "./buildStyleUtils.js";
+
+test("bracket repair displays the prior score separately from the changed list's rating", () => {
+  const deck = { status: "generated", validation: { external_rating: { status: "unverified" } },
+    statistics: { score_bracket_repair: { status: "repaired", from_power_level: "6.09", from_bracket: 4,
+      score_bracket: 2, swap_details: [{ out: "Restore Balance", in: "Replacement" }] } } };
+  assert.deepEqual(getGeneratedDeckBracketRepair(deck), { status: "repaired", targetBracket: 2,
+    previousBracket: 4, previousPower: "6.09", swaps: [{ out: "Restore Balance", in: "Replacement" }], reason: null });
+  assert.equal(getExternalDeckRating(deck.validation.external_rating), null);
+  deck.statistics.score_bracket_repair.status = "retained";
+  assert.equal(getGeneratedDeckBracketRepair(deck).status, "retained");
+  deck.statistics.score_bracket_repair.status = "blocked";
+  deck.statistics.score_bracket_repair.reason = "The commander itself has the restriction.";
+  assert.equal(getGeneratedDeckBracketRepair(deck).reason, "The commander itself has the restriction.");
+  for (const value of [undefined, {}, { status: "repaired", score_bracket: 8 }]) {
+    assert.equal(getGeneratedDeckBracketRepair({ status: "generated", statistics: { score_bracket_repair: value } }), null);
+  }
+});
 
 test("discovery lists only explicitly approved current collector reports", () => {
   const commanders = [

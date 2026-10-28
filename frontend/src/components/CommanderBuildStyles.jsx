@@ -14,6 +14,7 @@ import {
   getComparableProfilePairs,
   getDeckMixtureRows,
   getExternalDeckRating,
+  getGeneratedDeckBracketRepair,
   getGeneratedDeckColorChoices,
   getGeneratedDeckDistinctiveCards,
   getGeneratedDeckExport,
@@ -98,6 +99,7 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
   const exportText = getGeneratedDeckExport(deck);
   const primer = typeof deck.primer === "string" ? deck.primer : "";
   const distinctiveCards = getGeneratedDeckDistinctiveCards(deck);
+  const bracketRepair = getGeneratedDeckBracketRepair(deck);
   const colorChoices = getGeneratedDeckColorChoices(deck);
   async function copyText(text, label) {
     try {
@@ -129,6 +131,18 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
         {primer ? <button type="button" onClick={() => copyText(primer, "Primer")}>Copy primer</button> : null}
       </div>
       {validation.external_url ? <p className="build-source-links"><SourceLink url={validation.external_url}>Check on EDHPowerLevel</SourceLink></p> : null}
+      {bracketRepair ? <div className="build-generated-deck__review-note">
+        <p><strong>Score-based bracket adjustment{bracketRepair.status === "blocked" ? " needs review" : ""}.</strong>{bracketRepair.previousPower !== null
+          ? ` The original list scored ${bracketRepair.previousPower}, corresponding to Bracket ${bracketRepair.targetBracket}.`
+          : ` The original score corresponds to Bracket ${bracketRepair.targetBracket}.`}</p>
+        {bracketRepair.status !== "blocked" ? <>
+          <p>Cards that raised the bracket were replaced. {bracketRepair.status === "retained"
+            ? "These replacements were retained from an earlier repair; the original score is historical. " : ""}{externalRating?.status === "verified"
+            ? "The updated list’s own EDHPowerLevel result appears below."
+            : "The updated list needs its own current EDHPowerLevel check."}</p>
+          <ul>{bracketRepair.swaps.map((swap, index) => <li key={index}><DeckCardName name={swap.out} /> → <DeckCardName name={swap.in} /></li>)}</ul>
+        </> : <p>{bracketRepair.reason || "The available sampled cards could not resolve every bracket restriction while preserving deck construction requirements."}</p>}
+      </div> : null}
       <ExternalDeckRating rating={validation.external_rating} />
       <p className="build-generated-deck__copy-status" role="status" aria-live="polite">{copyStatus}</p>
       <p className="build-note">Paste the card list into Moxfield’s text import. Commander markers are included.</p>
