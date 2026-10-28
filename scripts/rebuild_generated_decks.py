@@ -19,6 +19,7 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, TimeoutErro
 from copy import deepcopy
 from datetime import datetime, timezone
 import gzip
+import hashlib
 import importlib.util
 import json
 import math
@@ -34,7 +35,12 @@ from edhrec_affinity.build_styles.card_metadata import (
 from edhrec_affinity.build_styles.collection import deck_dataset_sha256
 from edhrec_affinity.build_styles.deckbuilding import DECK_GENERATION_VERSION, generate_package_decks
 from edhrec_affinity.build_styles.eligibility import commander_is_eligible
-from edhrec_affinity.build_styles.external_validation import attach_external_validation, cardlist_hash
+from edhrec_affinity.build_styles.external_validation import (
+    attach_external_validation, cardlist_hash, external_validation_directory,
+)
+from edhrec_affinity.build_styles.power_brackets import (
+    POWER_SCORE_BRACKET_POLICY_VERSION, verified_score_bracket,
+)
 from edhrec_affinity.build_styles.pipeline import shutdown_executor
 from edhrec_affinity.build_styles.sources import (
     CommanderAliasCatalog, card_key, checked_identifier, commander_card_alias_groups,
@@ -90,17 +96,56 @@ def packages(report: dict):
             yield f"{model.get('components')}-packages", package
 
 
-def needs_rebuild(report: dict) -> bool:
-    """A stale failed upgrade must remain retryable rather than becoming current."""
+def score_repair_observations(report: dict, validation_directory: Path | None = None) -> list[dict]:
+    """Identify new repair work from canonical current exact-list observations.
+
+    Saved reports can contain an old ``verified`` label. Reload each rating so
+    an expired, replaced or invalid observation never triggers a fresh repair.
+    Only a small identity record is retained, bounded by the report's packages.
+    """
+    observations = []
+    for model, package in packages(report):
+        deck = package.get("generated_deck", {})
+        if deck.get("status") != "generated":
+            continue
+        checked_deck = {"cards": deck.get("cards")}
+        if "card_count" in deck:
+            checked_deck["card_count"] = deck["card_count"]
+        rating = attach_external_validation(checked_deck, validation_directory) if validation_directory is not None else attach_external_validation(checked_deck)
+        target = verified_score_bracket(rating)
+        native_bracket = deck.get("validation", {}).get("bracket", {}).get("recommended", 0)
+        native_bracket = native_bracket if type(native_bracket) is int and 1 <= native_bracket <= 5 else 0
+        current_bracket = max(rating.get("bracket", 0), native_bracket)
+        if target is None or target >= current_bracket:
+            continue
+        evidence = {key: rating[key] for key in
+                    ("deck_sha256", "checked_at", "power_level", "bracket", "score_bracket")}
+        evidence.update(bracket_restrictions=rating.get("bracket_restrictions", {}),
+                        native_bracket=native_bracket, policy_version=POWER_SCORE_BRACKET_POLICY_VERSION)
+        fingerprint = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False,
+                                                allow_nan=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+        observations.append({"model": model, "package_id": package.get("id"),
+                             "deck_sha256": rating["deck_sha256"], "observation_sha256": fingerprint,
+                             "policy_version": POWER_SCORE_BRACKET_POLICY_VERSION})
+    return observations
+
+
+def needs_rebuild(report: dict, *, validation_directory: Path | None = None) -> bool:
+    """Retry old generations, failed metadata or a newly checked score mismatch."""
     analysis = report.get("deck_analysis", {})
     if not (commander_is_eligible(report.get("total_edhrec_decks"))
             and analysis.get("status") == "fitted" and analysis.get("packages")):
         return False
     if report.get("deck_generation", {}).get("version", 0) < GENERATION_VERSION:
         return True
-    return any(package.get("generated_deck", {}).get("status") == "generated"
-               and package["generated_deck"].get("validation", {}).get("checks", {}).get("metadata_fresh") is False
-               for _, package in packages(report))
+    if any(package.get("generated_deck", {}).get("status") == "generated"
+           and package["generated_deck"].get("validation", {}).get("checks", {}).get("metadata_fresh") is False
+           for _, package in packages(report)):
+        return True
+    handled = report.get("deck_generation", {}).get("score_repair_observations", [])
+    if not isinstance(handled, list):
+        handled = []
+    return any(observation not in handled for observation in score_repair_observations(report, validation_directory))
 
 
 def current_discovery_slugs(root: Path, reports: dict[str, dict]) -> set[str]:
@@ -291,9 +336,11 @@ def rebuild_report(report: dict, inputs: dict, repository: MetadataRepository, *
     observed_by_name = {card_key(name): observed for name, observed in ages}
     observed_by_name.update({card_key(metadata[card_key(name)]["name"]): observed for name, observed in ages})
     output = deepcopy(report)
+    attempted_observations = score_repair_observations(report, validation_directory)
     before = {(model, package["id"]): package for model, package in packages(report)}
-    generate_package_decks(output["deck_analysis"], decks, base, inputs["profiles"], metadata,
-                           prefer_playability=prefer_playability)
+    with external_validation_directory(validation_directory):
+        generate_package_decks(output["deck_analysis"], decks, base, inputs["profiles"], metadata,
+                               prefer_playability=prefer_playability)
     summaries = []
     seen = set()
     for model, package in packages(output):
@@ -332,10 +379,17 @@ def rebuild_report(report: dict, inputs: dict, repository: MetadataRepository, *
         raise RebuildBlocked("Deck generation unexpectedly changed learned package fields")
     unavailable = any(package.get("generated_deck", {}).get("status") != "generated" for _, package in packages(output))
     generation = output.setdefault("deck_generation", {})
+    # A blocked attempt is a completed review of that exact observation. New
+    # timestamps, scores, restrictions or policy still request another pass.
+    # Replacing rather than accumulating this list keeps the audit bounded.
+    for observation in score_repair_observations(output, validation_directory):
+        if observation not in attempted_observations:
+            attempted_observations.append(observation)
     generation.update(version=GENERATION_VERSION, status=("partial" if summary["missing"] else "unavailable")
                       if unavailable else "complete", metadata=summary,
                       rebuilt_at=rebuilt_at or now.isoformat(), refitted=False,
-                      input_dataset_sha256=inputs["dataset_sha256"], input_source=inputs["source"])
+                      input_dataset_sha256=inputs["dataset_sha256"], input_source=inputs["source"],
+                      score_repair_observations=attempted_observations)
     return output, {"commander_slug": report["commander_slug"], "status": "rebuilt", "packages": summaries,
                     "metadata_missing": summary["missing"], "metadata_stale": summary["stale_cached"]}
 
@@ -347,7 +401,8 @@ def initialize_worker(root: str, cache: str, max_age_days: float) -> None:
 
 
 def prefetch_metadata(root: Path, paths: list[Path], repository: MetadataRepository, summary: dict, *,
-                      only_outdated: bool, time_remains, checkpoint) -> None:
+                      only_outdated: bool, time_remains, checkpoint,
+                      validation_directory: Path | None = None) -> None:
     """Warm one shared cache in the parent, never competing worker HTTP streams.
 
     Names are deduplicated across reports, including unresolved names, so an
@@ -373,7 +428,7 @@ def prefetch_metadata(root: Path, paths: list[Path], repository: MetadataReposit
             if (not commander_is_eligible(report.get("total_edhrec_decks"))
                     or report.get("deck_analysis", {}).get("status") != "fitted"
                     or not report.get("deck_analysis", {}).get("packages")
-                    or only_outdated and not needs_rebuild(report)):
+                    or only_outdated and not needs_rebuild(report, validation_directory=validation_directory)):
                 continue
             inputs = load_inputs(root, report, aliases)
             names.update({card_key(name): name for name in requested_metadata_names(report, inputs)})
@@ -451,11 +506,12 @@ def process_report(job: dict) -> dict:
         if (report.get("deck_analysis", {}).get("status") != "fitted"
                 or not report.get("deck_analysis", {}).get("packages")):
             return {"commander_slug": slug, "status": "skipped", "reason": "no_fitted_packages"}
-        if job.get("only_outdated") and not needs_rebuild(report):
+        validation_directory = Path(job["validation_directory"]) if job.get("validation_directory") else None
+        if job.get("only_outdated") and not needs_rebuild(report, validation_directory=validation_directory):
             return {"commander_slug": slug, "status": "skipped", "reason": "already_current_generation"}
         inputs = load_inputs(root, report, _worker_aliases)
         rebuilt, result = rebuild_report(report, inputs, _worker_repository,
-            validation_directory=Path(job["validation_directory"]) if job.get("validation_directory") else None,
+            validation_directory=validation_directory,
             prefer_playability=job["prefer_playability"], rebuilt_at=job["rebuilt_at"])
         result["input_dataset_sha256"] = inputs["dataset_sha256"]
         result["source_analysis_generated_at"] = report.get("generated_at")
@@ -489,7 +545,8 @@ def prefetch_metadata_job(job: dict) -> dict:
 
     prefetch_metadata(Path(job["root"]), [Path(path) for path in job["paths"]],
                       MetadataRepository(job["cache"], max_age_days=job["max_age_days"]), summary,
-                      only_outdated=job["only_outdated"], time_remains=time_remains, checkpoint=checkpoint)
+                      only_outdated=job["only_outdated"], time_remains=time_remains, checkpoint=checkpoint,
+                      validation_directory=Path(job["validation_directory"]) if job.get("validation_directory") else None)
     return summary["metadata_prefetch"]
 
 
@@ -547,7 +604,7 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
     for path in paths:
         try:
             report = read_json(path)
-            if (needs_rebuild(report) or not only_outdated and commander_is_eligible(report.get("total_edhrec_decks"))
+            if (needs_rebuild(report, validation_directory=validation_directory) or not only_outdated and commander_is_eligible(report.get("total_edhrec_decks"))
                     and report.get("deck_analysis", {}).get("status") == "fitted"
                     and report.get("deck_analysis", {}).get("packages")):
                 pending.add(path.stem)
@@ -602,6 +659,7 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
                 future = pool.submit(prefetch_metadata_job, {
                     "root": str(root), "paths": [str(path) for path in paths], "cache": str(cache),
                     "max_age_days": max_age_days, "summary": summary, "summary_path": str(summary_path),
+                    "validation_directory": str(validation_directory) if validation_directory is not None else None,
                     "only_outdated": only_outdated, "deadline": started + max_runtime_seconds})
                 try:
                     summary["metadata_prefetch"] = future.result(timeout=remaining_seconds())
@@ -619,7 +677,8 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
         elif not max_runtime_seconds:
             repository = MetadataRepository(cache, max_age_days=max_age_days)
             prefetch_metadata(root, paths, repository, summary, only_outdated=only_outdated,
-                              time_remains=time_remains, checkpoint=checkpoint)
+                              time_remains=time_remains, checkpoint=checkpoint,
+                              validation_directory=validation_directory)
     if workers == 1 and not max_runtime_seconds:
         initialize_worker(str(root), str(cache), max_age_days)
         for job in jobs:

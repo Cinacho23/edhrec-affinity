@@ -7,7 +7,7 @@ import json
 import pytest
 
 from edhrec_affinity.build_styles.external_validation import (
-    attach_external_validation, cardlist_hash, record_external_validation,
+    attach_external_validation, cardlist_hash, external_validation_directory, record_external_validation,
 )
 from edhrec_affinity.build_styles.power_brackets import verified_score_bracket
 
@@ -59,6 +59,25 @@ def test_records_exact_observations_and_reattaches_after_reload(tmp_path):
     assert "status" not in stored
     assert attach_external_validation(deck(), tmp_path) == rating
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_scoped_rating_directory_is_nested_and_restored_even_on_failure(tmp_path):
+    first, second, empty = [tmp_path / name for name in ("first", "second", "empty")]
+    record_external_validation(deck(), observations(power_level=6.1, bracket=2), first)
+    record_external_validation(deck(), observations(power_level=7.1, bracket=3), second)
+    with external_validation_directory(first):
+        assert attach_external_validation(deck())["power_level"] == 6.1
+        assert attach_external_validation(deck(), second)["power_level"] == 7.1
+        with pytest.raises(RuntimeError):
+            with external_validation_directory(second):
+                assert attach_external_validation(deck())["power_level"] == 7.1
+                raise RuntimeError("interrupted rebuild")
+        with external_validation_directory(None):
+            assert attach_external_validation(deck())["power_level"] == 6.1
+        with external_validation_directory(empty):
+            assert attach_external_validation(deck())["status"] == "unverified"
+        assert attach_external_validation(deck())["power_level"] == 6.1
+    assert attach_external_validation(deck())["status"] == "unverified"
 
 
 def test_old_record_is_stale_with_score_and_original_timestamp_preserved(tmp_path):
