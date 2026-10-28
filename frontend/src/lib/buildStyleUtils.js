@@ -221,6 +221,25 @@ export function getGeneratedDeckDistinctiveCards(deck) {
   };
 }
 
+export function getGeneratedDeckBracketRepair(deck) {
+  const repair = deck?.statistics?.score_bracket_repair;
+  if (deck?.status !== "generated" || !["repaired", "retained", "blocked"].includes(repair?.status)
+      || !Number.isInteger(repair.score_bracket) || repair.score_bracket < 1 || repair.score_bracket > 5) return null;
+  const swaps = (Array.isArray(repair.swap_details) ? repair.swap_details : [])
+    .filter((swap) => typeof swap?.out === "string" && swap.out.trim()
+      && typeof swap?.in === "string" && swap.in.trim());
+  return {
+    status: repair.status,
+    targetBracket: repair.score_bracket,
+    previousBracket: Number.isInteger(repair.from_bracket) ? repair.from_bracket : null,
+    previousPower: typeof repair.from_power_level === "number" && Number.isFinite(repair.from_power_level)
+      || typeof repair.from_power_level === "string" && repair.from_power_level.trim()
+      ? String(repair.from_power_level) : null,
+    swaps,
+    reason: typeof repair.reason === "string" && repair.reason.trim() ? repair.reason : null,
+  };
+}
+
 export function getGeneratedDeckColorChoices(deck) {
   const names = { W: "White", U: "Blue", B: "Black", R: "Red", G: "Green" };
   const choices = deck?.validation?.commander_color_choices;

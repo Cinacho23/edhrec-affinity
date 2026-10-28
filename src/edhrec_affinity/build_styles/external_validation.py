@@ -17,6 +17,7 @@ import tempfile
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
+from .power_brackets import bracket_for_power_score
 from .sources import card_key
 
 
@@ -70,7 +71,43 @@ def _strict_json(contents: str) -> Any:
     return value
 
 
-def _check_record(record: Any, sha256: str, count: int) -> dict:
+def _check_bracket_restrictions(value: Any, deck_names: set[str]) -> dict:
+    """Validate optional observed restrictions against the exact checked list."""
+    single_keys = {"game_changers", "extra_turns", "mass_land_denial"}
+    combo_keys = {"early_combos", "late_combos"}
+    if not isinstance(value, dict) or set(value) - single_keys - combo_keys:
+        raise ValueError("Invalid external bracket restriction categories")
+
+    def names(items: Any, *, combo: bool = False) -> list[str]:
+        if not isinstance(items, list):
+            raise ValueError("External bracket restrictions must list full card names")
+        cleaned, seen = [], set()
+        for name in items:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("External bracket restrictions must list full card names")
+            key = card_key(name)
+            if key not in deck_names:
+                raise ValueError("External bracket restriction names a card outside the checked list")
+            if key in seen:
+                raise ValueError("External bracket restriction contains duplicate card names")
+            seen.add(key)
+            cleaned.append(name.strip())
+        if combo and len(cleaned) < 2:
+            raise ValueError("External combo restrictions need at least two distinct cards")
+        return cleaned
+
+    result = {}
+    for key, entries in value.items():
+        if key in single_keys:
+            result[key] = names(entries)
+        else:
+            if not isinstance(entries, list):
+                raise ValueError("External combo restrictions must list card groups")
+            result[key] = [names(group, combo=True) for group in entries]
+    return result
+
+
+def _check_record(record: Any, sha256: str, count: int, deck_names: set[str]) -> dict:
     if not isinstance(record, dict) or type(record.get("schema_version")) is not int or record["schema_version"] != 1:
         raise ValueError("Unrecognized external validation record")
     if record.get("deck_sha256") != sha256:
@@ -114,6 +151,14 @@ def _check_record(record: Any, sha256: str, count: int) -> dict:
         elif isinstance(power, bool) or not isinstance(power, (int, float)) or not math.isfinite(power):
             raise ValueError("Invalid external power level")
         result["power_level"] = power
+        # Preserve the site's reported bracket separately: card restrictions
+        # can raise it above the numeric score's bracket. Always derive this
+        # field again rather than trusting a value supplied in the record.
+        score_bracket = bracket_for_power_score(power)
+        if score_bracket is not None:
+            result["score_bracket"] = score_bracket
+    if "bracket_restrictions" in record:
+        result["bracket_restrictions"] = _check_bracket_restrictions(record["bracket_restrictions"], deck_names)
     result["status"] = "stale" if now - checked >= timedelta(days=VALIDATION_MAX_AGE_DAYS) else "verified"
     return result
 
@@ -127,7 +172,8 @@ def attach_external_validation(
         sha256, count = _deck_identity(deck)
         path = Path(directory) / f"{sha256}.json"
         if path.exists():
-            rating = _check_record(_strict_json(path.read_text(encoding="utf-8")), sha256, count)
+            rating = _check_record(_strict_json(path.read_text(encoding="utf-8")), sha256, count,
+                                   set(_card_counts(deck["cards"])))
     except (ValueError, TypeError, OSError) as error:
         rating["reason"] = str(error)
     deck.setdefault("validation", {})["external_rating"] = rating
@@ -146,7 +192,7 @@ def record_external_validation(
         raise ValueError("Expected external validation observations")
     sha256, count = _deck_identity(deck)
     record = {"schema_version": 1, "deck_sha256": sha256, **values}
-    checked = _check_record(record, sha256, count)
+    checked = _check_record(record, sha256, count, set(_card_counts(deck["cards"])))
     stored = {key: value for key, value in checked.items() if key != "status"}
     destination = Path(directory) / f"{sha256}.json"
     destination.parent.mkdir(parents=True, exist_ok=True)

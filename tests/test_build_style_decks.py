@@ -7,7 +7,7 @@ import re
 import pytest
 
 from edhrec_affinity.build_styles.deckbuilding import (
-    functional_tags, generate_package_deck_candidates, generate_package_decks,
+    DECK_GENERATION_VERSION, functional_tags, generate_package_deck_candidates, generate_package_decks,
 )
 from edhrec_affinity.build_styles.sources import card_key, enrich_commander_name_groups
 
@@ -648,7 +648,7 @@ def test_all_twelve_distinctive_cards_are_inserted_despite_lower_consensus_and_d
     result = generate(data)
     names = {card["name"] for card in result["cards"]}
     assert {card["name"] for card in distinctive} <= names
-    assert result["generation_version"] == data[0]["deck_generation"]["version"] == 2
+    assert result["generation_version"] == data[0]["deck_generation"]["version"] == DECK_GENERATION_VERSION
     assert result["statistics"]["anchor_deck_id"] == "a"
     assert result["statistics"]["distinctive_swaps"] == 12
     assert result["distinctive_cards"] == {"total": 12, "included_count": 12, "coverage": 1,
@@ -805,7 +805,7 @@ def test_zero_core_and_unavailable_packages_have_honest_versioned_coverage():
     data = fixture()
     del data[4]["commander"]
     result = generate(data)
-    assert result["generation_version"] == 2 and result["status"] == "unavailable"
+    assert result["generation_version"] == DECK_GENERATION_VERSION and result["status"] == "unavailable"
     assert result["distinctive_cards"]["total"] == 1 and result["distinctive_cards"]["included_count"] == 0
     assert result["distinctive_cards"]["omitted"][0]["reason_code"] == "construction_unavailable"
 
@@ -1162,3 +1162,316 @@ def test_identical_lists_keep_the_best_native_color_choice_before_external_ratin
         assert result["validation"]["commander_color_choices"][0]["color"] in {"U", "G"}
         assert result["validation"]["effective_color_identity"] == ["U", "G"]
         assert "W" not in result["statistics"]["mana_quality"]["colored_source_targets"]
+
+
+_RESTORE_BALANCE_TEXT = ("Each player chooses a number of lands they control equal to the number of lands controlled "
+                         "by the player who controls the fewest, then sacrifices the rest. Players sacrifice creatures "
+                         "and discard cards the same way.")
+
+
+def score_repair_fixture():
+    data = fixture()
+    for deck in data[1]:
+        deck["source_bracket"] = 4
+        for card in deck["cards"]:
+            if card["name"] == "Core 0":
+                card["name"] = "Restore Balance"
+    del data[4]["core 0"]
+    data[4]["restore balance"] = metadata_card("Restore Balance", types="Sorcery", text=_RESTORE_BALANCE_TEXT)
+    for package in [*data[0]["packages"], *data[0]["alternative_models"][0]["packages"]]:
+        package["top_cards"] = [{"name": "Restore Balance"}]
+    return data
+
+
+def attach_score_record(data, monkeypatch, directory, *, power=6.09, bracket=4, days=0, **values):
+    from edhrec_affinity.build_styles import external_validation
+
+    original = generate(deepcopy(data))
+    external_validation.record_external_validation(original, {
+        "source": "edhpowerlevel.com", "source_url": original["validation"]["external_url"],
+        "card_count": 100, "checked_at": (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
+        "playability_pct": 75, "bracket": bracket, "power_level": power, **values,
+    }, directory)
+    real_attach = external_validation.attach_external_validation
+    monkeypatch.setattr(external_validation, "attach_external_validation", lambda deck: real_attach(deck, directory))
+    return original
+
+
+def test_restore_balance_land_sacrifice_text_is_mass_land_denial():
+    from edhrec_affinity.build_styles.deckbuilding import _bracket_flags
+
+    assert _bracket_flags(metadata_card("Restore Balance", text=_RESTORE_BALANCE_TEXT)) == (False, False, True)
+    assert _bracket_flags(metadata_card("Fair Land", text="Sacrifice this land: Search your library for a basic land card.")) == (False, False, False)
+
+
+def test_verified_power_score_repairs_distinctive_restore_balance_without_inheriting_old_rating(monkeypatch, tmp_path):
+    from edhrec_affinity.build_styles.external_validation import cardlist_hash
+
+    data = score_repair_fixture()
+    original = attach_score_record(data, monkeypatch, tmp_path)
+    result = generate(data)
+    repair = result["statistics"]["score_bracket_repair"]
+    assert repair["status"] == "repaired"
+    assert repair["from_power_level"] == 6.09 and repair["score_bracket"] == 2
+    assert repair["from_deck_sha256"] == cardlist_hash(original["cards"])
+    assert cardlist_hash(result["cards"]) != cardlist_hash(original["cards"])
+    assert "Restore Balance" not in {row["name"] for row in result["cards"]}
+    assert repair["swap_details"][0]["out"] == "Restore Balance"
+    assert repair["swap_details"][0]["restrictions"] == ["mass_land_denial"]
+    assert result["validation"]["external_rating"]["status"] == "unverified"
+    assert "power_level" not in result["validation"]["external_rating"]
+    assert result["card_count"] == 100 and result["validation"]["valid"]
+    assert result["statistics"]["land_count"] == original["statistics"]["land_count"]
+    assert result["validation"]["bracket"]["target"] == result["validation"]["bracket"]["recommended"] == 2
+    assert all(result["validation"]["bracket"]["rule_checks"].values())
+    assert result["distinctive_cards"]["omitted"][0]["reason_code"] == "score_bracket_conflict"
+    assert "[[Restore Balance]]" in result["primer"]
+    assert "Replaced [[Restore Balance]]" in result["primer"]
+    assert "Restore Balance" not in result["export_text"]
+    pool = {row["name"] for deck in data[1] for row in deck["cards"]} | {"Commander"}
+    assert {row["name"] for row in result["cards"]} <= pool
+    assert "bracket-3" not in result["statistics"]["profile_slugs"]
+
+
+@pytest.mark.parametrize("mode", ["stale", "missing_power", "unparseable_power", "changed_list", "already_matched"])
+def test_bracket_repair_requires_a_current_exact_list_numeric_score(monkeypatch, tmp_path, mode):
+    from edhrec_affinity.build_styles import external_validation
+
+    data = score_repair_fixture()
+    original = generate(deepcopy(data))
+    values = {"source": "edhpowerlevel.com", "source_url": original["validation"]["external_url"],
+              "card_count": 100, "checked_at": (datetime.now(timezone.utc) - timedelta(days=8 if mode == "stale" else 0)).isoformat(),
+              "playability_pct": 75, "bracket": 4}
+    if mode != "missing_power":
+        values["power_level"] = {"unparseable_power": "6 or 8", "already_matched": 8.2}.get(mode, 6.09)
+    external_validation.record_external_validation(original, values, tmp_path)
+    if mode == "changed_list":
+        for deck in data[1]:
+            deck["cards"][1]["name"] = "Changed Core"
+        data[4]["changed core"] = metadata_card("Changed Core")
+    real_attach = external_validation.attach_external_validation
+    monkeypatch.setattr(external_validation, "attach_external_validation", lambda deck: real_attach(deck, tmp_path))
+    result = generate(data)
+    assert "score_bracket_repair" not in result["statistics"]
+    assert "Restore Balance" in {row["name"] for row in result["cards"]}
+
+
+def test_score_repair_removes_multiple_restrictions_and_preserves_support_roles(monkeypatch, tmp_path):
+    data = score_repair_fixture()
+    data[4]["core 1"]["game_changer"] = True
+    data[4]["core 2"]["oracle_text"] = "Take an extra turn after this one."
+    data[4]["core 3"]["oracle_text"] = "Draw three cards."
+    data[4]["variant b"]["oracle_text"] = "Draw two cards."
+    data[4]["core 2"]["oracle_text"] += " Draw three cards."
+    attach_score_record(data, monkeypatch, tmp_path)
+    result = generate(data)
+    assert result["statistics"]["score_bracket_repair"]["status"] == "repaired"
+    assert len(result["statistics"]["score_bracket_repair"]["swap_details"]) == 3
+    assert result["validation"]["bracket"]["game_changer_count"] == 0
+    assert result["validation"]["bracket"]["extra_turn_count"] == 0
+    assert result["validation"]["bracket"]["mass_land_denial_count"] == 0
+    role_count = sum(row["quantity"] for row in result["cards"] if row["primary_role"] == "Card Advantage")
+    assert role_count >= 2
+
+
+def test_score_repair_prefers_non_distinctive_excess_game_changer_at_bracket_three(monkeypatch, tmp_path):
+    data = fixture()
+    data[0]["packages"][0]["top_cards"] = [{"name": "Core 0"}, {"name": "Core 1"}, {"name": "Core 2"}]
+    for index in range(4):
+        data[4][f"core {index}"]["game_changer"] = True
+    attach_score_record(data, monkeypatch, tmp_path, power=7.0)
+    result = generate(data)
+    assert result["statistics"]["score_bracket_repair"]["status"] == "repaired"
+    assert result["statistics"]["score_bracket_repair"]["swap_details"][0]["out"] == "Core 3"
+    assert result["distinctive_cards"]["included_count"] == 3
+    assert result["validation"]["bracket"]["recommended"] == 3
+    assert result["validation"]["bracket"]["game_changer_count"] == 3
+
+
+@pytest.mark.parametrize("blocker", ["commander", "support_floor", "unknown_external"])
+def test_impossible_score_repairs_are_explicit_and_never_commit_a_partial_list(monkeypatch, tmp_path, blocker):
+    data = score_repair_fixture() if blocker != "unknown_external" else fixture()
+    if blocker == "commander":
+        data[4]["commander"]["oracle_text"] = "Destroy all lands."
+    elif blocker == "support_floor":
+        data[4]["restore balance"]["oracle_text"] += " Draw three cards."
+    original = attach_score_record(data, monkeypatch, tmp_path)
+    result = generate(data)
+    assert result["statistics"]["score_bracket_repair"]["status"] == "blocked"
+    assert result["statistics"]["score_bracket_repair"]["swap_details"] == []
+    assert result["cards"] == original["cards"]
+    assert result["validation"]["external_rating"]["status"] == "verified"
+    assert result["validation"]["bracket"]["recommended"] == original["validation"]["bracket"]["recommended"]
+
+
+def test_playability_preference_keeps_repaired_core_exception_over_unscored_offending_alternates(monkeypatch, tmp_path):
+    data = score_repair_fixture()
+    attach_score_record(data, monkeypatch, tmp_path)
+    generate_package_decks(*data, prefer_playability=True)
+    chosen = data[0]["packages"][0]["generated_deck"]
+    assert chosen["statistics"]["score_bracket_repair"]["status"] == "repaired"
+    assert "Restore Balance" not in {row["name"] for row in chosen["cards"]}
+    assert chosen["validation"]["bracket"]["recommended"] == 2
+
+
+@pytest.mark.parametrize(("power", "target", "late_retained"), [(6.09, 2, False), (7.0, 3, True)])
+def test_observed_exact_list_combos_are_broken_only_when_disallowed_in_score_bracket(monkeypatch, tmp_path, power, target, late_retained):
+    data = score_repair_fixture()
+    add_observed_core(data, [metadata_card(f"Fair Replacement {index}") for index in range(6)], include_in_package=False)
+    evidence = {"game_changers": ["Core 1"], "extra_turns": ["Core 2"], "mass_land_denial": ["Restore Balance"],
+                "early_combos": [["Core 4", "Core 5"]], "late_combos": [["Core 6", "Core 7"]]}
+    attach_score_record(data, monkeypatch, tmp_path, power=power, bracket_restrictions=evidence)
+    result = generate(data)
+    names = {row["name"] for row in result["cards"]}
+    repair = result["statistics"]["score_bracket_repair"]
+    assert repair["status"] == "repaired"
+    assert result["validation"]["bracket"]["recommended"] == target
+    assert not {"Core 4", "Core 5"} <= names
+    assert ({"Core 6", "Core 7"} <= names) == late_retained
+    assert "Core 2" not in names and "Restore Balance" not in names
+    assert ("Core 1" in names) == (target == 3)
+    assert all(repair["rule_checks"].values())
+    assert repair["observed_restrictions"] == evidence
+    assert result["validation"]["bracket"]["observed_early_combo_count"] == 0
+    assert result["validation"]["bracket"]["observed_late_combo_count"] == late_retained
+    assert result["validation"]["external_rating"]["status"] == "unverified"
+
+
+def test_overlapping_observed_combos_can_share_one_replacement_without_reinsertion(monkeypatch, tmp_path):
+    data = fixture()
+    evidence = {"early_combos": [["Core 0", "Core 1"], ["Core 1", "Core 2"]]}
+    attach_score_record(data, monkeypatch, tmp_path, bracket_restrictions=evidence)
+    result = generate(data)
+    repair = result["statistics"]["score_bracket_repair"]
+    assert repair["status"] == "repaired" and len(repair["swap_details"]) == 1
+    assert repair["swap_details"][0]["out"] == "Core 1"
+    assert result["distinctive_cards"]["included_count"] == 1
+    assert result["validation"]["bracket"]["observed_early_combo_count"] == 0
+
+
+
+def test_rated_existing_deck_is_a_repair_seed_when_current_anchor_selection_changes(monkeypatch, tmp_path):
+    from edhrec_affinity.build_styles.external_validation import cardlist_hash
+
+    data = score_repair_fixture()
+    original = attach_score_record(data, monkeypatch, tmp_path)
+    original_hash = cardlist_hash(original["cards"])
+    for row in data[0]["decks"]:
+        row["memberships"] = [.1 if row["id"] == "a" else 1.0]
+    for row in data[0]["alternative_models"][0]["memberships"]:
+        row["weights"] = [.1 if row["id"] == "a" else 1.0]
+    data[4]["new anchor card"] = metadata_card("New Anchor Card", types="Artifact")
+    for deck in data[1][1:]:
+        next(row for row in deck["cards"] if row["name"] == "Core 1")["name"] = "New Anchor Card"
+    fresh = generate(deepcopy(data))
+    assert cardlist_hash(fresh["cards"]) != original_hash
+    assert "score_bracket_repair" not in fresh["statistics"]
+    for package in [*data[0]["packages"], *data[0]["alternative_models"][0]["packages"]]:
+        package["generated_deck"] = deepcopy(original)
+    generate_package_decks(*data, prefer_playability=True)
+    chosen = data[0]["packages"][0]["generated_deck"]
+    assert chosen["statistics"]["score_bracket_repair"]["status"] == "repaired"
+    assert chosen["statistics"]["score_bracket_repair"]["from_deck_sha256"] == original_hash
+    assert chosen["validation"]["bracket"]["recommended"] == 2
+    assert "Restore Balance" not in {row["name"] for row in chosen["cards"]}
+
+
+def test_existing_rated_deck_seed_cannot_use_cards_outside_current_observed_pool(monkeypatch, tmp_path):
+    data = score_repair_fixture()
+    original = attach_score_record(data, monkeypatch, tmp_path)
+    for deck in data[1]:
+        for row in deck["cards"]:
+            if row["name"] == "Restore Balance":
+                row["name"] = "Core 0"
+    data[4]["core 0"] = metadata_card("Core 0")
+    data[0]["packages"][0]["generated_deck"] = original
+    chosen = generate(data)
+    assert "score_bracket_repair" not in chosen["statistics"]
+    assert "Restore Balance" not in {row["name"] for row in chosen["cards"]}
+
+
+
+def test_successful_score_repair_is_reproducible_on_repeated_full_regeneration(monkeypatch, tmp_path):
+    from edhrec_affinity.build_styles.external_validation import cardlist_hash
+
+    data = score_repair_fixture()
+    original = attach_score_record(data, monkeypatch, tmp_path)
+    first = generate(data)
+    assert first["statistics"]["score_bracket_repair"]["from_cards"] == [
+        {"name": row["name"], "quantity": row["quantity"]} for row in original["cards"]]
+    first_hash = cardlist_hash(first["cards"])
+    second = generate(data)
+    assert cardlist_hash(second["cards"]) == first_hash
+    assert second["statistics"]["score_bracket_repair"]["status"] == "repaired"
+    assert second["validation"]["external_rating"]["status"] == "unverified"
+    assert "Restore Balance" not in second["export_text"]
+
+
+def test_expired_source_score_retains_an_already_applied_legal_repair_without_new_swaps(monkeypatch, tmp_path):
+    from edhrec_affinity.build_styles import external_validation
+
+    data = score_repair_fixture()
+    original = attach_score_record(data, monkeypatch, tmp_path)
+    first = generate(data)
+    first_hash = external_validation.cardlist_hash(first["cards"])
+    old_swaps = deepcopy(first["statistics"]["score_bracket_repair"]["swap_details"])
+    external_validation.record_external_validation(original, {
+        "source": "edhpowerlevel.com", "source_url": original["validation"]["external_url"], "card_count": 100,
+        "checked_at": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat(),
+        "playability_pct": 75, "power_level": 6.09, "bracket": 4,
+    }, tmp_path)
+    generate_package_decks(*data, prefer_playability=True)
+    retained = data[0]["packages"][0]["generated_deck"]
+    assert external_validation.cardlist_hash(retained["cards"]) == first_hash
+    assert retained["statistics"]["score_bracket_repair"]["status"] == "retained"
+    assert retained["statistics"]["score_bracket_repair"]["swap_details"] == old_swaps
+    assert retained["statistics"]["score_bracket_repair"]["original_rating_status"] == "stale"
+    assert retained["validation"]["external_rating"]["status"] == "unverified"
+    assert retained["validation"]["bracket"]["recommended"] == 2
+    assert "historical evidence" in retained["primer"]
+    assert "Restore Balance" not in retained["export_text"]
+
+
+def test_fresh_matching_check_of_repaired_list_is_retained_over_old_anchor_bracket(monkeypatch, tmp_path):
+    from edhrec_affinity.build_styles import external_validation
+
+    data = score_repair_fixture()
+    attach_score_record(data, monkeypatch, tmp_path)
+    first = generate(data)
+    external_validation.record_external_validation(first, {
+        "source": "edhpowerlevel.com", "source_url": first["validation"]["external_url"], "card_count": 100,
+        "checked_at": datetime.now(timezone.utc).isoformat(), "playability_pct": 75, "power_level": 6.0, "bracket": 2,
+    }, tmp_path)
+    second = generate(data)
+    assert second["cards"] == first["cards"]
+    assert second["statistics"]["score_bracket_repair"]["status"] == "retained"
+    assert second["validation"]["bracket"]["recommended"] == 2
+    assert second["validation"]["external_rating"]["status"] == "verified"
+    assert second["validation"]["external_rating"]["power_level"] == 6.0
+
+
+
+def test_new_metadata_cannot_use_an_expired_score_to_make_further_swaps_or_restore_removed_cards(monkeypatch, tmp_path):
+    from edhrec_affinity.build_styles import external_validation
+
+    data = score_repair_fixture()
+    original = attach_score_record(data, monkeypatch, tmp_path)
+    first = generate(data)
+    first_hash = external_validation.cardlist_hash(first["cards"])
+    replacement = first["statistics"]["score_bracket_repair"]["swap_details"][0]["in"]
+    external_validation.record_external_validation(original, {
+        "source": "edhpowerlevel.com", "source_url": original["validation"]["external_url"], "card_count": 100,
+        "checked_at": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat(),
+        "playability_pct": 75, "power_level": 6.09, "bracket": 4,
+    }, tmp_path)
+    data[4][card_key(replacement)]["game_changer"] = True
+    generate_package_decks(*data, prefer_playability=True)
+    reviewed = data[0]["packages"][0]["generated_deck"]
+    assert external_validation.cardlist_hash(reviewed["cards"]) == first_hash
+    assert reviewed["statistics"]["score_bracket_repair"]["status"] == "blocked"
+    assert reviewed["statistics"]["score_bracket_repair"]["retention_blocked"]
+    assert not reviewed["validation"]["bracket"]["rule_checks"]["game_changers"]
+    assert reviewed["validation"]["bracket"]["recommended"] == 4
+    assert reviewed["statistics"]["recommended_bracket"] == 4
+    assert "Restore Balance" not in reviewed["export_text"]
+    assert reviewed["validation"]["external_rating"]["status"] == "unverified"

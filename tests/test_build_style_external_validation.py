@@ -9,6 +9,7 @@ import pytest
 from edhrec_affinity.build_styles.external_validation import (
     attach_external_validation, cardlist_hash, record_external_validation,
 )
+from edhrec_affinity.build_styles.power_brackets import verified_score_bracket
 
 
 def deck():
@@ -67,6 +68,97 @@ def test_old_record_is_stale_with_score_and_original_timestamp_preserved(tmp_pat
     assert rating["status"] == "stale"
     assert rating["checked_at"] == checked_at
     assert rating["playability_pct"] == 74.5
+
+
+def test_numeric_score_bracket_is_derived_without_overwriting_reported_bracket(tmp_path):
+    rating = record_external_validation(deck(), observations(power_level="6.09", bracket=4,
+                                                            score_bracket=5), tmp_path)
+    assert rating["power_level"] == "6.09"
+    assert rating["bracket"] == 4
+    assert rating["score_bracket"] == 2
+    assert verified_score_bracket(rating) == 2
+    assert attach_external_validation(deck(), tmp_path) == rating
+
+
+def test_stale_numeric_score_is_displayable_but_cannot_drive_repairs(tmp_path):
+    checked_at = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+    rating = record_external_validation(deck(), observations(checked_at=checked_at,
+                                                            power_level=6.09, bracket=4), tmp_path)
+    assert rating["status"] == "stale"
+    assert rating["score_bracket"] == 2
+    assert verified_score_bracket(rating) is None
+
+
+def test_changed_list_cannot_inherit_numeric_repair_target(tmp_path):
+    record_external_validation(deck(), observations(power_level=6.09, bracket=4), tmp_path)
+    changed = deck()
+    changed["cards"][2]["name"] = "Arcane Signet"
+    rating = attach_external_validation(changed, tmp_path)
+    assert rating["status"] == "unverified"
+    assert "score_bracket" not in rating
+    assert verified_score_bracket(rating) is None
+
+
+@pytest.mark.parametrize("power_level", ["10+", "6–7", "high", None])
+def test_ambiguous_or_absent_score_is_not_turned_into_a_repair_target(tmp_path, power_level):
+    values = observations()
+    if power_level is None:
+        values.pop("power_level")
+    else:
+        values["power_level"] = power_level
+    rating = record_external_validation(deck(), values, tmp_path)
+    assert rating["status"] == "verified"
+    assert "score_bracket" not in rating
+    assert verified_score_bracket(rating) is None
+
+
+def test_observed_bracket_restrictions_are_checked_and_preserved_for_exact_list(tmp_path):
+    restrictions = {
+        "game_changers": [" Sol Ring "], "extra_turns": [], "mass_land_denial": [],
+        "early_combos": [["Ghave, Guru of Spores", "Sol Ring"]],
+        "late_combos": [["Ghave, Guru of Spores", "Sol Ring", "Forest"]],
+    }
+    rating = record_external_validation(deck(), observations(bracket_restrictions=restrictions), tmp_path)
+    assert rating["bracket_restrictions"] == {**restrictions, "game_changers": ["Sol Ring"]}
+    assert attach_external_validation(deck(), tmp_path) == rating
+    stored = json.loads((tmp_path / f"{cardlist_hash(deck()['cards'])}.json").read_text())
+    assert stored["bracket_restrictions"] == rating["bracket_restrictions"]
+
+
+@pytest.mark.parametrize("restrictions", [
+    None, [], {"unknown_restriction": []}, {"game_changers": "Sol Ring"},
+    {"game_changers": [None]}, {"game_changers": [""]},
+    {"game_changers": ["Arcane Signet"]}, {"game_changers": ["Ghave"]},
+    {"mass_land_denial": ["Sol Ring", " SOL RING "]},
+    {"early_combos": "Ghave, Guru of Spores + Sol Ring"},
+    {"early_combos": ["Ghave, Guru of Spores", "Sol Ring"]},
+    {"early_combos": [[]]}, {"late_combos": [["Sol Ring"]]},
+    {"early_combos": [["Sol Ring", " SOL RING "]]},
+    {"late_combos": [["Ghave, Guru of Spores", "Arcane Signet"]]},
+])
+def test_malformed_or_out_of_list_observed_restrictions_are_rejected(tmp_path, restrictions):
+    with pytest.raises(ValueError, match="restriction"):
+        record_external_validation(deck(), observations(bracket_restrictions=restrictions), tmp_path)
+    assert not list(tmp_path.iterdir())
+
+
+def test_restrictions_cannot_be_copied_to_another_list_even_if_file_is_renamed(tmp_path):
+    original = deck()
+    record_external_validation(original, observations(bracket_restrictions={"game_changers": ["Sol Ring"]}), tmp_path)
+    original_path = tmp_path / f"{cardlist_hash(original['cards'])}.json"
+    changed = deck()
+    changed["cards"][2]["name"] = "Arcane Signet"
+    changed_hash = cardlist_hash(changed["cards"])
+    changed_path = tmp_path / f"{changed_hash}.json"
+    changed_path.write_text(original_path.read_text())
+    assert "another card list" in attach_external_validation(changed, tmp_path)["reason"]
+    forged = json.loads(changed_path.read_text())
+    forged["deck_sha256"] = changed_hash
+    changed_path.write_text(json.dumps(forged))
+    rating = attach_external_validation(changed, tmp_path)
+    assert rating["status"] == "unverified"
+    assert "outside the checked list" in rating["reason"]
+    assert "bracket_restrictions" not in rating
 
 
 def test_changed_deck_cannot_inherit_previous_package_rating(tmp_path):
