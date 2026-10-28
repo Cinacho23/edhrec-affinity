@@ -7,6 +7,8 @@ previous list's rating, even if it retains the same commander or package name.
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -25,6 +27,20 @@ DEFAULT_VALIDATION_DIRECTORY = Path(__file__).resolve().parents[3] / "data/build
 VALIDATION_MAX_AGE_DAYS = 7
 FUTURE_TOLERANCE_SECONDS = 300
 SOURCE = "edhpowerlevel.com"
+_VALIDATION_DIRECTORY = ContextVar("build_style_validation_directory", default=DEFAULT_VALIDATION_DIRECTORY)
+
+
+@contextmanager
+def external_validation_directory(directory: Path | str | None = None):
+    """Scope all nested exact-list lookups to one rebuild's rating directory."""
+    if directory is None:
+        yield
+        return
+    token = _VALIDATION_DIRECTORY.set(Path(directory))
+    try:
+        yield
+    finally:
+        _VALIDATION_DIRECTORY.reset(token)
 
 
 def _card_counts(cards: Iterable[dict]) -> Counter:
@@ -164,13 +180,13 @@ def _check_record(record: Any, sha256: str, count: int, deck_names: set[str]) ->
 
 
 def attach_external_validation(
-    deck: dict, directory: Path | str = DEFAULT_VALIDATION_DIRECTORY,
+    deck: dict, directory: Path | str | None = None,
 ) -> dict:
     """Attach an exact-list record, or an explicit unverified state; return it."""
     rating = {"status": "unverified", "source": SOURCE}
     try:
         sha256, count = _deck_identity(deck)
-        path = Path(directory) / f"{sha256}.json"
+        path = Path(directory if directory is not None else _VALIDATION_DIRECTORY.get()) / f"{sha256}.json"
         if path.exists():
             rating = _check_record(_strict_json(path.read_text(encoding="utf-8")), sha256, count,
                                    set(_card_counts(deck["cards"])))

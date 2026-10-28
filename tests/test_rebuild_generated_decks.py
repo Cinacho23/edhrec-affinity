@@ -16,6 +16,7 @@ import httpx
 
 from edhrec_affinity.build_styles.card_metadata import MetadataRepository
 from edhrec_affinity.build_styles.collection import deck_dataset_sha256
+from edhrec_affinity.build_styles.external_validation import cardlist_hash, record_external_validation
 from edhrec_affinity.build_styles.sources import CommanderAliasCatalog, card_key
 
 
@@ -449,6 +450,126 @@ def test_current_version_with_failed_freshness_remains_retryable(tmp_path):
     result = rebuild.rebuild_all(root, cache, only_outdated=True, prefer_playability=False)
     assert result["regenerated"] == 1 and result["pending"] == 0
     assert not rebuild.needs_rebuild(rebuild.read_json(root / "commander.json"))
+
+
+def checked_score(report, directory, **changes):
+    deck = report["deck_analysis"]["packages"][0]["generated_deck"]
+    values = {"source": "edhpowerlevel.com", "checked_at": datetime.now(timezone.utc).isoformat(),
+              "card_count": 100, "source_url": "https://edhpowerlevel.com/?d=observed-deck",
+              "power_level": 6.09, "playability_pct": 70, "bracket": 3, **changes}
+    return record_external_validation(deck, values, directory)
+
+
+def test_current_generation_retries_new_exact_score_once_and_rechecks_changed_evidence(tmp_path):
+    report, inputs, cache = fixture(tmp_path)
+    ratings = tmp_path / "ratings"
+    root = tmp_path / "build-styles"
+    report, _ = rebuild.rebuild_report(report, inputs, MetadataRepository(cache),
+                                        validation_directory=ratings, prefer_playability=False)
+    original = deepcopy(report)
+    assert not rebuild.needs_rebuild(report, validation_directory=ratings)
+    observation = checked_score(report, ratings)
+    # A freshly recorded score must wake an otherwise current v3 report. The
+    # canonical record, not a stale embedded external_rating, drives selection.
+    assert rebuild.needs_rebuild(original, validation_directory=ratings)
+    assert not rebuild.needs_rebuild(original, validation_directory=tmp_path / "empty")
+    save_evidence(root, original, inputs)
+    first = rebuild.rebuild_all(root, cache, only_outdated=True, prefer_playability=False,
+                                 validation_directory=ratings)
+    assert first["regenerated"] == 1 and first["pending"] == 0
+    reviewed = rebuild.read_json(root / "commander.json")
+    deck = reviewed["deck_analysis"]["packages"][0]["generated_deck"]
+    assert deck["statistics"]["score_bracket_repair"]["status"] == "blocked"
+    assert cardlist_hash(deck["cards"]) == observation["deck_sha256"]
+    assert not rebuild.needs_rebuild(reviewed, validation_directory=ratings)
+    second = rebuild.rebuild_all(root, cache, only_outdated=True, prefer_playability=False,
+                                  validation_directory=ratings)
+    assert second["regenerated"] == 0 and second["skipped"] == 1 and second["pending"] == 0
+
+    # The same numeric score with new observed card restrictions is actionable.
+    # The configured directory must reach generation itself, not just scheduling.
+    checked_score(reviewed, ratings, checked_at=observation["checked_at"],
+                  bracket_restrictions={"mass_land_denial": ["Consensus Card"]})
+    assert rebuild.needs_rebuild(reviewed, validation_directory=ratings)
+    third = rebuild.rebuild_all(root, cache, only_outdated=True, prefer_playability=False,
+                                 validation_directory=ratings)
+    assert third["regenerated"] == 1
+    repaired = rebuild.read_json(root / "commander.json")
+    deck = repaired["deck_analysis"]["packages"][0]["generated_deck"]
+    assert deck["statistics"]["score_bracket_repair"]["status"] == "repaired"
+    assert "Consensus Card" not in {row["name"] for row in deck["cards"]}
+    assert deck["validation"]["external_rating"]["status"] == "unverified"
+    assert not rebuild.needs_rebuild(repaired, validation_directory=ratings)
+    assert len(repaired["deck_generation"]["score_repair_observations"]) <= 2 * len(list(rebuild.packages(repaired)))
+
+
+@pytest.mark.parametrize("change", [
+    {"power_level": "6–7"}, {"power_level": "10+"}, {"power_level": -1},
+    {"power_level": 6.7}, {"power_level": 7.0},
+    {"checked_at": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()},
+])
+def test_non_actionable_or_stale_canonical_scores_do_not_retry_current_generation(tmp_path, change):
+    report, inputs, cache = fixture(tmp_path)
+    ratings = tmp_path / "ratings"
+    report, _ = rebuild.rebuild_report(report, inputs, MetadataRepository(cache),
+                                        validation_directory=ratings, prefer_playability=False)
+    checked_score(report, ratings, **change)
+    assert not rebuild.needs_rebuild(report, validation_directory=ratings)
+
+
+def test_retry_fingerprint_tracks_rechecked_score_policy_and_current_card_hash(tmp_path, monkeypatch):
+    report, inputs, cache = fixture(tmp_path)
+    ratings = tmp_path / "ratings"
+    report, _ = rebuild.rebuild_report(report, inputs, MetadataRepository(cache),
+                                        validation_directory=ratings, prefer_playability=False)
+    observation = checked_score(report, ratings)
+    report["deck_generation"]["score_repair_observations"] = rebuild.score_repair_observations(report, ratings)
+    assert not rebuild.needs_rebuild(report, validation_directory=ratings)
+    checked_score(report, ratings, checked_at=observation["checked_at"], power_level=6.1)
+    assert rebuild.needs_rebuild(report, validation_directory=ratings)
+    report["deck_generation"]["score_repair_observations"] = rebuild.score_repair_observations(report, ratings)
+    checked_score(report, ratings, checked_at=(datetime.fromisoformat(observation["checked_at"]) + timedelta(seconds=1)).isoformat(),
+                  power_level=6.1)
+    assert rebuild.needs_rebuild(report, validation_directory=ratings)
+    report["deck_generation"]["score_repair_observations"] = rebuild.score_repair_observations(report, ratings)
+    monkeypatch.setattr(rebuild, "POWER_SCORE_BRACKET_POLICY_VERSION", rebuild.POWER_SCORE_BRACKET_POLICY_VERSION + 1)
+    assert rebuild.needs_rebuild(report, validation_directory=ratings)
+    # A record for the former list cannot schedule repairs for a changed list.
+    for _, package in rebuild.packages(report):
+        package["generated_deck"]["cards"][-1]["name"] = "Different Exact Card"
+    assert not rebuild.needs_rebuild(report, validation_directory=ratings)
+
+
+def test_native_bracket_mismatch_schedules_current_report_and_metadata_prefetch(tmp_path):
+    report, inputs, cache = fixture(tmp_path)
+    ratings = tmp_path / "ratings"
+    report, _ = rebuild.rebuild_report(report, inputs, MetadataRepository(cache),
+                                        validation_directory=ratings, prefer_playability=False)
+    for _, package in rebuild.packages(report):
+        package["generated_deck"]["validation"]["bracket"]["recommended"] = 3
+    # The external bracket already agrees with its score, but current local
+    # restrictions can still reveal a conflicting higher construction target.
+    checked_score(report, ratings, bracket=2)
+    assert rebuild.needs_rebuild(report, validation_directory=ratings)
+    root = tmp_path / "build-styles"
+    save_evidence(root, report, inputs)
+    calls = []
+
+    class Repository:
+        def load(self, names, **options):
+            assert options["fetch"]
+            calls.append(names)
+            return {}, {"requests": 1, "fetched": len(names), "resolved": len(names)}
+
+    summary = {"metadata_prefetch": {}}
+    rebuild.prefetch_metadata(root, [root / "commander.json"], Repository(), summary,
+                              only_outdated=True, validation_directory=ratings,
+                              time_remains=lambda: True, checkpoint=lambda: None)
+    assert calls and summary["metadata_prefetch"]["status"] == "complete"
+    # Persisted verified labels are not trusted after the canonical file goes.
+    (ratings / f"{cardlist_hash(report['deck_analysis']['packages'][0]['generated_deck']['cards'])}.json").unlink()
+    assert report["deck_analysis"]["packages"][0]["generated_deck"]["validation"]["external_rating"]["status"] == "verified"
+    assert not rebuild.needs_rebuild(report, validation_directory=ratings)
 
 
 def test_stale_unused_pool_card_does_not_block_current_generated_lists(tmp_path):

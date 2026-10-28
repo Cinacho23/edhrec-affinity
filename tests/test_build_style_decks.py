@@ -1288,6 +1288,42 @@ def test_score_repair_prefers_non_distinctive_excess_game_changer_at_bracket_thr
     assert result["validation"]["bracket"]["game_changer_count"] == 3
 
 
+@pytest.mark.parametrize("commander_name", ["First Commander", "Second Commander"])
+@pytest.mark.parametrize(("power", "target"), [(6.699999, 2), (6.7, 3)])
+def test_three_to_two_score_boundary_applies_to_all_commanders_and_package_models(
+        monkeypatch, tmp_path, commander_name, power, target):
+    data = fixture()
+    card = data[4].pop("commander")
+    card["name"] = commander_name
+    data[4][commander_name.casefold()] = card
+    data[2]["commander_names"] = [commander_name]
+    for sampled in data[1]:
+        sampled["commanders"] = [commander_name]
+    data[4]["core 0"]["game_changer"] = True
+    alternative = data[0]["alternative_models"][0]
+    alternative["components"] = 2
+    alternative["packages"].append({**deepcopy(alternative["packages"][0]), "id": 1, "name": "Package 2"})
+    for member in alternative["memberships"]:
+        member["weights"] = [member["weights"][0] / 2] * 2
+    original = attach_score_record(data, monkeypatch, tmp_path, power=power, bracket=3)
+    assert original["validation"]["bracket"]["recommended"] == 3
+    generate_package_decks(*data)
+    for package in [*data[0]["packages"], *alternative["packages"]]:
+        result = package["generated_deck"]
+        names = {row["name"] for row in result["cards"]}
+        assert result["card_count"] == 100 and result["validation"]["valid"]
+        assert commander_name in names
+        assert result["validation"]["bracket"]["recommended"] == target
+        assert ("Core 0" in names) == (target == 3)
+        if target == 2:
+            repair = result["statistics"]["score_bracket_repair"]
+            assert repair["status"] == "repaired" and repair["from_bracket"] == 3
+            assert repair["policy_version"] == 1 and all(repair["rule_checks"].values())
+            assert result["validation"]["external_rating"]["status"] == "unverified"
+        else:
+            assert "score_bracket_repair" not in result["statistics"]
+
+
 @pytest.mark.parametrize("blocker", ["commander", "support_floor", "unknown_external"])
 def test_impossible_score_repairs_are_explicit_and_never_commit_a_partial_list(monkeypatch, tmp_path, blocker):
     data = score_repair_fixture() if blocker != "unknown_external" else fixture()

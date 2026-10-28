@@ -1253,14 +1253,15 @@ def _score_target_context(prepared, profiles, metadata, target, source):
 def _repair_score_bracket(option, package, counts, prepared, profiles, metadata, *, anchor,
                           core_swaps, core_failures, swaps, land_changes, land_swaps):
     from .external_validation import attach_external_validation, cardlist_hash
-    from .power_brackets import verified_score_bracket
+    from .power_brackets import POWER_SCORE_BRACKET_POLICY_VERSION, verified_score_bracket
 
     rating = attach_external_validation(option)
     score_target = verified_score_bracket(rating)
     current_bracket = max(rating.get("bracket", 0), option["validation"]["bracket"]["recommended"])
     if score_target is None or score_target >= current_bracket:
         return option
-    repair = {"status": "blocked", "from_deck_sha256": cardlist_hash(option["cards"]),
+    repair = {"status": "blocked", "policy_version": POWER_SCORE_BRACKET_POLICY_VERSION,
+              "from_deck_sha256": cardlist_hash(option["cards"]),
               "from_power_level": rating["power_level"], "from_bracket": current_bracket,
               "score_bracket": score_target, "checked_at": rating["checked_at"],
               "source": rating["source"], "source_url": rating["source_url"], "swap_details": [],

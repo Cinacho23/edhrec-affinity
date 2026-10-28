@@ -257,6 +257,10 @@ color legality, land slots, colored sources and essential functional roles.
 Distinctive cards remain priorities; an unavoidable omission explicitly says
 which score/bracket restriction required it. If the restrictions cannot all be
 resolved, the existing list is retained with a blocked explanation.
+This policy applies to every commander and both Auto and alternative package
+counts. It includes Bracket 3 decks scoring 4.7–<6.7: the Bracket 2 repair
+removes Game Changers and breaks recorded two-card combos, as well as removing
+extra turns and mass land denial. A score of exactly 6.7 remains Bracket 3.
 
 Each successful repair records the original exact card list and rating, swaps
 and construction checks. The changed list receives only its own exact-list
@@ -265,6 +269,12 @@ reuse the original scored seed while that observation is current. Once it is
 stale, the builder can retain the unchanged repaired list only after rechecking
 its current pool, metadata, legality and bracket restrictions; it labels the repair
 historical and does not make new score-driven swaps from stale evidence.
+The bounded rebuild also checks newly saved exact-list scores for decks already
+on the current generation. It records which observations and score-policy
+version were attempted, so an unchanged blocked repair does not consume every
+later batch. A recheck, changed score or new named restriction can schedule a
+new attempt. The configured validation directory is used during generation as
+well as while selecting work.
 
 Export the lists, primers and per-card inclusion/lift CSVs locally:
 
