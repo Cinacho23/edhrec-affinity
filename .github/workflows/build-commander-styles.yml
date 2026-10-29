@@ -124,10 +124,11 @@ jobs:
             --state-file "${STYLES_DIR}/_collection/state.json"
 
       - name: Restore shared card rules cache
-        uses: actions/cache@v4
+        id: card_metadata_cache
+        uses: actions/cache/restore@v4
         with:
           path: data/raw/build-style-card-metadata.json
-          key: build-style-cards-${{ env.SAMPLE_DATE }}-${{ github.run_id }}
+          key: build-style-cards-${{ env.SAMPLE_DATE }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: build-style-cards-
 
       - name: Get current commander index and weekly dataset date
@@ -221,11 +222,51 @@ jobs:
             --summary data/build-style-artifact/deck-rebuild-summary.json \
             --backup-dir "${RUNNER_TEMP}/build-style-deck-backups"
 
+      - name: Save refreshed card rules cache
+        id: save_card_metadata
+        if: always() && steps.card_metadata_cache.outputs.cache-primary-key != '' && hashFiles('data/raw/build-style-card-metadata.json') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: data/raw/build-style-card-metadata.json
+          key: ${{ steps.card_metadata_cache.outputs.cache-primary-key }}
+
+      - name: Verify saved card rules cache
+        id: verify_card_metadata
+        if: always() && steps.save_card_metadata.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CARD_METADATA_CACHE_KEY: ${{ steps.card_metadata_cache.outputs.cache-primary-key }}
+        run: |
+          set -euo pipefail
+          inventory="${RUNNER_TEMP}/build-style-card-cache-inventory.json"
+          gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/caches" \
+            -f key="${CARD_METADATA_CACHE_KEY}" -f ref="${GITHUB_REF}" > "${inventory}"
+          python3 - "${inventory}" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          inventory = json.loads(Path(sys.argv[1]).read_text())
+          saved = any(cache.get("key") == os.environ["CARD_METADATA_CACHE_KEY"]
+              and cache.get("ref") == os.environ["GITHUB_REF"]
+              for cache in inventory.get("actions_caches", []) if isinstance(cache, dict))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"verified={str(saved).lower()}\n")
+          if not saved:
+              print("::warning::The exact saved metadata cache is not visible yet; metadata-only progress will not trigger immediate continuation.")
+          PY
+
       - name: Include rebuilt decks in publication progress
         if: always() && steps.collect_styles.outcome != 'skipped'
+        env:
+          METADATA_CACHE_SAVED: ${{ steps.verify_card_metadata.outputs.verified == 'true' }}
         run: |
           python - <<'PY'
           import json
+          import os
           from pathlib import Path
 
           path = Path("data/build-style-artifact/build_style_batch.json")
@@ -239,11 +280,31 @@ jobs:
               "generation_version", "regenerated", "pending", "blocked", "changed_deck_lists",
               "distinctive_omissions_before", "distinctive_omissions_after", "time_budget_reached",
           ) if key in rebuild}
+          metadata = rebuild.get("metadata_prefetch") or {}
+          metadata_blocked = metadata.get("blocked") is True or metadata.get("status") == "source_access_stopped"
+          metadata_saved = os.environ.get("METADATA_CACHE_SAVED") == "true"
+          metadata_progress = metadata_saved and (metadata.get("durable_cache_saved") is True
+              or type(metadata.get("fetched")) is int and metadata["fetched"] > 0)
+          if metadata:
+              summary["deck_rebuild"]["metadata_prefetch"] = {key: metadata[key] for key in (
+                  "status", "requested", "processed", "resolved", "requests", "fetched", "blocked",
+                  "durable_cache_saved",
+              ) if key in metadata}
+              summary["deck_rebuild"].update(metadata_cache_saved=metadata_saved,
+                  durable_metadata_progress=metadata_progress, metadata_source_blocked=metadata_blocked)
           if rebuild.get("regenerated", 0) > 0:
               summary.update(publish_needed=True, no_progress=False)
-              if (rebuild.get("pending", 0) > 0 and not summary.get("blocked")
-                      and not summary.get("resource_limit") and summary.get("automatic_continuation_allowed") is True):
-                  summary["continuation_needed"] = True
+          elif metadata_progress:
+              # Saved metadata is useful progress, but no report has changed.
+              # Continue from the remote cache without dispatching publication.
+              summary["no_progress"] = False
+          if ((rebuild.get("regenerated", 0) > 0 or metadata_progress) and rebuild.get("pending", 0) > 0
+                  and not summary.get("blocked") and not metadata_blocked
+                  and not summary.get("resource_limit") and summary.get("automatic_continuation_allowed") is True):
+              summary["continuation_needed"] = True
+          if metadata_blocked:
+              summary["continuation_needed"] = False
+              print("::warning::Card metadata access stopped; saved progress will not trigger an immediate source retry.")
           if rebuild.get("blocked", 0):
               print(f"::warning::{rebuild['blocked']} saved reports could not be rebuilt; their previous decks were preserved.")
           temporary = path.with_suffix(".json.tmp")
@@ -326,6 +387,9 @@ jobs:
           should_continue = (
               summary.get("continuation_needed") is True
               and not summary.get("blocked")
+              and not summary.get("resource_limit")
+              and summary.get("automatic_continuation_allowed") is not False
+              and not (summary.get("deck_rebuild") or {}).get("metadata_source_blocked")
               and not summary.get("no_progress")
               and not os.environ.get("TARGETED_COMMANDERS", "").strip()
               and os.environ.get("MAX_COMMANDERS", "0") == "0"

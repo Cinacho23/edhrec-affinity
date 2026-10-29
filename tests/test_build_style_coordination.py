@@ -477,6 +477,44 @@ def test_watchdog_can_publish_when_collection_is_complete_and_no_next_batch_is_d
     assert github.dispatches == [(coordinator.FRONTEND, {"source_run_id": "100"})]
 
 
+@pytest.mark.parametrize("progress", [{"regenerated": 1}, {"durable_metadata_progress": True}])
+def test_saved_deck_rebuild_progress_continues_after_source_collection_is_complete(progress):
+    summary = {"remaining_in_batch": 0, "publish_needed": False,
+               "capacity": {"evaluated_at": NOW.isoformat()},
+               "deck_rebuild": {"pending": 12, **progress}}
+    github = GitHub([summary])
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["run"] is True
+    assert github.dispatches == [(coordinator.COLLECTOR, {})]
+    assert coordinator.coordinate(GitHub([summary]), "preflight", now=NOW)["run"] is True
+
+
+@pytest.mark.parametrize("rebuild", [
+    {"pending": 12, "regenerated": 0},
+    {"pending": 0, "regenerated": 1},
+    {"pending": True, "regenerated": 1},
+    {"pending": 12, "regenerated": True},
+    {"pending": 12, "metadata_prefetch": {"fetched": 100}},
+    {"pending": 12, "durable_metadata_progress": True, "metadata_source_blocked": True},
+    {"pending": 12, "durable_metadata_progress": True,
+     "metadata_prefetch": {"status": "source_access_stopped"}},
+])
+def test_unfinished_rebuild_alone_does_not_bypass_source_idle_wait(rebuild):
+    github = GitHub([{"remaining_in_batch": 0, "capacity": {"evaluated_at": NOW.isoformat()},
+                      "deck_rebuild": rebuild}])
+    assert coordinator.coordinate(github, "watchdog", now=NOW)["run"] is False
+    assert github.dispatches == []
+
+
+@pytest.mark.parametrize("guard", [{"resource_limit": True}, paused(),
+                                  {"scope": {"commanders": ["the-indomitable"]}}])
+def test_deck_rebuild_progress_preserves_source_resource_and_manual_guards(guard):
+    github = GitHub([{"remaining_in_batch": 0, "capacity": {"evaluated_at": NOW.isoformat()},
+                      "deck_rebuild": {"pending": 12, "durable_metadata_progress": True}, **guard}])
+    assert coordinator.coordinate(github, "watchdog", now=NOW)["run"] is False
+    assert not any(workflow == coordinator.COLLECTOR for workflow, _ in github.dispatches)
+
+
 @pytest.mark.parametrize("changed", [True, False])
 def test_frontend_receiver_accepts_an_explicit_uploaded_source_before_collector_completion(tmp_path, changed):
     environment, dispatches = github_stub(tmp_path, {"publish_needed": changed})

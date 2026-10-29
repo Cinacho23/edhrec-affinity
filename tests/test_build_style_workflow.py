@@ -278,3 +278,148 @@ def test_successful_deck_rebuilds_publish_without_erasing_collection_controls(
     assert output["deck_rebuild"] == rebuild
     for field in ("blocked", "blocked_until", "automatic_continuation_allowed", "measured_request_rate"):
         assert output[field] == source[field]
+
+
+def test_refreshed_metadata_cache_is_saved_before_handled_failures_and_continuation():
+    workflow = COLLECTOR.read_text()
+    restore = workflow.split("      - name: Restore shared card rules cache\n", 1)[1].split(
+        "      - name: Get current commander index", 1)[0]
+    save = workflow.split("      - name: Save refreshed card rules cache\n", 1)[1].split(
+        "      - name: Verify saved card rules cache", 1)[0]
+    assert "id: card_metadata_cache" in restore
+    assert "uses: actions/cache/restore@v4" in restore
+    assert "${{ github.run_attempt }}" in restore
+    assert "uses: actions/cache/save@v4" in save
+    assert "if: always()" in save
+    assert "hashFiles('data/raw/build-style-card-metadata.json') != ''" in save
+    assert "key: ${{ steps.card_metadata_cache.outputs.cache-primary-key }}" in save
+    assert "continue-on-error: true" in save
+    assert workflow.index("      - name: Rebuild package decks from saved collections") < workflow.index(
+        "      - name: Save refreshed card rules cache") < workflow.index(
+        "      - name: Verify saved card rules cache") < workflow.index(
+        "      - name: Include rebuilt decks in publication progress")
+    assert workflow.index("      - name: Save refreshed card rules cache") < workflow.index(
+        "      - name: Fail the run after preserving collection progress")
+    body, _ = step(COLLECTOR, "Include rebuilt decks in publication progress")
+    assert "METADATA_CACHE_SAVED: ${{ steps.verify_card_metadata.outputs.verified == 'true' }}" in body
+
+
+@pytest.mark.parametrize("entries, expected", [
+    ([{"key": "cards-123-1", "ref": "refs/heads/main"}], True),
+    ([], False),
+    ([{"key": "cards-123-1-longer", "ref": "refs/heads/main"}], False),
+    ([{"key": "cards-123-1", "ref": "refs/heads/feature"}], False),
+    ([{"key": "other", "ref": "refs/heads/main"}, {"key": "cards-123-1", "ref": "refs/heads/main"}], True),
+])
+def test_remote_metadata_cache_proof_requires_the_exact_key_and_ref(tmp_path, entries, expected):
+    body, script = step(COLLECTOR, "Verify saved card rules cache")
+    assert "if: always() && steps.save_card_metadata.outcome == 'success'" in body
+    assert "continue-on-error: true" in body
+    stub(tmp_path, "gh", """\
+        import json, os, sys
+        assert sys.argv[1:] == ["api", "--method", "GET", "repos/owner/repo/actions/caches",
+                               "-f", "key=cards-123-1", "-f", "ref=refs/heads/main"]
+        print(os.environ["CACHE_INVENTORY"])
+    """)
+    output = tmp_path / "outputs"
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path,
+        text=True, capture_output=True, env={**os.environ,
+            "PATH": str(tmp_path) + os.pathsep + str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+            "RUNNER_TEMP": str(tmp_path), "GITHUB_REPOSITORY": "owner/repo", "GITHUB_REF": "refs/heads/main",
+            "CARD_METADATA_CACHE_KEY": "cards-123-1", "GITHUB_OUTPUT": str(output),
+            "CACHE_INVENTORY": json.dumps({"actions_caches": entries})})
+    assert result.returncode == 0, result.stderr
+    assert output.read_text().strip() == f"verified={str(expected).lower()}"
+
+
+def test_remote_cache_lookup_failure_cannot_claim_metadata_durability(tmp_path):
+    _, script = step(COLLECTOR, "Verify saved card rules cache")
+    stub(tmp_path, "gh", "raise SystemExit(1)\n")
+    output = tmp_path / "outputs"
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path,
+        text=True, capture_output=True, env={**os.environ,
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"], "RUNNER_TEMP": str(tmp_path),
+            "GITHUB_REPOSITORY": "owner/repo", "GITHUB_REF": "refs/heads/main", "GITHUB_OUTPUT": str(output),
+            "CARD_METADATA_CACHE_KEY": "cards-123-1"})
+    assert result.returncode == 1
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("fetched, durable, cached, pending, source_blocked, metadata_status, metadata_blocked, resource, automatic, expected_progress, expected_continue", [
+    (3, False, True, 5, False, "partial", False, False, True, True, True),
+    (0, True, True, 5, False, "time_budget_reached", False, False, True, True, True),
+    (0, False, True, 5, False, "complete", False, False, True, False, False),
+    (True, False, True, 5, False, "partial", False, False, True, False, False),
+    (3, True, False, 5, False, "partial", False, False, True, False, False),
+    (3, False, True, 0, False, "complete", False, False, True, True, False),
+    (3, False, True, 5, True, "partial", False, False, True, True, False),
+    (3, False, True, 5, False, "source_access_stopped", False, False, True, True, False),
+    (3, False, True, 5, False, "partial", True, False, True, True, False),
+    (3, False, True, 5, False, "partial", False, True, True, True, False),
+    (3, False, True, 5, False, "partial", False, False, False, True, False),
+])
+def test_metadata_only_progress_continues_from_a_saved_remote_cache_without_claiming_report_publication(
+    tmp_path, fetched, durable, cached, pending, source_blocked, metadata_status, metadata_blocked,
+    resource, automatic, expected_progress, expected_continue,
+):
+    _, script = step(COLLECTOR, "Include rebuilt decks in publication progress")
+    root = tmp_path / "data/build-style-artifact"
+    root.mkdir(parents=True)
+    source = {"blocked": source_blocked, "block_reason": "access_restriction" if source_blocked else None,
+              "resource_limit": resource, "automatic_continuation_allowed": automatic, "no_progress": True,
+              "publish_needed": False, "continuation_needed": False,
+              "measured_request_rate": {"successful_responses": 0}}
+    metadata = {"status": metadata_status, "requested": 300, "processed": 150, "resolved": 150,
+                "fetched": fetched, "requests": 2, "durable_cache_saved": durable, "blocked": metadata_blocked,
+                "missing": ["Large card-level diagnostic"]}
+    path = root / "build_style_batch.json"
+    path.write_text(json.dumps(source))
+    (root / "deck-rebuild-summary.json").write_text(json.dumps({
+        "generation_version": 4, "regenerated": 0, "pending": pending, "blocked": 0,
+        "time_budget_reached": True, "metadata_prefetch": metadata,
+    }))
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path,
+        text=True, capture_output=True, env={**os.environ, "METADATA_CACHE_SAVED": str(cached).lower(),
+            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]})
+    assert result.returncode == 0, result.stderr
+    output = json.loads(path.read_text())
+    assert output["publish_needed"] is False
+    assert output["no_progress"] is not expected_progress
+    assert output["continuation_needed"] is expected_continue
+    rebuilt = output["deck_rebuild"]
+    assert rebuilt["metadata_cache_saved"] is cached
+    assert rebuilt["durable_metadata_progress"] is expected_progress
+    assert rebuilt["metadata_source_blocked"] is (metadata_blocked or metadata_status == "source_access_stopped")
+    assert rebuilt["metadata_prefetch"] == {key: value for key, value in metadata.items() if key != "missing"}
+    for field in ("blocked", "block_reason", "resource_limit", "automatic_continuation_allowed", "measured_request_rate"):
+        assert output[field] == source[field]
+
+
+@pytest.mark.parametrize("changes, env_changes, expected", [
+    ({}, {}, True),
+    ({"blocked": True}, {}, False),
+    ({"resource_limit": True}, {}, False),
+    ({"automatic_continuation_allowed": False}, {}, False),
+    ({"no_progress": True}, {}, False),
+    ({"deck_rebuild": {"metadata_source_blocked": True}}, {}, False),
+    ({}, {"TARGETED_COMMANDERS": "the-indomitable"}, False),
+    ({}, {"MAX_COMMANDERS": "1"}, False),
+    ({}, {"SAMPLE_DECKS": "60"}, False),
+    ({}, {"REFRESH_REPORTS": "true"}, False),
+    ({}, {"GITHUB_REF_NAME": "feature"}, False),
+])
+def test_immediate_continuation_retains_source_resource_and_manual_scope_controls(tmp_path, changes, env_changes, expected):
+    _, script = step(COLLECTOR, "Decide whether collection can continue immediately")
+    root = tmp_path / "data/build-style-artifact"
+    root.mkdir(parents=True)
+    (root / "build_style_batch.json").write_text(json.dumps({
+        "continuation_needed": True, "no_progress": False, **changes,
+    }))
+    output = tmp_path / "outputs"
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path,
+        text=True, capture_output=True, env={**os.environ, "TARGETED_COMMANDERS": "", "MAX_COMMANDERS": "0",
+            "SAMPLE_DECKS": "all", "REFRESH_REPORTS": "false", "GITHUB_REF_NAME": "main", "DEFAULT_BRANCH": "main",
+            "GITHUB_OUTPUT": str(output), "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+            **env_changes})
+    assert result.returncode == 0, result.stderr
+    assert output.read_text().strip() == f"needed={str(expected).lower()}"

@@ -6,9 +6,10 @@ the smaller website export. Completed collectors retain parsed previews and
 source profiles after discarding their temporary analysis evidence. This tool
 uses either representation, checks that it matches the published model's
 dataset, and leaves source freshness and learned package membership unchanged.
-It is offline by default; ``--fetch-metadata`` refreshes Scryfall rules and power inputs in
-one paced stream before starting deck-generation workers. A finite runtime
-also bounds in-flight CPU and metadata work, retaining interrupted reports
+It is offline by default; ``--fetch-metadata`` refreshes Scryfall rules and power
+inputs in one paced stream for a bounded commander batch, then commits its
+decks before preparing another batch. A finite runtime also bounds in-flight
+CPU and metadata work, retaining interrupted reports
 for the next run.
 """
 
@@ -41,7 +42,9 @@ from edhrec_affinity.build_styles.external_validation import (
 from edhrec_affinity.build_styles.power_brackets import (
     POWER_SCORE_BRACKET_POLICY_VERSION, bracket_for_power_score, verified_score_bracket,
 )
-from edhrec_affinity.build_styles.power_scoring import ALGORITHM_SHA256, POWER_FORMULA_VERSION
+from edhrec_affinity.build_styles.power_scoring import (
+    ALGORITHM_SHA256, POWER_FORMULA_VERSION, calculate_power_rating,
+)
 from edhrec_affinity.build_styles.pipeline import shutdown_executor
 from edhrec_affinity.build_styles.sources import (
     CommanderAliasCatalog, card_key, checked_identifier, commander_card_alias_groups,
@@ -50,12 +53,19 @@ from edhrec_affinity.build_styles.sources import (
 
 
 GENERATION_VERSION = DECK_GENERATION_VERSION
+DEFAULT_COMMANDER_BATCH_SIZE = 5
+METADATA_BATCH_MAX_SECONDS = 180
+CPU_RESERVE_MAX_SECONDS = 120
 _worker_repository = None
 _worker_aliases = None
 
 
 class RebuildBlocked(ValueError):
     """Saved inputs cannot safely regenerate this learned model's decks."""
+
+
+class MetadataPending(RebuildBlocked):
+    """A bounded prefetch stopped before this report's inputs became usable."""
 
 
 def read_json(path: Path) -> dict:
@@ -170,6 +180,8 @@ def needs_rebuild(report: dict, *, validation_directory: Path | None = None,
                 or type(calculated.get("power_formula_version")) is not int
                 or calculated.get("power_formula_version") != POWER_FORMULA_VERSION
                 or calculated.get("algorithm_sha256") != ALGORITHM_SHA256):
+            return True
+        if calculated["status"] == "unavailable" and calculated.get("metadata_refresh_required") is not False:
             return True
         try:
             digest = cardlist_hash(deck.get("cards", []))
@@ -342,7 +354,7 @@ def _coverage(package: dict, metadata: dict) -> dict:
 
 def rebuild_report(report: dict, inputs: dict, repository: MetadataRepository, *,
                    validation_directory: Path | None = None, prefer_playability: bool = True,
-                   rebuilt_at: str | None = None) -> tuple[dict, dict]:
+                   rebuilt_at: str | None = None, defer_incomplete_metadata: bool = False) -> tuple[dict, dict]:
     """Regenerate primary and exploratory decks, keeping NMF/source facts intact."""
     old_analysis = learned_analysis(report["deck_analysis"])
     base, decks = deepcopy(inputs["base"]), inputs["decks"]
@@ -363,8 +375,9 @@ def rebuild_report(report: dict, inputs: dict, repository: MetadataRepository, *
     required = {card_key(name): name for name in [*base.get("commander_names", []), *existing_names]}
     required_missing = sorted(name for key, name in required.items() if key not in metadata)
     if required_missing:
-        raise RebuildBlocked(f"Verified metadata is missing for {len(required_missing)} commander/existing-deck cards: "
-                             + ", ".join(required_missing[:12]))
+        error = MetadataPending if defer_incomplete_metadata else RebuildBlocked
+        raise error(f"Verified metadata is missing for {len(required_missing)} commander/existing-deck cards: "
+                    + ", ".join(required_missing[:12]))
     now = datetime.now(timezone.utc)
     ages = []
     for key in requested.keys() & metadata.keys():
@@ -384,6 +397,24 @@ def rebuild_report(report: dict, inputs: dict, repository: MetadataRepository, *
         summary["oldest_checked_at"] = summary["oldest_checked_at"].isoformat()
     observed_by_name = {card_key(name): observed for name, observed in ages}
     observed_by_name.update({card_key(metadata[card_key(name)]["name"]): observed for name, observed in ages})
+    if defer_incomplete_metadata:
+        stale_required = [name for key, name in required.items() if key not in observed_by_name
+                          or not 0 <= (now - observed_by_name[key]).total_seconds() < repository.max_age_days * 86400]
+        if stale_required:
+            raise MetadataPending(f"Metadata refresh is still pending for {len(stale_required)} required cards: "
+                                  + ", ".join(stale_required[:12]))
+        checked_lists = set()
+        for _, package in packages(report):
+            deck = package.get("generated_deck", {})
+            if deck.get("status") != "generated":
+                continue
+            digest = cardlist_hash(deck["cards"])
+            if digest in checked_lists:
+                continue
+            checked_lists.add(digest)
+            rating = calculate_power_rating(deck["cards"], metadata, max_age_days=repository.max_age_days)
+            if rating.get("metadata_refresh_required") is not False:
+                raise MetadataPending("Fresh power inputs for this report were not completed within the metadata batch budget.")
     output = deepcopy(report)
     attempted_observations = score_repair_observations(report, validation_directory)
     before = {(model, package["id"]): package for model, package in packages(report)}
@@ -489,7 +520,10 @@ def prefetch_metadata(root: Path, paths: list[Path], repository: MetadataReposit
                 printing_ids.setdefault(name, identifier)
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
             progress["input_blockers"].append({"commander_slug": path.stem, "reason": str(error)})
-    requested = [names[key] for key in sorted(names)]
+    # Commander and existing-deck cards precede unused sampled-pool cards.
+    # A partial batch can therefore finish usable reports before a large pool
+    # or an unresolved printing consumes its metadata allowance.
+    requested = list(names.values())
     progress.update(status="refreshing_scryfall_metadata", requested=len(requested))
     checkpoint()
     for start in range(0, len(requested), COLLECTION_BATCH_SIZE):
@@ -536,6 +570,9 @@ def commit_report(job: dict, result: dict) -> dict:
             handle.write(contents)
             handle.flush()
             os.fsync(handle.fileno())
+        result["retry_needed"] = needs_rebuild(rebuilt,
+            validation_directory=Path(job["validation_directory"]) if job.get("validation_directory") else None,
+            max_age_days=job.get("max_age_days", 3))
         result["backup"] = str(backup.resolve())
         atomic_json(path, rebuilt)
         return result
@@ -563,7 +600,8 @@ def process_report(job: dict) -> dict:
         inputs = load_inputs(root, report, _worker_aliases)
         rebuilt, result = rebuild_report(report, inputs, _worker_repository,
             validation_directory=validation_directory,
-            prefer_playability=job["prefer_playability"], rebuilt_at=job["rebuilt_at"])
+            prefer_playability=job["prefer_playability"], rebuilt_at=job["rebuilt_at"],
+            defer_incomplete_metadata=job.get("metadata_partial", False))
         result["input_dataset_sha256"] = inputs["dataset_sha256"]
         result["source_analysis_generated_at"] = report.get("generated_at")
         result["dry_run"] = job["dry_run"]
@@ -572,6 +610,8 @@ def process_report(job: dict) -> dict:
             if not job.get("prepare_only"):
                 return commit_report(job, result)
         return result
+    except MetadataPending as error:
+        return {"commander_slug": path.stem, "status": "deferred", "reason": str(error)}
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
         return {"commander_slug": path.stem, "status": "blocked", "reason": str(error)}
 
@@ -601,14 +641,30 @@ def prefetch_metadata_job(job: dict) -> dict:
     return summary["metadata_prefetch"]
 
 
+def cache_digest(path: Path):
+    """Detect atomic cache progress even when a batch ends before its receipt."""
+    try:
+        digest, size = hashlib.sha256(), 0
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                size += len(chunk)
+                digest.update(chunk)
+        return (size, digest.hexdigest()) if size else None
+    except OSError:
+        return None
+
+
 def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None, workers: int = 1,
                 dry_run: bool = False, summary_path: Path | None = None, backup_dir: Path | None = None,
                 validation_directory: Path | None = None, max_age_days: float = 3,
                 prefer_playability: bool = True, only_outdated: bool = False,
                 max_runtime_seconds: float = 0, fetch_metadata: bool = False,
-                current_discovery_only: bool = False) -> dict:
+                current_discovery_only: bool = False,
+                batch_size: int = DEFAULT_COMMANDER_BATCH_SIZE) -> dict:
     if type(workers) is not int or not 1 <= workers <= 8:
         raise ValueError("Workers must be an integer from 1 through 8")
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("Commander batch size must be a positive integer")
     if not root.is_dir():
         raise ValueError(f"Build-style directory does not exist: {root}")
     if isinstance(max_runtime_seconds, bool) or not isinstance(max_runtime_seconds, (float, int)) or not math.isfinite(max_runtime_seconds) or max_runtime_seconds < 0:
@@ -644,6 +700,7 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
     summary = {"schema_version": 1, "generation_version": GENERATION_VERSION, "started_at": now.isoformat(),
                "completed_at": None, "network_enabled": bool(fetch_metadata and not dry_run), "refitted": False, "dry_run": dry_run,
                "report_count": len(paths), "rebuilt": 0, "regenerated": 0, "blocked": 0, "skipped": 0,
+               "deferred": 0, "batch_size": batch_size, "batches": [],
                "changed_deck_lists": 0, "distinctive_omissions_before": 0, "distinctive_omissions_after": 0,
                "backup_dir": str(backup_dir.resolve()), "reports": [], "blockers": [],
                "max_runtime_seconds": max_runtime_seconds, "time_budget_reached": False,
@@ -652,8 +709,13 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
                "outside_scope": outside_scope,
                "metadata_prefetch": {"enabled": bool(fetch_metadata and not dry_run),
                                      "status": "skipped_dry_run" if fetch_metadata and dry_run else "not_requested",
-                                     "network_enabled": bool(fetch_metadata and not dry_run), "edhrec_requests": 0}}
-    pending = set()
+                                     "network_enabled": bool(fetch_metadata and not dry_run), "edhrec_requests": 0,
+                                     "requested": 0, "processed": 0, "requests": 0, "fetched": 0, "resolved": 0,
+                                     "missing": [], "stale_names": [], "failures": [], "input_blockers": [],
+                                     "alias_resolutions": [], "blocked": False, "durable_cache_saved": False,
+                                     "batches_started": 0, "batches_completed": 0, "budget_limited_batches": 0,
+                                     "count_basis": "Card-name lookups per commander batch; shared cached names can occur in more than one batch."}}
+    pending, priorities = set(), {}
     for path in paths:
         try:
             report = read_json(path)
@@ -661,6 +723,10 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
                     and report.get("deck_analysis", {}).get("status") == "fitted"
                     and report.get("deck_analysis", {}).get("packages")):
                 pending.add(path.stem)
+                handled = report.get("deck_generation", {}).get("score_repair_observations", [])
+                handled = handled if isinstance(handled, list) else []
+                priorities[path.stem] = not any(observation not in handled
+                    for observation in score_repair_observations(report, validation_directory))
         except (OSError, ValueError, TypeError):
             pending.add(path.stem)
     jobs = [{"root": str(root), "path": str(path), "backup_dir": str(backup_dir),
@@ -674,6 +740,8 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
         atomic_json(summary_path, summary)
 
     def time_remains():
+        if summary["time_budget_reached"]:
+            return False
         if max_runtime_seconds and time.monotonic() - started >= max_runtime_seconds:
             summary["time_budget_reached"] = True
             return False
@@ -687,7 +755,7 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
         summary[result["status"]] += 1
         if result["status"] == "rebuilt":
             summary["regenerated"] += 1
-            if not dry_run:
+            if not dry_run and not result.get("retry_needed"):
                 pending.discard(result["commander_slug"])
         elif result["status"] == "blocked":
             summary["blockers"].append({key: result[key] for key in ("commander_slug", "reason")})
@@ -700,75 +768,146 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
               + (f" ({result['reason']})" if result.get("reason") else ""), flush=True)
 
     checkpoint()
-    if fetch_metadata and not dry_run:
-        if max_runtime_seconds and time_remains():
-            # Even one batch can contain many exact-name fallbacks. An HTTP
-            # timeout per request cannot bound that batch or a stuck library.
-            # Keep one serialized HTTP stream in an independently stoppable
-            # process, and never overlap it with CPU workers.
-            pool = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
-            expired = False
-            try:
-                future = pool.submit(prefetch_metadata_job, {
-                    "root": str(root), "paths": [str(path) for path in paths], "cache": str(cache),
-                    "max_age_days": max_age_days, "summary": summary, "summary_path": str(summary_path),
-                    "validation_directory": str(validation_directory) if validation_directory is not None else None,
-                    "only_outdated": only_outdated, "deadline": started + max_runtime_seconds})
-                try:
-                    summary["metadata_prefetch"] = future.result(timeout=remaining_seconds())
-                except TimeoutError:
-                    expired = True
-                    summary["time_budget_reached"] = True
-            finally:
-                shutdown_executor(pool, terminate=expired)
-            if expired:
-                # Read only the last fully completed checkpoint after the
-                # child has stopped. Successful cache batches remain usable.
-                summary["metadata_prefetch"] = read_json(summary_path)["metadata_prefetch"]
-                summary["metadata_prefetch"]["status"] = "time_budget_reached"
-                checkpoint()
-        elif not max_runtime_seconds:
-            repository = MetadataRepository(cache, max_age_days=max_age_days)
-            prefetch_metadata(root, paths, repository, summary, only_outdated=only_outdated,
-                              time_remains=time_remains, checkpoint=checkpoint,
-                              validation_directory=validation_directory)
-    if workers == 1 and not max_runtime_seconds:
-        initialize_worker(str(root), str(cache), max_age_days)
-        for job in jobs:
-            if not time_remains():
-                break
+    active_jobs = sorted((job for job in jobs if Path(job["path"]).stem in pending),
+                         key=lambda job: (priorities.get(Path(job["path"]).stem, True), Path(job["path"]).stem))
+    for job in jobs:
+        if Path(job["path"]).stem not in pending:
+            # These branches return before loading metadata or starting CPU work.
             record(process_report(job))
-    elif time_remains():
-        pool = ProcessPoolExecutor(max_workers=workers, initializer=initialize_worker,
-                                   initargs=(str(root), str(cache), max_age_days),
-                                   mp_context=multiprocessing.get_context("spawn"))
-        expired = False
-        running = {}
-        try:
-            unscheduled = iter(jobs)
-            while True:
-                while len(running) < workers and time_remains():
-                    job = next(unscheduled, None)
-                    if job is None:
+
+    all_metadata_complete = True
+    processed_batches = 0
+    for offset in range(0, len(active_jobs), batch_size):
+        if not time_remains():
+            all_metadata_complete = False
+            break
+        batch_jobs = active_jobs[offset:offset + batch_size]
+        batch_paths = [Path(job["path"]) for job in batch_jobs]
+        batch = {"index": len(summary["batches"]) + 1,
+                 "commanders": [path.stem for path in batch_paths], "status": "preparing_metadata",
+                 "rebuilt": 0, "deferred": 0}
+        summary["batches"].append(batch)
+        metadata_partial = False
+        progress = summary["metadata_prefetch"]
+        if fetch_metadata and not dry_run:
+            before_cache = cache_digest(cache)
+            if progress["blocked"]:
+                result = {"status": "source_access_stopped", "blocked": True}
+            else:
+                progress["batches_started"] += 1
+                progress["status"] = "refreshing_commander_batch"
+                checkpoint()
+                batch_summary = {"metadata_prefetch": {"enabled": True, "network_enabled": True,
+                    "status": "starting", "edhrec_requests": 0, "requested": 0, "processed": 0,
+                    "requests": 0, "fetched": 0, "resolved": 0}}
+                if max_runtime_seconds:
+                    remaining = remaining_seconds()
+                    reserve = min(CPU_RESERVE_MAX_SECONDS, max(2, remaining * .4))
+                    allowance = min(METADATA_BATCH_MAX_SECONDS, max(0, remaining - reserve))
+                    if allowance <= 0:
+                        result = {"status": "time_budget_reached"}
+                    else:
+                        # A separate checkpoint belongs only to this HTTP batch.
+                        # The parent retains the cumulative report/metadata audit.
+                        batch_path = summary_path.with_name(f".{summary_path.stem}.metadata-batch.json")
+                        atomic_json(batch_path, batch_summary)
+                        deadline = min(started + max_runtime_seconds, time.monotonic() + allowance)
+                        pool = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+                        expired = False
+                        try:
+                            future = pool.submit(prefetch_metadata_job, {
+                                "root": str(root), "paths": [str(path) for path in batch_paths], "cache": str(cache),
+                                "max_age_days": max_age_days, "summary": batch_summary, "summary_path": str(batch_path),
+                                "validation_directory": str(validation_directory) if validation_directory is not None else None,
+                                "only_outdated": only_outdated, "deadline": deadline})
+                            try:
+                                result = future.result(timeout=max(0, deadline - time.monotonic()))
+                            except TimeoutError:
+                                expired = True
+                        finally:
+                            shutdown_executor(pool, terminate=expired)
+                        if expired:
+                            result = read_json(batch_path)["metadata_prefetch"]
+                            result["status"] = "time_budget_reached"
+                        batch_path.unlink(missing_ok=True)
+                else:
+                    repository = MetadataRepository(cache, max_age_days=max_age_days)
+                    prefetch_metadata(root, batch_paths, repository, batch_summary, only_outdated=only_outdated,
+                        time_remains=lambda: True,
+                        checkpoint=lambda: atomic_json(summary_path, {**summary, "active_metadata_batch": batch_summary}),
+                        validation_directory=validation_directory)
+                    result = batch_summary["metadata_prefetch"]
+            after_cache = cache_digest(cache)
+            saved = after_cache is not None and after_cache != before_cache
+            progress["durable_cache_saved"] |= saved or result.get("fetched", 0) > 0
+            for key in ("requested", "processed", "requests", "fetched", "resolved"):
+                progress[key] += result.get(key, 0)
+            for key in ("missing", "stale_names", "failures", "alias_resolutions", "input_blockers"):
+                progress[key].extend(item for item in result.get(key, []) if item not in progress[key])
+            progress["blocked"] |= bool(result.get("blocked"))
+            metadata_partial = result.get("status") != "complete"
+            all_metadata_complete &= not metadata_partial
+            if result.get("status") == "time_budget_reached":
+                progress["budget_limited_batches"] += 1
+            if not metadata_partial:
+                progress["batches_completed"] += 1
+            batch.update(metadata_status=result.get("status"),
+                         metadata_requested=result.get("requested", 0), metadata_processed=result.get("processed", 0),
+                         metadata_fetched=result.get("fetched", 0), durable_cache_saved=saved)
+        batch["status"] = "rebuilding_decks"
+        checkpoint()
+        batch_jobs = [{**job, "metadata_partial": metadata_partial} for job in batch_jobs]
+        initial_rebuilt, initial_deferred = summary["regenerated"], summary["deferred"]
+        if workers == 1 and not max_runtime_seconds:
+            # Reopen the cache after each HTTP batch; an earlier offline worker
+            # must not retain a metadata snapshot from the previous batch.
+            initialize_worker(str(root), str(cache), max_age_days)
+            for job in batch_jobs:
+                record(process_report(job))
+        elif time_remains():
+            pool = ProcessPoolExecutor(max_workers=workers, initializer=initialize_worker,
+                                       initargs=(str(root), str(cache), max_age_days),
+                                       mp_context=multiprocessing.get_context("spawn"))
+            expired, running = False, {}
+            try:
+                unscheduled = iter(batch_jobs)
+                while True:
+                    while len(running) < workers and time_remains():
+                        job = next(unscheduled, None)
+                        if job is None:
+                            break
+                        running[pool.submit(process_report, {**job, "prepare_only": True})] = job
+                    if not running:
                         break
-                    running[pool.submit(process_report, {**job, "prepare_only": True})] = job
-                if not running:
-                    break
-                if not time_remains():
-                    expired = True
-                    break
-                done, _ = wait(running, timeout=remaining_seconds(), return_when=FIRST_COMPLETED)
-                if not done:
-                    summary["time_budget_reached"] = expired = True
-                    break
-                for completed in done:
-                    job = running.pop(completed)
-                    record(commit_report(job, completed.result()))
-        finally:
-            # A context manager performs shutdown(wait=True), which lets one
-            # stuck analysis consume the entire GitHub Actions job timeout.
-            # Timed-out children never own report or backup writes.
-            shutdown_executor(pool, terminate=expired or bool(running))
+                    if not time_remains():
+                        expired = True
+                        break
+                    done, _ = wait(running, timeout=remaining_seconds(), return_when=FIRST_COMPLETED)
+                    if not done:
+                        summary["time_budget_reached"] = expired = True
+                        break
+                    for completed in done:
+                        job = running.pop(completed)
+                        record(commit_report(job, completed.result()))
+            finally:
+                # Only the parent writes reports; terminating a CPU child
+                # preserves every previously committed commander in this run.
+                shutdown_executor(pool, terminate=expired or bool(running))
+        batch.update(rebuilt=summary["regenerated"] - initial_rebuilt,
+                     deferred=summary["deferred"] - initial_deferred,
+                     status="partial" if any(path.stem in pending for path in batch_paths) else "complete")
+        processed_batches += 1
+        checkpoint()
+    if fetch_metadata and not dry_run:
+        progress = summary["metadata_prefetch"]
+        if progress["blocked"]:
+            progress["status"] = "source_access_stopped"
+        elif processed_batches * batch_size >= len(active_jobs) and all_metadata_complete:
+            progress["status"] = "complete"
+        elif summary["time_budget_reached"]:
+            progress["status"] = "time_budget_reached"
+        else:
+            progress["status"] = "partial"
     summary["completed_at"] = datetime.now(timezone.utc).isoformat()
     checkpoint()
     return summary
@@ -780,6 +919,8 @@ def main() -> None:
     parser.add_argument("--card-metadata-cache", type=Path, required=True)
     parser.add_argument("--commander", action="append", dest="commanders")
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
+    parser.add_argument("--commander-batch-size", type=int, default=DEFAULT_COMMANDER_BATCH_SIZE,
+                        help="Warm metadata and commit decks for this many commanders before preparing the next group")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--summary", type=Path)
     parser.add_argument("--backup-dir", type=Path)
@@ -799,7 +940,7 @@ def main() -> None:
         validation_directory=args.validation_directory, max_age_days=args.metadata_max_age_days,
         prefer_playability=not args.single_anchor, only_outdated=args.only_outdated,
         max_runtime_seconds=args.max_runtime_seconds, fetch_metadata=args.fetch_metadata,
-        current_discovery_only=args.current_discovery_only)
+        current_discovery_only=args.current_discovery_only, batch_size=args.commander_batch_size)
     print(json.dumps({key: value for key, value in summary.items() if key != "reports"}, ensure_ascii=False, indent=2))
     raise SystemExit(1 if summary["blocked"] else 0)
 
