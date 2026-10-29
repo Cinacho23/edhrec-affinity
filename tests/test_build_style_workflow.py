@@ -59,7 +59,7 @@ def test_scheduled_collection_uses_source_freshness_without_a_completion_deadlin
     result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], text=True, capture_output=True,
         env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
              "STYLES_DIR": "data/styles", "SAMPLE_DATE": "2026-10-22", "MAX_COMMANDERS": "0",
-             "SAMPLE_DECKS": "all", "MAX_COMPONENTS": "8", "REQUESTS_PER_SECOND": "40",
+             "SAMPLE_DECKS": "all", "MAX_COMPONENTS": "all", "REQUESTS_PER_SECOND": "40",
              "COMMANDER_SLUGS": "", "REFRESH_REPORTS": "false"})
     assert result.returncode == 0, result.stderr
     args = json.loads(result.stdout)
@@ -69,12 +69,16 @@ def test_scheduled_collection_uses_source_freshness_without_a_completion_deadlin
     assert args[args.index("--workers") + 1] == "1"
     assert args[args.index("--preview-workers") + 1] == "16"
     assert args[args.index("--min-total-decks") + 1] == "200"
+    assert args[args.index("--max-components") + 1] == "all"
     assert args[args.index("--main-tag-decks") + 1] == "15"
     assert args[args.index("--min-tag-decks") + 1] == "5"
     assert args[args.index("--main-tag-fraction") + 1] == "0.03"
     assert args[args.index("--min-tag-fraction") + 1] == "0.01"
     assert "--target-completion-hours" not in args
     assert "reset_target" not in COLLECTOR.read_text()
+    config = COLLECTOR.read_text().split("      max_components:\n", 1)[1].split("      refresh:\n", 1)[0]
+    assert "type: string" in config and 'default: "all"' in config
+    assert "MAX_COMPONENTS: ${{ inputs.max_components || 'all' }}" in COLLECTOR.read_text()
 
 
 def test_failed_collection_fails_workflow_after_uploading_checkpoints():
@@ -90,11 +94,13 @@ def test_failed_collection_fails_workflow_after_uploading_checkpoints():
         "      - name: Fail the run after preserving collection progress")
 
 
-def test_pipeline_cli_has_no_default_completion_deadline(tmp_path):
+@pytest.mark.parametrize("maximum", [None, "all", "0", "64"])
+def test_pipeline_cli_has_no_default_completion_deadline(tmp_path, maximum):
     index = tmp_path / "index.json"
     index.write_text("[]")
+    ceiling = [] if maximum is None else ["--max-components", maximum]
     result = subprocess.run([sys.executable, str(ROOT / "scripts/build_site_build_styles.py"),
-        "--pipeline", "--dry-run", "--commander-index", str(index), "--output-dir", str(tmp_path / "styles")],
+        "--pipeline", "--dry-run", "--commander-index", str(index), "--output-dir", str(tmp_path / "styles"), *ceiling],
         text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     summary = json.loads(result.stdout)
@@ -102,6 +108,7 @@ def test_pipeline_cli_has_no_default_completion_deadline(tmp_path):
     assert summary["capacity"]["deadline_at"] is None
     assert summary["deadline_target_met"] is None
     assert summary["freshness_target_hours"] == 96
+    assert summary["model_policy"]["max_components"] == (64 if maximum == "64" else None)
 
 
 def test_watchdog_and_free_cooldown_waiter_are_separate_from_the_collector():

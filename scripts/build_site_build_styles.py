@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from edhrec_affinity.build_styles.analysis import tag_label_policy
+from edhrec_affinity.build_styles.__main__ import parse_max_components
 from edhrec_affinity.build_styles.collection import parse_sample_decks
 from edhrec_affinity.build_styles.eligibility import (
     MIN_COMMANDER_DECKS, commander_is_eligible, valid_deck_count, validate_minimum,
@@ -240,7 +241,8 @@ def run_batch(args: argparse.Namespace, *, runner: Callable | None = None, monot
             preview_state.unlink(missing_ok=True)
         policy = tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags,
                                   min_tag_fraction=args.min_tag_fraction, main_tag_fraction=args.main_tag_fraction)
-        argv = ["--commander", slug, "--components", "auto", "--max-components", str(args.max_components),
+        argv = ["--commander", slug, "--components", "auto", "--max-components",
+                "all" if args.max_components is None else str(args.max_components),
                 "--min-total-decks", str(args.min_total_decks),
                 "--max-tags", str(args.max_tags), "--min-tag-decks", str(args.min_tag_decks),
                 "--min-tag-fraction", str(args.min_tag_fraction), "--main-tag-fraction", str(args.main_tag_fraction),
@@ -348,7 +350,8 @@ def parser() -> argparse.ArgumentParser:
                      help="Minimum fraction of all commander EDHREC decks for supporting tags (default 0.01)")
     cli.add_argument("--main-tag-fraction", type=float, default=0.03,
                      help="Minimum fraction of all commander EDHREC decks for main tags (default 0.03)")
-    cli.add_argument("--max-components", type=int, default=8, help="Automatic package-count search: 1 through this ceiling")
+    cli.add_argument("--max-components", type=parse_max_components, default=None,
+                     help="all (default) searches every data-supported count; optional positive ceiling; 0 also means all")
     cli.add_argument("--seed", type=int, default=42)
     cli.add_argument("--request-delay", type=float, default=1)
     cli.add_argument("--cache-root", type=Path, default=Path("data/raw/build-styles"))
@@ -390,12 +393,12 @@ def main() -> int:
         cli.error(str(error))
     if args.max_commanders < 0 or not 1 <= args.max_tags <= 16:
         cli.error("Use a nonnegative commander count and 1–16 tag profiles")
-    if (not 1 <= args.max_components <= 32 or args.min_tag_decks < 1 or args.min_total_decks < 0
+    if (args.min_tag_decks < 1 or args.min_total_decks < 0
             or not math.isfinite(args.request_delay) or args.request_delay < 1 or args.refresh_after_days < 1
             or not math.isfinite(args.max_runtime_seconds) or args.max_runtime_seconds < 0
             or not math.isfinite(args.worker_grace_seconds) or args.worker_grace_seconds < 0
             or not math.isfinite(args.max_preview_seconds) or args.max_preview_seconds <= 0):
-        cli.error("Invalid package ceiling, deck minimum, or request delay (minimum one second)")
+        cli.error("Invalid deck minimum or request delay (minimum one second)")
     if (not 1 <= args.workers <= 32 or not 1 <= args.preview_workers <= 64 or not 1 <= args.analysis_workers <= 16
             or any(not math.isfinite(value) or value <= 0 for value in
                    (args.requests_per_second, args.source_max_age_hours, args.index_max_age_hours, args.freshness_target_hours))

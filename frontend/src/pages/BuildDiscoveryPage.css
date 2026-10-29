@@ -38,7 +38,13 @@
 .build-discovery-card__stats strong { color: var(--accent); font-size: 1.45rem; }
 .build-discovery-card__stats span { color: var(--muted); font-size: .75rem; }
 .build-discovery-card__packages { margin-bottom: 1.2rem; }
-.build-discovery-card__package-label { margin: 0 0 .7rem; color: var(--muted); font-size: .75rem; line-height: 1.5; }
+.build-discovery-card__packages > summary { display: flex; align-items: center; justify-content: space-between; gap: .8rem; padding: .55rem 0; color: var(--accent); cursor: pointer; list-style: none; font-size: .8rem; line-height: 1.5; }
+.build-discovery-card__packages > summary::-webkit-details-marker { display: none; }
+.build-discovery-card__packages > summary:hover { text-decoration: underline; }
+.build-discovery-card__packages > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: var(--radius-xs); }
+.build-discovery-card__package-toggle { width: .45rem; height: .45rem; flex-shrink: 0; margin-right: .2rem; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: translateY(-2px) rotate(45deg); }
+.build-discovery-card__packages[open] .build-discovery-card__package-toggle { transform: translateY(2px) rotate(225deg); }
+.build-discovery-card__packages[open] > summary { margin-bottom: .5rem; }
 .build-discovery-card__packages ul { display: grid; gap: .8rem; margin: 0; padding: 0; list-style: none; }
 .build-discovery-card__packages li { padding: .7rem; border: 1px solid var(--border-soft); border-radius: var(--radius-xs); }
 .build-discovery-card__package-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .45rem; font-size: .78rem; line-height: 1.5; }

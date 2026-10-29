@@ -237,6 +237,11 @@ def _memberships(model, weights):
     return scaled / np.maximum(scaled.sum(axis=1, keepdims=True), 1e-12)
 
 
+def _minimum_package_members(deck_count: int) -> int:
+    """At least three effective decks and an exact five-percent sample share."""
+    return max(3, (deck_count + 19) // 20)
+
+
 def _evaluate_components(matrix, components: int, seed: int, membership_threshold: float) -> dict:
     """Use held-out decks and repeated fits; source labels never enter this step.
 
@@ -266,7 +271,7 @@ def _evaluate_components(matrix, components: int, seed: int, membership_threshol
         subsample.append(_aligned_similarity(model.components_, candidate.components_))
     minimum_count = int((memberships >= membership_threshold).sum(axis=0).min())
     minimum_effective = float(memberships.sum(axis=0).min())
-    minimum_required = max(3, math.ceil(0.05 * matrix.shape[0]))
+    minimum_required = _minimum_package_members(matrix.shape[0])
     seed_consistency = float(np.mean(stability))
     subsample_consistency = float(np.mean(subsample))
     supported = minimum_count >= minimum_required and minimum_effective >= minimum_required
@@ -366,19 +371,21 @@ def _package_summary(fit: dict, kept: list[dict], vocabulary: list[str], presenc
 
 
 def analyze_decks(decks: list[dict], base: dict, profiles: list[dict], *, components: int | None = None,
-                  max_components: int = 8, seed: int = 42, min_cards: int = 90, min_support: int = 2,
+                  max_components: int | None = None, seed: int = 42, min_cards: int = 90, min_support: int = 2,
                   membership_threshold: float = 0.25, min_tag_decks: int = 5, main_tag_decks: int | None = None,
                   min_tag_fraction: float = 0.01, main_tag_fraction: float = 0.03) -> dict:
     """Learn flexible card packages, never source tags; weights are not probabilities.
 
     ``components=None`` chooses a conservative count from 1 through a data-supported
-    maximum. An explicit positive count requests that many components for exploration.
+    maximum, with no configured ceiling by default. ``max_components`` can impose
+    an optional positive ceiling. An explicit positive ``components`` count
+    requests that many components for exploration.
     Automatic selection is a diagnostic heuristic, not a discovered ground truth.
     """
     if components is not None and (isinstance(components, bool) or not isinstance(components, int) or components < 1):
         raise ValueError("components must be a positive integer or None for automatic selection")
-    if isinstance(max_components, bool) or not isinstance(max_components, int) or max_components < 1:
-        raise ValueError("max_components must be a positive integer")
+    if max_components is not None and (isinstance(max_components, bool) or not isinstance(max_components, int) or max_components < 1):
+        raise ValueError("max_components must be a positive integer or None for no configured ceiling")
     if not 0 < membership_threshold <= 1:
         raise ValueError("membership_threshold must be greater than zero and at most one")
     label_policy = tag_label_policy(min_tag_decks, main_tag_decks, min_tag_fraction=min_tag_fraction,
@@ -457,24 +464,34 @@ def analyze_decks(decks: list[dict], base: dict, profiles: list[dict], *, compon
         idf = np.ones(len(vocabulary))
         matrix = presence.copy()
         feature_mode = "shared_cards_fallback"
+    minimum_required = _minimum_package_members(len(kept))
+    # Membership weights sum to one per deck. Consequently K * minimum_required
+    # cannot exceed the sample size: larger candidates can never pass support.
+    effective_support_max = len(kept) // minimum_required
+    candidate_ceiling = min(len(kept) // 4, effective_support_max, len(vocabulary))
+    if max_components is not None:
+        candidate_ceiling = min(candidate_ceiling, max_components)
     if use_sparse:
         from sklearn.utils.extmath import randomized_svd
 
         norm = np.sqrt(np.asarray(matrix.multiply(matrix).sum(axis=1)).ravel())
         matrix = matrix.multiply((1 / np.maximum(norm, 1e-12))[:, None]).tocsr()
-        # Only determine rank up to the candidate ceiling, not a full costly SVD.
-        ceiling = min(max_components if components is None else components, *matrix.shape)
+        # Probe only the data-supported search range, keeping manual exploratory
+        # requests available even when they exceed the automatic support bound.
+        ceiling = min(max(candidate_ceiling, components or 1), *matrix.shape)
         _, values, _ = randomized_svd(matrix, n_components=ceiling, random_state=seed)
         rank = int((values > max(matrix.shape) * np.finfo(float).eps * values[0]).sum())
     else:
         matrix /= np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
         rank = int(np.linalg.matrix_rank(matrix))
-    supported_max = min(max_components, len(kept) // 4, len(vocabulary), rank)
+    supported_max = min(candidate_ceiling, rank)
     selection["max_components"] = supported_max
     selection["data_limits"] = {"usable_decks": len(kept), "features": len(vocabulary),
                                 "matrix_rank": None if use_sparse else rank,
                                 "rank_at_least": rank, "sparse_matrix": use_sparse,
-                                "minimum_decks_per_candidate_component": 4}
+                                "minimum_decks_per_candidate_component": 4,
+                                "minimum_required_members": minimum_required,
+                                "maximum_components_by_effective_membership": effective_support_max}
     if rank < (components or 1):
         result["reason"] = "Too few independent card signals for the requested package count"
         selection["reason"] = result["reason"]
