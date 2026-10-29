@@ -38,6 +38,7 @@ def test_calculation_is_dated_local_estimate_for_exact_card_list():
     cards, metadata = sample()
     rating = calculate(cards, metadata, commanders=["Test Commander"])
     assert rating["status"] == "calculated"
+    assert rating["metadata_refresh_required"] is False
     assert rating["source"] == "local_public_formula"
     assert rating["is_estimate"] is True
     assert rating["deck_sha256"] == cardlist_hash(cards)
@@ -119,6 +120,7 @@ def test_missing_inputs_do_not_become_zero_or_verified(field):
     assert "power_level" not in rating
     assert rating["invalid_cards"][0]["name"] == "Test Spell"
     assert "checked_at" not in rating
+    assert rating["metadata_refresh_required"] is True
 
 
 def test_explicit_unranked_card_differs_from_missing_rank():
@@ -233,6 +235,101 @@ def test_incomplete_or_mismatched_price_evidence_cannot_establish_power(changes)
     rating = calculate(cards, metadata)
     assert rating["status"] == "unavailable"
     assert rating["invalid_cards"] and "power_level" not in rating
+
+
+def unpriced_lookup(card):
+    identity = "11111111-1111-4111-8111-111111111111"
+    card["oracle_id"] = identity
+    card["prices"] = {"usd": None, "usd_foil": None, "usd_etched": None}
+    card["power_price_fallback"] = {
+        "status": "unavailable", "oracle_id": identity, "checked_at": CHECKED,
+        "source_url": f"https://api.scryfall.com/cards/search?q=oracleid%3A{identity}+game%3Apaper&unique=prints&order=usd&dir=asc&page=1",
+        "reason": "no_priced_printing",
+    }
+
+
+def test_fresh_legacy_structural_metadata_still_requires_power_input_upgrade():
+    cards, metadata = sample()
+    # A cached model-only analysis has current Oracle observations, but its
+    # stripped saved metadata has never collected any numeric scoring inputs.
+    for card in metadata.values():
+        for field in ("prices", "edhrec_rank", "reserved"):
+            card.pop(field)
+    rating = calculate(cards, metadata)
+    assert rating["status"] == "unavailable"
+    assert rating["metadata_refresh_required"] is True
+    assert rating["deck_sha256"] == cardlist_hash(cards)
+    assert all(row["reason"] == "Missing Scryfall USD prices" for row in rating["invalid_cards"])
+    assert rating["stale_cards"] == []
+
+
+def test_null_usd_price_without_attempt_requires_price_lookup():
+    cards, metadata = sample()
+    metadata["test spell"]["prices"] = {"usd": None, "usd_foil": None, "usd_etched": None}
+    rating = calculate(cards, metadata)
+    assert rating["status"] == "unavailable"
+    assert rating["metadata_refresh_required"] is True
+
+
+def test_fresh_completed_unpriced_search_is_an_honest_attempt_without_a_retry_loop():
+    cards, metadata = sample()
+    unpriced_lookup(metadata["test spell"])
+    rating = calculate(cards, metadata)
+    assert rating["status"] == "unavailable"
+    assert rating["metadata_refresh_required"] is False
+    assert rating["invalid_cards"] == [{"name": "Test Spell", "reason": "No available priced physical printing for this card"}]
+    assert "power_level" not in rating
+    assert rating == calculate(cards, metadata)
+
+
+def test_unpriced_basic_land_search_does_not_disable_its_fixed_impact():
+    cards, metadata = sample()
+    unpriced_lookup(metadata["island"])
+    rating = calculate(cards, metadata)
+    assert rating["status"] == "calculated"
+    assert rating["power_level"] == 7.51
+    assert rating["total_impact"] == 616  # Includes 36 Islands at two impact each.
+    assert rating["metadata_refresh_required"] is False
+
+
+@pytest.mark.parametrize("change", ["old", "future", "source", "identity", "legacy_rank"])
+def test_incomplete_or_stale_unpriced_search_evidence_cannot_suppress_refresh(change):
+    cards, metadata = sample()
+    card = metadata["test spell"]
+    unpriced_lookup(card)
+    proof = card["power_price_fallback"]
+    if change == "old":
+        proof["checked_at"] = (NOW - timedelta(days=8)).isoformat()
+    elif change == "future":
+        proof["checked_at"] = (NOW + timedelta(days=1)).isoformat()
+    elif change == "source":
+        proof["source_url"] = "https://untrusted.invalid/cards/search"
+    elif change == "identity":
+        proof["oracle_id"] = "another-card"
+    else:
+        card.pop("edhrec_rank")
+    rating = calculate(cards, metadata)
+    assert rating["status"] == "unavailable"
+    assert rating["metadata_refresh_required"] is True
+
+
+def test_observed_zero_price_and_unranked_card_can_calculate_zero_without_refresh():
+    cards = [{"name": "Test Spell", "quantity": 100}]
+    metadata = {"test spell": meta("Test Spell", price="0.00", rank=None)}
+    rating = calculate(cards, metadata)
+    assert rating["status"] == "calculated"
+    assert rating["power_level"] == 0
+    assert rating["score_bracket"] == 1
+    assert rating["metadata_refresh_required"] is False
+
+
+def test_complete_fractional_cost_is_unsupported_without_repeated_metadata_refresh():
+    cards, metadata = sample()
+    metadata["test spell"]["cmc"] = .5
+    rating = calculate(cards, metadata)
+    assert rating["status"] == "unavailable"
+    assert "Fractional mana value" in rating["invalid_cards"][0]["reason"]
+    assert rating["metadata_refresh_required"] is False
 
 
 # Minimal numerical facts from the public client's embedded Child of Alara

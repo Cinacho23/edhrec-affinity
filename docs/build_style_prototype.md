@@ -176,9 +176,12 @@ selected model and alternative package counts. The
 collector runs a bounded upgrade after collection for the same current reports
 eligible for Build Discovery. Saved parsed lists and profiles rebuild older
 generated decks without EDHREC requests, refitting NMF or changing source-check
-dates. One paced Scryfall stream refreshes required card metadata before CPU
-workers start; a missing input or stale rule for a selected card preserves the
-previous report for retry. Successful upgrades request publication even if
+dates. Small commander batches alternate one paced Scryfall metadata stream
+with offline deck-generation workers. Each batch reserves time for generation
+and commits completed reports before preparing the next batch, so catalog-wide
+metadata preparation cannot consume the entire rebuild window. A missing input
+or stale rule for a selected card preserves the previous report for retry.
+Successful upgrades request publication even if
 collection itself produced no new reports. Originals are backed up, missing
 required inputs leave existing reports intact, and remaining work resumes in
 later batches. For a restored checkpoint, the same operation is available as:
@@ -193,6 +196,12 @@ python scripts/rebuild_generated_decks.py \
 Omit `--fetch-metadata` for a fully offline rebuild using verified cached rules.
 The runtime bound includes metadata preparation, and unresolved unused cards
 do not prevent rebuilding a deck whose selected cards have current rules.
+Refreshed metadata is saved separately to the shared Actions cache before
+workflow outcome checks. Metadata-only progress requests continuation only after
+the remote cache key is confirmed; it does not request website publication.
+Pending deck rebuilds with saved progress can continue even when source
+collection has no work due. Source cooldown, resource and manual-scope guards
+remain in force.
 
 Scryfall supplies exact-name card rules, color identity and Commander legality
 in cached batches. Unresolved names receive an exact named-card lookup. Names
@@ -312,8 +321,10 @@ new attempt. The configured validation directory is used during generation as
 well as while selecting work. Current-generation reports are also selected
 again when their actual metadata dates exceed the configured three-day cache
 age, their local score expires, or their formula/hash evidence is missing.
-An explicit unavailable score is a completed attempt while its metadata is
-fresh, avoiding a retry loop for cards with no available prices.
+An unavailable score requests another metadata pass when its inputs have never
+been upgraded for power calculation, including fresh legacy rules records and
+null-price printings without a completed lookup. A fresh, completed lookup that
+still has no usable price remains explicitly unavailable without a retry loop.
 
 Export the lists, primers and per-card inclusion/lift CSVs locally:
 

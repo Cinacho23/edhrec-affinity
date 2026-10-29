@@ -18,6 +18,7 @@ import json
 import math
 import re
 from typing import Any, Iterable
+from urllib.parse import parse_qs, urlparse
 
 from .external_validation import cardlist_hash
 from .power_brackets import bracket_for_power_score
@@ -141,6 +142,24 @@ def _checked(value: Any) -> datetime:
     return checked.astimezone(timezone.utc)
 
 
+def _completed_unpriced_lookup(proof: dict, card: dict) -> bool:
+    """Recognize a dated documented lookup, rather than an unattempted null."""
+    identity = card.get("oracle_id")
+    source = proof.get("source_url")
+    if (proof.get("status") != "unavailable"
+            or proof.get("reason") not in {"not_found", "no_priced_printing", "page_limit"}
+            or not isinstance(identity, str) or not identity or proof.get("oracle_id") != identity
+            or not isinstance(source, str)):
+        return False
+    parsed = urlparse(source)
+    query = parse_qs(parsed.query)
+    return (parsed.scheme == "https" and parsed.hostname == "api.scryfall.com"
+            and parsed.username is None and parsed.password is None and parsed.port in {None, 443}
+            and parsed.path == "/cards/search" and query.get("q") == [f"oracleid:{identity} game:paper"]
+            and query.get("unique") == ["prints"] and query.get("order") == ["usd"]
+            and query.get("dir") == ["asc"])
+
+
 def calculate_power_rating(
     cards: Iterable[dict], metadata: dict[str, dict], *,
     commanders: Iterable[str] | None = None, now: datetime | None = None,
@@ -161,6 +180,7 @@ def calculate_power_rating(
         "power_formula_version": POWER_FORMULA_VERSION,
         "algorithm_sha256": ALGORITHM_SHA256, "source_url": ALGORITHM_SOURCE_URL,
         "is_estimate": True, "missing_cards": [], "stale_cards": [], "invalid_cards": [],
+        "metadata_refresh_required": False,
     }
     try:
         if isinstance(cards, (str, bytes, dict)):
@@ -178,6 +198,7 @@ def calculate_power_rating(
         if count != 100:
             raise ValueError("Power calculation requires the complete 100-card list")
         if not isinstance(metadata, dict):
+            result["metadata_refresh_required"] = True
             raise ValueError("Expected normalized Scryfall metadata")
         if isinstance(commanders, (str, bytes, dict)):
             raise ValueError("Commander names must be a list")
@@ -199,7 +220,9 @@ def calculate_power_rating(
             card = metadata.get(key)
             if card is None:
                 result["missing_cards"].append(names[key])
+                result["metadata_refresh_required"] = True
                 continue
+            card_needs_refresh = True
             try:
                 if not isinstance(card, dict):
                     raise ValueError("Invalid Scryfall card")
@@ -207,25 +230,31 @@ def calculate_power_rating(
                 age = current - checked
                 if age >= timedelta(days=max_age_days) or age < timedelta(minutes=-5):
                     result["stale_cards"].append(names[key])
+                    result["metadata_refresh_required"] = True
                     continue
                 price_proof = card.get("power_price_fallback")
                 price_checked, price_printing = checked, None
+                completed_unpriced = False
                 if price_proof is not None:
-                    if not isinstance(price_proof, dict) or price_proof.get("status") != "resolved":
-                        raise ValueError("No available priced physical printing for this card")
+                    if not isinstance(price_proof, dict) or price_proof.get("status") not in {"resolved", "unavailable"}:
+                        raise ValueError("Invalid priced physical-printing evidence")
                     price_checked = _checked(price_proof.get("checked_at"))
                     price_age = current - price_checked
                     if price_age >= timedelta(days=max_age_days) or price_age < timedelta(minutes=-5):
                         result["stale_cards"].append(names[key])
+                        result["metadata_refresh_required"] = True
                         continue
-                    if (price_proof.get("oracle_id") != card.get("oracle_id")
+                    if price_proof["status"] == "unavailable":
+                        completed_unpriced = _completed_unpriced_lookup(price_proof, card)
+                        if not completed_unpriced:
+                            raise ValueError("Unavailable price evidence does not establish a completed lookup")
+                    elif (price_proof.get("oracle_id") != card.get("oracle_id")
                             or price_proof.get("prices") != card.get("prices")
                             or not isinstance(price_proof.get("printing_id"), str)):
                         raise ValueError("Priced-printing evidence does not identify this card's prices")
-                    price_printing = price_proof["printing_id"]
+                    else:
+                        price_printing = price_proof["printing_id"]
                 price = _usd(card.get("prices"))
-                if price is None and key not in _BASICS:
-                    raise ValueError("No available Scryfall USD price")
                 rank = card["edhrec_rank"]
                 if rank is not None and (type(rank) is not int or rank < 1):
                     raise ValueError("Invalid Scryfall EDHREC rank")
@@ -238,6 +267,16 @@ def calculate_power_rating(
                 layout, type_line = card.get("layout"), card.get("type_line")
                 if not isinstance(layout, str) or not layout or not isinstance(type_line, str) or not type_line:
                     raise ValueError("Missing Scryfall layout or type")
+                if price is None and key not in _BASICS:
+                    # A fresh completed lookup is an honest terminal attempt;
+                    # an older stripped cache or unattempted null price still
+                    # needs a network metadata pass before it can be skipped.
+                    card_needs_refresh = not completed_unpriced
+                    raise ValueError("No available priced physical printing for this card" if completed_unpriced
+                                     else "No available Scryfall USD price")
+                if completed_unpriced and key not in _BASICS:
+                    raise ValueError("Unavailable price evidence cannot establish a usable price")
+                card_needs_refresh = False
                 # The client puts impact into a discrete CMC array. Unknown
                 # fractional entries cannot be reproduced as a reliable score.
                 adjusted_cmc = _CMC_ADJUSTMENTS.get(key, cmc)
@@ -255,6 +294,7 @@ def calculate_power_rating(
                 })
             except (ValueError, TypeError, KeyError, OverflowError) as error:
                 result["invalid_cards"].append({"name": names[key], "reason": str(error)})
+                result["metadata_refresh_required"] |= card_needs_refresh
         if result["missing_cards"] or result["stale_cards"] or result["invalid_cards"]:
             result["reason"] = "Complete fresh price, rank and Oracle metadata is required for every card."
             return result

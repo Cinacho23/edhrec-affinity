@@ -210,6 +210,18 @@ def decision(snapshot, *, now, older=(), allow_bounded=False):
         return {"run": False, "reason": "Previous collection reached a resource limit"}
     if allow_bounded and not automatic_continuation_allowed(summary):
         return {"run": True, "reason": "An explicit collector request follows the previous bounded batch"}
+    rebuild = summary.get("deck_rebuild")
+    if isinstance(rebuild, dict):
+        pending = rebuild.get("pending")
+        regenerated = rebuild.get("regenerated")
+        metadata = rebuild.get("metadata_prefetch") or {}
+        metadata_blocked = (rebuild.get("metadata_source_blocked") is True
+                            or isinstance(metadata, dict) and (metadata.get("blocked") is True
+                                or metadata.get("status") == "source_access_stopped"))
+        progress = (type(regenerated) is int and regenerated > 0
+                    or rebuild.get("durable_metadata_progress") is True)
+        if type(pending) is int and pending > 0 and progress and not metadata_blocked:
+            return {"run": True, "reason": "Saved package-deck rebuild work remains"}
     checked = timestamp((summary.get("capacity") or {}).get("evaluated_at"))
     if checked is not None:
         retry_delay = 1800 if summary.get("failures") and summary.get("no_progress") else 86400

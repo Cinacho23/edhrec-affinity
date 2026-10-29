@@ -107,6 +107,35 @@ def hanging_prefetch(job):
     raise AssertionError("Hung metadata child should have been stopped")
 
 
+def require_stopped_metadata_before_cpu(job):
+    marker = Path(job["root"]) / "metadata.started"
+    if marker.exists():
+        try:
+            os.kill(int(marker.read_text()), 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError("CPU work overlapped the metadata stream")
+    # This test module loads the CLI through importlib; spawn can import its
+    # own independent module object, so initialize the helper's offline copy.
+    rebuild.initialize_worker(job["root"], str(Path(job["root"]).parent / "metadata.json"), job["max_age_days"])
+    return rebuild.process_report(job)
+
+
+def hang_only_second_metadata_batch(job):
+    if Path(job["paths"][0]).stem == "commander-b":
+        return hanging_prefetch(job)
+    return rebuild.prefetch_metadata_job(job)
+
+
+def save_metadata_then_hang(job):
+    records = rebuild.read_json(Path(job["cache"]))
+    records["cards"]["consensus card"]["prices"]["usd"] = ".20"
+    records["cards"]["consensus card"]["checked_at"] = datetime.now(timezone.utc).isoformat()
+    rebuild.atomic_json(Path(job["cache"]), records)
+    return hanging_prefetch(job)
+
+
 def test_rebuild_all_models_keeps_learned_inputs_and_invalidates_changed_list_rating(tmp_path, monkeypatch):
     report, inputs, cache = fixture(tmp_path)
     monkeypatch.setattr("httpx.Client", lambda **_: pytest.fail("Offline rebuild tried to start HTTP"))
@@ -286,20 +315,22 @@ def test_runtime_stops_real_hung_cpu_children_preserves_reports_and_resumes(tmp_
     assert all(rebuild.read_json(root / name)["collection"] == report["collection"] for name in originals)
 
 
-def test_runtime_stops_real_hung_metadata_stream_without_starting_cpu_work(tmp_path, monkeypatch):
+def test_runtime_stops_hung_metadata_then_commits_already_cached_decks(tmp_path, monkeypatch):
     report, inputs, cache = fixture(tmp_path)
     root = tmp_path / "build-styles"
     save_evidence(root, report, inputs)
     original, original_cache = (root / "commander.json").read_bytes(), cache.read_bytes()
     monkeypatch.setattr(rebuild, "prefetch_metadata_job", hanging_prefetch)
+    monkeypatch.setattr(rebuild, "process_report", require_stopped_metadata_before_cpu)
     started = time.monotonic()
     result = rebuild.rebuild_all(root, cache, workers=2, fetch_metadata=True,
                                  max_runtime_seconds=3, only_outdated=True)
     assert time.monotonic() - started < 8
-    assert result["time_budget_reached"] and result["pending"] == 1
-    assert result["metadata_prefetch"]["status"] == "time_budget_reached"
-    assert result["blocked"] == result["regenerated"] == 0
-    assert (root / "commander.json").read_bytes() == original
+    assert not result["time_budget_reached"] and result["pending"] == 0
+    assert result["metadata_prefetch"]["status"] == "partial"
+    assert result["metadata_prefetch"]["budget_limited_batches"] == 1
+    assert result["blocked"] == 0 and result["regenerated"] == 1
+    assert (root / "commander.json").read_bytes() != original
     assert cache.read_bytes() == original_cache
     marker = root / "metadata.started"
     assert marker.exists()
@@ -324,6 +355,115 @@ def test_bounded_metadata_prefetch_completes_then_commits_offline_worker_output(
     assert generated["collection"] == report["collection"]
     assert rebuild.learned_analysis(generated["deck_analysis"]) == rebuild.learned_analysis(report["deck_analysis"])
     assert generated["deck_generation"]["version"] == rebuild.GENERATION_VERSION
+
+
+def test_each_commander_batch_is_committed_before_preparing_the_next_pool(tmp_path, monkeypatch):
+    report, inputs, cache = fixture(tmp_path, "commander-a")
+    root = tmp_path / "build-styles"
+    for slug in ("commander-a", "commander-b", "commander-c"):
+        save_evidence(root, {**report, "commander_slug": slug}, inputs)
+    calls = []
+    prefetch = rebuild.prefetch_metadata
+    def batch_prefetch(directory, paths, *args, **kwargs):
+        assert len(paths) == 1
+        if calls:
+            previous = rebuild.read_json(root / f"{calls[-1]}.json")
+            assert previous["deck_generation"]["version"] == rebuild.GENERATION_VERSION
+            assert previous["collection"] == report["collection"]
+        calls.append(paths[0].stem)
+        return prefetch(directory, paths, *args, **kwargs)
+    monkeypatch.setattr(rebuild, "prefetch_metadata", batch_prefetch)
+    result = rebuild.rebuild_all(root, cache, fetch_metadata=True, batch_size=1,
+                                 only_outdated=True, prefer_playability=False)
+    assert calls == ["commander-a", "commander-b", "commander-c"]
+    assert result["regenerated"] == 3 and result["pending"] == result["blocked"] == 0
+    assert len(result["batches"]) == result["metadata_prefetch"]["batches_completed"] == 3
+    assert all(batch["status"] == "complete" and batch["rebuilt"] == 1 for batch in result["batches"])
+    assert result["metadata_prefetch"]["requests"] == result["metadata_prefetch"]["fetched"] == 0
+    assert result["metadata_prefetch"]["durable_cache_saved"] is False
+    again = rebuild.rebuild_all(root, cache, fetch_metadata=True, batch_size=1, only_outdated=True)
+    assert again["skipped"] == 3 and again["regenerated"] == again["pending"] == 0
+    assert len(calls) == 3 and not again["batches"]
+
+
+def test_slow_later_metadata_batch_preserves_first_commit_and_defers_cold_report(tmp_path, monkeypatch):
+    report, inputs, cache = fixture(tmp_path, "commander-a")
+    root = tmp_path / "build-styles"
+    save_evidence(root, report, inputs)
+    second, second_inputs = deepcopy(report), deepcopy(inputs)
+    second["commander_slug"] = "commander-b"
+    for sampled in second_inputs["decks"]:
+        next(card for card in sampled["cards"] if card["name"] == "Core 1")["name"] = "Unwarmed B Card"
+    second_inputs["dataset_sha256"] = deck_dataset_sha256(second_inputs["decks"])
+    second["collection"]["dataset_sha256"] = second_inputs["dataset_sha256"]
+    for _, package in rebuild.packages(second):
+        next(card for card in package["generated_deck"]["cards"] if card["name"] == "Core 1")["name"] = "Unwarmed B Card"
+    save_evidence(root, second, second_inputs)
+    original_second = (root / "commander-b.json").read_bytes()
+    monkeypatch.setattr(rebuild, "prefetch_metadata_job", hang_only_second_metadata_batch)
+    started = time.monotonic()
+    result = rebuild.rebuild_all(root, cache, workers=1, fetch_metadata=True, batch_size=1,
+                                 max_runtime_seconds=5, only_outdated=True, prefer_playability=False)
+    assert time.monotonic() - started < 9
+    assert result["regenerated"] == 1 and result["deferred"] == result["pending"] == 1
+    assert result["blocked"] == 0 and result["pending_commanders"] == ["commander-b"]
+    assert result["metadata_prefetch"]["status"] == "partial"
+    assert result["batches"][0]["status"] == "complete" and result["batches"][1]["status"] == "partial"
+    assert (root / "commander-b.json").read_bytes() == original_second
+    assert rebuild.read_json(root / "commander-a.json")["deck_generation"]["version"] == rebuild.GENERATION_VERSION
+    assert not (Path(result["backup_dir"]) / "commander-b.json").exists()
+
+
+def test_partial_prefetch_cannot_publish_fresh_but_never_upgraded_power_inputs(tmp_path, monkeypatch):
+    report, inputs, cache = fixture(tmp_path)
+    root = tmp_path / "build-styles"
+    save_evidence(root, report, inputs)
+    records = rebuild.read_json(cache)
+    for card in records["cards"].values():
+        for field in ("prices", "reserved", "edhrec_rank", "power_metadata_version"):
+            card.pop(field, None)
+    write(cache, records)
+    original = (root / "commander.json").read_bytes()
+    monkeypatch.setattr(rebuild, "prefetch_metadata_job", hanging_prefetch)
+    result = rebuild.rebuild_all(root, cache, fetch_metadata=True, max_runtime_seconds=3,
+                                 only_outdated=True, prefer_playability=False)
+    assert result["regenerated"] == result["blocked"] == 0
+    assert result["deferred"] == result["pending"] == 1
+    assert "power inputs" in result["reports"][0]["reason"]
+    assert (root / "commander.json").read_bytes() == original
+    assert not Path(result["backup_dir"]).exists()
+
+
+def test_interrupted_metadata_save_is_durable_progress_without_a_completed_batch_counter(tmp_path, monkeypatch):
+    report, inputs, cache = fixture(tmp_path)
+    root = tmp_path / "build-styles"
+    save_evidence(root, report, inputs)
+    monkeypatch.setattr(rebuild, "prefetch_metadata_job", save_metadata_then_hang)
+    result = rebuild.rebuild_all(root, cache, fetch_metadata=True, max_runtime_seconds=3,
+                                 only_outdated=True, prefer_playability=False)
+    progress = result["metadata_prefetch"]
+    assert progress["fetched"] == 0 and progress["durable_cache_saved"] is True
+    assert progress["status"] == "partial" and progress["budget_limited_batches"] == 1
+    assert rebuild.read_json(cache)["cards"]["consensus card"]["prices"]["usd"] == ".20"
+    assert result["regenerated"] == 1 and result["pending"] == result["blocked"] == 0
+
+
+def test_source_access_stop_allows_cached_batches_without_starting_another_http_stream(tmp_path, monkeypatch):
+    report, inputs, cache = fixture(tmp_path, "commander-a")
+    root = tmp_path / "build-styles"
+    for slug in ("commander-a", "commander-b"):
+        save_evidence(root, {**report, "commander_slug": slug}, inputs)
+    calls = []
+    def source_stop(_root, paths, _repository, summary, **_):
+        calls.append(paths)
+        summary["metadata_prefetch"].update(status="source_access_stopped", blocked=True,
+                                           requested=1, processed=1, requests=1, fetched=0, resolved=0)
+    monkeypatch.setattr(rebuild, "prefetch_metadata", source_stop)
+    result = rebuild.rebuild_all(root, cache, fetch_metadata=True, batch_size=1,
+                                 only_outdated=True, prefer_playability=False)
+    assert len(calls) == 1 and result["metadata_prefetch"]["requests"] == 1
+    assert result["metadata_prefetch"]["blocked"] and result["metadata_prefetch"]["status"] == "source_access_stopped"
+    assert result["regenerated"] == 2 and result["pending"] == result["blocked"] == 0
 
 
 def test_below_threshold_and_insufficient_reports_are_not_pending(tmp_path):
@@ -508,6 +648,40 @@ def test_explicit_unavailable_local_power_does_not_busy_loop_while_metadata_is_f
     assert not rebuild.needs_rebuild(report)
     validation["metadata"]["oldest_checked_at"] = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
     assert rebuild.needs_rebuild(report)
+
+
+@pytest.mark.parametrize("flag", [None, True])
+def test_never_upgraded_current_generation_power_is_retried_without_waiting_three_days(tmp_path, flag):
+    report, inputs, cache = fixture(tmp_path)
+    report, _ = rebuild.rebuild_report(report, inputs, MetadataRepository(cache), prefer_playability=False)
+    for _, package in rebuild.packages(report):
+        power = package["generated_deck"]["validation"]["calculated_power"]
+        power["status"] = "unavailable"
+        if flag is None:
+            power.pop("metadata_refresh_required", None)
+        else:
+            power["metadata_refresh_required"] = flag
+    assert rebuild.needs_rebuild(report)
+    root = tmp_path / "build-styles"
+    save_evidence(root, report, inputs)
+    result = rebuild.rebuild_all(root, cache, only_outdated=True, prefer_playability=False)
+    assert result["regenerated"] == 1 and result["pending"] == result["blocked"] == 0
+    assert not rebuild.needs_rebuild(rebuild.read_json(root / "commander.json"))
+
+
+def test_offline_legacy_power_attempt_remains_pending_until_metadata_is_upgraded(tmp_path):
+    report, inputs, cache = fixture(tmp_path)
+    root = tmp_path / "build-styles"
+    save_evidence(root, report, inputs)
+    records = rebuild.read_json(cache)
+    for card in records["cards"].values():
+        for field in ("edhrec_rank", "prices", "reserved", "power_metadata_version"):
+            card.pop(field, None)
+    write(cache, records)
+    result = rebuild.rebuild_all(root, cache, only_outdated=True, prefer_playability=False)
+    assert result["regenerated"] == result["pending"] == 1 and result["blocked"] == 0
+    assert result["reports"][0]["retry_needed"] is True
+    assert rebuild.needs_rebuild(rebuild.read_json(root / "commander.json"))
 
 
 def test_metadata_age_option_reaches_selection_and_worker_retry_for_current_generation(tmp_path):
