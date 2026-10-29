@@ -477,7 +477,8 @@ def test_watchdog_can_publish_when_collection_is_complete_and_no_next_batch_is_d
     assert github.dispatches == [(coordinator.FRONTEND, {"source_run_id": "100"})]
 
 
-@pytest.mark.parametrize("progress", [{"regenerated": 1}, {"durable_metadata_progress": True}])
+@pytest.mark.parametrize("progress", [{"regenerated": 1}, {"durable_metadata_progress": True},
+                                     {"scored_reports": 1}, {"power_refreshed_reports": 1}])
 def test_saved_deck_rebuild_progress_continues_after_source_collection_is_complete(progress):
     summary = {"remaining_in_batch": 0, "publish_needed": False,
                "capacity": {"evaluated_at": NOW.isoformat()},
@@ -494,6 +495,8 @@ def test_saved_deck_rebuild_progress_continues_after_source_collection_is_comple
     {"pending": 0, "regenerated": 1},
     {"pending": True, "regenerated": 1},
     {"pending": 12, "regenerated": True},
+    {"pending": 12, "scored_reports": True},
+    {"pending": 12, "power_refreshed_reports": -1},
     {"pending": 12, "metadata_prefetch": {"fetched": 100}},
     {"pending": 12, "durable_metadata_progress": True, "metadata_source_blocked": True},
     {"pending": 12, "durable_metadata_progress": True,
@@ -513,6 +516,83 @@ def test_deck_rebuild_progress_preserves_source_resource_and_manual_guards(guard
                       "deck_rebuild": {"pending": 12, "durable_metadata_progress": True}, **guard}])
     assert coordinator.coordinate(github, "watchdog", now=NOW)["run"] is False
     assert not any(workflow == coordinator.COLLECTOR for workflow, _ in github.dispatches)
+
+
+def test_power_only_readiness_uses_durable_inputs_even_when_source_collection_is_idle():
+    summary = {"remaining_in_batch": 0, "capacity": {"evaluated_at": NOW.isoformat()}}
+    github = GitHub([summary])
+    assert coordinator.coordinate(github, "preflight", now=NOW)["run"] is False
+    ready = coordinator.coordinate(github, "preflight", now=NOW, power_only=True)
+    assert ready["run"] is True and ready["restore_run_id"] == 100
+    assert github.dispatches == []
+    assert coordinator.coordinate(GitHub(active=True), "preflight", now=NOW, power_only=True)["run"] is False
+    assert coordinator.coordinate(GitHub(), "preflight", now=NOW, power_only=True)["run"] is False
+
+
+@pytest.mark.parametrize("changes", [paused(), {"resource_limit": True},
+    {"deck_rebuild": {"metadata_source_blocked": True}},
+    {"deck_rebuild": {"metadata_prefetch": {"blocked": True}}},
+    {"deck_rebuild": {"metadata_prefetch": {"status": "source_access_stopped"}}}])
+def test_power_only_readiness_retains_source_and_resource_guards(changes):
+    assert coordinator.coordinate(GitHub([changes]), "preflight", now=NOW, power_only=True)["run"] is False
+
+
+def test_power_only_readiness_does_not_use_an_incomplete_checkpoint():
+    github = GitHub([{}])
+    github.saved[0].durable = False
+    assert coordinator.coordinate(github, "preflight", now=NOW, power_only=True)["run"] is False
+
+
+@pytest.mark.parametrize("options", [{"mode": "watchdog"}, {"mode": "preflight", "recovery_run_id": 100}])
+def test_power_only_readiness_cannot_change_watchdog_or_recovery_semantics(options):
+    with pytest.raises(ValueError, match="only for preflight"):
+        coordinator.coordinate(GitHub([{}]), now=NOW, power_only=True, **options)
+
+
+def test_power_only_summary_preserves_source_facts_without_inheriting_publication_progress():
+    original = {"scope": {"commanders": ["commander-a"]}, "automatic_continuation_allowed": False,
+                "source_rate": {"learned_rate": 1.25}, "measured_request_rate": {"requests_started": 123},
+                "capacity": {"evaluated_at": NOW.isoformat()}, "remaining_in_batch": 500,
+                "publish_needed": True, "continuation_needed": True, "no_progress": False,
+                "deck_rebuild": {"regenerated": 100}}
+    saved = json.loads(json.dumps(original))
+    prepared = coordinator.prepare_power_only_summary(coordinator.Snapshot(100, original), now=NOW)
+    assert original == saved
+    for key in ("scope", "automatic_continuation_allowed", "source_rate", "measured_request_rate", "capacity", "remaining_in_batch"):
+        assert prepared[key] == original[key]
+    assert prepared["publish_needed"] is False and prepared["continuation_needed"] is False
+    assert prepared["no_progress"] is True and "deck_rebuild" not in prepared
+    assert prepared["power_only"] is True and prepared["power_only_source_run_id"] == 100
+
+
+@pytest.mark.parametrize("summary,durable", [({}, False), (paused(), True),
+    ({"resource_limit": True}, True), ({"preflight_skipped": True}, True),
+    ({"deck_rebuild": {"metadata_source_blocked": True}}, True),
+    ({"deck_rebuild": {"metadata_prefetch": {"blocked": True}}}, True),
+    ({"deck_rebuild": {"metadata_prefetch": {"status": "source_access_stopped"}}}, True)])
+def test_power_only_summary_rejects_unsafe_source_context(summary, durable):
+    with pytest.raises(ValueError):
+        coordinator.prepare_power_only_summary(coordinator.Snapshot(100, summary, durable), now=NOW)
+
+
+@pytest.mark.parametrize("durable,status,allowed", [(True, "completed", True), (False, "completed", False),
+                                                   (True, "in_progress", False)])
+def test_power_only_cli_prepares_the_exact_restored_checkpoint_offline(tmp_path, durable, status, allowed):
+    summary = {"publish_needed": True, "continuation_needed": True, "no_progress": False,
+               "source_rate": {"learned_rate": 1.25}, "deck_rebuild": {"regenerated": 100}}
+    environment, dispatches = github_stub(tmp_path, summary, durable=durable)
+    environment["TEST_SOURCE_STATUS"] = status
+    target = tmp_path / "prepared.json"
+    result = subprocess.run([sys.executable, str(SCRIPT), "prepare-power-only", "--source-run-id", "100",
+                             "--summary-file", str(target)], env=environment, text=True, capture_output=True)
+    assert (result.returncode == 0) is allowed, result.stdout + result.stderr
+    assert target.exists() is allowed
+    assert not dispatches.exists()
+    if allowed:
+        prepared = json.loads(target.read_text())
+        assert prepared["power_only_source_run_id"] == 100
+        assert prepared["source_rate"] == summary["source_rate"]
+        assert prepared["publish_needed"] is False and "deck_rebuild" not in prepared
 
 
 @pytest.mark.parametrize("changed", [True, False])

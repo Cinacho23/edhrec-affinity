@@ -27,6 +27,10 @@ on:
         description: "Resample selected commanders that already have fitted reports"
         type: boolean
         default: false
+      power_only:
+        description: "Calculate power for all saved package decks from the cache, then resume normal work"
+        type: boolean
+        default: false
       recovery_run_id:
         description: "Optional interrupted latest run whose summary survived a missing checkpoint upload"
         type: string
@@ -66,10 +70,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
+          POWER_ONLY: ${{ inputs.power_only }}
         run: |
           args=(preflight --summary-file data/build-style-artifact/build_style_batch.json)
           if [[ -n "${RECOVERY_RUN_ID}" ]]; then
             args+=(--recovery-run-id "${RECOVERY_RUN_ID}")
+          fi
+          if [[ "${POWER_ONLY}" == "true" ]]; then
+            args+=(--power-only)
           fi
           python3 scripts/coordinate_build_styles.py "${args[@]}"
       - name: Retain a skipped-run summary
@@ -132,6 +140,7 @@ jobs:
           restore-keys: build-style-cards-
 
       - name: Get current commander index and weekly dataset date
+        if: inputs.power_only != true
         shell: bash
         run: |
           set -euo pipefail
@@ -170,6 +179,7 @@ jobs:
 
       - name: Continue the resumable catalog queue
         id: collect_styles
+        if: inputs.power_only != true
         continue-on-error: true
         timeout-minutes: 36
         shell: bash
@@ -208,23 +218,42 @@ jobs:
         if: steps.collect_styles.outcome == 'failure'
         run: echo "::notice::Collection stopped; reports and the source cooldown are retained. The outcome check distinguishes a rate-limit pause from a failure."
 
+      - name: Prepare saved reports for a power-only pass
+        id: prepare_power_only
+        if: inputs.power_only == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESTORED_RUN_ID: ${{ steps.restored_styles.outputs['run-id'] }}
+        run: |
+          python3 scripts/coordinate_build_styles.py prepare-power-only \
+            --source-run-id "${RESTORED_RUN_ID}" \
+            --summary-file data/build-style-artifact/build_style_batch.json
+
       - name: Rebuild package decks from saved collections
         id: rebuild_decks
-        if: always() && steps.collect_styles.outcome != 'skipped'
+        if: always() && (steps.collect_styles.outcome != 'skipped' || steps.prepare_power_only.outcome == 'success')
         continue-on-error: true
         timeout-minutes: 22
+        env:
+          POWER_ONLY: ${{ inputs.power_only }}
         run: |
-          timeout --signal=INT --kill-after=30s 21m python scripts/rebuild_generated_decks.py \
-            --build-styles-dir "${STYLES_DIR}" \
-            --card-metadata-cache data/raw/build-style-card-metadata.json \
-            --workers 2 --only-outdated --current-discovery-only --fetch-metadata \
-            --max-runtime-seconds 1200 \
-            --summary data/build-style-artifact/deck-rebuild-summary.json \
-            --backup-dir "${RUNNER_TEMP}/build-style-deck-backups"
+          set -euo pipefail
+          args=(--build-styles-dir "${STYLES_DIR}"
+                --card-metadata-cache data/raw/build-style-card-metadata.json
+                --workers 2 --only-outdated --current-discovery-only
+                --max-runtime-seconds 1200
+                --summary data/build-style-artifact/deck-rebuild-summary.json
+                --backup-dir "${RUNNER_TEMP}/build-style-deck-backups")
+          if [[ "${POWER_ONLY}" == "true" ]]; then
+            args+=(--scores-only)
+          else
+            args+=(--fetch-metadata)
+          fi
+          timeout --signal=INT --kill-after=30s 21m python scripts/rebuild_generated_decks.py "${args[@]}"
 
       - name: Save refreshed card rules cache
         id: save_card_metadata
-        if: always() && steps.card_metadata_cache.outputs.cache-primary-key != '' && hashFiles('data/raw/build-style-card-metadata.json') != ''
+        if: always() && inputs.power_only != true && steps.card_metadata_cache.outputs.cache-primary-key != '' && hashFiles('data/raw/build-style-card-metadata.json') != ''
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -260,7 +289,7 @@ jobs:
           PY
 
       - name: Include rebuilt decks in publication progress
-        if: always() && steps.collect_styles.outcome != 'skipped'
+        if: always() && (steps.collect_styles.outcome != 'skipped' || steps.prepare_power_only.outcome == 'success')
         env:
           METADATA_CACHE_SAVED: ${{ steps.verify_card_metadata.outputs.verified == 'true' }}
         run: |
@@ -278,6 +307,7 @@ jobs:
           rebuild = json.loads(rebuild_path.read_text())
           summary["deck_rebuild"] = {key: rebuild[key] for key in (
               "generation_version", "regenerated", "pending", "blocked", "changed_deck_lists",
+              "scored_reports", "scored_decks", "calculated_decks", "power_refreshed_reports", "scoring_pending",
               "distinctive_omissions_before", "distinctive_omissions_after", "time_budget_reached",
           ) if key in rebuild}
           metadata = rebuild.get("metadata_prefetch") or {}
@@ -292,13 +322,15 @@ jobs:
               ) if key in metadata}
               summary["deck_rebuild"].update(metadata_cache_saved=metadata_saved,
                   durable_metadata_progress=metadata_progress, metadata_source_blocked=metadata_blocked)
-          if rebuild.get("regenerated", 0) > 0:
+          report_progress = any(type(rebuild.get(key)) is int and rebuild[key] > 0
+              for key in ("regenerated", "scored_reports", "power_refreshed_reports"))
+          if report_progress:
               summary.update(publish_needed=True, no_progress=False)
           elif metadata_progress:
               # Saved metadata is useful progress, but no report has changed.
               # Continue from the remote cache without dispatching publication.
               summary["no_progress"] = False
-          if ((rebuild.get("regenerated", 0) > 0 or metadata_progress) and rebuild.get("pending", 0) > 0
+          if ((report_progress or metadata_progress) and rebuild.get("pending", 0) > 0
                   and not summary.get("blocked") and not metadata_blocked
                   and not summary.get("resource_limit") and summary.get("automatic_continuation_allowed") is True):
               summary["continuation_needed"] = True
@@ -365,7 +397,7 @@ jobs:
 
       - name: Decide whether collection can continue immediately
         id: continuation
-        if: success() && steps.checkpoint.outcome == 'success' && steps.collect_styles.outcome == 'success'
+        if: success() && steps.checkpoint.outcome == 'success' && (steps.collect_styles.outcome == 'success' || steps.prepare_power_only.outcome == 'success')
         shell: bash
         env:
           TARGETED_COMMANDERS: ${{ inputs.commanders }}

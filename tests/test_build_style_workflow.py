@@ -204,7 +204,8 @@ def test_cooldown_dispatch_uses_the_token_exception_after_both_durable_uploads()
     assert "Resume collector #{0} after cooldown (attempt {1})" in waiter
 
 
-def test_saved_deck_upgrade_is_bounded_to_current_reports_and_uploaded_before_publication(tmp_path):
+@pytest.mark.parametrize("power_only", [False, True])
+def test_saved_deck_upgrade_is_bounded_to_current_reports_and_uploaded_before_publication(tmp_path, power_only):
     body, script = step(COLLECTOR, "Rebuild package decks from saved collections")
     stub_timeout(tmp_path)
     stub(tmp_path, "python", """\
@@ -213,14 +214,16 @@ def test_saved_deck_upgrade_is_bounded_to_current_reports_and_uploaded_before_pu
     """)
     result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], text=True, capture_output=True,
         env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
-             "STYLES_DIR": "saved/styles", "RUNNER_TEMP": "scratch"})
+             "STYLES_DIR": "saved/styles", "RUNNER_TEMP": "scratch", "POWER_ONLY": str(power_only).lower()})
     assert result.returncode == 0, result.stderr
     args = json.loads(result.stdout)
     assert args[0] == "scripts/rebuild_generated_decks.py"
     assert args[args.index("--build-styles-dir") + 1] == "saved/styles"
     assert args[args.index("--max-runtime-seconds") + 1] == "1200"
     assert args[args.index("--backup-dir") + 1].startswith("scratch/")
-    assert {"--only-outdated", "--current-discovery-only", "--fetch-metadata"} <= set(args)
+    assert {"--only-outdated", "--current-discovery-only"} <= set(args)
+    assert ("--scores-only" in args) is power_only
+    assert ("--fetch-metadata" in args) is not power_only
     assert "--fetch" not in args
     assert "continue-on-error: true" in body
     workflow = COLLECTOR.read_text()
@@ -228,6 +231,55 @@ def test_saved_deck_upgrade_is_bounded_to_current_reports_and_uploaded_before_pu
         "      - name: Rebuild package decks from saved collections") < workflow.index(
         "      - name: Upload cumulative build-style samples")
     assert "data/build-style-artifact/deck-rebuild-summary.json" in workflow
+
+
+def test_power_only_mode_prepares_the_exact_restored_source_and_skips_collection(tmp_path):
+    workflow = COLLECTOR.read_text()
+    config = workflow.split("      power_only:\n", 1)[1].split("      recovery_run_id:\n", 1)[0]
+    assert "type: boolean" in config and "default: false" in config
+    for name in ("Get current commander index and weekly dataset date", "Continue the resumable catalog queue"):
+        body, _ = step(COLLECTOR, name)
+        assert "if: inputs.power_only != true" in body
+    stub(tmp_path, "python3", """\
+        import json, sys
+        print(json.dumps(sys.argv[1:]))
+    """)
+    body, script = step(COLLECTOR, "Prepare saved reports for a power-only pass")
+    assert "if: inputs.power_only == true" in body
+    assert "RESTORED_RUN_ID: ${{ steps.restored_styles.outputs['run-id'] }}" in body
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], text=True, capture_output=True,
+        env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"], "RESTORED_RUN_ID": "123"})
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["scripts/coordinate_build_styles.py", "prepare-power-only",
+        "--source-run-id", "123", "--summary-file", "data/build-style-artifact/build_style_batch.json"]
+    assert workflow.index("      - name: Restore shared card rules cache") < workflow.index(
+        "      - name: Prepare saved reports for a power-only pass") < workflow.index(
+        "      - name: Rebuild package decks from saved collections")
+    for name in ("Rebuild package decks from saved collections", "Include rebuilt decks in publication progress",
+                 "Decide whether collection can continue immediately"):
+        body, _ = step(COLLECTOR, name)
+        assert "steps.prepare_power_only.outcome == 'success'" in body
+    body = workflow.split("      - name: Save refreshed card rules cache\n", 1)[1].split(
+        "      - name: Verify saved card rules cache", 1)[0]
+    assert "inputs.power_only != true" in body
+    _, dispatch = step(COLLECTOR, "Continue from the uploaded checkpoint")
+    assert "--scores-only" not in dispatch and "power_only" not in dispatch
+
+
+@pytest.mark.parametrize("power_only", [False, True])
+def test_power_only_preflight_uses_its_explicit_offline_guard(tmp_path, power_only):
+    _, script = step(COLLECTOR, "Check active collectors and source cooldown")
+    stub(tmp_path, "python3", """\
+        import json, sys
+        print(json.dumps(sys.argv[1:]))
+    """)
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], text=True, capture_output=True,
+        env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+             "POWER_ONLY": str(power_only).lower(), "RECOVERY_RUN_ID": ""})
+    assert result.returncode == 0, result.stderr
+    args = json.loads(result.stdout)
+    assert args[:3] == ["scripts/coordinate_build_styles.py", "preflight", "--summary-file"]
+    assert ("--power-only" in args) is power_only
 
 
 def test_work_stages_leave_time_for_checkpoint_upload_before_the_job_deadline():
@@ -302,6 +354,63 @@ def test_refreshed_metadata_cache_is_saved_before_handled_failures_and_continuat
         "      - name: Fail the run after preserving collection progress")
     body, _ = step(COLLECTOR, "Include rebuilt decks in publication progress")
     assert "METADATA_CACHE_SAVED: ${{ steps.verify_card_metadata.outputs.verified == 'true' }}" in body
+
+
+@pytest.mark.parametrize("progress", [
+    {"scored_reports": 7, "scored_decks": 25, "calculated_decks": 25},
+    {"power_refreshed_reports": 7},
+])
+@pytest.mark.parametrize("blocked, automatic, pending, expected_continuation", [
+    (False, True, 5, True), (True, True, 5, False),
+    (False, False, 5, False), (False, True, 0, False),
+])
+def test_saved_fast_power_updates_publish_before_full_regeneration_without_claiming_decks_rebuilt(
+    tmp_path, progress, blocked, automatic, pending, expected_continuation,
+):
+    _, script = step(COLLECTOR, "Include rebuilt decks in publication progress")
+    root = tmp_path / "data/build-style-artifact"
+    root.mkdir(parents=True)
+    path = root / "build_style_batch.json"
+    source = {"blocked": blocked, "automatic_continuation_allowed": automatic,
+              "no_progress": True, "publish_needed": False, "continuation_needed": False}
+    path.write_text(json.dumps(source))
+    rebuilt = {"generation_version": 4, "regenerated": 0, "pending": pending, "blocked": 0,
+               "changed_deck_lists": 0, "time_budget_reached": True, "scoring_pending": 3, **progress}
+    (root / "deck-rebuild-summary.json").write_text(json.dumps(rebuilt))
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path,
+        text=True, capture_output=True,
+        env={**os.environ, "METADATA_CACHE_SAVED": "false",
+             "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]})
+    assert result.returncode == 0, result.stderr
+    output = json.loads(path.read_text())
+    assert output["publish_needed"] is True
+    assert output["no_progress"] is False
+    assert output["continuation_needed"] is expected_continuation
+    assert output["deck_rebuild"] == rebuilt
+    assert output["deck_rebuild"]["regenerated"] == output["deck_rebuild"]["changed_deck_lists"] == 0
+    for key in ("blocked", "automatic_continuation_allowed"):
+        assert output[key] == source[key]
+
+
+def test_fast_power_attempts_without_a_committed_report_do_not_claim_publishable_progress(tmp_path):
+    _, script = step(COLLECTOR, "Include rebuilt decks in publication progress")
+    root = tmp_path / "data/build-style-artifact"
+    root.mkdir(parents=True)
+    path = root / "build_style_batch.json"
+    source = {"automatic_continuation_allowed": True, "no_progress": True,
+              "publish_needed": False, "continuation_needed": False}
+    path.write_text(json.dumps(source))
+    (root / "deck-rebuild-summary.json").write_text(json.dumps({
+        "regenerated": 0, "pending": 12, "scored_reports": 0, "scored_decks": 0,
+        "power_refreshed_reports": 0, "calculated_decks": 0, "scoring_pending": 12,
+    }))
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path,
+        text=True, capture_output=True, env={**os.environ, "METADATA_CACHE_SAVED": "false",
+            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]})
+    assert result.returncode == 0, result.stderr
+    output = json.loads(path.read_text())
+    for key in ("no_progress", "publish_needed", "continuation_needed"):
+        assert output[key] == source[key]
 
 
 @pytest.mark.parametrize("entries, expected", [

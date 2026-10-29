@@ -136,6 +136,189 @@ def save_metadata_then_hang(job):
     return hanging_prefetch(job)
 
 
+def hang_only_second_power_report(job):
+    if Path(job["path"]).stem == "commander-b":
+        return hanging_report(job)
+    rebuild.initialize_power_worker(str(Path(job["root"]).parent / "metadata.json"), job["max_age_days"])
+    return rebuild.refresh_existing_report_power(job)
+
+
+def test_scores_only_uses_cached_current_lists_without_reconstruction_or_network(tmp_path, monkeypatch):
+    report, _, cache = fixture(tmp_path)
+    root = tmp_path / "build-styles"
+    write(root / "commander.json", report)  # Deliberately no preview/evidence pool.
+    original = (root / "commander.json").read_bytes()
+    monkeypatch.setattr(rebuild, "load_inputs", lambda *_: pytest.fail("Score pass loaded sampled pool"))
+    monkeypatch.setattr(rebuild, "generate_package_decks", lambda *_a, **_k: pytest.fail("Score pass reconstructed cards"))
+    monkeypatch.setattr("httpx.Client", lambda **_: pytest.fail("Score pass tried HTTP"))
+    result = rebuild.rebuild_all(root, cache, scores_only=True, fetch_metadata=True,
+                                 validation_directory=tmp_path / "ratings", only_outdated=True)
+    updated = rebuild.read_json(root / "commander.json")
+    assert result["scored_reports"] == result["power_refreshed_reports"] == 1
+    assert result["scored_decks"] == 2 and result["scoring_pending"] == 0
+    assert result["regenerated"] == result["blocked"] == 0 and result["pending"] == 1
+    assert result["network_enabled"] is False and result["metadata_prefetch"]["enabled"] is False
+    assert result["score_refresh"]["cache_only"] and result["score_refresh"]["requests"] == 0
+    assert updated["deck_generation"]["version"] == 1
+    assert updated["deck_generation"]["full_rebuild_pending"] and rebuild.needs_rebuild(updated)
+    assert updated["generated_at"] == report["generated_at"]
+    assert updated["collection"] == report["collection"]
+    assert rebuild.learned_analysis(updated["deck_analysis"]) == rebuild.learned_analysis(report["deck_analysis"])
+    for (_, before), (_, after) in zip(rebuild.packages(report), rebuild.packages(updated)):
+        old, new = before["generated_deck"], after["generated_deck"]
+        assert new["cards"] == old["cards"] and new["primer"] == old["primer"]
+        assert new["validation"]["calculated_power"]["status"] == "calculated"
+        assert new["validation"]["deck_sha256"] == cardlist_hash(new["cards"])
+        assert new["validation"]["power_alignment"]["status"] == "pending"
+        assert new["validation"]["external_rating"]["status"] == "unverified"
+    assert (Path(result["backup_dir"]) / "power-refresh/commander.json").read_bytes() == original
+
+
+def test_unchanged_score_proofs_are_idempotent_and_do_not_report_false_progress(tmp_path):
+    report, _, cache = fixture(tmp_path)
+    root = tmp_path / "build-styles"
+    write(root / "commander.json", report)
+    rebuild.rebuild_all(root, cache, scores_only=True, validation_directory=tmp_path / "ratings")
+    original = (root / "commander.json").read_bytes()
+    again = rebuild.rebuild_all(root, cache, scores_only=True, validation_directory=tmp_path / "ratings")
+    assert again["power_refreshed_reports"] == again["scored_reports"] == again["scored_decks"] == 0
+    assert again["scoring_pending"] == 0 and again["pending"] == 1
+    assert (root / "commander.json").read_bytes() == original
+
+
+def test_score_pass_marks_checked_restrictions_pending_without_swapping_cards(tmp_path):
+    report, _, cache = fixture(tmp_path)
+    records = rebuild.read_json(cache)
+    records["cards"]["core 0"]["oracle_text"] = "Destroy all lands."
+    write(cache, records)
+    root = tmp_path / "build-styles"
+    write(root / "commander.json", report)
+    result = rebuild.rebuild_all(root, cache, scores_only=True, validation_directory=tmp_path / "ratings")
+    assert result["scored_decks"] == 2
+    generated = rebuild.read_json(root / "commander.json")["deck_analysis"]["packages"][0]["generated_deck"]
+    assert generated["cards"] == report["deck_analysis"]["packages"][0]["generated_deck"]["cards"]
+    alignment = generated["validation"]["power_alignment"]
+    assert alignment["status"] == "known_mismatch"
+    assert alignment["minimum_checked_bracket"] == 4 > alignment["score_bracket"]
+    assert alignment["deck_sha256"] == cardlist_hash(generated["cards"])
+
+
+def test_score_pass_uses_verified_exact_numeric_score_before_local_estimate(tmp_path):
+    report, _, cache = fixture(tmp_path)
+    root, ratings = tmp_path / "build-styles", tmp_path / "ratings"
+    checked_score(report, ratings, power_level=6.71, bracket=4)
+    write(root / "commander.json", report)
+    rebuild.rebuild_all(root, cache, scores_only=True, validation_directory=ratings)
+    generated = rebuild.read_json(root / "commander.json")["deck_analysis"]["packages"][0]["generated_deck"]
+    assert generated["validation"]["calculated_power"]["score_bracket"] != 3
+    assert generated["validation"]["power_alignment"]["score_bracket"] == 3
+    assert generated["validation"]["power_alignment"]["rating_kind"] == "verified"
+
+
+def test_score_pass_records_unavailable_inputs_without_claiming_numeric_progress(tmp_path):
+    report, _, cache = fixture(tmp_path)
+    records = rebuild.read_json(cache)
+    records["cards"]["weak card"].pop("prices")
+    write(cache, records)
+    root = tmp_path / "build-styles"
+    write(root / "commander.json", report)
+    first = rebuild.rebuild_all(root, cache, scores_only=True, validation_directory=tmp_path / "ratings")
+    assert first["power_refreshed_reports"] == 1
+    assert first["scored_reports"] == first["scored_decks"] == 0 and first["scoring_pending"] == 2
+    saved = rebuild.read_json(root / "commander.json")
+    calculated = saved["deck_analysis"]["packages"][0]["generated_deck"]["validation"]["calculated_power"]
+    assert calculated["status"] == "unavailable" and calculated["metadata_refresh_required"]
+    assert rebuild.needs_rebuild(saved)
+    again = rebuild.rebuild_all(root, cache, scores_only=True, validation_directory=tmp_path / "ratings")
+    assert again["power_refreshed_reports"] == 0 and again["scoring_pending"] == 2
+
+
+def test_full_reconstruction_clears_score_refresh_pending_markers(tmp_path):
+    report, inputs, cache = fixture(tmp_path)
+    report["deck_generation"]["full_rebuild_pending"] = True
+    for _, package in rebuild.packages(report):
+        package["generated_deck"]["validation"]["power_alignment"] = {"status": "known_mismatch"}
+    updated, _ = rebuild.rebuild_report(report, inputs, MetadataRepository(cache), prefer_playability=False,
+                                       validation_directory=tmp_path / "ratings")
+    assert "full_rebuild_pending" not in updated["deck_generation"]
+    assert all("power_alignment" not in package["generated_deck"]["validation"]
+               for _, package in rebuild.packages(updated))
+    assert not rebuild.needs_rebuild(updated)
+
+
+def test_new_score_bracket_schedules_reconstruction_for_an_otherwise_current_report(tmp_path, monkeypatch):
+    report, inputs, cache = fixture(tmp_path)
+    report, _ = rebuild.rebuild_report(report, inputs, MetadataRepository(cache), prefer_playability=False,
+                                      validation_directory=tmp_path / "ratings")
+    assert not rebuild.needs_rebuild(report)
+    root = tmp_path / "build-styles"
+    write(root / "commander.json", report)
+    original_scorer = rebuild.calculate_power_rating
+    def higher_score(*args, **kwargs):
+        result = original_scorer(*args, **kwargs)
+        assert result["score_bracket"] != 3
+        return {**result, "power_level": 6.71, "score_bracket": 3}
+    monkeypatch.setattr(rebuild, "calculate_power_rating", higher_score)
+    result = rebuild.rebuild_all(root, cache, scores_only=True, only_outdated=True,
+                                 validation_directory=tmp_path / "ratings")
+    updated = rebuild.read_json(root / "commander.json")
+    assert result["scored_reports"] == 1 and result["pending"] == 1
+    assert updated["deck_generation"]["full_rebuild_pending"]
+    assert rebuild.needs_rebuild(updated)
+    assert updated["deck_analysis"]["packages"][0]["generated_deck"]["validation"]["power_alignment"]["score_bracket"] == 3
+
+
+def test_score_commit_refuses_concurrent_report_changes(tmp_path):
+    report, _, cache = fixture(tmp_path)
+    root = tmp_path / "build-styles"
+    path = root / "commander.json"
+    write(path, report)
+    job = {"path": str(path), "backup_dir": str(tmp_path / "backups"),
+           "refreshed_at": datetime.now(timezone.utc).isoformat(), "validation_directory": str(tmp_path / "ratings")}
+    rebuild.initialize_power_worker(str(cache), 3)
+    prepared = rebuild.refresh_existing_report_power(job)
+    report["concurrent_work"] = True
+    write(path, report)
+    original = path.read_bytes()
+    committed = rebuild.commit_power_refresh(job, prepared)
+    assert not committed["changed"] and committed["scored_decks"] == 0
+    assert "concurrent work" in committed["error"]
+    assert path.read_bytes() == original and not (tmp_path / "backups").exists()
+
+
+def test_score_pass_deadline_preserves_prior_commit_and_stops_hung_child(tmp_path, monkeypatch):
+    report, _, cache = fixture(tmp_path, "commander-a")
+    root = tmp_path / "build-styles"
+    for slug in ("commander-a", "commander-b"):
+        write(root / f"{slug}.json", {**report, "commander_slug": slug})
+    original_b = (root / "commander-b.json").read_bytes()
+    monkeypatch.setattr(rebuild, "refresh_existing_report_power", hang_only_second_power_report)
+    started = time.monotonic()
+    result = rebuild.rebuild_all(root, cache, scores_only=True, max_runtime_seconds=3, workers=1,
+                                 validation_directory=tmp_path / "ratings")
+    assert time.monotonic() - started < 8
+    assert result["score_refresh"]["time_budget_reached"] and result["time_budget_reached"]
+    assert result["scored_reports"] == 1 and result["scored_decks"] == 2
+    assert result["pending"] == 2 and result["regenerated"] == 0
+    assert (root / "commander-b.json").read_bytes() == original_b
+    marker = root / "commander-b.started"
+    assert marker.exists()
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(marker.read_text()), 0)
+
+
+def test_score_only_dry_run_does_not_write_reports_or_open_network(tmp_path, monkeypatch):
+    report, _, cache = fixture(tmp_path)
+    root = tmp_path / "build-styles"
+    write(root / "commander.json", report)
+    original = (root / "commander.json").read_bytes()
+    monkeypatch.setattr("httpx.Client", lambda **_: pytest.fail("Dry score run tried HTTP"))
+    result = rebuild.rebuild_all(root, cache, scores_only=True, dry_run=True, fetch_metadata=True)
+    assert result["scored_decks"] == result["power_refreshed_reports"] == result["regenerated"] == 0
+    assert result["score_refresh"]["status"] == "skipped_dry_run" and result["network_enabled"] is False
+    assert (root / "commander.json").read_bytes() == original
+
+
 def test_rebuild_all_models_keeps_learned_inputs_and_invalidates_changed_list_rating(tmp_path, monkeypatch):
     report, inputs, cache = fixture(tmp_path)
     monkeypatch.setattr("httpx.Client", lambda **_: pytest.fail("Offline rebuild tried to start HTTP"))
@@ -409,7 +592,12 @@ def test_slow_later_metadata_batch_preserves_first_commit_and_defers_cold_report
     assert result["blocked"] == 0 and result["pending_commanders"] == ["commander-b"]
     assert result["metadata_prefetch"]["status"] == "partial"
     assert result["batches"][0]["status"] == "complete" and result["batches"][1]["status"] == "partial"
-    assert (root / "commander-b.json").read_bytes() == original_second
+    deferred = rebuild.read_json(root / "commander-b.json")
+    assert deferred["deck_generation"]["version"] == second["deck_generation"]["version"]
+    assert deferred["deck_generation"]["full_rebuild_pending"]
+    assert all(after["generated_deck"]["cards"] == before["generated_deck"]["cards"]
+               for (_, before), (_, after) in zip(rebuild.packages(second), rebuild.packages(deferred)))
+    assert (Path(result["backup_dir"]) / "power-refresh/commander-b.json").read_bytes() == original_second
     assert rebuild.read_json(root / "commander-a.json")["deck_generation"]["version"] == rebuild.GENERATION_VERSION
     assert not (Path(result["backup_dir"]) / "commander-b.json").exists()
 
@@ -430,8 +618,13 @@ def test_partial_prefetch_cannot_publish_fresh_but_never_upgraded_power_inputs(t
     assert result["regenerated"] == result["blocked"] == 0
     assert result["deferred"] == result["pending"] == 1
     assert "power inputs" in result["reports"][0]["reason"]
-    assert (root / "commander.json").read_bytes() == original
-    assert not Path(result["backup_dir"]).exists()
+    deferred = rebuild.read_json(root / "commander.json")
+    assert deferred["deck_generation"]["version"] == report["deck_generation"]["version"]
+    assert result["scored_decks"] == 0 and result["power_refreshed_reports"] == 1
+    assert all(package["generated_deck"]["validation"]["calculated_power"]["status"] == "unavailable"
+               for _, package in rebuild.packages(deferred))
+    assert (Path(result["backup_dir"]) / "power-refresh/commander.json").read_bytes() == original
+    assert not (Path(result["backup_dir"]) / "commander.json").exists()
 
 
 def test_interrupted_metadata_save_is_durable_progress_without_a_completed_batch_counter(tmp_path, monkeypatch):
