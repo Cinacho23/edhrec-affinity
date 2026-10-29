@@ -236,7 +236,10 @@ def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_
     source = report(packages=4)
     packages = source["deck_analysis"]["packages"]
     rating = {"status": "verified", "checked_at": "2026-10-24T10:00:00Z",
-              "playability_pct": 75.2, "bracket": 4, "deck_sha256": "large-rating-detail"}
+              "playability_pct": 75.2, "bracket": 4, "power_level": 6.71, "deck_sha256": "large-rating-detail"}
+    calculated = {"status": "calculated", "checked_at": "2026-10-24T10:00:00Z", "power_level": 6.72,
+                  "score_bracket": 3, "deck_sha256": "current-list", "source": "local_public_formula",
+                  "power_formula_version": 1, "card_details": ["large internal calculation detail"]}
     packages[0].update(name="Package 1", tag_suggestions=[
         {"tag_slug": "tokens", "tag_name": "Tokens", "similarity": 0.8, "compared_cards": 81,
          "support_tier": "main", "deck_count": 15, "commander_deck_count": 300, "deck_fraction": 0.05},
@@ -248,7 +251,9 @@ def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_
         "validation": {"valid": True, "bracket": {"recommended": 3, "rule_checks": {"expensive": True}},
                        "external_rating": rating},
         "statistics": {"recommended_bracket": 3, "swap_details": [{"in": "Large card detail"}]}})
-    packages[1].update(generated_deck={"status": "generated", "statistics": {"recommended_bracket": 2}})
+    packages[1].update(generated_deck={"status": "generated", "validation": {
+        "deck_sha256": "current-list", "calculated_power": calculated},
+                                      "statistics": {"recommended_bracket": 2}})
     packages[2].update(tag_suggestions=[], generated_deck={"status": "unavailable", "reason": "Metadata missing"})
     # Older packages can lack generation and labels; alternative model packages
     # are deliberately excluded from this summary of the selected model.
@@ -267,17 +272,19 @@ def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_
              "support_tier": "supporting", "deck_count": 5, "commander_deck_count": 300, "deck_fraction": 5 / 300},
             {"tag_slug": "legacy", "tag_name": "Legacy", "similarity": 0.5}],
          "generated_deck": {"status": "generated", "validation": {
-             "bracket": {"recommended": 3}, "external_rating": {
-                 key: value for key, value in rating.items() if key != "deck_sha256"}},
+             "bracket": {"recommended": 3}, "external_rating": rating},
              "statistics": {"recommended_bracket": 3}}},
         {"id": 1, "tag_suggestions": [], "generated_deck": {
-            "status": "generated", "statistics": {"recommended_bracket": 2}}},
+            "status": "generated", "validation": {"deck_sha256": "current-list", "calculated_power": {
+                key: value for key, value in calculated.items() if key != "card_details"}},
+            "statistics": {"recommended_bracket": 2}}},
         {"id": 2, "tag_suggestions": [], "generated_deck": {"status": "unavailable"}},
         {"id": 3, "tag_suggestions": []},
     ]
     assert "Long primer content" not in json.dumps(index)
     assert "Do not embed full decks" not in json.dumps(index)
     assert "Alternative tag" not in json.dumps(index)
+    assert "large internal calculation detail" not in json.dumps(index)
 
 
 @pytest.mark.parametrize("cards", [

@@ -19,6 +19,7 @@ import {
   getGeneratedDeckDistinctiveCards,
   getGeneratedDeckExport,
   getGeneratedDeckGroups,
+  getGeneratedDeckPowerRating,
   getPackageBracketLabel,
   getSupportedThemes,
   hasBuildStylePopulation,
@@ -64,20 +65,24 @@ function checkedDate(value) {
     : "Date unavailable";
 }
 
-function ExternalDeckRating({ rating }) {
-  const result = getExternalDeckRating(rating);
+function ExternalDeckRating({ rating, deckHash }) {
+  const result = getExternalDeckRating(rating, undefined, deckHash);
   if (!result) return <p className="build-note"><strong>External rating: unverified.</strong> Use the EDHPowerLevel link to assess this exact card list.</p>;
   const stale = result.status === "stale";
   return <div className="build-external-rating" data-status={result.status}>
-    <p><strong>EDHPowerLevel result{stale ? " · stale" : " · verified for this card list"}</strong><span>Checked {checkedDate(result.checked_at)}</span></p>
+    <p><strong>EDHPowerLevel result{stale ? " · historical observation" : " · verified for this card list"}</strong><span>Checked {checkedDate(result.checked_at)}</span></p>
     <div className="build-generated-deck__metrics">
-      <span><strong>{formatDecimal(result.playability_pct, 1)}%</strong> playability</span>
-      {Number.isFinite(result.bracket) ? <span><strong>{result.bracket}</strong> external bracket</span> : null}
-      {result.power_level !== undefined && result.power_level !== null ? <span><strong>{String(result.power_level)}</strong> external power</span> : null}
+      {result.scoreBracket !== null ? <span><strong>{result.scoreBracket}</strong> {stale ? "historical" : "calculated"} power bracket</span> : null}
+      {result.power_level !== undefined && result.power_level !== null ? <span><strong>{String(result.power_level)}</strong> {stale ? "historical" : result.scoreBracket === null ? "reported" : "calculated"} power</span> : null}
+      {result.playabilityKnown ? <span><strong>{formatDecimal(result.playability_pct, 1)}%</strong> {stale ? "historical " : ""}playability</span> : null}
     </div>
+    {result.bracketMismatch ? <p className="build-generated-deck__review-note">{stale ? "At that check, the reported" : "The reported"} restriction bracket was {result.reportedBracket}, while the power score corresponds to bracket {result.scoreBracket}.{stale
+      ? " This observation does not establish the current deck’s bracket."
+      : result.reportedBracket > result.scoreBracket ? " The card list needs adjustment to match its calculated power bracket." : " The displayed bracket follows the calculated power score."}</p> : null}
     <p className="build-note">{stale
-      ? `This older observation was ${result.inTargetRange ? "within" : "outside"} the 72.5–77.5% playability target. Recheck before treating it as current.`
-      : `72.5–77.5% playability target ${result.targetMet ? "met" : "not met"}.`} External bracket and power are separate from the site’s source-informed bracket estimate.</p>
+      ? "Recheck this older observation before treating its score as current. " : ""}{result.playabilityKnown
+      ? `72.5–77.5% playability target ${stale ? `was ${result.inTargetRange ? "met" : "not met"} at that check` : result.targetMet ? "met" : "not met"}. `
+      : "Playability was not recorded. "}The displayed power bracket uses score thresholds 4.7, 6.7, 7.7 and 9.25. Card restrictions are checked separately.</p>
     {result.source_url ? <p className="build-source-links"><SourceLink url={result.source_url}>Open rated card list</SourceLink></p> : null}
   </div>;
 }
@@ -92,7 +97,8 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
   const stats = deck.statistics || {};
   const validation = deck.validation || {};
   const bracket = validation.bracket || {};
-  const externalRating = getExternalDeckRating(validation.external_rating);
+  const externalRating = getExternalDeckRating(validation.external_rating, undefined, validation.deck_sha256);
+  const powerRating = getGeneratedDeckPowerRating(deck);
   const metadata = validation.metadata || {};
   const metadataFresh = isBuildMetadataFresh(metadata);
   const highestLift = stats.highest_average_lift;
@@ -121,9 +127,9 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
         {Number.isFinite(stats.land_count) ? <span><strong>{formatNumber(stats.land_count)}</strong> lands</span> : null}
         {Number.isFinite(stats.swaps) ? <span><strong>{formatNumber(stats.swaps)}</strong> consensus swaps</span> : null}
         {Array.isArray(stats.land_adjustments) && stats.land_adjustments.length ? <span><strong>{formatNumber(stats.land_adjustments.length)}</strong> land adjustments</span> : null}
-        {externalRating?.status === "verified" && Number.isFinite(externalRating.bracket)
-          ? <span><strong>{externalRating.bracket}</strong> external bracket</span>
-          : Number.isFinite(bracket.recommended) ? <span><strong>{bracket.recommended}</strong> estimated bracket</span> : null}
+        {powerRating
+          ? <span><strong>{powerRating.scoreBracket}</strong> {powerRating.kind === "local" ? "estimated" : "calculated"} power bracket</span>
+          : <span>Power bracket unverified</span>}
       </div>
       {!metadataFresh ? <p className="build-generated-deck__review-note">Current card-rule freshness has not been verified. Refresh card metadata before relying on current legality.</p> : null}
       <div className="build-generated-deck__actions">
@@ -133,8 +139,9 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
       {validation.external_url ? <p className="build-source-links"><SourceLink url={validation.external_url}>Check on EDHPowerLevel</SourceLink></p> : null}
       {bracketRepair ? <div className="build-generated-deck__review-note">
         <p><strong>Score-based bracket adjustment{bracketRepair.status === "blocked" ? " needs review" : ""}.</strong>{bracketRepair.previousPower !== null
-          ? ` The original list scored ${bracketRepair.previousPower}, corresponding to Bracket ${bracketRepair.targetBracket}.`
-          : ` The original score corresponds to Bracket ${bracketRepair.targetBracket}.`}</p>
+          ? ` The original list scored ${bracketRepair.previousPower}, corresponding to Bracket ${bracketRepair.initialBracket}.`
+          : ` The original score corresponds to Bracket ${bracketRepair.initialBracket}.`}{bracketRepair.targetBracket !== bracketRepair.initialBracket
+          ? ` Recalculation during the adjustment changed the target to Bracket ${bracketRepair.targetBracket}.` : ""}</p>
         {bracketRepair.status !== "blocked" ? <>
           <p>Cards that raised the bracket were replaced. {bracketRepair.status === "retained"
             ? "These replacements were retained from an earlier repair; the original score is historical. " : ""}{externalRating?.status === "verified"
@@ -143,7 +150,13 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
           <ul>{bracketRepair.swaps.map((swap, index) => <li key={index}><DeckCardName name={swap.out} /> → <DeckCardName name={swap.in} /></li>)}</ul>
         </> : <p>{bracketRepair.reason || "The available sampled cards could not resolve every bracket restriction while preserving deck construction requirements."}</p>}
       </div> : null}
-      <ExternalDeckRating rating={validation.external_rating} />
+      {powerRating?.kind === "local" ? <div className="build-external-rating" data-status="calculated">
+        <p><strong>Local power estimate</strong><span>Inputs checked {checkedDate(powerRating.checked_at)}</span></p>
+        <div className="build-generated-deck__metrics"><span><strong>{String(powerRating.power_level)}</strong> estimated power</span><span><strong>{powerRating.scoreBracket}</strong> estimated power bracket</span></div>
+        <p className="build-note">Calculated for this exact card list using the public power formula and available card metadata. A current EDHPowerLevel result takes priority when available.</p>
+        {powerRating.source_url ? <p className="build-source-links"><SourceLink url={powerRating.source_url}>Power formula source</SourceLink></p> : null}
+      </div> : null}
+      <ExternalDeckRating rating={validation.external_rating} deckHash={validation.deck_sha256} />
       <p className="build-generated-deck__copy-status" role="status" aria-live="polite">{copyStatus}</p>
       <p className="build-note">Paste the card list into Moxfield’s text import. Commander markers are included.</p>
       <div className="build-generated-deck__card-list" tabIndex="0" role="region" aria-label={`Package ${packageNumber} generated deck cards`}>
@@ -167,7 +180,7 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
         {metadata.checked_at || metadata.oldest_checked_at ? <p className="build-note">Rules-cache check recorded {checkedDate(metadata.checked_at)}. Oldest card record: {checkedDate(metadata.oldest_checked_at)}.{metadata.stale_cached ? ` ${formatNumber(metadata.stale_cached)} cached ${metadata.stale_cached === 1 ? "entry needed" : "entries needed"} a freshness check at generation.` : ""}</p> : null}
         {(validation.errors || []).length ? <ul>{validation.errors.map((error, index) => <li key={index}>{error}</li>)}</ul> : null}
         {Number.isFinite(bracket.recommended) ? <>
-          <p className="build-note"><strong>Estimated bracket {bracket.recommended}{Number.isFinite(bracket.target) ? ` · source target ${bracket.target}` : ""}.</strong> Based on {bracket.source === "membership_weighted_median" ? "brackets reported for the package’s sampled decks" : "the available sample"} and recorded card constraints.</p>
+          <p className="build-note"><strong>Card-constraint guidance: bracket {bracket.recommended}{Number.isFinite(bracket.target) ? ` · construction target ${bracket.target}` : ""}.</strong> Based on {bracket.source === "membership_weighted_median" ? "brackets reported for the package’s sampled decks" : "the available sample"} and recorded card constraints. This guidance does not set the displayed power bracket.</p>
           {Number.isFinite(bracket.game_changer_count) ? <p className="build-note">{formatNumber(bracket.game_changer_count)} Game Changers{Number.isFinite(bracket.game_changer_limit) ? ` · bracket limit ${bracket.game_changer_limit}` : ""}.</p> : null}
           {(bracket.notes || []).map((note, index) => <p className="build-note" key={index}>{note}</p>)}
         </> : bracket.reason ? <p className="build-note">{bracket.reason}</p> : null}

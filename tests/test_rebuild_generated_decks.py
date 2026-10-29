@@ -50,6 +50,8 @@ def fixture(tmp_path, slug="commander"):
             "game_changer": False, "keywords": [], "layout": "normal", "mana_cost": "",
             "card_faces": [], "produced_mana": ["G"] if name == "Forest" else [],
             "oracle_id": f"oracle-{name}", "checked_at": now,
+            "colors": ["G"], "edhrec_rank": 1000, "reserved": False,
+            "prices": {"usd": ".15", "usd_foil": None, "usd_etched": None},
         }
     decks = []
     for identifier, choice in [("a", "Weak Card"), ("b", "Consensus Card"), ("c", "Consensus Card")]:
@@ -452,6 +454,73 @@ def test_current_version_with_failed_freshness_remains_retryable(tmp_path):
     assert not rebuild.needs_rebuild(rebuild.read_json(root / "commander.json"))
 
 
+@pytest.mark.parametrize("mode", ["missing", "formula", "hash", "algorithm", "score_bracket", "input_hash"])
+def test_current_generation_retries_missing_or_invalid_local_power_proof(tmp_path, mode):
+    report, inputs, cache = fixture(tmp_path)
+    report, _ = rebuild.rebuild_report(report, inputs, MetadataRepository(cache), prefer_playability=False)
+    assert not rebuild.needs_rebuild(report)
+    validation = report["deck_analysis"]["packages"][0]["generated_deck"]["validation"]
+    if mode == "missing":
+        validation.pop("calculated_power")
+    else:
+        power = validation["calculated_power"]
+        if mode == "formula":
+            power["power_formula_version"] -= 1
+        elif mode == "hash":
+            power["deck_sha256"] = "0" * 64
+        elif mode == "algorithm":
+            power["algorithm_sha256"] = "0" * 64
+        elif mode == "score_bracket":
+            power["score_bracket"] = 5
+        else:
+            power["input_sha256"] = "incomplete"
+    assert rebuild.needs_rebuild(report)
+
+
+def test_current_generation_expires_metadata_dates_and_independent_power_dates(tmp_path):
+    report, inputs, cache = fixture(tmp_path)
+    report, _ = rebuild.rebuild_report(report, inputs, MetadataRepository(cache), prefer_playability=False)
+    assert not rebuild.needs_rebuild(report)
+    validation = report["deck_analysis"]["packages"][0]["generated_deck"]["validation"]
+    old = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+    validation["metadata"]["oldest_checked_at"] = old
+    assert validation["checks"]["metadata_fresh"]  # A historical true flag is insufficient.
+    assert rebuild.needs_rebuild(report)
+    assert not rebuild.needs_rebuild(report, max_age_days=5)
+    validation["metadata"]["oldest_checked_at"] = datetime.now(timezone.utc).isoformat()
+    validation["calculated_power"]["checked_at"] = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+    assert rebuild.needs_rebuild(report, max_age_days=10)
+
+
+def test_explicit_unavailable_local_power_does_not_busy_loop_while_metadata_is_fresh(tmp_path):
+    report, inputs, cache = fixture(tmp_path)
+    report, _ = rebuild.rebuild_report(report, inputs, MetadataRepository(cache), prefer_playability=False)
+    validation = report["deck_analysis"]["packages"][0]["generated_deck"]["validation"]
+    power = validation["calculated_power"]
+    power["status"] = "unavailable"
+    for key in ("power_level", "score_bracket", "checked_at", "metadata_checked_at", "input_sha256"):
+        power.pop(key)
+    power["reason"] = "No paper printing with a usable USD price was found."
+    assert not rebuild.needs_rebuild(report)
+    validation["metadata"]["oldest_checked_at"] = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+    assert rebuild.needs_rebuild(report)
+
+
+def test_metadata_age_option_reaches_selection_and_worker_retry_for_current_generation(tmp_path):
+    report, inputs, cache = fixture(tmp_path)
+    report, _ = rebuild.rebuild_report(report, inputs, MetadataRepository(cache), prefer_playability=False)
+    for _, package in rebuild.packages(report):
+        package["generated_deck"]["validation"]["metadata"]["oldest_checked_at"] = (
+            datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    root = tmp_path / "build-styles"
+    save_evidence(root, report, inputs)
+    default_age = rebuild.rebuild_all(root, cache, only_outdated=True, prefer_playability=False)
+    assert default_age["skipped"] == 1 and default_age["regenerated"] == 0
+    shorter_age = rebuild.rebuild_all(root, cache, max_age_days=1, only_outdated=True, prefer_playability=False)
+    assert shorter_age["regenerated"] == 1 and shorter_age["pending"] == shorter_age["blocked"] == 0
+    assert not rebuild.needs_rebuild(rebuild.read_json(root / "commander.json"), max_age_days=1)
+
+
 def checked_score(report, directory, **changes):
     deck = report["deck_analysis"]["packages"][0]["generated_deck"]
     values = {"source": "edhpowerlevel.com", "checked_at": datetime.now(timezone.utc).isoformat(),
@@ -537,7 +606,10 @@ def test_retry_fingerprint_tracks_rechecked_score_policy_and_current_card_hash(t
     # A record for the former list cannot schedule repairs for a changed list.
     for _, package in rebuild.packages(report):
         package["generated_deck"]["cards"][-1]["name"] = "Different Exact Card"
-    assert not rebuild.needs_rebuild(report, validation_directory=ratings)
+    assert not rebuild.score_repair_observations(report, ratings)
+    # The former external observation cannot transfer, but the changed list
+    # independently requires its own hash-bound local power calculation.
+    assert rebuild.needs_rebuild(report, validation_directory=ratings)
 
 
 def test_native_bracket_mismatch_schedules_current_report_and_metadata_prefetch(tmp_path):

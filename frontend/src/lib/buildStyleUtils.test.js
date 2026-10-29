@@ -2,15 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildCollectionProgress, getBuildModel, getBuildModelOptions, getBuildSourceFreshness, getBuildThemeEvidence, getComparableProfilePairs,
-  getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckBracketRepair, getGeneratedDeckColorChoices, getGeneratedDeckDistinctiveCards, getGeneratedDeckExport, getGeneratedDeckGroups, getPackageBracketLabel, getSupportedThemes, hasBuildStylePopulation, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
+  bracketForBuildPowerScore, formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildCollectionProgress, getBuildModel, getBuildModelOptions, getBuildSourceFreshness, getBuildThemeEvidence, getComparableProfilePairs,
+  getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckBracketRepair, getGeneratedDeckColorChoices, getGeneratedDeckDistinctiveCards, getGeneratedDeckExport, getGeneratedDeckGroups, getGeneratedDeckPowerRating, getPackageBracketLabel, getSupportedThemes, hasBuildStylePopulation, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
 } from "./buildStyleUtils.js";
 
 test("bracket repair displays the prior score separately from the changed list's rating", () => {
   const deck = { status: "generated", validation: { external_rating: { status: "unverified" } },
     statistics: { score_bracket_repair: { status: "repaired", from_power_level: "6.09", from_bracket: 4,
       score_bracket: 2, swap_details: [{ out: "Restore Balance", in: "Replacement" }] } } };
-  assert.deepEqual(getGeneratedDeckBracketRepair(deck), { status: "repaired", targetBracket: 2,
+  assert.deepEqual(getGeneratedDeckBracketRepair(deck), { status: "repaired", targetBracket: 2, initialBracket: 2,
     previousBracket: 4, previousPower: "6.09", swaps: [{ out: "Restore Balance", in: "Replacement" }], reason: null });
   assert.equal(getExternalDeckRating(deck.validation.external_rating), null);
   deck.statistics.score_bracket_repair.status = "retained";
@@ -21,6 +21,18 @@ test("bracket repair displays the prior score separately from the changed list's
   for (const value of [undefined, {}, { status: "repaired", score_bracket: 8 }]) {
     assert.equal(getGeneratedDeckBracketRepair({ status: "generated", statistics: { score_bracket_repair: value } }), null);
   }
+});
+
+test("iterative repair keeps the original score's bracket separate from its final target", () => {
+  const deck = { status: "generated", statistics: { score_bracket_repair: { status: "repaired",
+    from_power_level: 6.71, initial_score_bracket: 3, score_bracket: 2 } } };
+  const repair = getGeneratedDeckBracketRepair(deck);
+  assert.equal(repair.previousPower, "6.71");
+  assert.equal(repair.initialBracket, 3);
+  assert.equal(repair.targetBracket, 2);
+  // A saved final-target field must never reinterpret the original numeric score.
+  deck.statistics.score_bracket_repair.initial_score_bracket = 2;
+  assert.equal(getGeneratedDeckBracketRepair(deck).initialBracket, 3);
 });
 
 test("discovery lists only explicitly approved current collector reports", () => {
@@ -414,15 +426,95 @@ test("version verification can retain cached lists without changing their actual
   assert.equal(getBuildCollectionProgress(collection, now + 96 * 3600 * 1000).targetMet, false);
 });
 
-test("package headings prefer a current external bracket and identify fallback estimates", () => {
+test("package headings derive the bracket from the current exact score rather than card restrictions", () => {
   const now = Date.parse("2026-10-21T12:00:00Z");
   const deck = { status: "generated", validation: { bracket: { recommended: 3 },
-    external_rating: { status: "verified", checked_at: "2026-10-20T12:00:00Z", playability_pct: 74.5, bracket: 5 } } };
-  assert.equal(getPackageBracketLabel(deck, now), "Bracket 5 · EDHPowerLevel");
-  assert.equal(getPackageBracketLabel(deck, now + 7 * 24 * 3600 * 1000), "Estimated bracket 3");
+    external_rating: { status: "verified", checked_at: "2026-10-20T12:00:00Z", playability_pct: 74.5,
+      power_level: "6.71", bracket: 4, score_bracket: 4 } } };
+  assert.equal(getPackageBracketLabel(deck, now), "Bracket 3 · calculated power");
+  const rating = getExternalDeckRating(deck.validation.external_rating, now);
+  assert.equal(rating.scoreBracket, 3);
+  assert.equal(rating.reportedBracket, 4);
+  assert.equal(rating.bracketMismatch, true);
+  assert.equal(getPackageBracketLabel(deck, now + 7 * 24 * 3600 * 1000), "Power bracket unverified");
   assert.equal(getPackageBracketLabel({ ...deck, validation: { ...deck.validation,
-    external_rating: { ...deck.validation.external_rating, status: "stale" } } }, now), "Estimated bracket 3");
+    external_rating: { ...deck.validation.external_rating, status: "stale" } } }, now), "Power bracket unverified");
   assert.equal(getPackageBracketLabel({ ...deck, status: "unavailable" }, now), null);
-  assert.equal(getPackageBracketLabel({ status: "generated", validation: {} }, now), null);
-  assert.equal(getPackageBracketLabel({ status: "generated", validation: { bracket: { recommended: 9 } } }, now), null);
+  assert.equal(getPackageBracketLabel({ status: "generated", validation: {} }, now), "Power bracket unverified");
+  assert.equal(getPackageBracketLabel({ status: "generated", validation: { bracket: { recommended: 4 } } }, now), "Power bracket unverified");
+  assert.equal(getPackageBracketLabel({ ...deck, validation: { external_rating: {
+    ...deck.validation.external_rating, power_level: undefined } } }, now), "Power bracket unverified");
+});
+
+test("calculated power brackets use exact numeric thresholds and reject ambiguous score values", () => {
+  for (const [score, bracket] of [[0, 1], [4.699, 1], [4.7, 2], [6.699, 2], [6.7, 3],
+    [6.71, 3], [7.0, 3], [7.699, 3], [7.7, 4], [9.249, 4], [9.25, 5], [10, 5]]) {
+    assert.equal(bracketForBuildPowerScore(score), bracket);
+    assert.equal(bracketForBuildPowerScore(` ${score} `), bracket);
+  }
+  for (const score of [undefined, null, false, true, [], {}, "", "10+", "6.7–7.7", "7e0", "0x7", "+7", "-1", -1, NaN, Infinity]) {
+    assert.equal(bracketForBuildPowerScore(score), null);
+  }
+  assert.equal(bracketForBuildPowerScore(".7"), 1);
+  assert.equal(bracketForBuildPowerScore("7."), 3);
+});
+
+test("partial numeric ratings still determine the bracket without claiming playability", () => {
+  const now = Date.parse("2026-10-21T12:00:00Z");
+  const external_rating = { status: "verified", checked_at: "2026-10-20T12:00:00Z", power_level: 7, bracket: 4 };
+  const rating = getExternalDeckRating(external_rating, now);
+  assert.equal(rating.scoreBracket, 3);
+  assert.equal(rating.playabilityKnown, false);
+  assert.equal(rating.targetMet, false);
+  assert.equal(getPackageBracketLabel({ status: "generated", validation: { external_rating } }, now), "Bracket 3 · calculated power");
+  assert.equal(getExternalDeckRating({ ...external_rating, status: "unverified" }, now), null);
+  assert.equal(getExternalDeckRating({ ...external_rating, bracket: 3 }, now).bracketMismatch, false);
+  assert.equal(getExternalDeckRating({ ...external_rating, bracket: 8 }, now).reportedBracket, null);
+});
+
+test("exact-list local scores supply every package's power bracket when external verification is absent", () => {
+  const now = Date.parse("2026-10-21T12:00:00Z");
+  const deck_sha256 = "a".repeat(64);
+  const calculated_power = { status: "calculated", source: "local_public_formula", power_formula_version: 1,
+    checked_at: "2026-10-20T12:00:00Z", power_level: 6.71, score_bracket: 4, deck_sha256 };
+  const deck = { status: "generated", validation: { deck_sha256, calculated_power,
+    bracket: { recommended: 4 }, external_rating: { status: "unverified" } } };
+  assert.equal(getPackageBracketLabel(deck, now), "Bracket 3 · local power estimate");
+  assert.equal(getGeneratedDeckPowerRating(deck, now).kind, "local");
+  assert.equal(getGeneratedDeckPowerRating(deck, now).scoreBracket, 3);
+  // The same helper supplies discovery, Auto and numbered-model package headings.
+  for (const power_level of [4.6, 6.09, 7, 8, 9.5]) {
+    const variant = { ...deck, validation: { ...deck.validation, calculated_power: { ...calculated_power, power_level } } };
+    assert.equal(getPackageBracketLabel(variant, now), `Bracket ${bracketForBuildPowerScore(power_level)} · local power estimate`);
+  }
+  const external_rating = { status: "verified", checked_at: calculated_power.checked_at,
+    power_level: 6.69, bracket: 4, playability_pct: 75, deck_sha256 };
+  const rated = { ...deck, validation: { ...deck.validation, external_rating } };
+  assert.equal(getPackageBracketLabel(rated, now), "Bracket 2 · calculated power");
+  assert.equal(getGeneratedDeckPowerRating(rated, now).kind, "external");
+  for (const external of [{ ...external_rating, status: "stale" }, { ...external_rating, power_level: "10+" },
+    { ...external_rating, deck_sha256: "b".repeat(64) }]) {
+    assert.equal(getPackageBracketLabel({ ...rated, validation: { ...rated.validation, external_rating: external } }, now), "Bracket 3 · local power estimate");
+  }
+});
+
+test("stale, foreign-list or unsupported local calculations never acquire a current power bracket", () => {
+  const checked_at = "2026-10-20T12:00:00Z";
+  const now = Date.parse(checked_at);
+  const week = 7 * 24 * 3600 * 1000;
+  const deck_sha256 = "a".repeat(64);
+  const calculated_power = { status: "calculated", source: "local_public_formula", power_formula_version: 1,
+    checked_at, power_level: 6.71, score_bracket: 4, deck_sha256 };
+  const deck = { status: "generated", validation: { deck_sha256, calculated_power, bracket: { recommended: 4 } } };
+  for (const time of [now - 5 * 60 * 1000 - 1, now + week, now + 2 * week]) {
+    assert.equal(getPackageBracketLabel(deck, time), "Power bracket unverified");
+  }
+  assert.equal(getPackageBracketLabel(deck, now + week - 1), "Bracket 3 · local power estimate");
+  for (const changed of [{ status: "unavailable" }, { source: "external" }, { power_formula_version: 2 },
+    { checked_at: "unknown" }, { power_level: "6.71+" }, { deck_sha256: "b".repeat(64) }]) {
+    assert.equal(getPackageBracketLabel({ ...deck, validation: { ...deck.validation,
+      calculated_power: { ...calculated_power, ...changed } } }, now), "Power bracket unverified");
+  }
+  assert.equal(getPackageBracketLabel({ ...deck, validation: { calculated_power } }, now), "Power bracket unverified");
+  assert.equal(getGeneratedDeckPowerRating({ ...deck, status: "unavailable" }, now), null);
 });

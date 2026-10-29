@@ -54,6 +54,22 @@ def generate(data):
     return analysis["packages"][0]["generated_deck"]
 
 
+def rename_fixture_card(data, old_name, new_name):
+    """Give a synthetic card a named restriction while keeping pool identities."""
+    card = data[4].pop(card_key(old_name))
+    card["name"] = new_name
+    data[4][card_key(new_name)] = card
+    for sampled in data[1]:
+        for row in sampled["cards"]:
+            if row["name"] == old_name:
+                row["name"] = new_name
+    for package in [*data[0]["packages"], *[package for model in data[0].get("alternative_models", [])
+                                        for package in model.get("packages", [])]]:
+        for row in package.get("top_cards", []):
+            if row.get("name") == old_name:
+                row["name"] = new_name
+
+
 def test_membership_consensus_preserves_real_structure_and_only_uses_sampled_cards():
     data = fixture()
     result = generate(data)
@@ -315,7 +331,7 @@ def test_bracket_guidance_uses_source_memberships_and_raises_for_checked_restric
     data[4]["core 0"]["game_changer"] = True
     result = generate(data)
     bracket = result["validation"]["bracket"]
-    assert bracket["target"] == 2 and bracket["recommended"] == 4
+    assert bracket["target"] == 2 and bracket["recommended"] == 3
     assert bracket["game_changer_count"] == 1
     assert not bracket["rule_checks"]["game_changers"]
     assert "not fully evaluated" in bracket["notes"][0]
@@ -330,6 +346,8 @@ def test_obvious_mass_land_denial_and_extra_turns_raise_lower_target_guidance():
     for text in ("Destroy all lands.", "Take an extra turn after this one."):
         data = fixture()
         data[4]["core 0"]["oracle_text"] = text
+        if "extra turn" in text:
+            rename_fixture_card(data, "Core 0", "Time Warp")
         result = generate(data)
         assert result["validation"]["bracket"]["recommended"] == 4
 
@@ -665,7 +683,7 @@ def test_all_twelve_distinctive_cards_are_inserted_despite_lower_consensus_and_d
 def test_distinctive_omissions_explain_metadata_legality_pool_color_and_bracket_failures():
     data = fixture()
     cards = [metadata_card("Present Core"), metadata_card("Banned Core", legalities={"commander": "banned"}),
-             metadata_card("Red Core", colors=["R"]), metadata_card("Extra Turn Core", text="Take an extra turn after this one."),
+             metadata_card("Red Core", colors=["R"]), metadata_card("Time Warp", text="Take an extra turn after this one."),
              metadata_card("Incomplete Core")]
     add_observed_core(data, cards)
     del data[4]["incomplete core"]["type_line"]
@@ -677,7 +695,7 @@ def test_distinctive_omissions_explain_metadata_legality_pool_color_and_bracket_
     assert coverage["coverage"] == pytest.approx(1 / 7)
     assert {row["name"]: row["reason_code"] for row in coverage["omitted"]} == {
         "Banned Core": "illegal_in_commander", "Red Core": "color_identity_conflict",
-        "Extra Turn Core": "bracket_conflict", "Incomplete Core": "metadata_incomplete",
+        "Time Warp": "bracket_conflict", "Incomplete Core": "metadata_incomplete",
         "Missing Core": "metadata_missing", "Outside Core": "not_in_sampled_pool"}
     assert result["validation"]["valid"] and result["validation"]["bracket"]["recommended"] == 3
     for row in coverage["omitted"]:
@@ -877,9 +895,14 @@ def test_distinctive_restricted_effects_replace_like_for_like_without_increasing
     data = fixture()
     data[4]["core 0"]["oracle_text"] = text
     add_observed_core(data, [metadata_card("Restricted Core", text=text)])
+    if "extra turn" in text:
+        rename_fixture_card(data, "Core 0", "Time Warp")
+        rename_fixture_card(data, "Restricted Core", "Capture of Jingzhou")
     result = generate(data)
     names = {row["name"] for row in result["cards"]}
-    assert "Restricted Core" in names and "Core 0" not in names
+    expected = "Capture of Jingzhou" if "extra turn" in text else "Restricted Core"
+    removed = "Time Warp" if "extra turn" in text else "Core 0"
+    assert expected in names and removed not in names
     assert result["validation"]["bracket"][count_key] == 1
     assert result["validation"]["bracket"]["recommended"] == 4
     assert result["distinctive_cards"]["included_count"] == 1
@@ -900,13 +923,16 @@ def test_consensus_does_not_add_more_restricted_cards_to_an_already_over_target_
         # restricted effect so the exact-signature consensus swap is eligible.
         data[4]["core 0"]["oracle_text"] = text
         data[4]["consensus card"]["oracle_text"] = text
+        if restriction == "extra_turns":
+            rename_fixture_card(data, "Core 0", "Time Warp")
+            rename_fixture_card(data, "Consensus Card", "Capture of Jingzhou")
         if restriction == "mass_land_denial":
             data[4]["weak card"]["oracle_text"] = "Destroy all artifacts."
         count_key = "extra_turn_count" if restriction == "extra_turns" else "mass_land_denial_count"
         expected = 1
     result = generate(data)
     assert "Weak Card" in {row["name"] for row in result["cards"]}
-    assert "Consensus Card" not in {row["name"] for row in result["cards"]}
+    assert ("Capture of Jingzhou" if restriction == "extra_turns" else "Consensus Card") not in {row["name"] for row in result["cards"]}
     assert result["validation"]["bracket"][count_key] == expected
     assert result["validation"]["valid"]
 
@@ -1005,7 +1031,7 @@ def test_anchor_bracket_cache_stays_immutable_while_generated_variants_recompute
                                        anchor_id="a", _context=context)
     sources = context["source_context"]["prepared"]
     anchor = next(deck for deck in sources["anchors"] if deck["id"] == "a")
-    assert sources["anchor_bracket_counts"][id(anchor)] == (1, 0, 0)
+    assert sources["anchor_bracket_counts"][id(anchor)] == (1, 0, 0, 0)
     assert anchor["counts"]["weak card"] == 1 and "ordinary distinctive" not in anchor["counts"]
     assert first["validation"]["bracket"]["game_changer_count"] == 0
     original_counters = {id(deck["counts"]) for deck in sources["anchors"]}
@@ -1021,7 +1047,7 @@ def test_anchor_bracket_cache_stays_immutable_while_generated_variants_recompute
     assert not scanned_originals
     assert second["validation"]["bracket"]["game_changer_count"] == 0
     assert second["validation"]["valid"] and second["card_count"] == 100
-    assert sources["anchor_bracket_counts"][id(anchor)] == (1, 0, 0)
+    assert sources["anchor_bracket_counts"][id(anchor)] == (1, 0, 0, 0)
     assert anchor["counts"]["weak card"] == 1
 
 
@@ -1139,6 +1165,7 @@ def test_chosen_color_candidates_cover_legal_choices_and_preserve_analysis_and_b
         assert candidate["validation"]["valid"] and candidate["card_count"] == 100
     assert data == before
     data[4]["green core"]["oracle_text"] = "Take an extra turn after this one."
+    rename_fixture_card(data, "Green Core", "Time Warp")
     result = generate(data)
     assert result["validation"]["commander_color_choices"] == [{"commander_name": "Clara Oswald", "color": "R"}]
     assert result["validation"]["bracket"]["recommended"] == 3
@@ -1263,6 +1290,7 @@ def test_score_repair_removes_multiple_restrictions_and_preserves_support_roles(
     data[4]["core 3"]["oracle_text"] = "Draw three cards."
     data[4]["variant b"]["oracle_text"] = "Draw two cards."
     data[4]["core 2"]["oracle_text"] += " Draw three cards."
+    rename_fixture_card(data, "Core 2", "Time Warp")
     attach_score_record(data, monkeypatch, tmp_path)
     result = generate(data)
     assert result["statistics"]["score_bracket_repair"]["status"] == "repaired"
@@ -1318,10 +1346,230 @@ def test_three_to_two_score_boundary_applies_to_all_commanders_and_package_model
         if target == 2:
             repair = result["statistics"]["score_bracket_repair"]
             assert repair["status"] == "repaired" and repair["from_bracket"] == 3
-            assert repair["policy_version"] == 1 and all(repair["rule_checks"].values())
+            assert repair["policy_version"] == 2 and all(repair["rule_checks"].values())
             assert result["validation"]["external_rating"]["status"] == "unverified"
         else:
             assert "score_bracket_repair" not in result["statistics"]
+
+
+@pytest.mark.parametrize("prefer_playability", [False, True])
+def test_six_point_seven_one_replaces_repeatable_extra_turns_in_auto_and_alternative_packages(
+        monkeypatch, tmp_path, prefer_playability):
+    from edhrec_affinity.build_styles.external_validation import cardlist_hash
+
+    data = fixture()
+    data[4]["commander"]["color_identity"] = ["G", "U"]
+    data[4].pop("core 0")
+    data[4]["timestream navigator"] = metadata_card(
+        "Timestream Navigator", types="Creature — Human Pirate Wizard", colors=["U"],
+        text=("Ascend (If you control ten or more permanents, you get the city's blessing for the rest of the game.)\n"
+              "{2}{U}{U}, {T}, Put this creature on the bottom of its owner's library: Take an extra turn after this one. "
+              "Activate only if you have the city's blessing."))
+    data[4]["core 1"]["oracle_text"] = "Draw three cards."
+    data[4]["core 2"]["oracle_text"] = "{T}: Add {G}."
+    for sampled in data[1]:
+        sampled["source_bracket"] = 2
+        next(row for row in sampled["cards"] if row["name"] == "Core 0")["name"] = "Timestream Navigator"
+    for package in [*data[0]["packages"], *data[0]["alternative_models"][0]["packages"]]:
+        package["top_cards"] = [{"name": "Timestream Navigator"}]
+    data[0]["packages"].append({**deepcopy(data[0]["packages"][0]), "id": 1, "name": "Package 2"})
+    for member in data[0]["decks"]:
+        member["memberships"] = [member["memberships"][0] / 2] * 2
+    alternative = data[0]["alternative_models"][0]
+    alternative["components"] = 2
+    alternative["packages"] = deepcopy(data[0]["packages"])
+    for member in alternative["memberships"]:
+        member["weights"] = [member["weights"][0] / 2] * 2
+
+    original = attach_score_record(data, monkeypatch, tmp_path, power=6.71, bracket=4)
+    assert original["validation"]["bracket"]["target"] == 2
+    assert original["validation"]["bracket"]["recommended"] == 4
+    assert original["validation"]["bracket"]["extra_turn_count"] == 1
+    original_hash = cardlist_hash(original["cards"])
+    observed_pool = {row["name"] for sampled in data[1] for row in sampled["cards"]} | {"Commander"}
+
+    # The same score-based construction rule applies to Auto and a selected
+    # alternative model, and survives a subsequent full rebuild.
+    hashes = []
+    for _ in range(2):
+        generate_package_decks(*data, prefer_playability=prefer_playability)
+        current_hashes = []
+        for package in [*data[0]["packages"], *alternative["packages"]]:
+            result = package["generated_deck"]
+            names = {row["name"] for row in result["cards"]}
+            repair = result["statistics"]["score_bracket_repair"]
+            assert repair["status"] == "repaired" and repair["from_deck_sha256"] == original_hash
+            assert repair["from_power_level"] == 6.71 and repair["score_bracket"] == 3
+            assert repair["from_bracket"] == 4 and all(repair["rule_checks"].values())
+            assert repair["swap_details"][0]["out"] == "Timestream Navigator"
+            assert repair["swap_details"][0]["restrictions"] == ["chaining_extra_turns"]
+            assert "Timestream Navigator" not in names and names <= observed_pool
+            assert {"Commander", "Core 1", "Core 2"} <= names
+            assert result["card_count"] == 100 and all(result["validation"]["checks"].values())
+            assert result["statistics"]["land_count"] == original["statistics"]["land_count"] == 36
+            assert result["validation"]["bracket"]["target"] == result["validation"]["bracket"]["recommended"] == 3
+            assert result["validation"]["bracket"]["extra_turn_count"] == 0
+            assert result["validation"]["external_rating"]["status"] == "unverified"
+            assert "power_level" not in result["validation"]["external_rating"]
+            assert result["distinctive_cards"]["omitted"][0]["reason_code"] == "score_bracket_conflict"
+            current_hashes.append(cardlist_hash(result["cards"]))
+        if hashes:
+            assert current_hashes == hashes
+        hashes = current_hashes
+
+
+def fresh_power_inputs(data, *, rank=100, price=".15"):
+    checked_at = datetime.now(timezone.utc).isoformat()
+    for card in data[4].values():
+        card.update(edhrec_rank=rank, reserved=False, colors=card["color_identity"].copy(),
+            prices={"usd": price, "usd_foil": None, "usd_etched": None}, layout="normal", checked_at=checked_at)
+    return data
+
+
+def test_local_numeric_power_drives_all_package_brackets_without_a_site_observation():
+    from edhrec_affinity.build_styles.external_validation import cardlist_hash
+
+    data = fresh_power_inputs(fixture())
+    for sampled in data[1]:
+        sampled["source_bracket"] = 2
+    generate_package_decks(*data)
+    for package in [*data[0]["packages"], *data[0]["alternative_models"][0]["packages"]]:
+        deck = package["generated_deck"]
+        rating = deck["validation"]["calculated_power"]
+        assert rating["status"] == "calculated" and rating["source"] == "local_public_formula"
+        assert rating["power_level"] == 7.24 and rating["score_bracket"] == 3
+        assert rating["deck_sha256"] == deck["validation"]["deck_sha256"] == cardlist_hash(deck["cards"])
+        assert deck["validation"]["bracket"]["target"] == deck["validation"]["bracket"]["recommended"] == 3
+        assert deck["validation"]["external_rating"]["status"] == "unverified"
+
+
+@pytest.mark.parametrize("distinctive_changers", [1, 3, 4])
+def test_anchor_numeric_bracket_allows_distinctive_game_changers_despite_lower_source_annotations(distinctive_changers):
+    data = fixture()
+    for sampled in data[1]:
+        sampled["source_bracket"] = 2
+    cards = [metadata_card(f"Distinctive Changer {index}", game_changer=True)
+             for index in range(distinctive_changers)]
+    add_observed_core(data, cards)
+    for package in data[0]["alternative_models"][0]["packages"]:
+        package["top_cards"] = deepcopy(data[0]["packages"][0]["top_cards"])
+    fresh_power_inputs(data)
+    generate_package_decks(*data)
+    for package in [*data[0]["packages"], *data[0]["alternative_models"][0]["packages"]]:
+        deck = package["generated_deck"]
+        assert deck["validation"]["calculated_power"]["score_bracket"] == 3
+        assert deck["validation"]["bracket"]["recommended"] == 3
+        assert deck["validation"]["bracket"]["game_changer_count"] == min(3, distinctive_changers)
+        assert deck["distinctive_cards"]["included_count"] == min(3, distinctive_changers)
+        assert all(row["reason_code"] == "bracket_conflict" for row in deck["distinctive_cards"]["omitted"])
+        assert deck["validation"]["valid"] and deck["card_count"] == 100
+
+
+def test_verified_exact_numeric_power_takes_priority_over_local_estimate(monkeypatch, tmp_path):
+    from edhrec_affinity.build_styles.external_validation import cardlist_hash
+
+    data = fixture()
+    original = attach_score_record(data, monkeypatch, tmp_path, power=6.5, bracket=2)
+    fresh_power_inputs(data)
+    result = generate(data)
+    assert cardlist_hash(result["cards"]) == cardlist_hash(original["cards"])
+    assert result["validation"]["calculated_power"]["score_bracket"] == 3
+    assert result["validation"]["external_rating"]["power_level"] == 6.5
+    assert result["validation"]["external_rating"]["status"] == "verified"
+    assert result["validation"]["bracket"]["target"] == result["validation"]["bracket"]["recommended"] == 2
+
+
+@pytest.mark.parametrize("include_chain", [False, True])
+def test_one_shot_extra_turn_remains_legal_at_three_while_named_chain_is_replaced(include_chain):
+    data = fixture()
+    data[4]["core 0"]["oracle_text"] = "Take an extra turn after this one. Exile Part the Waterveil."
+    rename_fixture_card(data, "Core 0", "Part the Waterveil")
+    if include_chain:
+        data[4]["core 1"]["oracle_text"] = "Buyback—Sacrifice three Islands. Take an extra turn after this one."
+        rename_fixture_card(data, "Core 1", "Walk the Aeons")
+    fresh_power_inputs(data)
+    result = generate(data)
+    names = {row["name"] for row in result["cards"]}
+    assert "Part the Waterveil" in names and "Walk the Aeons" not in names
+    assert result["validation"]["bracket"]["target"] == result["validation"]["bracket"]["recommended"] == 3
+    assert result["validation"]["bracket"]["extra_turn_count"] == 1
+    assert result["validation"]["bracket"]["chainable_extra_turn_count"] == 0
+    assert all(result["validation"]["bracket"]["rule_checks"].values())
+    if include_chain:
+        repair = result["statistics"]["score_bracket_repair"]
+        assert repair["rating_kind"] == "calculated" and repair["source"] == "local_public_formula"
+        assert len(repair["swap_details"]) == 1 and repair["swap_details"][0]["out"] == "Walk the Aeons"
+    else:
+        assert "score_bracket_repair" not in result["statistics"]
+
+
+@pytest.mark.parametrize(("target", "turns", "recommended"), [
+    (1, 1, 2), (2, 2, 2), (2, 3, 3), (3, 3, 3), (3, 4, 4),
+])
+def test_ordinary_extra_turn_counts_use_the_public_bracket_limits(target, turns, recommended):
+    data = fixture()
+    for sampled in data[1]:
+        sampled["source_bracket"] = target
+    for index in range(turns):
+        data[4][f"core {index}"]["oracle_text"] = "Take an extra turn after this one. Exile this spell."
+    bracket = generate(data)["validation"]["bracket"]
+    assert bracket["extra_turn_count"] == turns and bracket["chainable_extra_turn_count"] == 0
+    assert bracket["recommended"] == recommended
+
+
+def test_fresh_local_repair_survives_repeated_generation_with_current_score():
+    from edhrec_affinity.build_styles.external_validation import cardlist_hash
+
+    data = fixture()
+    data[4]["core 0"]["oracle_text"] = "Take an extra turn after this one."
+    rename_fixture_card(data, "Core 0", "Time Warp")
+    fresh_power_inputs(data)
+    first = generate(data)
+    second = generate(data)
+    assert first["statistics"]["score_bracket_repair"]["status"] == "repaired"
+    assert second["statistics"]["score_bracket_repair"]["status"] == "retained"
+    assert cardlist_hash(second["cards"]) == cardlist_hash(first["cards"])
+    assert second["validation"]["calculated_power"]["status"] == "calculated"
+    assert second["validation"]["calculated_power"]["score_bracket"] == second["validation"]["bracket"]["recommended"] == 3
+    assert second["validation"]["external_rating"]["status"] == "unverified"
+
+
+@pytest.mark.parametrize("blocked_second_step", [False, True])
+def test_replacements_recalculate_power_and_repair_new_lower_bracket_or_keep_original(monkeypatch, blocked_second_step):
+    from edhrec_affinity.build_styles import power_scoring
+    from edhrec_affinity.build_styles.external_validation import cardlist_hash
+
+    data = fixture()
+    for sampled in data[1]:
+        sampled["source_bracket"] = 4
+    data[4]["core 0"]["oracle_text"] = "Take an extra turn after this one."
+    rename_fixture_card(data, "Core 0", "Time Warp")
+    data[4]["core 1"]["game_changer"] = True
+    if blocked_second_step:
+        data[4]["core 1"]["oracle_text"] = "Draw two cards."
+    checked_at = datetime.now(timezone.utc).isoformat()
+    def observed_calculation(cards, metadata, **kwargs):
+        names = {row["name"] for row in cards}
+        power, bracket = (7.0, 3) if "Time Warp" in names else (6.5, 2) if "Core 1" in names else (6.4, 2)
+        return {"status": "calculated", "source": "local_public_formula", "power_level": power,
+            "score_bracket": bracket, "checked_at": checked_at, "source_url": power_scoring.ALGORITHM_SOURCE_URL,
+            "deck_sha256": cardlist_hash(cards), "card_count": 100}
+    monkeypatch.setattr(power_scoring, "calculate_power_rating", observed_calculation)
+    result = generate(data)
+    repair = result["statistics"]["score_bracket_repair"]
+    names = {row["name"] for row in result["cards"]}
+    assert result["card_count"] == 100 and result["validation"]["valid"]
+    if blocked_second_step:
+        assert repair["status"] == "blocked" and not repair["swap_details"]
+        assert {"Time Warp", "Core 1"} <= names
+        assert result["validation"]["calculated_power"]["power_level"] == 7.0
+    else:
+        assert repair["status"] == "repaired" and repair["initial_score_bracket"] == 3
+        assert repair["score_bracket"] == 2 and repair["iterations"] == 3
+        assert not {"Time Warp", "Core 1"} & names
+        assert result["validation"]["calculated_power"]["power_level"] == 6.4
+        assert result["validation"]["bracket"]["recommended"] == 2
+        assert all(repair["rule_checks"].values())
 
 
 @pytest.mark.parametrize("blocker", ["commander", "support_floor", "unknown_external"])
@@ -1507,7 +1755,7 @@ def test_new_metadata_cannot_use_an_expired_score_to_make_further_swaps_or_resto
     assert reviewed["statistics"]["score_bracket_repair"]["status"] == "blocked"
     assert reviewed["statistics"]["score_bracket_repair"]["retention_blocked"]
     assert not reviewed["validation"]["bracket"]["rule_checks"]["game_changers"]
-    assert reviewed["validation"]["bracket"]["recommended"] == 4
-    assert reviewed["statistics"]["recommended_bracket"] == 4
+    assert reviewed["validation"]["bracket"]["recommended"] == 3
+    assert reviewed["statistics"]["recommended_bracket"] == 3
     assert "Restore Balance" not in reviewed["export_text"]
     assert reviewed["validation"]["external_rating"]["status"] == "unverified"

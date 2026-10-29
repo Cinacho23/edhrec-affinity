@@ -182,23 +182,57 @@ export function getBuildCollectionProgress(collection, now = Date.now()) {
   };
 }
 
-export function getExternalDeckRating(rating, now = Date.now()) {
-  if (!rating || !["verified", "stale"].includes(rating.status)
-      || !Number.isFinite(rating.playability_pct) || rating.playability_pct < 0 || rating.playability_pct > 100) return null;
+const POWER_SCORE_BRACKET_THRESHOLDS = [4.7, 6.7, 7.7, 9.25];
+
+export function bracketForBuildPowerScore(value) {
+  if (typeof value === "string") {
+    value = value.trim();
+    if (!/^(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$/.test(value)) return null;
+  } else if (typeof value !== "number") return null;
+  const score = Number(value);
+  if (!Number.isFinite(score) || score < 0) return null;
+  return 1 + POWER_SCORE_BRACKET_THRESHOLDS.filter((threshold) => score >= threshold).length;
+}
+
+export function getExternalDeckRating(rating, now = Date.now(), expectedHash = null) {
+  if (!rating || !["verified", "stale"].includes(rating.status)) return null;
+  if (expectedHash && rating.deck_sha256 !== expectedHash) return null;
+  const scoreBracket = bracketForBuildPowerScore(rating.power_level);
+  const playabilityKnown = Number.isFinite(rating.playability_pct)
+    && rating.playability_pct >= 0 && rating.playability_pct <= 100;
+  if (!playabilityKnown && scoreBracket === null) return null;
   const checkedAt = typeof rating.checked_at === "string" ? Date.parse(rating.checked_at) : NaN;
   if (!Number.isFinite(checkedAt) || !Number.isFinite(now) || checkedAt > now + BUILD_EVIDENCE_FUTURE_TOLERANCE_MS) return null;
   const status = rating.status === "stale" || now - checkedAt >= BUILD_EVIDENCE_MAX_AGE_MS ? "stale" : "verified";
-  const inTargetRange = rating.playability_pct >= 72.5 && rating.playability_pct <= 77.5;
-  return { ...rating, status, inTargetRange, targetMet: status === "verified" && inTargetRange };
+  const reportedBracket = Number.isInteger(rating.bracket) && rating.bracket >= 1 && rating.bracket <= 5 ? rating.bracket : null;
+  const inTargetRange = playabilityKnown && rating.playability_pct >= 72.5 && rating.playability_pct <= 77.5;
+  return { ...rating, status, playabilityKnown, scoreBracket, reportedBracket,
+    bracketMismatch: scoreBracket !== null && reportedBracket !== null && scoreBracket !== reportedBracket,
+    inTargetRange, targetMet: status === "verified" && inTargetRange };
+}
+
+export function getGeneratedDeckPowerRating(deck, now = Date.now()) {
+  if (deck?.status !== "generated") return null;
+  const validation = deck.validation || {};
+  const external = getExternalDeckRating(validation.external_rating, now, validation.deck_sha256);
+  if (external?.status === "verified" && external.scoreBracket !== null) {
+    return { ...external, kind: "external", label: "calculated power" };
+  }
+  const calculated = validation.calculated_power;
+  if (calculated?.status !== "calculated" || calculated.source !== "local_public_formula"
+      || calculated.power_formula_version !== 1 || !/^[a-f0-9]{64}$/.test(validation.deck_sha256 || "")
+      || calculated.deck_sha256 !== validation.deck_sha256) return null;
+  const scoreBracket = bracketForBuildPowerScore(calculated.power_level);
+  const checkedAt = typeof calculated.checked_at === "string" ? Date.parse(calculated.checked_at) : NaN;
+  if (scoreBracket === null || !Number.isFinite(now) || !Number.isFinite(checkedAt)
+      || checkedAt > now + BUILD_EVIDENCE_FUTURE_TOLERANCE_MS || now - checkedAt >= BUILD_EVIDENCE_MAX_AGE_MS) return null;
+  return { ...calculated, scoreBracket, kind: "local", label: "local power estimate" };
 }
 
 export function getPackageBracketLabel(deck, now = Date.now()) {
   if (deck?.status !== "generated") return null;
-  const validBracket = (value) => Number.isInteger(value) && value >= 1 && value <= 5;
-  const external = getExternalDeckRating(deck.validation?.external_rating, now);
-  if (external?.status === "verified" && validBracket(external.bracket)) return `Bracket ${external.bracket} · EDHPowerLevel`;
-  const estimated = deck.validation?.bracket?.recommended ?? deck.statistics?.recommended_bracket;
-  return validBracket(estimated) ? `Estimated bracket ${estimated}` : null;
+  const rating = getGeneratedDeckPowerRating(deck, now);
+  return rating ? `Bracket ${rating.scoreBracket} · ${rating.label}` : "Power bracket unverified";
 }
 
 export function getGeneratedDeckDistinctiveCards(deck) {
@@ -231,6 +265,9 @@ export function getGeneratedDeckBracketRepair(deck) {
   return {
     status: repair.status,
     targetBracket: repair.score_bracket,
+    initialBracket: bracketForBuildPowerScore(repair.from_power_level)
+      ?? (Number.isInteger(repair.initial_score_bracket) && repair.initial_score_bracket >= 1
+        && repair.initial_score_bracket <= 5 ? repair.initial_score_bracket : repair.score_bracket),
     previousBracket: Number.isInteger(repair.from_bracket) ? repair.from_bracket : null,
     previousPower: typeof repair.from_power_level === "number" && Number.isFinite(repair.from_power_level)
       || typeof repair.from_power_level === "string" && repair.from_power_level.trim()
