@@ -19,6 +19,7 @@ import {
   getGeneratedDeckDistinctiveCards,
   getGeneratedDeckExport,
   getGeneratedDeckGroups,
+  getGeneratedDeckPowerAlignment,
   getGeneratedDeckPowerRating,
   getPackageBracketLabel,
   getSupportedThemes,
@@ -99,6 +100,7 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
   const bracket = validation.bracket || {};
   const externalRating = getExternalDeckRating(validation.external_rating, undefined, validation.deck_sha256);
   const powerRating = getGeneratedDeckPowerRating(deck);
+  const powerAlignment = getGeneratedDeckPowerAlignment(deck);
   const metadata = validation.metadata || {};
   const metadataFresh = isBuildMetadataFresh(metadata);
   const highestLift = stats.highest_average_lift;
@@ -132,6 +134,8 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
           : <span>Power bracket unverified</span>}
       </div>
       {!metadataFresh ? <p className="build-generated-deck__review-note">Current card-rule freshness has not been verified. Refresh card metadata before relying on current legality.</p> : null}
+      {powerAlignment ? <p className="build-generated-deck__review-note"><strong>Power calculated; deck review pending.</strong> This saved list is awaiting the deck-generation review.{powerAlignment.status === "known_mismatch"
+        ? ` Checked card restrictions currently require Bracket ${powerAlignment.minimumCheckedBracket}, above the score’s Bracket ${powerAlignment.scoreBracket}. The cards still need adjustment.` : ""}</p> : null}
       <div className="build-generated-deck__actions">
         {exportText ? <><button type="button" onClick={() => copyText(exportText, "Deck")}>Copy for Moxfield</button><button type="button" onClick={() => downloadDeckText(exportText, deck.name, "txt")}>Download deck .txt</button></> : null}
         {primer ? <button type="button" onClick={() => copyText(primer, "Primer")}>Copy primer</button> : null}

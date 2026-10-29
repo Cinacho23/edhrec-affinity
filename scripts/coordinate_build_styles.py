@@ -8,6 +8,7 @@ and cooldown checks do not install analysis dependencies or restore deck data.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
@@ -213,12 +214,12 @@ def decision(snapshot, *, now, older=(), allow_bounded=False):
     rebuild = summary.get("deck_rebuild")
     if isinstance(rebuild, dict):
         pending = rebuild.get("pending")
-        regenerated = rebuild.get("regenerated")
         metadata = rebuild.get("metadata_prefetch") or {}
         metadata_blocked = (rebuild.get("metadata_source_blocked") is True
                             or isinstance(metadata, dict) and (metadata.get("blocked") is True
                                 or metadata.get("status") == "source_access_stopped"))
-        progress = (type(regenerated) is int and regenerated > 0
+        progress = (any(type(rebuild.get(key)) is int and rebuild[key] > 0
+                        for key in ("regenerated", "scored_reports", "power_refreshed_reports"))
                     or rebuild.get("durable_metadata_progress") is True)
         if type(pending) is int and pending > 0 and progress and not metadata_blocked:
             return {"run": True, "reason": "Saved package-deck rebuild work remains"}
@@ -228,6 +229,35 @@ def decision(snapshot, *, now, older=(), allow_bounded=False):
         if summary.get("remaining_in_batch") == 0 and checked + timedelta(seconds=retry_delay) > now:
             return {"run": False, "reason": "No eligible collection work is due yet"}
     return {"run": True, "reason": "Collection work remains"}
+
+
+def power_only_readiness(snapshot):
+    if snapshot is None or not snapshot.durable:
+        return {"run": False, "reason": "Power backfill requires a durable saved collector checkpoint"}
+    if snapshot.summary.get("blocked"):
+        return {"run": False, "reason": "Saved source controls remain blocked; power backfill will not replace them"}
+    if snapshot.summary.get("resource_limit"):
+        return {"run": False, "reason": "Previous collection reached a resource limit"}
+    rebuild = snapshot.summary.get("deck_rebuild")
+    if isinstance(rebuild, dict):
+        metadata = rebuild.get("metadata_prefetch")
+        if (rebuild.get("metadata_source_blocked") is True or isinstance(metadata, dict)
+                and (metadata.get("blocked") is True or metadata.get("status") == "source_access_stopped")):
+            return {"run": False, "reason": "Saved card-metadata access controls require review before backfill"}
+    return {"run": True, "restore_run_id": snapshot.run_id,
+            "reason": "Offline power backfill uses the saved collector checkpoint"}
+
+
+def prepare_power_only_summary(snapshot, *, now):
+    ready = power_only_readiness(snapshot)
+    if not ready["run"] or snapshot.summary.get("preflight_skipped"):
+        raise ValueError(ready["reason"] if not ready["run"] else "Skipped preflight is not a source checkpoint")
+    summary = deepcopy(snapshot.summary)
+    summary.update(publish_needed=False, continuation_needed=False, no_progress=True,
+                   power_only=True, power_only_source_run_id=snapshot.run_id,
+                   power_only_started_at=now.isoformat())
+    summary.pop("deck_rebuild", None)
+    return summary
 
 
 def classify_outcome(summary):
@@ -362,7 +392,10 @@ def merge_recovery_controls(state, summary, *, source_run_id, checkpoint_run_id,
                          "recovered_at": now.isoformat()}
 
 
-def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, attempt=0, recovery_run_id=None):
+def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, attempt=0,
+               recovery_run_id=None, power_only=False):
+    if power_only and (mode != "preflight" or recovery_run_id):
+        raise ValueError("Power-only readiness is available only for preflight without checkpoint recovery")
     if mode == "prepare-cooldown":
         # The collector dispatches immediately after immutable artifact upload,
         # before its own final bookkeeping steps finish.
@@ -401,7 +434,9 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
     else:
         snapshots = iter(client.snapshots())
         latest = next(snapshots, None)
-    if mode == "preflight" and recovery_run_id:
+    if mode == "preflight" and power_only:
+        result = power_only_readiness(latest)
+    elif mode == "preflight" and recovery_run_id:
         result = recovery_plan(latest, list(snapshots), requested_run_id=recovery_run_id, now=now)
     else:
         result = decision(latest, now=now, older=snapshots, allow_bounded=mode == "preflight")
@@ -424,7 +459,7 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("preflight", "watchdog", "prepare-cooldown", "resume", "outcome", "recover-control", "publish", "publication", "queue-cooldown"))
+    parser.add_argument("mode", choices=("preflight", "watchdog", "prepare-cooldown", "resume", "outcome", "recover-control", "publish", "publication", "queue-cooldown", "prepare-power-only"))
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--current-run-id", type=int, default=int(os.environ.get("GITHUB_RUN_ID", "0")))
     parser.add_argument("--source-run-id", type=int)
@@ -433,6 +468,7 @@ def main():
     parser.add_argument("--recovery-run-id", type=int)
     parser.add_argument("--restored-run-id", type=int)
     parser.add_argument("--state-file", type=Path)
+    parser.add_argument("--power-only", action="store_true")
     args = parser.parse_args()
     try:
         if not 0 <= args.attempt <= MAX_WAIT_ATTEMPTS:
@@ -443,7 +479,19 @@ def main():
             raise ValueError("Checkpoint recovery is available only for an explicit collector request")
         if args.recovery_run_id and os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
             raise ValueError("Checkpoint recovery requires an explicit workflow_dispatch request")
-        if args.mode == "outcome":
+        if args.power_only and (args.mode != "preflight" or args.recovery_run_id):
+            raise ValueError("Power-only readiness is available only for preflight without checkpoint recovery")
+        if args.mode == "prepare-power-only":
+            if not args.source_run_id or args.source_run_id <= 0 or args.summary_file is None:
+                raise ValueError("Power backfill requires the exact restored source run and a summary file")
+            source = GitHub(args.repository).source(args.source_run_id)
+            summary = prepare_power_only_summary(source, now=datetime.now(timezone.utc))
+            args.summary_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary = args.summary_file.with_suffix(".power.tmp")
+            temporary.write_text(json.dumps(summary, allow_nan=False), encoding="utf-8")
+            temporary.replace(args.summary_file)
+            result = {"prepared": True, "source_run_id": source.run_id, "power_only": True}
+        elif args.mode == "outcome":
             summary = json.loads(args.summary_file.read_text(), parse_constant=reject_nonfinite)
             result = {"status": classify_outcome(summary)}
             if result["status"] == "rate_limit_paused":
@@ -488,7 +536,7 @@ def main():
         else:
             result = coordinate(GitHub(args.repository), args.mode, now=datetime.now(timezone.utc),
                 current_run_id=args.current_run_id, source_run_id=args.source_run_id, attempt=args.attempt,
-                recovery_run_id=args.recovery_run_id)
+                recovery_run_id=args.recovery_run_id, power_only=args.power_only)
         snapshot = result.pop("snapshot", {})
         if args.mode == "preflight" and not result["run"] and args.summary_file is not None:
             snapshot.update(publish_needed=False, continuation_needed=False, preflight_skipped=True,

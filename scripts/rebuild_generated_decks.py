@@ -6,16 +6,18 @@ the smaller website export. Completed collectors retain parsed previews and
 source profiles after discarding their temporary analysis evidence. This tool
 uses either representation, checks that it matches the published model's
 dataset, and leaves source freshness and learned package membership unchanged.
-It is offline by default; ``--fetch-metadata`` refreshes Scryfall rules and power
-inputs in one paced stream for a bounded commander batch, then commits its
-decks before preparing another batch. A finite runtime also bounds in-flight
-CPU and metadata work, retaining interrupted reports
-for the next run.
+It is offline by default. ``--fetch-metadata`` first refreshes existing-list
+power scores from the cache, then refreshes Scryfall inputs in one paced stream
+for a bounded commander batch and commits its decks before the next batch.
+``--scores-only`` stops after the cache-only score pass, preserving all card
+lists and pending reconstruction work. A finite runtime also bounds in-flight
+CPU and metadata work, retaining interrupted reports for the next run.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, TimeoutError, wait
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -34,7 +36,9 @@ from edhrec_affinity.build_styles.card_metadata import (
     CACHE_MAX_AGE_DAYS, COLLECTION_BATCH_SIZE, COLLECTION_URL, MetadataRepository, metadata_aliases,
 )
 from edhrec_affinity.build_styles.collection import deck_dataset_sha256
-from edhrec_affinity.build_styles.deckbuilding import DECK_GENERATION_VERSION, generate_package_decks
+from edhrec_affinity.build_styles.deckbuilding import (
+    DECK_GENERATION_VERSION, _bracket_validation, _metadata_index, generate_package_decks,
+)
 from edhrec_affinity.build_styles.eligibility import commander_is_eligible
 from edhrec_affinity.build_styles.external_validation import (
     attach_external_validation, cardlist_hash, external_validation_directory,
@@ -56,8 +60,11 @@ GENERATION_VERSION = DECK_GENERATION_VERSION
 DEFAULT_COMMANDER_BATCH_SIZE = 5
 METADATA_BATCH_MAX_SECONDS = 180
 CPU_RESERVE_MAX_SECONDS = 120
+POWER_REFRESH_MAX_SECONDS = 300
+POWER_REPORT_MAX_SECONDS = 10
 _worker_repository = None
 _worker_aliases = None
+_power_repository = None
 
 
 class RebuildBlocked(ValueError):
@@ -163,6 +170,8 @@ def needs_rebuild(report: dict, *, validation_directory: Path | None = None,
             and analysis.get("status") == "fitted" and analysis.get("packages")):
         return False
     if report.get("deck_generation", {}).get("version", 0) < GENERATION_VERSION:
+        return True
+    if report.get("deck_generation", {}).get("full_rebuild_pending") is True:
         return True
     if any(package.get("generated_deck", {}).get("status") == "generated"
            and package["generated_deck"].get("validation", {}).get("checks", {}).get("metadata_fresh") is False
@@ -426,6 +435,8 @@ def rebuild_report(report: dict, inputs: dict, repository: MetadataRepository, *
     for model, package in packages(output):
         previous = before[model, package["id"]]
         generated = package.get("generated_deck", {})
+        if generated.get("status") == "generated":
+            generated.get("validation", {}).pop("power_alignment", None)
         if previous.get("generated_deck", {}).get("status") == "generated" and generated.get("status") != "generated":
             raise RebuildBlocked(f"Regeneration would remove an existing deck: {model}, package {package['id'] + 1}: {generated.get('reason')}")
         if generated.get("status") == "generated" and id(generated) not in seen:
@@ -459,6 +470,7 @@ def rebuild_report(report: dict, inputs: dict, repository: MetadataRepository, *
         raise RebuildBlocked("Deck generation unexpectedly changed learned package fields")
     unavailable = any(package.get("generated_deck", {}).get("status") != "generated" for _, package in packages(output))
     generation = output.setdefault("deck_generation", {})
+    generation.pop("full_rebuild_pending", None)
     # A blocked attempt is a completed review of that exact observation. New
     # timestamps, scores, restrictions or policy still request another pass.
     # Replacing rather than accumulating this list keeps the audit bounded.
@@ -654,13 +666,144 @@ def cache_digest(path: Path):
         return None
 
 
+def stored_numeric_power(deck: dict) -> bool:
+    """Cheap initial coverage count; scoring rechecks the actual card-list hash."""
+    if deck.get("status") != "generated":
+        return False
+    validation = deck.get("validation", {})
+    digest = validation.get("deck_sha256")
+    now = datetime.now(timezone.utc)
+    for key, status in (("external_rating", "verified"), ("calculated_power", "calculated")):
+        rating = validation.get(key, {})
+        if (rating.get("status") == status and rating.get("deck_sha256") == digest and digest
+                and bracket_for_power_score(rating.get("power_level")) is not None
+                and not _expired_timestamp(rating.get("checked_at"), now, CACHE_MAX_AGE_DAYS)):
+            return True
+    return False
+
+
+def initialize_power_worker(cache: str, max_age_days: float) -> None:
+    global _power_repository
+    _power_repository = MetadataRepository(cache, max_age_days=max_age_days)
+
+
+def refresh_existing_report_power(job: dict) -> dict:
+    """Score unchanged lists without loading preview pools, refitting or swapping."""
+    path = Path(job["path"])
+    end = min(job.get("score_deadline", float("inf")), time.monotonic() + POWER_REPORT_MAX_SECONDS)
+    try:
+        contents = path.read_bytes()
+        report = read_json(path)
+        slug = checked_identifier(report["commander_slug"])
+        if path.stem != slug:
+            raise RebuildBlocked("Report filename does not match its commander")
+        entries = [package["generated_deck"] for _, package in packages(report)
+                   if package.get("generated_deck", {}).get("status") == "generated"]
+        if not commander_is_eligible(report.get("total_edhrec_decks")) or not entries:
+            return {"commander_slug": slug, "changed": False, "scored_decks": 0, "scoring_pending": 0}
+        directory = Path(job["validation_directory"]) if job.get("validation_directory") else None
+        pending_before = needs_rebuild(report, validation_directory=directory,
+                                       max_age_days=job.get("max_age_days", 3))
+        names = {card_key(row["name"]): row["name"] for deck in entries for row in deck.get("cards", [])}
+        metadata, _ = _power_repository.load(list(names.values()), fetch=False)
+        indexed = _metadata_index(metadata)
+        changed, scored, seen, checked, report_pending = False, 0, {}, 0, pending_before
+        for deck in entries:
+            if time.monotonic() >= end:
+                break
+            validation = deck.setdefault("validation", {})
+            previous = {key: deepcopy(validation.get(key)) for key in
+                        ("deck_sha256", "calculated_power", "external_rating", "power_alignment")}
+            digest = cardlist_hash(deck["cards"])
+            commanders = tuple(row["name"] for row in deck.get("commanders", [])
+                               if isinstance(row, dict) and isinstance(row.get("name"), str))
+            identity = digest, commanders
+            if identity not in seen:
+                seen[identity] = calculate_power_rating(deck["cards"], metadata, commanders=commanders)
+            calculated = deepcopy(seen[identity])
+            validation.update(deck_sha256=digest, calculated_power=calculated)
+            external = attach_external_validation(deck, directory)
+            target = verified_score_bracket(external)
+            kind = "verified" if target is not None else "local"
+            if target is None and calculated.get("status") == "calculated":
+                target = calculated["score_bracket"]
+            previous_target = verified_score_bracket(previous["external_rating"])
+            if previous_target is None and isinstance(previous["calculated_power"], dict):
+                previous_target = bracket_for_power_score(previous["calculated_power"].get("power_level"))
+            entry_pending = pending_before or target is not None and previous_target != target
+            report_pending |= entry_pending
+            if target is not None and entry_pending:
+                alignment = {"status": "pending", "score_bracket": target,
+                    "deck_sha256": digest, "rating_kind": kind, "rule_checks": {},
+                    "note": "The numeric power was refreshed for this unchanged card list. Full deck reconstruction and any required card replacements are still queued."}
+                counts = Counter()
+                for row in deck["cards"]:
+                    card = indexed.get(card_key(row["name"]))
+                    if card is None:
+                        break
+                    counts[card_key(card["name"])] += row.get("quantity", 1)
+                else:
+                    guidance = _bracket_validation(counts, indexed, target, "unchanged_list_power_review")
+                    alignment.update(minimum_checked_bracket=guidance["recommended"],
+                                     rule_checks=guidance["rule_checks"])
+                    if guidance["recommended"] > target:
+                        alignment.update(status="known_mismatch",
+                            note="This unchanged list still contains checked card restrictions above its numeric power bracket. Card replacements are queued; this score refresh has not repaired the deck.")
+                validation["power_alignment"] = alignment
+            elif not entry_pending:
+                validation.pop("power_alignment", None)
+            current = {key: validation.get(key) for key in previous}
+            entry_changed = previous != current
+            changed |= entry_changed
+            scored += int(entry_changed and target is not None)
+            checked += 1
+        if changed:
+            generation = report.setdefault("deck_generation", {})
+            if report_pending:
+                generation["full_rebuild_pending"] = True
+            generation["power_refreshed_at"] = job["refreshed_at"]
+        result = {"commander_slug": slug, "changed": changed, "scored_decks": scored,
+                  "checked_decks": checked, "scoring_pending": sum(not stored_numeric_power(deck) for deck in entries),
+                  "partial": checked < len(entries), "full_rebuild_pending": report_pending}
+        if changed:
+            result.update(_power_report=report, _original_contents=contents)
+        return result
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        return {"commander_slug": path.stem, "changed": False, "scored_decks": 0,
+                "error": str(error)}
+
+
+def commit_power_refresh(job: dict, result: dict) -> dict:
+    report = result.pop("_power_report", None)
+    original = result.pop("_original_contents", None)
+    if report is None:
+        return result
+    path = Path(job["path"])
+    try:
+        if path.read_bytes() != original:
+            raise RebuildBlocked("Report changed during score refresh; refusing to overwrite concurrent work")
+        backup = Path(job["backup_dir"]) / "power-refresh" / path.name
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        if not backup.exists():
+            with backup.open("xb") as handle:
+                handle.write(original)
+                handle.flush()
+                os.fsync(handle.fileno())
+        atomic_json(path, report)
+        result.update(committed=True, backup=str(backup.resolve()))
+        return result
+    except (OSError, ValueError, TypeError) as error:
+        return {"commander_slug": path.stem, "changed": False, "scored_decks": 0, "error": str(error)}
+
+
 def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None, workers: int = 1,
                 dry_run: bool = False, summary_path: Path | None = None, backup_dir: Path | None = None,
                 validation_directory: Path | None = None, max_age_days: float = 3,
                 prefer_playability: bool = True, only_outdated: bool = False,
                 max_runtime_seconds: float = 0, fetch_metadata: bool = False,
                 current_discovery_only: bool = False,
-                batch_size: int = DEFAULT_COMMANDER_BATCH_SIZE) -> dict:
+                batch_size: int = DEFAULT_COMMANDER_BATCH_SIZE,
+                scores_only: bool = False) -> dict:
     if type(workers) is not int or not 1 <= workers <= 8:
         raise ValueError("Workers must be an integer from 1 through 8")
     if type(batch_size) is not int or batch_size < 1:
@@ -671,6 +814,10 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
         raise ValueError("Runtime must be a finite nonnegative number of seconds")
     if isinstance(max_age_days, bool) or not isinstance(max_age_days, (float, int)) or not math.isfinite(max_age_days) or max_age_days <= 0:
         raise ValueError("Metadata age must be a positive finite number of days")
+    # This operational mode is strictly cache-only, including when an API
+    # caller accidentally combines it with the normal metadata-fetch flag.
+    fetch_metadata = fetch_metadata and not scores_only
+    refresh_power = bool((fetch_metadata or scores_only) and not dry_run)
     started = time.monotonic()
     requested = {checked_identifier(slug) for slug in (commanders or [])}
     paths = sorted(path for path in root.glob("*.json") if path.stem not in {"index", "build_style_batch"}
@@ -705,6 +852,13 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
                "backup_dir": str(backup_dir.resolve()), "reports": [], "blockers": [],
                "max_runtime_seconds": max_runtime_seconds, "time_budget_reached": False,
                "only_outdated": only_outdated, "pending": 0, "pending_commanders": [],
+               "scores_only": scores_only, "scored_reports": 0, "scored_decks": 0,
+               "power_refreshed_reports": 0, "scoring_pending": 0,
+               "score_refresh": {"enabled": refresh_power, "cache_only": True,
+                                 "status": "skipped_dry_run" if dry_run and (fetch_metadata or scores_only) else "not_requested",
+                                 "network_enabled": False, "requests": 0, "edhrec_requests": 0,
+                                 "attempted_reports": 0, "checked_decks": 0, "partial_reports": 0,
+                                 "time_budget_reached": False, "errors": []},
                "scope": "current_discovery" if current_discovery_only else "all_saved_reports",
                "outside_scope": outside_scope,
                "metadata_prefetch": {"enabled": bool(fetch_metadata and not dry_run),
@@ -715,10 +869,14 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
                                      "alias_resolutions": [], "blocked": False, "durable_cache_saved": False,
                                      "batches_started": 0, "batches_completed": 0, "budget_limited_batches": 0,
                                      "count_basis": "Card-name lookups per commander batch; shared cached names can occur in more than one batch."}}
-    pending, priorities = set(), {}
+    pending, priorities, scoring_pending = set(), {}, {}
     for path in paths:
         try:
             report = read_json(path)
+            scoring_pending[path.stem] = sum(not stored_numeric_power(package["generated_deck"])
+                for _, package in packages(report)
+                if commander_is_eligible(report.get("total_edhrec_decks"))
+                and package.get("generated_deck", {}).get("status") == "generated")
             if (needs_rebuild(report, validation_directory=validation_directory, max_age_days=max_age_days) or not only_outdated and commander_is_eligible(report.get("total_edhrec_decks"))
                     and report.get("deck_analysis", {}).get("status") == "fitted"
                     and report.get("deck_analysis", {}).get("packages")):
@@ -737,6 +895,7 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
     def checkpoint():
         summary["pending_commanders"] = sorted(pending)
         summary["pending"] = len(pending)
+        summary["scoring_pending"] = sum(scoring_pending.values())
         atomic_json(summary_path, summary)
 
     def time_remains():
@@ -757,6 +916,14 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
             summary["regenerated"] += 1
             if not dry_run and not result.get("retry_needed"):
                 pending.discard(result["commander_slug"])
+            if not dry_run:
+                try:
+                    current = read_json(root / f"{result['commander_slug']}.json")
+                    scoring_pending[result["commander_slug"]] = sum(not stored_numeric_power(package["generated_deck"])
+                        for _, package in packages(current)
+                        if package.get("generated_deck", {}).get("status") == "generated")
+                except (OSError, ValueError, TypeError):
+                    pass
         elif result["status"] == "blocked":
             summary["blockers"].append({key: result[key] for key in ("commander_slug", "reason")})
         for package in result.get("packages", []):
@@ -768,6 +935,78 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
               + (f" ({result['reason']})" if result.get("reason") else ""), flush=True)
 
     checkpoint()
+    if refresh_power and time_remains():
+        progress = summary["score_refresh"]
+        progress["status"] = "refreshing_unchanged_lists"
+        # Scores do not require the much larger preview pool or a new model.
+        # Normal collection reserves most of its budget for actual rebuilding;
+        # a dedicated scores-only run can spend its whole budget on this pass.
+        remaining = remaining_seconds()
+        allowance = (remaining if scores_only else min(POWER_REFRESH_MAX_SECONDS, remaining * .25)) if remaining is not None else POWER_REFRESH_MAX_SECONDS
+        score_deadline = time.monotonic() + allowance
+        score_jobs = [{**job, "refreshed_at": now.isoformat(), "score_deadline": score_deadline} for job in jobs]
+
+        def record_power(job, result):
+            result = commit_power_refresh(job, result)
+            progress["attempted_reports"] += 1
+            progress["checked_decks"] += result.get("checked_decks", 0)
+            progress["partial_reports"] += int(result.get("partial", False))
+            if result.get("error"):
+                progress["errors"].append({"commander_slug": result["commander_slug"], "reason": result["error"]})
+            else:
+                if "scoring_pending" in result:
+                    scoring_pending[result["commander_slug"]] = result["scoring_pending"]
+                if result.get("full_rebuild_pending"):
+                    pending.add(result["commander_slug"])
+            if result.get("committed"):
+                summary["power_refreshed_reports"] += 1
+                summary["scored_reports"] += int(result.get("scored_decks", 0) > 0)
+                summary["scored_decks"] += result.get("scored_decks", 0)
+            checkpoint()
+
+        checkpoint()
+        if not max_runtime_seconds and workers == 1:
+            initialize_power_worker(str(cache), max_age_days)
+            for job in score_jobs:
+                if time.monotonic() >= score_deadline:
+                    progress["time_budget_reached"] = True
+                    break
+                record_power(job, refresh_existing_report_power(job))
+        else:
+            score_workers = min(workers, 2)
+            pool = ProcessPoolExecutor(max_workers=score_workers, initializer=initialize_power_worker,
+                initargs=(str(cache), max_age_days), mp_context=multiprocessing.get_context("spawn"))
+            running, expired = {}, False
+            try:
+                unscheduled = iter(score_jobs)
+                while True:
+                    while len(running) < score_workers and time.monotonic() < score_deadline:
+                        job = next(unscheduled, None)
+                        if job is None:
+                            break
+                        running[pool.submit(refresh_existing_report_power, job)] = job
+                    if not running:
+                        break
+                    done, _ = wait(running, timeout=max(0, score_deadline - time.monotonic()), return_when=FIRST_COMPLETED)
+                    if not done:
+                        progress["time_budget_reached"] = expired = True
+                        break
+                    for completed in done:
+                        job = running.pop(completed)
+                        record_power(job, completed.result())
+            finally:
+                shutdown_executor(pool, terminate=expired or bool(running))
+        if progress["attempted_reports"] < len(score_jobs):
+            progress["time_budget_reached"] = True
+        progress["status"] = ("time_budget_reached" if progress["time_budget_reached"] else
+                              "partial" if progress["partial_reports"] or progress["errors"] else "complete")
+        checkpoint()
+    if scores_only:
+        if max_runtime_seconds and not time_remains():
+            summary["time_budget_reached"] = True
+        summary["completed_at"] = datetime.now(timezone.utc).isoformat()
+        checkpoint()
+        return summary
     active_jobs = sorted((job for job in jobs if Path(job["path"]).stem in pending),
                          key=lambda job: (priorities.get(Path(job["path"]).stem, True), Path(job["path"]).stem))
     for job in jobs:
@@ -932,6 +1171,8 @@ def main() -> None:
                         help="Stop work at this deadline, retaining interrupted reports for retry (0 means unlimited)")
     parser.add_argument("--fetch-metadata", action="store_true",
                         help="Refresh missing/stale Scryfall metadata in one paced stream before workers; disabled for --dry-run")
+    parser.add_argument("--scores-only", action="store_true",
+                        help="Refresh power scores for unchanged existing lists from cached metadata only; disables network and full deck reconstruction")
     parser.add_argument("--current-discovery-only", action="store_true",
                         help="Use the website export's current-collector discovery scope, excluding archival reports")
     args = parser.parse_args()
@@ -940,7 +1181,8 @@ def main() -> None:
         validation_directory=args.validation_directory, max_age_days=args.metadata_max_age_days,
         prefer_playability=not args.single_anchor, only_outdated=args.only_outdated,
         max_runtime_seconds=args.max_runtime_seconds, fetch_metadata=args.fetch_metadata,
-        current_discovery_only=args.current_discovery_only, batch_size=args.commander_batch_size)
+        current_discovery_only=args.current_discovery_only, batch_size=args.commander_batch_size,
+        scores_only=args.scores_only)
     print(json.dumps({key: value for key, value in summary.items() if key != "reports"}, ensure_ascii=False, indent=2))
     raise SystemExit(1 if summary["blocked"] else 0)
 

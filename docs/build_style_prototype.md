@@ -172,7 +172,13 @@ and keeps the external target explicitly unverified or unmet.
 Generation version 4 calculates local power estimates and applies score-based
 bracket repairs to the core coverage,
 omission explanations and primer references recorded by version 2, for both the
-selected model and alternative package counts. The
+selected model and alternative package counts. A cache-only first pass scores
+existing saved card lists across the catalog before spending time on full deck
+regeneration. It preserves cards, exports, primers, learned models, source dates
+and generation versions. Reports that still need generation review remain
+explicitly pending; a score update does not certify that a restriction conflict
+has been repaired. Completed score updates independently request publication.
+The
 collector runs a bounded upgrade after collection for the same current reports
 eligible for Build Discovery. Saved parsed lists and profiles rebuild older
 generated decks without EDHREC requests, refitting NMF or changing source-check
@@ -192,6 +198,13 @@ python scripts/rebuild_generated_decks.py \
   --card-metadata-cache data/raw/build-style-card-metadata.json \
   --workers 2 --only-outdated --current-discovery-only --fetch-metadata
 ```
+
+For a fast offline score backfill, use `--scores-only` without
+`--fetch-metadata`. The collector workflow's `power_only` input runs this mode
+against its exact restored checkpoint, skipping EDHREC collection and full deck
+regeneration. After publishing saved score updates, normal collection and deck
+review resume under the existing continuation controls. Missing or stale inputs
+remain unverified for a later metadata pass.
 
 Omit `--fetch-metadata` for a fully offline rebuild using verified cached rules.
 The runtime bound includes metadata preparation, and unresolved unused cards
@@ -233,7 +246,8 @@ not the model's percentage-point enrichment. Coverage counts distinguish measure
 entries from zero-filled missing entries. These deck-ranking conventions do not
 change how missing data is handled by the statistical model.
 
-The primary package bracket follows its numeric power score, using a current
+Package headings show both numeric power and its corresponding bracket. The
+primary package bracket follows its numeric power score, using a current
 exact-list EDHPowerLevel observation first and a fresh local calculation when
 one is unavailable. Every primary and alternative package uses the same rule.
 Missing or stale score inputs show an explicitly unverified power bracket;

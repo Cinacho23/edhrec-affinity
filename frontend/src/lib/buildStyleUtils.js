@@ -232,7 +232,23 @@ export function getGeneratedDeckPowerRating(deck, now = Date.now()) {
 export function getPackageBracketLabel(deck, now = Date.now()) {
   if (deck?.status !== "generated") return null;
   const rating = getGeneratedDeckPowerRating(deck, now);
-  return rating ? `Bracket ${rating.scoreBracket} · ${rating.label}` : "Power bracket unverified";
+  if (!rating) return "Power bracket unverified";
+  const power = Number(rating.power_level);
+  const rounded = power.toFixed(2);
+  const displayPower = bracketForBuildPowerScore(rounded) === rating.scoreBracket ? rounded : String(power);
+  return `Power ${displayPower} · Bracket ${rating.scoreBracket} · ${rating.kind === "external" ? "EDHPowerLevel" : "local estimate"}`;
+}
+
+export function getGeneratedDeckPowerAlignment(deck, now = Date.now()) {
+  const alignment = deck?.validation?.power_alignment;
+  if (!["pending", "known_mismatch"].includes(alignment?.status)) return null;
+  const rating = getGeneratedDeckPowerRating(deck, now);
+  if (!rating) return null;
+  const minimum = Number.isInteger(alignment.minimum_checked_bracket)
+    && alignment.minimum_checked_bracket >= 1 && alignment.minimum_checked_bracket <= 5
+    ? alignment.minimum_checked_bracket : null;
+  return { status: minimum !== null && minimum > rating.scoreBracket ? "known_mismatch" : "pending",
+    scoreBracket: rating.scoreBracket, minimumCheckedBracket: minimum };
 }
 
 export function getGeneratedDeckDistinctiveCards(deck) {
