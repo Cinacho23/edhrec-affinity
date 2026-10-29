@@ -169,7 +169,8 @@ When no candidate in that tier has a
 qualifying external observation, selection uses native mana and role diagnostics
 and keeps the external target explicitly unverified or unmet.
 
-Generation version 3 adds score-based bracket repairs to the core coverage,
+Generation version 4 calculates local power estimates and applies score-based
+bracket repairs to the core coverage,
 omission explanations and primer references recorded by version 2, for both the
 selected model and alternative package counts. The
 collector runs a bounded upgrade after collection for the same current reports
@@ -223,19 +224,40 @@ not the model's percentage-point enrichment. Coverage counts distinguish measure
 entries from zero-filled missing entries. These deck-ranking conventions do not
 change how missing data is handled by the statistical model.
 
-Bracket guidance starts from the NMF-weighted median of sampled deck brackets,
-defaulting explicitly to 3 when no annotations are available. It checks Game
-Changer counts, detectable extra turns and mass land denial, raising the
-recommendation when needed. This adapts the repository's bracket approach to
-actual deck evidence; the commander z-score classifier does not establish a
-generated deck's power. Combo speed, all play patterns and the 72.5–77.5%
-external playability target are not certified by structure checks. Each list
+The primary package bracket follows its numeric power score, using a current
+exact-list EDHPowerLevel observation first and a fresh local calculation when
+one is unavailable. Every primary and alternative package uses the same rule.
+Missing or stale score inputs show an explicitly unverified power bracket;
+neither source-deck brackets nor card constraints supply a numeric power score.
+Card-constraint guidance remains secondary. Construction starts from a fresh
+anchor score when available, with the NMF-weighted median of sampled brackets
+as its unscored fallback. It checks Game Changers, extra turns and mass land
+denial, but does not raise the primary displayed power bracket. A conflict
+requests constrained card replacements and remains visible if it cannot be
+resolved. Combo speed, all play patterns and the 72.5–77.5% external playability
+target are not certified by structure checks. Each list
 links to the official [EDHPowerLevel preloaded deck flow](https://edhpowerlevel.com/button/).
 Observed external ratings are stored under `data/build-styles/validations/`,
 matched by a hash of all card names and quantities, and marked stale after seven
 days. A changed card list cannot inherit a previous list's rating. The scheduled
 collector does not claim to have run a live external check merely by generating
 the list or its validation link.
+
+`power_scoring.py` calculates a local estimate using the arithmetic, curves and
+card adjustments from the public EDHPowerLevel client. It requires the exact
+100-card list and fresh Scryfall metadata, including USD finish prices,
+EDHREC rank, reserved status, type, layout and mana value. Its result records
+the deck and input hashes, formula version, source-script hash and oldest
+input date. It makes no scoring-site requests. The selected Scryfall printing
+and data date can differ from the live site's lowest-price printing and cache,
+so these scores are labeled **local power estimates**, never verified external
+results. A verified external observation takes precedence. Price is an input
+to the published power formula. Null-price printings trigger a bounded,
+paced Scryfall search for a priced physical printing of the same Oracle card;
+the original printing and dated price evidence are preserved. Missing prices
+still produce an explicit unavailable score. Ordinary package card ranking uses
+sampled support and the requested inclusion/lift measurements, without a budget
+or price-ranking objective.
 
 Numeric power scores use a centralized policy in `power_brackets.py`: below
 4.7 is Bracket 1; 4.7–<6.7 is Bracket 2; 6.7–<7.7 is Bracket 3;
@@ -245,8 +267,8 @@ provided these EDHPowerLevel thresholds on October 27, 2026; the official
 that day and contains `bracketCurve:[0,4.7,6.7,7.7,9.25,10]`. This is separate
 from the site's reported bracket and its playability percentage. For example,
 6.09 maps to Bracket 2 even if a mass land denial card raises the reported
-bracket to 4. Only a current exact-list observation with an unambiguous numeric
-score may drive score-based deck repairs. Missing scores, ranges and labels
+bracket to 4. A current exact-list observation or complete fresh local power
+calculation with an unambiguous numeric score may drive repairs. Missing scores, ranges and labels
 such as `10+` remain available as observations but do not supply an exact score.
 An exact-list observation may also record `bracket_restrictions`: lists of full
 card names under `game_changers`, `extra_turns` and `mass_land_denial`, and lists
@@ -254,7 +276,7 @@ of groups of at least two distinct card names under `early_combos` and
 `late_combos`. All named cards must belong to the exact checked list. These are
 observed results, not an inferred complete combo search.
 
-When a verified numeric score maps below the deck's restriction-driven bracket,
+When a current numeric score maps below the deck's restriction-driven bracket,
 the builder attempts replacements from the sampled package pool. It checks
 Game Changer limits, extra turns, mass land denial and any recorded early/late
 two-card combos. Mass land denial detection includes Restore Balance's
@@ -266,13 +288,19 @@ which score/bracket restriction required it. If the restrictions cannot all be
 resolved, the existing list is retained with a blocked explanation.
 This policy applies to every commander and both Auto and alternative package
 counts. It includes Bracket 3 decks scoring 4.7–<6.7: the Bracket 2 repair
-removes Game Changers and breaks recorded two-card combos, as well as removing
-extra turns and mass land denial. A score of exactly 6.7 remains Bracket 3.
+removes Game Changers, chainable turns, mass land denial and prohibited recorded
+combos. Ordinary extra-turn counts are limited to zero, two and three in
+Brackets 1, 2 and 3 respectively; Brackets 4 and 5 are unrestricted.
+The public client's chainable-turn list is checked separately: Walk the Aeons
+is prohibited below Bracket 4, while Part the Waterveil can remain in Bracket 3.
+A score of exactly 6.7 remains Bracket 3.
 
 Each successful repair records the original exact card list and rating, swaps
 and construction checks. The changed list receives only its own exact-list
-external observation; the old score is never transferred. Subsequent rebuilds
-reuse the original scored seed while that observation is current. Once it is
+external observation and local calculation; the old score is never transferred.
+Every changed list is recalculated when complete fresh inputs are available,
+and a bounded six-pass repair follows any resulting bracket threshold crossings.
+Subsequent rebuilds prefer fresh current-list evidence. Once score evidence is
 stale, the builder can retain the unchanged repaired list only after rechecking
 its current pool, metadata, legality and bracket restrictions; it labels the repair
 historical and does not make new score-driven swaps from stale evidence.
@@ -281,7 +309,11 @@ on the current generation. It records which observations and score-policy
 version were attempted, so an unchanged blocked repair does not consume every
 later batch. A recheck, changed score or new named restriction can schedule a
 new attempt. The configured validation directory is used during generation as
-well as while selecting work.
+well as while selecting work. Current-generation reports are also selected
+again when their actual metadata dates exceed the configured three-day cache
+age, their local score expires, or their formula/hash evidence is missing.
+An explicit unavailable score is a completed attempt while its metadata is
+fresh, avoiding a retry loop for cards with no available prices.
 
 Export the lists, primers and per-card inclusion/lift CSVs locally:
 

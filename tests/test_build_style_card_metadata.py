@@ -17,6 +17,8 @@ def card(name="Forest", **changes):
             "legalities": {"commander": "legal"}, "keywords": [], "cmc": 0,
             "mana_cost": "", "layout": "normal", "game_changer": False,
             "produced_mana": ["G"], "oracle_id": f"oracle-{name}",
+            "colors": ["G"], "reserved": False, "edhrec_rank": 100,
+            "prices": {"usd": "0.15", "usd_foil": "0.30", "usd_etched": None},
             "scryfall_uri": "https://scryfall.com/card/test/1/forest", **changes}
 
 
@@ -75,6 +77,40 @@ def test_offline_cache_reuses_checked_metadata_without_starting_http_client(tmp_
     assert offline["forest"]["produced_mana"] == ["G"]
     assert offline["forest"]["game_changer"] is False
     assert offline["forest"]["oracle_id"] == "oracle-Forest"
+    assert offline["forest"]["edhrec_rank"] == 100
+    assert offline["forest"]["reserved"] is False
+    assert offline["forest"]["prices"] == {"usd": "0.15", "usd_foil": "0.30", "usd_etched": None}
+    assert offline["forest"]["power_metadata_version"] == metadata.POWER_METADATA_VERSION
+
+
+def test_fresh_legacy_structural_cache_refreshes_missing_power_inputs_without_inventing_zero(tmp_path, monkeypatch):
+    cache = tmp_path / "cache.json"
+    old = card()
+    for field in ("colors", "reserved", "edhrec_rank", "prices"):
+        old.pop(field)
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([old])))
+    structural, _ = metadata.load_card_metadata(["Forest"], cache, fetch=True)
+    assert "edhrec_rank" not in structural["forest"] and "prices" not in structural["forest"]
+    offline, summary = metadata.load_card_metadata(["Forest"], cache)
+    assert offline == structural and summary["requests"] == 0
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([card(edhrec_rank=None)])))
+    refreshed, summary = metadata.load_card_metadata(["Forest"], cache, fetch=True)
+    assert summary["requests"] == summary["fetched"] == 1
+    assert refreshed["forest"]["edhrec_rank"] is None
+    assert refreshed["forest"]["prices"]["usd"] == "0.15"
+    assert refreshed["forest"]["power_metadata_version"] == metadata.POWER_METADATA_VERSION
+
+
+@pytest.mark.parametrize("changes", [
+    {"edhrec_rank": True}, {"edhrec_rank": -1}, {"edhrec_rank": 1.5},
+    {"reserved": "yes"}, {"colors": ["UG"]}, {"colors": ["G", "G"]},
+    {"prices": {"usd": "NaN"}}, {"prices": {"usd_foil": "-0.1"}},
+    {"prices": {"usd": .15}},
+])
+def test_invalid_power_metadata_is_not_promoted_to_authoritative_cache(tmp_path, monkeypatch, changes):
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([card(**changes)])))
+    found, summary = metadata.load_card_metadata(["Forest"], tmp_path / "cache.json", fetch=True)
+    assert not found and summary["failures"]
 
 
 def test_only_uncached_cards_are_fetched_and_negative_results_are_retried(tmp_path, monkeypatch):
@@ -751,3 +787,224 @@ def test_collection_non_deck_evidence_allows_exact_search_when_named_endpoint_mi
     found, summary = metadata.load_card_metadata(["No Way Out"], tmp_path / "cards.json", fetch=True)
     assert found["no way out"]["oracle_id"] == NO_WAY_OUT_ORACLE
     assert summary["requests"] == 3 and not summary["failures"]
+
+
+PRICE_ORACLE = "11111111-1111-4111-8111-111111111111"
+ORIGINAL_PRINTING = "22222222-2222-4222-8222-222222222222"
+PRICED_PRINTING = "33333333-3333-4333-8333-333333333333"
+NULL_PRICES = {"usd": None, "usd_foil": None, "usd_etched": None}
+
+
+def price_card(name="Arcane Signet", *, priced=False, **changes):
+    return card(name, id=PRICED_PRINTING if priced else ORIGINAL_PRINTING,
+                oracle_id=PRICE_ORACLE, type_line="Artifact", cmc=2,
+                prices={"usd": ".25", "usd_foil": ".40", "usd_etched": None} if priced else NULL_PRICES,
+                digital=False, games=["paper"], **changes)
+
+
+def seed_price_cache(path, raw=None):
+    raw = raw or price_card()
+    checked = datetime.now(timezone.utc).isoformat()
+    metadata._write_cache(path, {raw["name"].casefold(): metadata._metadata(raw, checked)})
+
+
+def test_fresh_null_price_cache_uses_only_oracle_printing_search_and_preserves_rules(tmp_path, monkeypatch):
+    cache = tmp_path / "cards.json"
+    seed_price_cache(cache)
+    attempts = []
+
+    def handler(request):
+        attempts.append(request)
+        assert request.method == "GET" and request.url.path == "/cards/search"
+        assert dict(request.url.params) == {key: str(value) for key, value in metadata._price_params(PRICE_ORACLE).items()}
+        return httpx.Response(200, json=collection([price_card(priced=True, oracle_text="Different printing text")]))
+
+    delays = client(monkeypatch, handler)
+    found, summary = metadata.load_card_metadata(["Arcane Signet"], cache, fetch=True)
+    actual = found["arcane signet"]
+    assert summary["requests"] == summary["price_printing_searches"] == len(attempts) == 1
+    assert delays == [.1]
+    assert actual["id"] == ORIGINAL_PRINTING
+    assert actual["oracle_id"] == PRICE_ORACLE
+    assert actual["oracle_text"] == "({T}: Add {G}.)"
+    assert actual["prices"]["usd"] == ".25"
+    assert actual["original_prices"] == NULL_PRICES
+    assert actual["power_price_fallback"]["printing_id"] == PRICED_PRINTING
+    assert actual["power_price_fallback"]["oracle_id"] == PRICE_ORACLE
+    assert actual["power_price_fallback"]["checked_at"]
+    assert actual["power_price_source"] == "verified_priced_physical_printing_of_same_oracle_card"
+    monkeypatch.setattr(metadata.httpx, "Client", lambda **_: pytest.fail("Resolved price must reuse cache"))
+    offline, offline_summary = metadata.load_card_metadata(["Arcane Signet"], cache, fetch=True)
+    assert offline == found
+    assert offline_summary["requests"] == 0 and offline_summary["cached"] == 1
+
+
+def test_collection_null_price_uses_separate_dated_fallback_in_the_same_request_stream(tmp_path, monkeypatch):
+    attempts = []
+    def handler(request):
+        attempts.append(request)
+        rows = [price_card()] if request.method == "POST" else [price_card(priced=True)]
+        return httpx.Response(200, json=collection(rows))
+    delays = client(monkeypatch, handler)
+    found, summary = metadata.load_card_metadata(["Arcane Signet"], tmp_path / "cache.json", fetch=True)
+    assert [request.method for request in attempts] == ["POST", "GET"]
+    assert summary["requests"] == 2 and summary["price_printing_searches"] == 1
+    assert delays == [.1, .1]
+    assert found["arcane signet"]["prices"]["usd"] == ".25"
+
+
+@pytest.mark.parametrize("status,payload,reason", [
+    (404, {"object": "error"}, "not_found"),
+    (200, collection([price_card()]), "no_priced_printing"),
+])
+def test_no_priced_printing_is_dated_and_cached_without_losing_structural_metadata(
+    tmp_path, monkeypatch, status, payload, reason,
+):
+    cache = tmp_path / "cards.json"
+    seed_price_cache(cache)
+    client(monkeypatch, lambda _: httpx.Response(status, json=payload))
+    found, summary = metadata.load_card_metadata(["Arcane Signet"], cache, fetch=True)
+    actual = found["arcane signet"]
+    assert actual["prices"] == NULL_PRICES
+    assert actual["id"] == ORIGINAL_PRINTING
+    assert actual["power_price_fallback"]["status"] == "unavailable"
+    assert actual["power_price_fallback"]["reason"] == reason
+    assert summary["resolved"] == 1 and summary["price_unavailable"]
+    monkeypatch.setattr(metadata.httpx, "Client", lambda **_: pytest.fail("Dated negative price lookup repeated"))
+    again, summary = metadata.load_card_metadata(["Arcane Signet"], cache, fetch=True)
+    assert again == found and summary["requests"] == 0
+
+
+@pytest.mark.parametrize("changes", [
+    {"oracle_id": "44444444-4444-4444-8444-444444444444"},
+    {"name": "Different Card"}, {"digital": True}, {"games": ["mtgo"]},
+    {"id": "not-a-printing-uuid"}, {"prices": {"usd": "NaN"}},
+])
+def test_priced_printing_mismatch_or_malformed_price_cannot_establish_demand(tmp_path, monkeypatch, changes):
+    cache = tmp_path / "cards.json"
+    seed_price_cache(cache)
+    candidate = {**price_card(priced=True), **changes}
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([candidate])))
+    found, summary = metadata.load_card_metadata(["Arcane Signet"], cache, fetch=True)
+    assert found["arcane signet"]["prices"] == NULL_PRICES
+    assert "power_price_fallback" not in found["arcane signet"]
+    assert summary["price_failures"] and not summary["price_resolutions"]
+
+
+def test_entire_price_page_is_validated_before_its_first_priced_result_is_used(tmp_path, monkeypatch):
+    cache = tmp_path / "cards.json"
+    seed_price_cache(cache)
+    payload = collection([price_card(priced=True), {**price_card(priced=True), "digital": True}])
+    client(monkeypatch, lambda _: httpx.Response(200, json=payload))
+    found, summary = metadata.load_card_metadata(["Arcane Signet"], cache, fetch=True)
+    assert found["arcane signet"]["prices"] == NULL_PRICES
+    assert summary["price_failures"]
+
+
+def test_price_search_pages_are_bounded_and_do_not_follow_response_urls(tmp_path, monkeypatch):
+    cache = tmp_path / "cards.json"
+    seed_price_cache(cache)
+    pages = []
+    def handler(request):
+        pages.append(request.url.params["page"])
+        assert request.url.host == "api.scryfall.com"
+        return httpx.Response(200, json={**collection([price_card()]), "has_more": True,
+                                        "next_page": "https://untrusted.invalid/follow-me"})
+    client(monkeypatch, handler)
+    found, summary = metadata.load_card_metadata(["Arcane Signet"], cache, fetch=True)
+    assert pages == [str(page) for page in range(1, metadata.PRICE_PRINTING_MAX_PAGES + 1)]
+    assert summary["price_printing_searches"] == metadata.PRICE_PRINTING_MAX_PAGES
+    assert found["arcane signet"]["prices"] == NULL_PRICES
+    assert found["arcane signet"]["power_price_fallback"]["reason"] == "page_limit"
+
+
+@pytest.mark.parametrize("status", [401, 403, 429])
+def test_price_search_access_stop_is_shared_across_commanders(tmp_path, monkeypatch, status):
+    cache = tmp_path / "cards.json"
+    seed_price_cache(cache)
+    attempts = []
+    def handler(request):
+        attempts.append(request)
+        return httpx.Response(status, json={"object": "error"})
+    delays = client(monkeypatch, handler)
+    repository = metadata.MetadataRepository(cache)
+    found, summary = repository.load(["Arcane Signet"], fetch=True)
+    assert found["arcane signet"]["prices"] == NULL_PRICES
+    assert summary["blocked"] and summary["failures"]
+    assert "power_price_fallback" not in found["arcane signet"]
+    _, later = repository.load(["Other Card"], fetch=True)
+    assert later["requests"] == 0 and later["blocked"]
+    assert len(attempts) == 1 and delays == [.1]
+
+
+def test_price_search_obeys_deadline_without_network_or_rewriting_cache(tmp_path, monkeypatch):
+    cache = tmp_path / "cards.json"
+    seed_price_cache(cache)
+    before = cache.read_text()
+    client(monkeypatch, lambda _: pytest.fail("Expired price lookup made a request"))
+    repository = metadata.MetadataRepository(cache, deadline=1, monotonic=lambda: 2)
+    with pytest.raises(metadata.BudgetExpired):
+        repository.load(["Arcane Signet"], fetch=True)
+    assert cache.read_text() == before
+
+
+def test_cached_price_proof_cannot_change_oracle_identity(tmp_path, monkeypatch):
+    cache = tmp_path / "cards.json"
+    seed_price_cache(cache)
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([price_card(priced=True)])))
+    metadata.load_card_metadata(["Arcane Signet"], cache, fetch=True)
+    raw = json.loads(cache.read_text())
+    raw["cards"]["arcane signet"]["power_price_fallback"]["oracle_id"] = "44444444-4444-4444-8444-444444444444"
+    cache.write_text(json.dumps(raw))
+    found, summary = metadata.load_card_metadata(["Arcane Signet"], cache)
+    assert not found and "different Oracle" in summary["cache_error"]
+
+
+def test_multiface_card_without_top_level_colors_keeps_fresh_power_inputs(tmp_path, monkeypatch):
+    raw = card("Bala Ged Recovery // Bala Ged Sanctuary", layout="modal_dfc", cmc=3,
+               type_line="Sorcery // Land", card_faces=[
+                   {"name": "Bala Ged Recovery", "type_line": "Sorcery", "colors": ["G"]},
+                   {"name": "Bala Ged Sanctuary", "type_line": "Land", "colors": []},
+               ])
+    raw.pop("colors")
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([raw])))
+    cache = tmp_path / "cards.json"
+    first, summary = metadata.load_card_metadata([raw["name"]], cache, fetch=True)
+    assert summary["requests"] == 1
+    assert first[raw["name"].casefold()]["power_metadata_version"] == metadata.POWER_METADATA_VERSION
+    assert "colors" not in first[raw["name"].casefold()]
+    monkeypatch.setattr(metadata.httpx, "Client", lambda **_: pytest.fail("Fresh multi-face card was fetched again"))
+    again, summary = metadata.load_card_metadata([raw["name"]], cache, fetch=True)
+    assert first == again and summary["requests"] == 0
+
+
+def reversible_price(*, face_oracle=PRICE_ORACLE):
+    return {"object": "card", "name": "Arcane Signet // Arcane Signet", "id": PRICED_PRINTING,
+            "layout": "reversible_card", "prices": {"usd": None, "usd_foil": ".40", "usd_etched": None},
+            "digital": False, "games": ["paper"], "card_faces": [
+                {"name": "Arcane Signet", "oracle_id": PRICE_ORACLE},
+                {"name": "Arcane Signet", "oracle_id": face_oracle},
+            ]}
+
+
+def test_reversible_art_printing_prices_use_verified_face_oracle_ids_without_replacing_rules(tmp_path, monkeypatch):
+    cache = tmp_path / "cards.json"
+    seed_price_cache(cache)
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([reversible_price()])))
+    found, summary = metadata.load_card_metadata(["Arcane Signet"], cache, fetch=True)
+    actual = found["arcane signet"]
+    assert actual["prices"]["usd_foil"] == ".40"
+    assert actual["id"] == ORIGINAL_PRINTING
+    assert actual["oracle_id"] == PRICE_ORACLE
+    assert actual["cmc"] == 2 and actual["layout"] == "normal"
+    assert summary["price_resolutions"] and not summary["price_failures"]
+
+
+@pytest.mark.parametrize("other_oracle", [None, "44444444-4444-4444-8444-444444444444"])
+def test_reversible_printing_requires_every_face_to_identify_the_same_oracle(tmp_path, monkeypatch, other_oracle):
+    cache = tmp_path / "cards.json"
+    seed_price_cache(cache)
+    client(monkeypatch, lambda _: httpx.Response(200, json=collection([reversible_price(face_oracle=other_oracle)])))
+    found, summary = metadata.load_card_metadata(["Arcane Signet"], cache, fetch=True)
+    assert found["arcane signet"]["prices"] == NULL_PRICES
+    assert summary["price_failures"]

@@ -19,7 +19,9 @@ def card(name="Forest"):
     return {"object": "card", "name": name, "type_line": "Basic Land — Forest",
             "oracle_text": "({T}: Add {G}.)", "color_identity": ["G"],
             "legalities": {"commander": "legal"}, "keywords": [], "cmc": 0,
-            "mana_cost": "", "layout": "normal", "produced_mana": ["G"]}
+            "mana_cost": "", "layout": "normal", "produced_mana": ["G"],
+            "colors": ["G"], "edhrec_rank": 1000, "reserved": False,
+            "prices": {"usd": ".15", "usd_foil": None, "usd_etched": None}}
 
 
 def mock_client(monkeypatch, handler):

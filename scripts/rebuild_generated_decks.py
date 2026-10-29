@@ -6,7 +6,7 @@ the smaller website export. Completed collectors retain parsed previews and
 source profiles after discarding their temporary analysis evidence. This tool
 uses either representation, checks that it matches the published model's
 dataset, and leaves source freshness and learned package membership unchanged.
-It is offline by default; ``--fetch-metadata`` refreshes only Scryfall rules in
+It is offline by default; ``--fetch-metadata`` refreshes Scryfall rules and power inputs in
 one paced stream before starting deck-generation workers. A finite runtime
 also bounds in-flight CPU and metadata work, retaining interrupted reports
 for the next run.
@@ -30,7 +30,7 @@ import tempfile
 import time
 
 from edhrec_affinity.build_styles.card_metadata import (
-    COLLECTION_BATCH_SIZE, COLLECTION_URL, MetadataRepository, metadata_aliases,
+    CACHE_MAX_AGE_DAYS, COLLECTION_BATCH_SIZE, COLLECTION_URL, MetadataRepository, metadata_aliases,
 )
 from edhrec_affinity.build_styles.collection import deck_dataset_sha256
 from edhrec_affinity.build_styles.deckbuilding import DECK_GENERATION_VERSION, generate_package_decks
@@ -39,8 +39,9 @@ from edhrec_affinity.build_styles.external_validation import (
     attach_external_validation, cardlist_hash, external_validation_directory,
 )
 from edhrec_affinity.build_styles.power_brackets import (
-    POWER_SCORE_BRACKET_POLICY_VERSION, verified_score_bracket,
+    POWER_SCORE_BRACKET_POLICY_VERSION, bracket_for_power_score, verified_score_bracket,
 )
+from edhrec_affinity.build_styles.power_scoring import ALGORITHM_SHA256, POWER_FORMULA_VERSION
 from edhrec_affinity.build_styles.pipeline import shutdown_executor
 from edhrec_affinity.build_styles.sources import (
     CommanderAliasCatalog, card_key, checked_identifier, commander_card_alias_groups,
@@ -130,8 +131,23 @@ def score_repair_observations(report: dict, validation_directory: Path | None = 
     return observations
 
 
-def needs_rebuild(report: dict, *, validation_directory: Path | None = None) -> bool:
-    """Retry old generations, failed metadata or a newly checked score mismatch."""
+def _expired_timestamp(value, now: datetime, max_age_days: float) -> bool:
+    try:
+        checked = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return checked.tzinfo is None or not 0 <= (now - checked).total_seconds() < max_age_days * 86400
+    except (ValueError, AttributeError, TypeError):
+        return True
+
+
+def needs_rebuild(report: dict, *, validation_directory: Path | None = None,
+                  max_age_days: float = 3) -> bool:
+    """Retry old generations, expired inputs or a newly checked score mismatch.
+
+    A saved ``metadata_fresh`` flag is only a fact about its build time. Check
+    actual observation dates on every selection, including already-v4 reports.
+    Explicit unavailable calculations remain honest completed attempts while
+    their metadata is fresh; they are retried when that metadata expires.
+    """
     analysis = report.get("deck_analysis", {})
     if not (commander_is_eligible(report.get("total_edhrec_decks"))
             and analysis.get("status") == "fitted" and analysis.get("packages")):
@@ -142,6 +158,39 @@ def needs_rebuild(report: dict, *, validation_directory: Path | None = None) -> 
            and package["generated_deck"].get("validation", {}).get("checks", {}).get("metadata_fresh") is False
            for _, package in packages(report)):
         return True
+    now = datetime.now(timezone.utc)
+    for _, package in packages(report):
+        deck = package.get("generated_deck", {})
+        if deck.get("status") != "generated":
+            continue
+        validation = deck.get("validation", {})
+        calculated = validation.get("calculated_power")
+        if (not isinstance(calculated, dict) or calculated.get("status") not in {"calculated", "unavailable"}
+                or calculated.get("source") != "local_public_formula"
+                or type(calculated.get("power_formula_version")) is not int
+                or calculated.get("power_formula_version") != POWER_FORMULA_VERSION
+                or calculated.get("algorithm_sha256") != ALGORITHM_SHA256):
+            return True
+        try:
+            digest = cardlist_hash(deck.get("cards", []))
+            if calculated.get("deck_sha256") != digest or validation.get("deck_sha256") != digest:
+                return True
+        except (ValueError, TypeError):
+            return True
+        metadata = validation.get("metadata", {})
+        observed = metadata.get("oldest_checked_at") or calculated.get("metadata_checked_at") or calculated.get("checked_at")
+        if _expired_timestamp(observed, now, max_age_days):
+            return True
+        if calculated["status"] == "calculated":
+            score = calculated.get("power_level")
+            digest = calculated.get("input_sha256")
+            score_bracket = bracket_for_power_score(score)
+            if (isinstance(score, bool) or not isinstance(score, (int, float))
+                    or score_bracket is None or score_bracket != calculated.get("score_bracket")
+                    or not isinstance(digest, str) or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                    or _expired_timestamp(calculated.get("checked_at"), now, CACHE_MAX_AGE_DAYS)):
+                return True
     handled = report.get("deck_generation", {}).get("score_repair_observations", [])
     if not isinstance(handled, list):
         handled = []
@@ -406,8 +455,8 @@ def prefetch_metadata(root: Path, paths: list[Path], repository: MetadataReposit
     """Warm one shared cache in the parent, never competing worker HTTP streams.
 
     Names are deduplicated across reports, including unresolved names, so an
-    unsupported unused card is attempted once in this run. Successful v2
-    reports are subsequently skipped, without adding a negative metadata cache.
+    unsupported unused card is attempted once in this run. Current reports with
+    fresh inputs are skipped, without adding a negative metadata cache.
     The existing repository supplies exact lookup proofs, pacing, and its
     global 401/403/429 access stop.
     """
@@ -428,7 +477,8 @@ def prefetch_metadata(root: Path, paths: list[Path], repository: MetadataReposit
             if (not commander_is_eligible(report.get("total_edhrec_decks"))
                     or report.get("deck_analysis", {}).get("status") != "fitted"
                     or not report.get("deck_analysis", {}).get("packages")
-                    or only_outdated and not needs_rebuild(report, validation_directory=validation_directory)):
+                    or only_outdated and not needs_rebuild(report, validation_directory=validation_directory,
+                                                          max_age_days=getattr(repository, "max_age_days", 3))):
                 continue
             inputs = load_inputs(root, report, aliases)
             names.update({card_key(name): name for name in requested_metadata_names(report, inputs)})
@@ -507,7 +557,8 @@ def process_report(job: dict) -> dict:
                 or not report.get("deck_analysis", {}).get("packages")):
             return {"commander_slug": slug, "status": "skipped", "reason": "no_fitted_packages"}
         validation_directory = Path(job["validation_directory"]) if job.get("validation_directory") else None
-        if job.get("only_outdated") and not needs_rebuild(report, validation_directory=validation_directory):
+        if job.get("only_outdated") and not needs_rebuild(report, validation_directory=validation_directory,
+                                                        max_age_days=job.get("max_age_days", 3)):
             return {"commander_slug": slug, "status": "skipped", "reason": "already_current_generation"}
         inputs = load_inputs(root, report, _worker_aliases)
         rebuilt, result = rebuild_report(report, inputs, _worker_repository,
@@ -562,6 +613,8 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
         raise ValueError(f"Build-style directory does not exist: {root}")
     if isinstance(max_runtime_seconds, bool) or not isinstance(max_runtime_seconds, (float, int)) or not math.isfinite(max_runtime_seconds) or max_runtime_seconds < 0:
         raise ValueError("Runtime must be a finite nonnegative number of seconds")
+    if isinstance(max_age_days, bool) or not isinstance(max_age_days, (float, int)) or not math.isfinite(max_age_days) or max_age_days <= 0:
+        raise ValueError("Metadata age must be a positive finite number of days")
     started = time.monotonic()
     requested = {checked_identifier(slug) for slug in (commanders or [])}
     paths = sorted(path for path in root.glob("*.json") if path.stem not in {"index", "build_style_batch"}
@@ -604,7 +657,7 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
     for path in paths:
         try:
             report = read_json(path)
-            if (needs_rebuild(report, validation_directory=validation_directory) or not only_outdated and commander_is_eligible(report.get("total_edhrec_decks"))
+            if (needs_rebuild(report, validation_directory=validation_directory, max_age_days=max_age_days) or not only_outdated and commander_is_eligible(report.get("total_edhrec_decks"))
                     and report.get("deck_analysis", {}).get("status") == "fitted"
                     and report.get("deck_analysis", {}).get("packages")):
                 pending.add(path.stem)
@@ -613,7 +666,7 @@ def rebuild_all(root: Path, cache: Path, *, commanders: list[str] | None = None,
     jobs = [{"root": str(root), "path": str(path), "backup_dir": str(backup_dir),
              "validation_directory": str(validation_directory) if validation_directory is not None else None,
              "prefer_playability": prefer_playability, "dry_run": dry_run, "rebuilt_at": now.isoformat(),
-             "only_outdated": only_outdated} for path in paths]
+             "only_outdated": only_outdated, "max_age_days": max_age_days} for path in paths]
 
     def checkpoint():
         summary["pending_commanders"] = sorted(pending)
@@ -733,7 +786,7 @@ def main() -> None:
     parser.add_argument("--validation-directory", type=Path)
     parser.add_argument("--metadata-max-age-days", type=float, default=3)
     parser.add_argument("--single-anchor", action="store_true", help="Skip optional playability/mana candidate exploration")
-    parser.add_argument("--only-outdated", action="store_true", help="Skip reports already rebuilt by this generation version")
+    parser.add_argument("--only-outdated", action="store_true", help="Rebuild older generations, missing/expired power inputs, and new exact-list score mismatches")
     parser.add_argument("--max-runtime-seconds", type=float, default=0,
                         help="Stop work at this deadline, retaining interrupted reports for retry (0 means unlimited)")
     parser.add_argument("--fetch-metadata", action="store_true",

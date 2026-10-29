@@ -1394,14 +1394,22 @@ def summarize_build_style_packages(analysis: dict[str, Any]) -> list[dict[str, A
             validation = deck.get("validation", {})
             if isinstance(validation, dict):
                 compact_validation = {}
+                if isinstance(validation.get("deck_sha256"), str):
+                    compact_validation["deck_sha256"] = validation["deck_sha256"]
                 bracket = validation.get("bracket")
                 if isinstance(bracket, dict) and "recommended" in bracket:
                     compact_validation["bracket"] = {"recommended": bracket["recommended"]}
                 external = validation.get("external_rating")
                 if isinstance(external, dict):
                     compact_validation["external_rating"] = {key: external[key] for key in (
-                        "status", "checked_at", "playability_pct", "bracket",
+                        "status", "checked_at", "playability_pct", "bracket", "power_level", "deck_sha256",
                     ) if key in external}
+                calculated = validation.get("calculated_power")
+                if isinstance(calculated, dict):
+                    compact_validation["calculated_power"] = {key: calculated[key] for key in (
+                        "status", "checked_at", "power_level", "score_bracket", "deck_sha256", "source",
+                        "power_formula_version",
+                    ) if key in calculated}
                 if compact_validation:
                     generated["validation"] = compact_validation
             statistics = deck.get("statistics")

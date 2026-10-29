@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Iterable
+from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 import httpx
@@ -41,6 +42,14 @@ DEFAULT_CACHE_PATH = Path("data/raw/build-style-card-metadata.json")
 COLLECTION_BATCH_SIZE = 75
 REQUEST_DELAY_SECONDS = 0.1
 CACHE_MAX_AGE_DAYS = 7
+POWER_METADATA_VERSION = 1
+PRICE_PRINTING_MAX_PAGES = 3
+_USD_PRICE_FIELDS = ("usd", "usd_foil", "usd_etched")
+_FIXED_IMPACT_BASICS = frozenset(card_key(name) for name in (
+    "Mountain", "Forest", "Island", "Swamp", "Plains", "Wastes",
+    "Snow-Covered Mountain", "Snow-Covered Forest", "Snow-Covered Island",
+    "Snow-Covered Swamp", "Snow-Covered Plains", "Snow-Covered Wastes",
+))
 _LEGALITIES = {"legal", "not_legal", "restricted", "banned"}
 # The front of these cards identifies the playable card. A split/aftermath half
 # is deliberately not accepted as an alias for its full card name.
@@ -72,6 +81,100 @@ def _stale(card: dict[str, Any], now: datetime, max_age_days: float = CACHE_MAX_
     age_seconds = (now - checked).total_seconds()
     # A future timestamp cannot establish freshness either.
     return age_seconds < 0 or age_seconds >= max_age_days * 86400
+
+
+def _needs_refresh(card: dict[str, Any], now: datetime, max_age_days: float) -> bool:
+    """Old structural caches remain usable, but cannot supply fresh power inputs."""
+    return _stale(card, now, max_age_days) or card.get("power_metadata_version") != POWER_METADATA_VERSION
+
+
+def _priced_usd(prices: Any) -> float | None:
+    if not isinstance(prices, dict):
+        return None
+    values = [float(value) for field in _USD_PRICE_FIELDS if (value := prices.get(field)) is not None]
+    return min(values) if values else None
+
+
+def _needs_price_refresh(card: dict[str, Any], now: datetime, max_age_days: float) -> bool:
+    if (card.get("power_metadata_version") != POWER_METADATA_VERSION
+            or card_key(card["name"]) in _FIXED_IMPACT_BASICS):
+        return False
+    proof = card.get("power_price_fallback")
+    if proof is not None:
+        return _stale(proof, now, max_age_days)
+    return _priced_usd(card.get("prices")) is None
+
+
+def _usd_prices(prices: Any) -> dict[str, str | None]:
+    if not isinstance(prices, dict):
+        raise ValueError("Invalid Scryfall prices")
+    normalized = {}
+    for field in _USD_PRICE_FIELDS:
+        value = prices.get(field)
+        if value is not None:
+            if not isinstance(value, str):
+                raise ValueError("Invalid Scryfall USD price")
+            try:
+                numeric = float(value)
+            except ValueError as error:
+                raise ValueError("Invalid Scryfall USD price") from error
+            if not math.isfinite(numeric) or numeric < 0 or not value.strip():
+                raise ValueError("Invalid Scryfall USD price")
+        normalized[field] = value
+    return normalized
+
+
+def _oracle_uuid(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Priced-printing lookup requires a verified Oracle UUID")
+    try:
+        identity = str(UUID(value))
+    except (ValueError, AttributeError) as error:
+        raise ValueError("Priced-printing lookup requires a verified Oracle UUID") from error
+    if value != identity:
+        raise ValueError("Priced-printing lookup requires a canonical Oracle UUID")
+    return identity
+
+
+def _price_params(oracle_id: str, page: int = 1) -> dict:
+    return {"q": f"oracleid:{oracle_id} game:paper", "unique": "prints",
+            "order": "usd", "dir": "asc", "page": page}
+
+
+def _price_proof(value: Any, card: dict) -> dict:
+    if not isinstance(value, dict) or value.get("status") not in {"resolved", "unavailable"}:
+        raise ValueError("Invalid Scryfall priced-printing evidence")
+    identity = _oracle_uuid(value.get("oracle_id"))
+    if identity != card.get("oracle_id"):
+        raise ValueError("Priced-printing evidence has a different Oracle identity")
+    source = value.get("source_url")
+    if not isinstance(source, str):
+        raise ValueError("Priced-printing evidence needs a source URL")
+    parsed = urlparse(source)
+    query = parse_qs(parsed.query)
+    if (parsed.scheme != "https" or parsed.hostname != "api.scryfall.com"
+            or parsed.username is not None or parsed.password is not None
+            or parsed.port not in {None, 443} or parsed.path != "/cards/search"
+            or query.get("q") != [f"oracleid:{identity} game:paper"]
+            or query.get("unique") != ["prints"] or query.get("order") != ["usd"]
+            or query.get("dir") != ["asc"]):
+        raise ValueError("Unexpected priced-printing source URL")
+    result = {"status": value["status"], "oracle_id": identity, "source_url": source,
+              "checked_at": _timestamp(value.get("checked_at"))}
+    if value["status"] == "resolved":
+        result["printing_id"] = _oracle_uuid(value.get("printing_id"))
+        prices = _usd_prices(value.get("prices"))
+        if prices != card.get("prices") or _priced_usd(prices) is None:
+            raise ValueError("Priced-printing evidence does not establish these USD prices")
+        result["prices"] = prices
+    else:
+        if _priced_usd(card.get("prices")) is not None:
+            raise ValueError("Unavailable price evidence cannot establish a price")
+        reason = value.get("reason")
+        if reason not in {"not_found", "no_priced_printing", "page_limit"}:
+            raise ValueError("Invalid unavailable priced-printing reason")
+        result["reason"] = reason
+    return result
 
 
 def _strict_json(text: str) -> Any:
@@ -153,6 +256,44 @@ def _metadata(raw: Any, checked_at: str) -> dict[str, Any]:
                          "flavor_name", "printed_name") if field in raw},
         "checked_at": _timestamp(checked_at),
     }
+    # Preserve the independently observed demand and price inputs used by the
+    # public power formula. Their absence in an older cache is unknown, never
+    # zero. A structural metadata lookup can still use such an older record.
+    if "edhrec_rank" in raw or (raw.get("object") == "card" and "prices" in raw and "reserved" in raw):
+        # Scryfall omits this optional field for unranked cards, including
+        # basics. Only a complete raw response establishes that observation;
+        # a legacy stripped cache must still refresh before power calculation.
+        rank = raw.get("edhrec_rank")
+        if rank is not None and (type(rank) is not int or rank <= 0):
+            raise ValueError("Invalid Scryfall EDHREC rank")
+        result["edhrec_rank"] = rank
+    if "reserved" in raw:
+        if not isinstance(raw["reserved"], bool):
+            raise ValueError("Invalid Scryfall reserved flag")
+        result["reserved"] = raw["reserved"]
+    if "colors" in raw:
+        colors = raw["colors"]
+        if (not isinstance(colors, list) or any(not isinstance(color, str) or color not in "WUBRG"
+                or len(color) != 1 for color in colors) or len(set(colors)) != len(colors)):
+            raise ValueError("Invalid Scryfall card colors")
+        result["colors"] = list(colors)
+    if "prices" in raw:
+        result["prices"] = _usd_prices(raw["prices"])
+    # Multi-face Scryfall objects can legitimately omit top-level colors. The
+    # power arithmetic uses total nonland impact, so color partitions are not
+    # required and their absence must not cause perpetual metadata refreshes.
+    if all(field in result for field in ("edhrec_rank", "reserved", "prices")):
+        result["power_metadata_version"] = POWER_METADATA_VERSION
+        result["power_price_source"] = "minimum_available_usd_finish_of_returned_scryfall_printing"
+    if "power_price_fallback" in raw:
+        proof = _price_proof(raw["power_price_fallback"], result)
+        result["power_price_fallback"] = proof
+        if proof["status"] == "resolved":
+            original = _usd_prices(raw.get("original_prices"))
+            if _priced_usd(original) is not None:
+                raise ValueError("Priced-printing fallback cannot replace an observed priced printing")
+            result["original_prices"] = original
+            result["power_price_source"] = "verified_priced_physical_printing_of_same_oracle_card"
     # A printing can have a different displayed name while sharing the same
     # Oracle identity. Preserve the exact English printing evidence separately
     # so refreshing to a regular printing cannot erase a verified alternate name.
@@ -327,6 +468,48 @@ def _exact_deck_card(payload: Any, name: str, checked_at: str) -> dict:
     if len(identities) != 1:
         raise ValueError("Exact physical-card search returned multiple distinct Oracle identities")
     return min(cards, key=lambda card: (card_key(card["name"]) != card_key(name), card.get("id", ""), card["name"]))
+
+
+def _priced_printing(payload: Any, original: dict, checked_at: str) -> tuple[dict | None, bool]:
+    """Validate a bounded search page before using any of its price observations."""
+    if (not isinstance(payload, dict) or payload.get("object") != "list"
+            or not isinstance(payload.get("data"), list)
+            or not isinstance(payload.get("has_more"), bool)):
+        raise ValueError("Priced-printing search must return a Scryfall list")
+    rows, has_more = payload["data"], payload["has_more"]
+    total = payload.get("total_cards", len(rows))
+    if type(total) is not int or total < len(rows) or (not rows and has_more):
+        raise ValueError("Invalid priced-printing search page")
+    identity = _oracle_uuid(original.get("oracle_id"))
+    priced = []
+    for raw in rows:
+        # This lookup supplies only prices. Reversible art printings can
+        # legitimately carry their Oracle IDs and rules on each face rather
+        # than the parent object; requiring parent mana/rules fields rejects
+        # valid physical printings (including a Sol Ring art treatment).
+        if not isinstance(raw, dict) or raw.get("object") != "card":
+            raise ValueError("Priced-printing search must contain Scryfall cards")
+        layout = _string(raw.get("layout"), "layout", empty=False)
+        name = _string(raw.get("name"), "name", empty=False)
+        same_identity = raw.get("oracle_id") == identity and card_key(name) == card_key(original["name"])
+        if layout == "reversible_card" and raw.get("oracle_id") is None:
+            faces = raw.get("card_faces")
+            same_identity = (isinstance(faces, list) and len(faces) >= 2 and all(
+                isinstance(face, dict) and face.get("oracle_id") == identity
+                and isinstance(face.get("name"), str)
+                and card_key(face["name"]) == card_key(original["name"])
+                for face in faces
+            ))
+        if not same_identity or layout in _NON_DECK_LAYOUTS:
+            raise ValueError("Priced-printing search returned a different card identity")
+        printing_id = _oracle_uuid(raw.get("id"))
+        if raw.get("digital") is not False or not isinstance(raw.get("games"), list) or "paper" not in raw["games"]:
+            raise ValueError("Priced-printing search returned a nonphysical printing")
+        prices = _usd_prices(raw.get("prices"))
+        price = _priced_usd(prices)
+        if price is not None:
+            priced.append((price, printing_id, {"id": printing_id, "prices": prices}))
+    return (min(priced, key=lambda row: (row[0], row[1]))[2] if priced else None), has_more
 
 
 def _identifier_name(name: str) -> str:
@@ -509,6 +692,8 @@ class MetadataRepository:
             "collection_rejections": [],
             "printing_requests": 0,
             "physical_name_searches": 0, "non_deck_resolutions": [],
+            "price_printing_searches": 0, "price_resolutions": [],
+            "price_unavailable": [], "price_failures": [],
         }
         if self._cache_error is not None:
             summary["cache_error"] = self._cache_error
@@ -517,7 +702,9 @@ class MetadataRepository:
                           if (card := self._cards.get(key)) is not None and card["layout"] in _NON_DECK_LAYOUTS}
         lookup, _ = _group_lookup(self._lookup, groups)
         pending = [name for key, name in requested.items()
-                   if key not in lookup or _stale(lookup[key], now, self.max_age_days)]
+                   if key not in lookup or _needs_refresh(lookup[key], now, self.max_age_days)]
+        price_pending = [name for key, name in requested.items()
+                         if key in lookup and _needs_price_refresh(lookup[key], now, self.max_age_days)]
         refreshed_cards: set[str] = set()
 
         def save(fresh: dict[str, dict]) -> None:
@@ -529,12 +716,12 @@ class MetadataRepository:
             self._cache_error = None
             refreshed_cards.update(fresh)
 
-        if fetch and pending and self.blocked:
+        if fetch and (pending or price_pending) and self.blocked:
             summary["failures"].append({
-                "names": pending, "status_code": self._blocked_status,
+                "names": list(dict.fromkeys(pending + price_pending)), "status_code": self._blocked_status,
                 "error": "Repository paused after an access or rate limit response; no request was retried",
             })
-        elif fetch and pending:
+        elif fetch and (pending or price_pending):
             with httpx.Client(headers={"User-Agent": DEFAULT_USER_AGENT,
                                        "Accept": "application/json"}, timeout=30,
                               follow_redirects=False) as client:
@@ -597,7 +784,7 @@ class MetadataRepository:
                     lookup, _ = _group_lookup(self._lookup, groups)
                     batch = [name for name in pending[start:start + COLLECTION_BATCH_SIZE]
                              if card_key(name) not in lookup
-                             or _stale(lookup[card_key(name)], batch_now, self.max_age_days)]
+                             or _needs_refresh(lookup[card_key(name)], batch_now, self.max_age_days)]
                     if not batch:
                         continue
                     try:
@@ -628,7 +815,7 @@ class MetadataRepository:
                         break
                     lookup, conflicts = _group_lookup(self._lookup, groups)
                     key = card_key(name)
-                    if key in lookup and not _stale(lookup[key], datetime.now(timezone.utc), self.max_age_days):
+                    if key in lookup and not _needs_refresh(lookup[key], datetime.now(timezone.utc), self.max_age_days):
                         continue
                     # EDHREC may expose the exact Scryfall printing even when
                     # name search does not index its Secret Lair display name.
@@ -686,6 +873,65 @@ class MetadataRepository:
                         except (httpx.HTTPError, ValueError, OSError, TypeError) as error:
                             summary["failures"].append({"names": [name], "error": str(error)})
                             break
+                # A collection response can choose an unpriced promotional
+                # printing. Resolve USD demand separately from its Oracle and
+                # rules metadata, using the documented physical-print search.
+                # Cached null-price cards enter this path without re-fetching
+                # otherwise fresh collection batches. Every request shares the
+                # same pacing, deadline and repository-wide access stop.
+                priced_oracles = set()
+                for key, name in requested.items():
+                    if self.blocked:
+                        break
+                    lookup, _ = _group_lookup(self._lookup, groups)
+                    card = lookup.get(key)
+                    if card is None or not _needs_price_refresh(card, datetime.now(timezone.utc), self.max_age_days):
+                        continue
+                    try:
+                        identity = _oracle_uuid(card.get("oracle_id"))
+                        if identity in priced_oracles:
+                            continue
+                        priced_oracles.add(identity)
+                        checked_at = _now()
+                        chosen, reason, source_url = None, "no_priced_printing", None
+                        for page in range(1, PRICE_PRINTING_MAX_PAGES + 1):
+                            params = _price_params(identity, page)
+                            source_url = str(httpx.URL(SEARCH_URL, params=params))
+                            summary["price_printing_searches"] += 1
+                            payload = request("GET", SEARCH_URL, [name], params=params)
+                            if self.blocked:
+                                break
+                            if payload is None:
+                                reason = "not_found"
+                                break
+                            chosen, has_more = _priced_printing(payload, card, checked_at)
+                            if chosen is not None or not has_more:
+                                break
+                            reason = "page_limit"
+                        if self.blocked:
+                            break
+                        proof = {"status": "resolved" if chosen else "unavailable", "oracle_id": identity,
+                                 "source_url": source_url, "checked_at": checked_at}
+                        updated = copy.deepcopy(card)
+                        if chosen:
+                            # Retain the returned printing ID, rules, legality,
+                            # aliases and original null prices on the card.
+                            updated["original_prices"] = card.get("original_prices", card["prices"])
+                            updated["prices"] = chosen["prices"]
+                            proof.update({"printing_id": chosen["id"], "prices": chosen["prices"]})
+                            summary["price_resolutions"].append({"name": name, **proof})
+                        else:
+                            # A dated negative observation avoids repeating
+                            # the same bounded lookup in every commander pool.
+                            updated["prices"] = card.get("original_prices", card["prices"])
+                            updated.pop("original_prices", None)
+                            proof["reason"] = reason
+                            summary["price_unavailable"].append({"name": name, **proof})
+                        updated["power_price_fallback"] = proof
+                        updated = _metadata(updated, card["checked_at"])
+                        save({card_key(updated["name"]): updated})
+                    except (httpx.HTTPError, ValueError, OSError, TypeError) as error:
+                        summary["price_failures"].append({"names": [name], "error": str(error)})
                 lookup, _ = _group_lookup(self._lookup, groups)
                 summary["not_found"] = [name for name in missing_names if card_key(name) not in lookup]
                 summary["collection_rejections"] = collection_rejections

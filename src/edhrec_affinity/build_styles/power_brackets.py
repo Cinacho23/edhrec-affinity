@@ -16,7 +16,7 @@ from typing import Any
 
 
 POWER_SCORE_BRACKET_THRESHOLDS = (4.7, 6.7, 7.7, 9.25)
-POWER_SCORE_BRACKET_POLICY_VERSION = 1
+POWER_SCORE_BRACKET_POLICY_VERSION = 2
 POWER_SCORE_BRACKET_SOURCE = "https://edhpowerlevel.com/js/main-C1lbqCDd.js"
 _DECIMAL_SCORE = re.compile(r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)\Z")
 

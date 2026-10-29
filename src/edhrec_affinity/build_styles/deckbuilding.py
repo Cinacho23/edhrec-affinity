@@ -20,12 +20,13 @@ import re
 from urllib.parse import quote_plus
 
 from .card_metadata import metadata_aliases
+from .power_scoring import CHAINABLE_EXTRA_TURN_CARDS, EXTRA_TURN_LIMITS
 from .sources import card_key, commander_card_alias_groups
 
 
 ROLES = ("Commander", "Lands", "Fast Mana", "Ramp", "Card Advantage", "Wipe",
          "Removal", "Tutor", "Recursion", "Protection", "Leftover")
-DECK_GENERATION_VERSION = 3
+DECK_GENERATION_VERSION = 4
 _BASIC_COLORS = {"plains": "W", "island": "U", "swamp": "B", "mountain": "R", "forest": "G"}
 _COLOR_NAMES = dict(zip("WUBRG", ("white", "blue", "black", "red", "green")))
 _NUMBER_WORDS = {word: number for number, word in enumerate(
@@ -300,6 +301,15 @@ def _bracket_flags(card):
     return bool(card.get("game_changer")), extra, mass_land
 
 
+@_cached_card
+def _chainable_extra_turn(card):
+    return card_key(card["name"]) in CHAINABLE_EXTRA_TURN_CARDS
+
+
+def _all_bracket_flags(card):
+    return (*_bracket_flags(card), _chainable_extra_turn(card))
+
+
 def _bracket_target(decks, weights):
     values = sorted((int(deck["source_bracket"]), weights.get(deck["id"], 0)) for deck in decks
                     if isinstance(deck.get("source_bracket"), int) and not isinstance(deck["source_bracket"], bool)
@@ -314,26 +324,30 @@ def _bracket_target(decks, weights):
 
 
 def _bracket_counts(counts, metadata):
-    changers = extra = denial = 0
+    changers = extra = denial = chainable = 0
     for key, quantity in counts.items():
         changer_flag, extra_flag, denial_flag = _bracket_flags(metadata[key])
         changers += quantity * changer_flag
         extra += quantity * extra_flag
         denial += quantity * denial_flag
-    return changers, extra, denial
+        chainable += quantity * _chainable_extra_turn(metadata[key])
+    return changers, extra, denial, chainable
 
 
 def _bracket_rule_checks(counts, target):
-    changers, extra, denial = counts
+    changers, extra, denial, chainable = counts
     limit = 0 if target <= 2 else 3 if target == 3 else None
+    extra_limit = EXTRA_TURN_LIMITS[target - 1]
     return {"game_changers": limit is None or changers <= limit,
-            "extra_turns": target >= 4 or not extra,
-            "mass_land_denial": target >= 4 or not denial}
+            "extra_turns": extra_limit is None or extra <= extra_limit,
+            "mass_land_denial": target >= 4 or not denial,
+            "chaining_extra_turns": target >= 4 or not chainable}
 
 
 def _preserves_bracket_counts(current, following, target):
     limits = (0 if target <= 2 else 3 if target == 3 else None,
-              0 if target < 4 else None, 0 if target < 4 else None)
+              EXTRA_TURN_LIMITS[target - 1], 0 if target < 4 else None,
+              0 if target < 4 else None)
     # An observed anchor can already exceed a checked restriction. Preserve its
     # honest higher recommendation without permitting further violations.
     return all(limit is None or after <= max(before, limit)
@@ -345,21 +359,24 @@ def _preserves_bracket(counts, candidate, metadata, target):
 
 
 def _bracket_validation(counts, metadata, target, source):
-    changers, extra_count, denial_count = _bracket_counts(counts, metadata)
+    changers, extra_count, denial_count, chainable_count = _bracket_counts(counts, metadata)
     extra, denial = extra_count > 0, denial_count > 0
     limit = 0 if target <= 2 else 3 if target == 3 else None
-    checks = _bracket_rule_checks((changers, extra_count, denial_count), target)
-    recommended = max(target, 4) if not all(checks.values()) else target
+    checks = _bracket_rule_checks((changers, extra_count, denial_count, chainable_count), target)
+    recommended = next(bracket for bracket in range(target, 6)
+        if all(_bracket_rule_checks((changers, extra_count, denial_count, chainable_count), bracket).values()))
     notes = ["Exploratory bracket guidance; speed, tutors, combos and all play patterns are not fully evaluated."]
     if source == "default":
         notes.append("No usable source-deck bracket annotations; the construction target defaults to bracket 3.")
     if any(not isinstance(metadata[key].get("game_changer"), bool) for key in counts):
         notes.append("Game Changer annotations are incomplete; the count can be understated.")
     if recommended != target:
-        notes.append("Observed cards exceed the target's checked restrictions, so the recommendation is raised to bracket 4 or above.")
+        notes.append("Observed cards exceed the target's checked restrictions, so the recommendation uses the lowest bracket that passes those checks.")
     return {"status": "estimated", "target": target, "recommended": recommended, "source": source,
             "game_changer_count": changers, "game_changer_limit": limit, "rule_checks": checks,
             "extra_turn_count": extra_count, "mass_land_denial_count": denial_count,
+            "chainable_extra_turn_count": chainable_count,
+            "extra_turn_limit": EXTRA_TURN_LIMITS[target - 1],
             "extra_turns_present": extra, "mass_land_denial_present": denial, "notes": notes}
 
 
@@ -611,7 +628,7 @@ _CORE_REASONS = {
     "color_identity_conflict": "This card is outside the commander's permitted color identity.",
     "essential_role_conflict": "No replacement retained the deck's required ramp, card advantage, and interaction support.",
     "bracket_conflict": "No replacement retained the package's checked bracket restrictions.",
-    "score_bracket_conflict": "Replaced because its checked restrictions forced a higher bracket than the original list's verified power score supports.",
+    "score_bracket_conflict": "Replaced because its checked restrictions forced a higher bracket than the original list's power score supports.",
     "mana_base_conflict": "No land replacement retained the mana base's required colored sources.",
     "no_safe_replacement": "No replacement retained the commander, land slots, and higher-priority distinctive cards.",
     "construction_unavailable": "A verified 100-card deck could not be constructed for this package.",
@@ -727,7 +744,7 @@ def _insert_distinctive(counts, targets, prepared, metadata):
                 if any(roles[role] - (role in old_roles) + (role in incoming_roles) < floor for role, floor in floors.items()):
                     role_blocked = True
                     continue
-                old_flags, incoming_flags = _bracket_flags(old), _bracket_flags(card)
+                old_flags, incoming_flags = _all_bracket_flags(old), _all_bracket_flags(card)
                 next_bracket_counts = tuple(value - old + incoming for value, old, incoming in
                                             zip(current_bracket_counts, old_flags, incoming_flags))
                 if not _preserves_bracket_counts(current_bracket_counts, next_bracket_counts, target):
@@ -847,7 +864,7 @@ def _prepare_sources(source_decks, base, metadata):
     return {"commander_keys": commander_keys, "pool": pool, "observed": observed, "anchors": anchors,
             "colors": colors, "eligible": eligible, "signatures": signatures, "presence": presence,
             "commander_color_choices": color_choices,
-            "anchor_bracket_counts": anchor_bracket_counts}
+            "anchor_bracket_counts": anchor_bracket_counts, "anchor_power_targets": {}}
 
 
 def _prepare_package(package, model_decks, source_decks, base, profiles, metadata, *, _source_context=None):
@@ -890,7 +907,8 @@ def _prepare_package(package, model_decks, source_decks, base, profiles, metadat
             "suggested": suggested, "metric_profiles": metric_profiles, "metrics": metrics,
             "anchors": anchors, "colors": sources["colors"], "eligible": eligible, "signatures": sources["signatures"],
             "commander_color_choices": sources["commander_color_choices"],
-            "anchor_bracket_counts": sources["anchor_bracket_counts"]}
+            "anchor_bracket_counts": sources["anchor_bracket_counts"],
+            "anchor_power_targets": sources["anchor_power_targets"]}
 
 
 def _generate_one(package, model_decks, source_decks, base, profiles, metadata, *, anchor_id=None, land_adjustment=0,
@@ -914,8 +932,25 @@ def _generate_one(package, model_decks, source_decks, base, profiles, metadata, 
     if targets is None:
         targets = prepared["distinctive_targets"] = _distinctive_targets(package, prepared, metadata)
     core_anchors = prepared.setdefault("core_anchors", {})
+    anchor_contexts = prepared.setdefault("anchor_power_contexts", {})
+    def context_for_anchor(deck):
+        power_targets = prepared["anchor_power_targets"]
+        if id(deck) not in power_targets:
+            value = {"cards": [{"name": metadata[key]["name"], "quantity": quantity}
+                               for key, quantity in deck["counts"].items()], "card_count": 100}
+            _, numeric_target, kind = _construction_power_rating(value, metadata, commander_keys)
+            power_targets[id(deck)] = numeric_target, kind
+        numeric_target, kind = power_targets[id(deck)]
+        if numeric_target is None:
+            return prepared
+        key = numeric_target, kind
+        if key not in anchor_contexts:
+            anchor_contexts[key] = _score_target_context(prepared, profiles, metadata, numeric_target,
+                "verified_anchor_power_score" if kind == "verified" else "calculated_anchor_power_score")
+        return anchor_contexts[key]
     def bracket_penalty(deck):
-        return sum(not passed for passed in _bracket_rule_checks(prepared["anchor_bracket_counts"][id(deck)], target).values())
+        return sum(not passed for passed in _bracket_rule_checks(prepared["anchor_bracket_counts"][id(deck)],
+                                                               context_for_anchor(deck)["target"]).values())
     if anchor_id is not None:
         anchors = [deck for deck in anchors if deck["id"] == anchor_id]
         if not anchors:
@@ -926,27 +961,31 @@ def _generate_one(package, model_decks, source_decks, base, profiles, metadata, 
         -sum(support.get(key, 0) for key in deck["counts"] if key not in commander_keys), str(deck["id"])))
     best, best_rank = None, None
     for observed_anchor in anchors:
+        anchor_context = context_for_anchor(observed_anchor)
+        anchor_target = anchor_context["target"]
         penalty = bracket_penalty(observed_anchor)
         if best_rank is not None and penalty > best_rank[0]:
             break
         if observed_anchor["id"] not in core_anchors:
-            core_anchors[observed_anchor["id"]] = _insert_distinctive(observed_anchor["counts"], targets, prepared, metadata)
+            core_anchors[observed_anchor["id"]] = _insert_distinctive(observed_anchor["counts"], targets, anchor_context, metadata)
         core_counts, core_swaps, core_failures = core_anchors[observed_anchor["id"]]
         core_score = _distinctive_score(targets, core_counts, metadata)
         candidate_rank = (penalty, *(-value for value in core_score), -weights[observed_anchor["id"]],
             -sum(support.get(key, 0) for key in core_counts if key not in commander_keys), str(observed_anchor["id"]))
         if best_rank is None or candidate_rank < best_rank:
-            best, best_rank = (observed_anchor, core_counts, core_swaps, core_failures), candidate_rank
+            best, best_rank = (observed_anchor, core_counts, core_swaps, core_failures, anchor_context), candidate_rank
         if core_score[0] == len(targets):
             break
         # Absolute exclusions cannot be solved by trying hundreds more anchors.
         present = {_metadata_identity(metadata[key]) for key in core_counts}
         unresolved = [row for row in targets if row.get("identity") not in present and "reason_code" not in row]
         if not unresolved or all(core_failures.get(row["identity"]) == "bracket_conflict" and
-                (target <= 2 and _bracket_flags(metadata[row["key"]])[0] or target < 4 and
+                (anchor_target <= 2 and _bracket_flags(metadata[row["key"]])[0] or anchor_target < 4 and
                  any(_bracket_flags(metadata[row["key"]])[1:])) for row in unresolved):
             break
-    anchor, counts, core_swaps, core_failures = best
+    anchor, counts, core_swaps, core_failures, prepared = best
+    target, bracket_source = prepared["target"], prepared["bracket_source"]
+    metric_profiles, metrics = prepared["metric_profiles"], prepared["metrics"]
     counts = counts.copy()
     rank = lambda key: (support.get(key, 0), metrics[key]["average_inclusion"] or 0,
                         metrics[key]["average_lift"] or 0)
@@ -1083,19 +1122,46 @@ def _assemble_generated_deck(package, counts, prepared, metadata, *, anchor, cor
             "card_count": sum(counts.values()), "export_text": export,
             "primer": _primer(name, commander_rows, rows, package, statistics, bracket, distinctive, color_choices),
             "validation": validation, "statistics": statistics}
-
+    _attach_calculated_power(result, metadata, commander_keys)
     return result
+
+
+def _attach_calculated_power(deck, metadata, commander_keys):
+    from .external_validation import cardlist_hash
+    from .power_scoring import calculate_power_rating
+
+    deck.setdefault("validation", {})["deck_sha256"] = cardlist_hash(deck["cards"])
+    rating = calculate_power_rating(deck["cards"], metadata,
+        commanders=[metadata[key]["name"] for key in commander_keys])
+    deck["validation"]["calculated_power"] = rating
+    return rating
+
+
+def _construction_power_rating(deck, metadata, commander_keys):
+    """Prefer current exact-list site observations, then a dated local estimate."""
+    from .external_validation import attach_external_validation
+    from .power_brackets import verified_score_bracket
+
+    calculated = _attach_calculated_power(deck, metadata, commander_keys)
+    external = attach_external_validation(deck)
+    target = verified_score_bracket(external)
+    if target is not None:
+        return external, target, "verified"
+    if calculated.get("status") == "calculated":
+        return calculated, calculated["score_bracket"], "calculated"
+    return external, None, None
 
 
 def _bracket_excess(counts, target):
     limits = (0 if target <= 2 else 3 if target == 3 else None,
-              0 if target < 4 else None, 0 if target < 4 else None,
-              0 if target < 4 else None, 0 if target < 3 else None)
+              EXTRA_TURN_LIMITS[target - 1], 0 if target < 4 else None,
+              0 if target < 4 else None, 0 if target < 3 else None,
+              0 if target < 4 else None)
     return tuple(max(0, value - limit) if limit is not None else 0
                  for value, limit in zip(counts, limits))
 
 
-_SCORE_RESTRICTION_NAMES = ("game_changers", "extra_turns", "mass_land_denial", "early_combos", "late_combos")
+_SCORE_RESTRICTION_NAMES = ("game_changers", "extra_turns", "mass_land_denial", "early_combos", "late_combos", "chaining_extra_turns")
 
 
 def _observed_bracket_restrictions(rating, metadata):
@@ -1104,7 +1170,7 @@ def _observed_bracket_restrictions(rating, metadata):
     canonical = lambda name: card_key(metadata.get(card_key(name), {}).get("name", name))
     return {name: ({canonical(card) for card in observed.get(name, [])} if index < 3 else
                    [frozenset(canonical(card) for card in group) for group in observed.get(name, [])])
-            for index, name in enumerate(_SCORE_RESTRICTION_NAMES)}
+            for index, name in enumerate(_SCORE_RESTRICTION_NAMES[:5])}
 
 
 def _score_restriction_counts(counts, metadata, restrictions):
@@ -1112,8 +1178,10 @@ def _score_restriction_counts(counts, metadata, restrictions):
     for key, quantity in counts.items():
         for index, flag in enumerate(_bracket_flags(metadata[key])):
             values[index] += quantity * (flag or key in restrictions[_SCORE_RESTRICTION_NAMES[index]])
+    chainable = sum(quantity * (_chainable_extra_turn(metadata[key]) or key in restrictions["extra_turns"])
+                    for key, quantity in counts.items())
     return (*values, *[sum(group <= counts.keys() for group in restrictions[name])
-                       for name in _SCORE_RESTRICTION_NAMES[3:]])
+                       for name in _SCORE_RESTRICTION_NAMES[3:5]], chainable)
 
 
 def _score_restriction_checks(counts, target):
@@ -1148,8 +1216,9 @@ def _strict_bracket_replacements(counts, prepared, metadata, target, restriction
     core_weights = Counter()
     for row in targets:
         core_weights[row.get("identity")] += row["weight"]
-    card_flags = {key: tuple(flag or key in restrictions[name] for flag, name in
-                            zip(_bracket_flags(metadata[key]), _SCORE_RESTRICTION_NAMES))
+    card_flags = {key: (*[flag or key in restrictions[name] for flag, name in
+                            zip(_bracket_flags(metadata[key]), _SCORE_RESTRICTION_NAMES)],
+                       _chainable_extra_turn(metadata[key]) or key in restrictions["extra_turns"])
                   for key in set(incoming_pool) | counts.keys()}
     beam = [(counts.copy(), [], 0.0)]
     seen = {tuple(sorted(counts.items()))}
@@ -1195,7 +1264,8 @@ def _strict_bracket_replacements(counts, prepared, metadata, target, restriction
                     next_flags = (*[value - old + new for value, old, new in
                                     zip(current_flags[:3], card_flags[outgoing], card_flags[incoming])],
                                   *[sum(group <= candidate.keys() for group in restrictions[name])
-                                    for name in _SCORE_RESTRICTION_NAMES[3:]])
+                                    for name in _SCORE_RESTRICTION_NAMES[3:5]],
+                                  current_flags[5] - card_flags[outgoing][3] + card_flags[incoming][3])
                     next_excess = _bracket_excess(next_flags, target)
                     if (sum(next_excess) >= sum(excess)
                             or any(after > before for before, after in zip(excess, next_excess))):
@@ -1253,61 +1323,104 @@ def _score_target_context(prepared, profiles, metadata, target, source):
 def _repair_score_bracket(option, package, counts, prepared, profiles, metadata, *, anchor,
                           core_swaps, core_failures, swaps, land_changes, land_swaps):
     from .external_validation import attach_external_validation, cardlist_hash
-    from .power_brackets import POWER_SCORE_BRACKET_POLICY_VERSION, verified_score_bracket
+    from .power_brackets import POWER_SCORE_BRACKET_POLICY_VERSION
 
-    rating = attach_external_validation(option)
-    score_target = verified_score_bracket(rating)
-    current_bracket = max(rating.get("bracket", 0), option["validation"]["bracket"]["recommended"])
-    if score_target is None or score_target >= current_bracket:
+    rating, score_target, rating_kind = _construction_power_rating(option, metadata, prepared["commander_keys"])
+    if score_target is None:
         return option
+    current_bracket = max(rating.get("bracket", 0), option["validation"]["bracket"]["recommended"])
+    original = option
+    original_counts = counts.copy()
     repair = {"status": "blocked", "policy_version": POWER_SCORE_BRACKET_POLICY_VERSION,
               "from_deck_sha256": cardlist_hash(option["cards"]),
               "from_power_level": rating["power_level"], "from_bracket": current_bracket,
-              "score_bracket": score_target, "checked_at": rating["checked_at"],
+              "score_bracket": score_target, "initial_score_bracket": score_target,
+              "checked_at": rating["checked_at"], "rating_kind": rating_kind,
               "source": rating["source"], "source_url": rating["source_url"], "swap_details": [],
               "from_cards": [{"name": row["name"], "quantity": row["quantity"]} for row in option["cards"]]}
     restrictions = _observed_bracket_restrictions(rating, metadata)
-    flags = _score_restriction_counts(counts, metadata, restrictions)
     repair["observed_restrictions"] = deepcopy(rating.get("bracket_restrictions", {}))
-    repair["original_rule_checks"] = _score_restriction_checks(flags, score_target)
-    if not any(_bracket_excess(flags, score_target)):
-        repair["reason"] = "The external bracket is higher than the score, but no excess checked card restriction identifies a safe card to remove."
-        option["statistics"]["score_bracket_repair"] = repair
-        option["primer"] += "\n\nScore and bracket review\n" + repair["reason"]
-        return option
-    outcome = _strict_bracket_replacements(counts, prepared, metadata, score_target, restrictions)
-    if outcome is None:
-        repair["reason"] = "No complete in-pool replacement retained the commander, 100-card legality, land slots, colored mana sources and required support roles while meeting the score bracket's checked restrictions."
-        option["statistics"]["score_bracket_repair"] = repair
-        option["primer"] += "\n\nScore and bracket review\n" + repair["reason"]
-        return option
-    repaired_counts, repair_swaps = outcome
-    repaired_prepared = _score_target_context(prepared, profiles, metadata, score_target, "verified_power_score_repair")
-    removed_identities = {_metadata_identity(metadata[card_key(row["out"])]) for row in repair_swaps
-                          if card_key(row["out"]) not in repaired_counts}
-    failures = {**core_failures, **{identity: "score_bracket_conflict" for identity in removed_identities}}
-    repaired = _assemble_generated_deck(package, repaired_counts, repaired_prepared, metadata,
-        anchor=anchor, core_swaps=core_swaps, core_failures=failures, swaps=swaps,
-        land_changes=land_changes, land_swaps=land_swaps)
-    repaired_flags = _score_restriction_counts(repaired_counts, metadata, restrictions)
-    strict_checks = _score_restriction_checks(repaired_flags, score_target)
-    repaired["validation"]["bracket"]["rule_checks"].update(strict_checks)
-    repaired["validation"]["bracket"].update(
-        game_changer_count=repaired_flags[0], extra_turn_count=repaired_flags[1], mass_land_denial_count=repaired_flags[2],
-        extra_turns_present=repaired_flags[1] > 0, mass_land_denial_present=repaired_flags[2] > 0,
-        observed_early_combo_count=repaired_flags[3], observed_late_combo_count=repaired_flags[4])
-    if (not repaired["validation"]["valid"]
-            or not all(repaired["validation"]["bracket"]["rule_checks"].values())):
-        raise RuntimeError("Score bracket repair did not pass its final strict checks")
-    repair.update(status="repaired", swap_details=repair_swaps, rule_checks=strict_checks,
-                  note="The original exact-list power score selected the construction target. Replacements change the card list; the new score and bracket require a separate external check.")
-    repaired["statistics"]["score_bracket_repair"] = repair
-    repaired["validation"]["bracket"]["notes"].append(repair["note"])
-    repaired["primer"] += "\n\nScore and bracket adjustment\n" + repair["note"]
-    for swap in repair_swaps:
-        repaired["primer"] += f"\nReplaced [[{swap['out']}]] with [[{swap['in']}]] to remove {', '.join(swap['restrictions']).replace('_', ' ')}."
-    attach_external_validation(repaired)
-    return repaired
+    repair["original_rule_checks"] = _score_restriction_checks(
+        _score_restriction_counts(counts, metadata, restrictions), score_target)
+    all_swaps, seen = [], set()
+    for _ in range(6):
+        identity = (cardlist_hash(option["cards"]), score_target)
+        if identity in seen:
+            repair["reason"] = "The bounded score/bracket adjustment did not converge to one consistent card list and target."
+            break
+        seen.add(identity)
+        flags = _score_restriction_counts(counts, metadata, restrictions)
+        checks = _score_restriction_checks(flags, score_target)
+        if all(checks.values()):
+            # An unknown externally reported restriction must remain a review,
+            # while a lower source-deck bracket can safely follow the score.
+            if not all_swaps and rating.get("bracket", 0) > score_target:
+                repair["reason"] = "The external bracket is higher than the score, but no excess checked card restriction identifies a safe card to remove."
+                break
+            context = _score_target_context(prepared, profiles, metadata, score_target,
+                "verified_power_score" if rating_kind == "verified" else "calculated_power_score")
+            removed = {_metadata_identity(metadata[card_key(row["out"])]) for row in all_swaps
+                       if card_key(row["out"]) not in counts}
+            failures = {**core_failures, **{identity: "score_bracket_conflict" for identity in removed}}
+            result = _assemble_generated_deck(package, counts, context, metadata, anchor=anchor,
+                core_swaps=core_swaps, core_failures=failures, swaps=swaps,
+                land_changes=land_changes, land_swaps=land_swaps)
+            _apply_score_bracket_checks(result, flags, checks, score_target)
+            attach_external_validation(result)
+            if all_swaps:
+                note = ("The original exact-list power score selected the initial construction target. "
+                        "Every replacement list was recalculated when complete fresh inputs were available; "
+                        "a local estimate is not an externally verified EDHPowerLevel rating.")
+                repair.update(status="repaired", score_bracket=score_target, swap_details=all_swaps,
+                    rule_checks=checks, iterations=len(seen), note=note)
+                result["statistics"]["score_bracket_repair"] = repair
+                result["validation"]["bracket"]["notes"].append(note)
+                result["primer"] += "\n\nScore and bracket adjustment\n" + note
+                for swap in all_swaps:
+                    result["primer"] += (f"\nReplaced [[{swap['out']}]] with [[{swap['in']}]] to remove "
+                        f"{', '.join(swap['restrictions']).replace('_', ' ')}.")
+            return result
+        outcome = _strict_bracket_replacements(counts, prepared, metadata, score_target, restrictions)
+        if outcome is None:
+            repair["reason"] = "No complete in-pool replacement retained the commander, 100-card legality, land slots, colored mana sources and required support roles while meeting the score bracket's checked restrictions."
+            break
+        counts, replacements = outcome
+        all_swaps.extend(replacements)
+        context = _score_target_context(prepared, profiles, metadata, score_target,
+            "verified_power_score_repair" if rating_kind == "verified" else "calculated_power_score_repair")
+        option = _assemble_generated_deck(package, counts, context, metadata, anchor=anchor,
+            core_swaps=core_swaps, core_failures=core_failures, swaps=swaps,
+            land_changes=land_changes, land_swaps=land_swaps)
+        next_rating, next_target, next_kind = _construction_power_rating(option, metadata, prepared["commander_keys"])
+        if next_target is not None:
+            rating, score_target, rating_kind = next_rating, next_target, next_kind
+            following = _observed_bracket_restrictions(rating, metadata)
+            for name, values in following.items():
+                if isinstance(values, set):
+                    restrictions[name].update(values)
+                else:
+                    restrictions[name].extend(group for group in values if group not in restrictions[name])
+    else:
+        repair["reason"] = "The score/bracket adjustment reached its bounded iteration limit without a consistent final target."
+    # A later failed step never publishes a partially repaired card list.
+    repair.update(swap_details=[], rule_checks=_score_restriction_checks(
+        _score_restriction_counts(original_counts, metadata, restrictions), repair["initial_score_bracket"]))
+    original["statistics"]["score_bracket_repair"] = repair
+    original["primer"] += "\n\nScore and bracket review\n" + repair["reason"]
+    return original
+
+
+def _apply_score_bracket_checks(deck, flags, checks, target):
+    bracket = deck["validation"]["bracket"]
+    bracket["rule_checks"].update(checks)
+    recommended = next(bracket for bracket in range(target, 6)
+                       if all(_score_restriction_checks(flags, bracket).values()))
+    bracket.update(target=target, recommended=recommended,
+        game_changer_count=flags[0], extra_turn_count=flags[1], mass_land_denial_count=flags[2],
+        extra_turns_present=flags[1] > 0, mass_land_denial_present=flags[2] > 0,
+        observed_early_combo_count=flags[3], observed_late_combo_count=flags[4],
+        chainable_extra_turn_count=flags[5], extra_turn_limit=EXTRA_TURN_LIMITS[target - 1])
+    deck["statistics"].update(target_bracket=target, recommended_bracket=recommended)
 
 
 def _successful_score_repair(option):
@@ -1331,10 +1444,13 @@ def _repair_existing_package_deck(existing, package, memberships, decks, base, p
     if not isinstance(existing, dict) or existing.get("status") != "generated":
         return None
     from .external_validation import attach_external_validation, cardlist_hash
-    from .power_brackets import bracket_for_power_score, verified_score_bracket
+    from .power_brackets import bracket_for_power_score
 
     current = deepcopy(existing)
-    current_rating = attach_external_validation(current)
+    commander_keys = [card_key(row["name"]) for row in current.get("commanders", [])
+                      if isinstance(row, dict) and isinstance(row.get("name"), str)
+                      and card_key(row["name"]) in metadata]
+    current_rating, current_target, _ = _construction_power_rating(current, metadata, commander_keys)
     history = deepcopy(current.get("statistics", {}).get("score_bracket_repair", {}))
     successful_history = history.get("status") in {"repaired", "retained"}
     seed = deepcopy(current)
@@ -1347,12 +1463,12 @@ def _repair_existing_package_deck(existing, package, memberships, decks, base, p
             return None
         seed["cards"] = deepcopy(original_cards)
         seed["card_count"] = sum(row["quantity"] for row in original_cards)
-    original_rating = attach_external_validation(seed)
-    current_target, original_target = verified_score_bracket(current_rating), verified_score_bracket(original_rating)
+    original_rating, original_target, _ = _construction_power_rating(seed, metadata, commander_keys)
     if current_target is not None:
         seed = current
     elif original_target is None:
-        if not successful_history or bracket_for_power_score(history.get("from_power_level")) != history.get("score_bracket"):
+        if (not successful_history or bracket_for_power_score(history.get("from_power_level"))
+                != history.get("initial_score_bracket", history.get("score_bracket"))):
             return None
         seed = current
     prepared = context.get("prepared")
@@ -1420,28 +1536,21 @@ def _repair_existing_package_deck(existing, package, memberships, decks, base, p
         # Preserve honest guidance when changed metadata invalidates an old fix.
         current["validation"]["bracket"] = _bracket_validation(
             counts, metadata, target, "previous_score_bracket_repair")
-        current["validation"]["bracket"]["rule_checks"].update(checks)
-        current["validation"]["bracket"].update(
-            recommended=max(target, 4), game_changer_count=flags[0], extra_turn_count=flags[1],
-            mass_land_denial_count=flags[2], extra_turns_present=flags[1] > 0, mass_land_denial_present=flags[2] > 0,
-            observed_early_combo_count=flags[3], observed_late_combo_count=flags[4])
-        current["statistics"].update(target_bracket=target, recommended_bracket=max(target, 4))
+        _apply_score_bracket_checks(current, flags, checks, target)
         current["statistics"]["score_bracket_repair"] = {**history, "status": "blocked", "rule_checks": checks,
             "retention_blocked": True,
-            "reason": "Current checked restrictions no longer allow the previous score-bracket repair to be retained. A new exact-list external check and complete repair are required."}
+            "reason": "Current checked restrictions no longer allow the previous score-bracket repair to be retained. Fresh exact-list power inputs or an external check and a complete repair are required."}
         return current
     retained_context = _score_target_context(prepared, profiles, metadata, target, "previous_score_bracket_repair")
     retained = _assemble_generated_deck(package, counts, retained_context, metadata, anchor=anchor,
         core_swaps=core_swaps, core_failures=failures, swaps=old_swaps,
         land_changes=statistics.get("land_adjustments", []), land_swaps=statistics.get("land_swaps", []))
-    retained["validation"]["bracket"]["rule_checks"].update(checks)
-    retained["validation"]["bracket"].update(
-        game_changer_count=flags[0], extra_turn_count=flags[1], mass_land_denial_count=flags[2],
-        extra_turns_present=flags[1] > 0, mass_land_denial_present=flags[2] > 0,
-        observed_early_combo_count=flags[3], observed_late_combo_count=flags[4])
+    _apply_score_bracket_checks(retained, flags, checks, target)
     note = ("Retained the already-applied score/bracket adjustment after checking its unchanged card list against current metadata and sampled cards. "
             "The original score is historical evidence; it is not a current rating of this list.")
-    retained["statistics"]["score_bracket_repair"] = {**history, "status": "retained", "rule_checks": checks,
+    retained["statistics"]["score_bracket_repair"] = {**history, "status": "retained", "score_bracket": target,
+        "initial_score_bracket": history.get("initial_score_bracket", bracket_for_power_score(history.get("from_power_level"))),
+        "rule_checks": checks,
         "original_rating_status": original_rating.get("status", "unverified"), "note": note}
     retained["validation"]["bracket"]["notes"].append(note)
     retained["primer"] += "\n\nRetained score and bracket adjustment\n" + note
