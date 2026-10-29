@@ -90,7 +90,7 @@ function ExternalDeckRating({ rating, deckHash }) {
 }
 
 const RESTRICTION_LABELS = {
-  game_changers: "Game Changers", extra_turns: "Ordinary extra turns",
+  game_changers: "Game Changers", extra_turns: "All extra-turn cards",
   chaining_extra_turns: "Chaining extra turns", mass_land_denial: "Mass land denial",
   early_combos: "Early combos", late_combos: "Late combos",
 };
@@ -100,7 +100,7 @@ function OfficialRestrictionCheck({ deck }) {
   if (!check) return null;
   return <div className="build-official-restrictions" data-status={check.status}>
     <p><strong>{check.label}.</strong>{check.checkedAt ? <span> Checked {checkedDate(check.checkedAt)}.</span> : null}</p>
-    {check.status === "verified" ? <p className="build-note">The complete EDHPowerLevel analysis covered mass land denial, chaining extra turns, ordinary extra turns, Game Changers, and early and late combos for this exact list and its commanders.</p>
+    {check.status === "verified" ? <p className="build-note">The complete EDHPowerLevel analysis covered mass land denial, chaining extra turns, total extra-turn cards, Game Changers, and early and late combos for this exact list and its commanders.</p>
       : check.status === "conflict" ? <p className="build-note">EDHPowerLevel requires Bracket {check.requiredBracket}, above this list’s calculated Bracket {check.scoreBracket}. The cards need adjustment; the displayed bracket continues to follow the power score.</p>
         : check.status === "stale" ? <p className="build-note">This complete observation is older than seven days. Recheck the current list before relying on its restrictions.</p>
           : ["failed", "blocked"].includes(check.status) ? <p className="build-note">The site check did not complete, so restrictions remain unverified.{check.reason ? ` ${check.reason}` : ""}</p>
