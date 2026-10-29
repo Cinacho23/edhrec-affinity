@@ -400,6 +400,75 @@ The Build Discovery page checks published results and the latest public GitHub w
 
 `--max-commanders`, `--commanders`, and a numeric `--sample-decks` remain optional bounded experiments. A finite sample cannot satisfy full-index coverage, and bounded/manual refresh runs do not self-dispatch indefinitely. Without `--pipeline`, the older sequential batch mode remains available for local experiments; its dated cache/refresh behavior is separate from the production rolling pipeline.
 
+## EDHPowerLevel restriction checks and repairs
+
+The `validate_power` workflow input checks existing saved package decks on the
+actual EDHPowerLevel website, without first collecting EDHREC pages. It shares
+the normal collector's concurrency group and trusted cumulative checkpoint.
+The queue includes Auto and every numbered model, deduplicating each complete
+100-card list together with its commander roles. A fresh observation is reused
+for seven days; a changed card or commander role always needs another check.
+
+The browser records the site's numeric score, reported bracket, Game Changers,
+ordinary extra turns, chaining extra turns, mass land denial, and early/late
+combos. Empty categories count as checked only when the actual page completed
+its analysis. Every complete observation includes the exact list hash,
+commander names, checking time, and SHA-256 of the site's loaded calculation
+script. A local estimate, legacy partial observation, incomplete combo response,
+or an HTTP failure cannot certify that restrictions are absent.
+
+When the site's restrictions put a list above its numeric power bracket, the
+queue first finishes checking that commander's saved package family, rebuilds
+from its existing sampled card pool using the recorded card/combo exclusions,
+then checks every changed final list on the website. The displayed bracket
+continues to follow the numeric score. Modified lists remain restriction-check
+pending until their own final observation exists. Distinctive-card protections
+and explanations still apply. A commander that itself causes a conflict, or a
+pool without suitable replacements, retains an explicit unresolved conflict.
+Two completed repair attempts bound a lineage; interrupted metadata or runtime
+work does not consume those attempts.
+
+Each validation batch permits at most 300 actual deck checks inside a 30-minute
+budget, with at least five seconds between sequential checks and a 120-second
+per-deck timeout. Successful observations and report updates are saved
+immediately. Known official conflicts take priority, followed by suspected
+local conflicts. Within that ordering, never-checked lists precede expired
+observations, so early alphabetic commanders cannot monopolize rechecks while
+later commanders still have no coverage. Automatic continuation alternates a
+validation batch with a normal collection batch to preserve source freshness.
+Newly generated lists trigger another validation pass.
+
+HTTP 401, 403, or 429 from the website/backend stops the entire external queue.
+The saved source retry time is at least 24 hours away and honors a longer
+Retry-After. Failed list checks get at most two attempts before a 24-hour
+backoff. Browser startup and incomplete saved-pool repair use a one-hour retry.
+These pending counts and retry dates survive restarts; ordinary EDHREC
+collection remains separate from an EDHPowerLevel access pause. The workflow
+watchdog respects the saved retry dates rather than immediately relaunching
+futile checks.
+
+Observations, queue state, and its retained summary live in
+`build-styles/_collection/external-validations/` and the neighboring
+`official-validation-queue.json` / `official-validation-summary.json` files.
+They are included in cumulative artifacts. Checked repository examples are
+seeded before either rebuild mode without overwriting a newer checkpoint
+observation. Publication is requested only for actual changed reports; site
+requests and card repairs never fabricate new EDHREC collection timestamps.
+
+For a local run after restoring the cumulative artifact and card metadata cache:
+
+```sh
+.venv/bin/python -m pip install -e ".[prototype,validation]"
+.venv/bin/python -m playwright install chromium
+.venv/bin/python scripts/validate_generated_decks.py \
+  --build-styles-dir data/build-style-artifact/build-styles \
+  --card-metadata-cache data/raw/build-style-card-metadata.json \
+  --max-runtime-seconds 1800 --max-decks 300
+```
+
+`--commander` restricts a local experiment; the workflow's blank commander input
+continues the whole eligible catalog. No bulk API or completion date is assumed.
+
 ## Local deck imports
 
 A folder of `.txt` or `.json` exports can replace or supplement previews:

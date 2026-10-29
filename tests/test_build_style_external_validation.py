@@ -3,11 +3,13 @@
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
+from urllib.parse import quote_plus
 
 import pytest
 
 from edhrec_affinity.build_styles.external_validation import (
-    attach_external_validation, cardlist_hash, external_validation_directory, record_external_validation,
+    attach_external_validation, cardlist_hash, external_restriction_evidence, external_validation_directory,
+    record_external_validation, RESTRICTION_CATEGORIES, validation_record_key,
 )
 from edhrec_affinity.build_styles.power_brackets import verified_score_bracket
 
@@ -24,6 +26,24 @@ def observations(**changes):
     return {"source": "edhpowerlevel.com", "checked_at": datetime.now(timezone.utc).isoformat(),
             "card_count": 100, "playability_pct": 74.5, "bracket": 5, "power_level": "10+",
             "source_url": "https://edhpowerlevel.com?d=1+Ghave~99+Forest~Z~", **changes}
+
+
+def official_deck():
+    current = deck()
+    current["commanders"] = [{"name": "Ghave, Guru of Spores", "quantity": 1}]
+    return current
+
+
+def complete_observations(**changes):
+    values = observations(power_level=6.5, bracket=2,
+        source_url="https://edhpowerlevel.com?d=" + quote_plus(
+            "98 Forest~1 Sol Ring~~1 Ghave, Guru of Spores~Z~"),
+        bracket_restrictions={key: [] for key in RESTRICTION_CATEGORIES},
+        restriction_check={"status": "complete", "method": "edhpowerlevel_page",
+                           "source_script_sha256": "a" * 64,
+                           "commander_names": ["Ghave, Guru of Spores"]})
+    values.update(changes)
+    return values
 
 
 def test_cardlist_hash_ignores_order_tags_case_and_equivalent_quantity_rows():
@@ -244,3 +264,87 @@ def test_incomplete_or_misreported_generated_list_cannot_be_checked(tmp_path):
 def test_hash_rejects_malformed_card_lists(cards):
     with pytest.raises(ValueError):
         cardlist_hash(cards)
+
+
+def test_complete_official_check_preserves_distinct_chaining_and_combo_categories(tmp_path):
+    current = official_deck()
+    values = complete_observations()
+    values["bracket_restrictions"].update(
+        extra_turns=["Forest"], chaining_extra_turns=["Sol Ring"],
+        early_combos=[["Ghave, Guru of Spores", "Sol Ring"]])
+    rating = record_external_validation(current, values, tmp_path)
+    assert external_restriction_evidence(rating) == values["bracket_restrictions"]
+    assert rating["restriction_check"] == values["restriction_check"]
+    assert (tmp_path / f"{validation_record_key(current)}.json").exists()
+    assert not (tmp_path / f"{cardlist_hash(current['cards'])}.json").exists()
+    assert attach_external_validation(official_deck(), tmp_path) == rating
+    copied = external_restriction_evidence(rating)
+    copied["extra_turns"].append("Sol Ring")
+    assert rating["bracket_restrictions"]["extra_turns"] == ["Forest"]
+
+
+def test_score_only_or_partial_observations_never_certify_official_restrictions(tmp_path):
+    for restrictions in (None, {"mass_land_denial": []}, {key: [] for key in RESTRICTION_CATEGORIES}):
+        values = observations()
+        if restrictions is not None:
+            values["bracket_restrictions"] = restrictions
+        rating = record_external_validation(deck(), values, tmp_path)
+        assert rating["status"] == "verified"
+        assert external_restriction_evidence(rating) is None
+
+
+@pytest.mark.parametrize("change", [
+    {"restriction_check": None},
+    {"restriction_check": {"status": "complete", "method": "local"}},
+    {"restriction_check": {"status": "complete", "method": "edhpowerlevel_page", "source_script_sha256": "a" * 63}},
+    {"restriction_check": {"status": "complete", "method": "edhpowerlevel_page", "source_script_sha256": "A" * 64}},
+    {"bracket_restrictions": {"mass_land_denial": []}},
+    {"source_url": "https://edhpowerlevel.com?d=100+Forest~Z~"},
+    {"source_url": "https://edhpowerlevel.com?d=" + quote_plus("98 Forest~1 Sol Ring~1 Ghave, Guru of Spores~Z~")},
+    {"source_url": "https://edhpowerlevel.com?d=" + quote_plus("98 Forest~1 Ghave, Guru of Spores~~1 Sol Ring~Z~")},
+])
+def test_incomplete_or_foreign_page_provenance_is_not_recorded(tmp_path, change):
+    with pytest.raises(ValueError, match="restriction"):
+        record_external_validation(official_deck(), complete_observations(**change), tmp_path)
+    assert not list(tmp_path.iterdir())
+
+
+def test_complete_proof_requires_matching_declared_commander_roles(tmp_path):
+    current = official_deck()
+    values = complete_observations()
+    values["restriction_check"]["commander_names"] = ["Sol Ring"]
+    with pytest.raises(ValueError, match="commander roles"):
+        record_external_validation(current, values, tmp_path)
+    current.pop("commanders")
+    with pytest.raises(ValueError, match="commander roles"):
+        record_external_validation(current, complete_observations(), tmp_path)
+
+
+def test_same_cards_with_another_commander_have_distinct_validation_cache_keys(tmp_path):
+    original = official_deck()
+    changed = official_deck()
+    changed["commanders"] = [{"name": "Sol Ring"}]
+    assert cardlist_hash(original["cards"]) == cardlist_hash(changed["cards"])
+    assert validation_record_key(original) != validation_record_key(changed)
+    rating = record_external_validation(original, complete_observations(), tmp_path)
+    assert external_restriction_evidence(rating, expected_commanders=["Sol Ring"]) is None
+    assert attach_external_validation(changed, tmp_path)["status"] == "unverified"
+    # Renaming the cache file cannot bypass the role checks.
+    (tmp_path / f"{validation_record_key(changed)}.json").write_text(
+        (tmp_path / f"{validation_record_key(original)}.json").read_text())
+    failed = attach_external_validation(changed, tmp_path)
+    assert failed["status"] == "unverified"
+    assert "commander roles" in failed["reason"]
+
+
+def test_full_check_cannot_be_used_when_stale_future_foreign_or_mutated(tmp_path):
+    rating = record_external_validation(official_deck(), complete_observations(), tmp_path)
+    assert external_restriction_evidence(rating, expected_hash=rating["deck_sha256"])
+    assert external_restriction_evidence(rating, expected_hash="b" * 64) is None
+    for change in (
+        {"status": "stale"}, {"source": "local"}, {"card_count": 99},
+        {"checked_at": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()},
+        {"checked_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()},
+        {"bracket_restrictions": {**rating["bracket_restrictions"], "mass_land_denial": ["Outside card"]}},
+    ):
+        assert external_restriction_evidence({**rating, **change}) is None

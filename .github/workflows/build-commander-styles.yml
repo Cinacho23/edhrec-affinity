@@ -31,6 +31,10 @@ on:
         description: "Calculate power for all saved package decks from the cache, then resume normal work"
         type: boolean
         default: false
+      validate_power:
+        description: "Check saved decks on EDHPowerLevel, repair restriction conflicts, and recheck final lists"
+        type: boolean
+        default: false
       recovery_run_id:
         description: "Optional interrupted latest run whose summary survived a missing checkpoint upload"
         type: string
@@ -71,12 +75,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
           POWER_ONLY: ${{ inputs.power_only }}
+          VALIDATE_POWER: ${{ inputs.validate_power }}
         run: |
           args=(preflight --summary-file data/build-style-artifact/build_style_batch.json)
           if [[ -n "${RECOVERY_RUN_ID}" ]]; then
             args+=(--recovery-run-id "${RECOVERY_RUN_ID}")
           fi
-          if [[ "${POWER_ONLY}" == "true" ]]; then
+          if [[ "${POWER_ONLY}" == "true" || "${VALIDATE_POWER:-false}" == "true" ]]; then
             args+=(--power-only)
           fi
           python3 scripts/coordinate_build_styles.py "${args[@]}"
@@ -109,6 +114,12 @@ jobs:
       - name: Install analysis dependencies
         run: python -m pip install -e ".[prototype]"
 
+      - name: Install the EDHPowerLevel browser
+        if: inputs.validate_power == true
+        run: |
+          python -m pip install -e ".[validation]"
+          python -m playwright install --with-deps chromium
+
       - name: Compute sample date
         shell: bash
         run: echo "SAMPLE_DATE=$(TZ=America/Toronto date +%F)" >> "$GITHUB_ENV"
@@ -131,6 +142,12 @@ jobs:
             --recovery-run-id "${RECOVERY_RUN_ID}" --restored-run-id "${RESTORED_RUN_ID}" \
             --state-file "${STYLES_DIR}/_collection/state.json"
 
+      - name: Retain checked repository examples alongside accumulated observations
+        run: |
+          python scripts/seed_build_style_validations.py \
+            --source data/build-styles/validations \
+            --destination "${STYLES_DIR}/_collection/external-validations"
+
       - name: Restore shared card rules cache
         id: card_metadata_cache
         uses: actions/cache/restore@v4
@@ -140,7 +157,7 @@ jobs:
           restore-keys: build-style-cards-
 
       - name: Get current commander index and weekly dataset date
-        if: inputs.power_only != true
+        if: inputs.power_only != true && inputs.validate_power != true
         shell: bash
         run: |
           set -euo pipefail
@@ -179,7 +196,7 @@ jobs:
 
       - name: Continue the resumable catalog queue
         id: collect_styles
-        if: inputs.power_only != true
+        if: inputs.power_only != true && inputs.validate_power != true
         continue-on-error: true
         timeout-minutes: 36
         shell: bash
@@ -220,7 +237,7 @@ jobs:
 
       - name: Prepare saved reports for a power-only pass
         id: prepare_power_only
-        if: inputs.power_only == true
+        if: inputs.power_only == true || inputs.validate_power == true
         env:
           GH_TOKEN: ${{ github.token }}
           RESTORED_RUN_ID: ${{ steps.restored_styles.outputs['run-id'] }}
@@ -231,7 +248,7 @@ jobs:
 
       - name: Rebuild package decks from saved collections
         id: rebuild_decks
-        if: always() && (steps.collect_styles.outcome != 'skipped' || steps.prepare_power_only.outcome == 'success')
+        if: always() && inputs.validate_power != true && (steps.collect_styles.outcome != 'skipped' || steps.prepare_power_only.outcome == 'success')
         continue-on-error: true
         timeout-minutes: 22
         env:
@@ -240,6 +257,7 @@ jobs:
           set -euo pipefail
           args=(--build-styles-dir "${STYLES_DIR}"
                 --card-metadata-cache data/raw/build-style-card-metadata.json
+                --validation-directory "${STYLES_DIR}/_collection/external-validations"
                 --workers 2 --only-outdated --current-discovery-only
                 --max-runtime-seconds 1200
                 --summary data/build-style-artifact/deck-rebuild-summary.json
@@ -251,9 +269,32 @@ jobs:
           fi
           timeout --signal=INT --kill-after=30s 21m python scripts/rebuild_generated_decks.py "${args[@]}"
 
+      - name: Check EDHPowerLevel restrictions and repair saved decks
+        id: official_validation
+        if: inputs.validate_power == true && steps.prepare_power_only.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 33
+        env:
+          COMMANDER_SLUGS: ${{ inputs.commanders }}
+        run: |
+          set -euo pipefail
+          args=(--build-styles-dir "${STYLES_DIR}"
+                --card-metadata-cache data/raw/build-style-card-metadata.json
+                --validation-directory "${STYLES_DIR}/_collection/external-validations"
+                --max-runtime-seconds 1800 --max-decks 300 --check-interval-seconds 5
+                --summary data/build-style-artifact/official-validation-summary.json
+                --backup-dir "${RUNNER_TEMP}/official-validation-backups")
+          if [[ -n "${COMMANDER_SLUGS}" ]]; then
+            read -r -a commander_args <<< "${COMMANDER_SLUGS}"
+            for commander_slug in "${commander_args[@]}"; do
+              args+=(--commander "${commander_slug}")
+            done
+          fi
+          timeout --signal=INT --kill-after=30s 32m python scripts/validate_generated_decks.py "${args[@]}"
+
       - name: Save refreshed card rules cache
         id: save_card_metadata
-        if: always() && inputs.power_only != true && steps.card_metadata_cache.outputs.cache-primary-key != '' && hashFiles('data/raw/build-style-card-metadata.json') != ''
+        if: always() && (inputs.power_only != true || inputs.validate_power == true) && steps.card_metadata_cache.outputs.cache-primary-key != '' && hashFiles('data/raw/build-style-card-metadata.json') != ''
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -289,7 +330,7 @@ jobs:
           PY
 
       - name: Include rebuilt decks in publication progress
-        if: always() && (steps.collect_styles.outcome != 'skipped' || steps.prepare_power_only.outcome == 'success')
+        if: always() && inputs.validate_power != true && (steps.collect_styles.outcome != 'skipped' || steps.prepare_power_only.outcome == 'success')
         env:
           METADATA_CACHE_SAVED: ${{ steps.verify_card_metadata.outputs.verified == 'true' }}
         run: |
@@ -344,6 +385,52 @@ jobs:
           temporary.replace(path)
           PY
 
+      - name: Include EDHPowerLevel checks in publication progress
+        if: always() && (steps.collect_styles.outcome != 'skipped' || steps.prepare_power_only.outcome == 'success')
+        env:
+          VALIDATE_POWER: ${{ inputs.validate_power }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("data/build-style-artifact/build_style_batch.json")
+          current_check = os.environ.get("VALIDATE_POWER") == "true"
+          validation_path = (path.parent / "official-validation-summary.json" if current_check else
+              Path(os.environ["STYLES_DIR"]) / "_collection/official-validation-summary.json")
+          if not path.exists() or not validation_path.exists():
+              print("::warning::No completed EDHPowerLevel queue summary; preserving the restored checkpoint.")
+              raise SystemExit(0)
+          summary = json.loads(path.read_text())
+          validation = json.loads(validation_path.read_text())
+          summary["power_validation"] = current_check
+          summary["official_validation"] = {key: validation[key] for key in (
+              "source", "checked", "records_written", "repaired_reports", "changed_reports", "changed_deck_lists",
+              "pending", "verified", "unique_lists", "conflicts", "unresolved", "invalid", "source_blocked",
+              "source_block_reason", "metadata_source_blocked", "time_budget_reached", "check_limit_reached",
+              "continuation_needed", "retry_at", "deferred_checks", "started_at", "completed_at",
+          ) if key in validation}
+          changed = current_check and type(validation.get("changed_reports")) is int and validation["changed_reports"] > 0
+          progress = current_check and (changed or type(validation.get("checked")) is int and validation["checked"] > 0)
+          if changed:
+              summary["publish_needed"] = True
+          if progress:
+              summary["no_progress"] = False
+          if (current_check and validation.get("continuation_needed") is True and not validation.get("source_blocked")
+                  and not validation.get("metadata_source_blocked") and not summary.get("blocked")
+                  and not summary.get("resource_limit") and summary.get("automatic_continuation_allowed") is True):
+              summary["continuation_needed"] = True
+          if current_check and validation.get("source_blocked"):
+              summary["continuation_needed"] = False
+              print("::warning::EDHPowerLevel access stopped; its queue retains progress and waits for the saved retry time.")
+          if validation.get("unresolved"):
+              print(f"::warning::{len(validation['unresolved'])} deck checks or repairs need review; existing lists and evidence were retained.")
+          temporary = path.with_suffix(".json.tmp")
+          temporary.write_text(json.dumps(summary, separators=(",", ":")))
+          temporary.replace(path)
+          PY
+
       - name: Upload cumulative build-style samples
         id: checkpoint
         if: always()
@@ -371,6 +458,7 @@ jobs:
           path: |
             data/build-style-artifact/build_style_batch.json
             data/build-style-artifact/deck-rebuild-summary.json
+            data/build-style-artifact/official-validation-summary.json
           if-no-files-found: ignore
           retention-days: 7
 
@@ -404,20 +492,36 @@ jobs:
           MAX_COMMANDERS: ${{ inputs.max_commanders || 0 }}
           SAMPLE_DECKS: ${{ inputs.sample_decks || 'all' }}
           REFRESH_REPORTS: ${{ inputs.refresh }}
+          CURRENT_VALIDATION: ${{ inputs.validate_power }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           python - <<'PY'
           import json
           import os
           from pathlib import Path
+          from datetime import datetime, timezone
 
           path = Path("data/build-style-artifact/build_style_batch.json")
           summary = json.loads(path.read_text()) if path.exists() else {}
+          official = summary.get("official_validation") or {}
+          retry_at = official.get("retry_at")
+          try:
+              retry = datetime.fromisoformat(retry_at.replace("Z", "+00:00")) if retry_at else None
+              checks_due = retry is None or retry.tzinfo is not None and retry <= datetime.now(timezone.utc)
+          except (ValueError, TypeError, AttributeError):
+              checks_due = False
+          new_lists = (bool(summary.get("completed"))
+              or type((summary.get("deck_rebuild") or {}).get("changed_deck_lists")) is int
+                  and summary["deck_rebuild"]["changed_deck_lists"] > 0)
+          validate_power = (os.environ.get("CURRENT_VALIDATION") != "true"
+              and (type(official.get("pending")) is int and official["pending"] > 0 or new_lists)
+              and checks_due and (not official.get("source_blocked") or retry_at)
+              and (not official.get("metadata_source_blocked") or retry_at))
           # Explicitly bounded/manual refresh runs stay bounded. An access
           # rate-limit cooldown is resumed separately through a server-side
           # environment timer. No-progress batches wait for the watchdog.
           should_continue = (
-              summary.get("continuation_needed") is True
+              (summary.get("continuation_needed") is True or validate_power and not summary.get("no_progress"))
               and not summary.get("blocked")
               and not summary.get("resource_limit")
               and summary.get("automatic_continuation_allowed") is not False
@@ -431,6 +535,7 @@ jobs:
           )
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"needed={str(should_continue).lower()}\n")
+              output.write(f"validate_power={str(should_continue and validate_power).lower()}\n")
           if not should_continue:
               print("No immediate continuation: work is current, bounded, paused, or made no progress.")
           PY
@@ -441,7 +546,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: gh workflow run build-commander-styles.yml --ref "${DEFAULT_BRANCH}"
+          VALIDATE_POWER: ${{ steps.continuation.outputs.validate_power }}
+        run: |
+          args=(--ref "${DEFAULT_BRANCH}")
+          if [[ "${VALIDATE_POWER:-false}" == "true" ]]; then
+            args+=(-f validate_power=true)
+          fi
+          gh workflow run build-commander-styles.yml "${args[@]}"
 
       - name: Fail the run after preserving collection progress
         if: always() && steps.collect_styles.outcome == 'failure' && steps.collection_status.outputs.status != 'rate_limit_paused'

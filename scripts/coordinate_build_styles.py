@@ -211,6 +211,34 @@ def decision(snapshot, *, now, older=(), allow_bounded=False):
         return {"run": False, "reason": "Previous collection reached a resource limit"}
     if allow_bounded and not automatic_continuation_allowed(summary):
         return {"run": True, "reason": "An explicit collector request follows the previous bounded batch"}
+    official = summary.get("official_validation")
+    if isinstance(official, dict):
+        pending = official.get("pending")
+        retry_at = official.get("retry_at")
+        retry = timestamp(retry_at)
+        checks_due = retry_at is None or retry is not None and retry <= now
+        progress = any(type(official.get(key)) is int and official[key] > 0
+                       for key in ("checked", "repaired_reports", "changed_reports"))
+        if (type(pending) is int and pending > 0 and (progress or retry is not None and retry <= now)
+                and checks_due and (not official.get("source_blocked") or retry is not None)
+                and (not official.get("metadata_source_blocked") or retry is not None)):
+            if summary.get("power_validation") is True:
+                return {"run": True,
+                        "reason": "Alternate saved EDHPowerLevel work with a source collection batch"}
+            return {"run": True, "validate_power": True,
+                    "reason": "Saved EDHPowerLevel deck checks or restriction repairs remain"}
+    else:
+        official = {}
+    retry_at = official.get("retry_at")
+    retry = timestamp(retry_at)
+    checks_due = retry_at is None or retry is not None and retry <= now
+    new_lists = (isinstance(summary.get("completed"), list) and bool(summary["completed"])
+                 or type((summary.get("deck_rebuild") or {}).get("changed_deck_lists")) is int
+                 and summary["deck_rebuild"]["changed_deck_lists"] > 0)
+    if (new_lists and summary.get("power_validation") is not True and checks_due
+            and (not official.get("source_blocked") or retry is not None)
+            and (not official.get("metadata_source_blocked") or retry is not None)):
+        return {"run": True, "validate_power": True, "reason": "New generated deck lists need EDHPowerLevel checks"}
     rebuild = summary.get("deck_rebuild")
     if isinstance(rebuild, dict):
         pending = rebuild.get("pending")
@@ -450,7 +478,7 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
             result["requeued"] = True
         return result
     if mode in {"watchdog", "resume"} and result["run"]:
-        client.dispatch(COLLECTOR)
+        client.dispatch(COLLECTOR, {"validate_power": "true"} if result.get("validate_power") else None)
         result["dispatched"] = True
     if latest is not None:
         result["snapshot"] = latest.summary

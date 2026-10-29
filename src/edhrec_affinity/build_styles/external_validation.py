@@ -1,4 +1,4 @@
-"""Attach dated human-observed ratings to an exact generated card list.
+"""Attach dated EDHPowerLevel observations to an exact generated card list.
 
 This module performs no external requests. A changed deck cannot inherit a
 previous list's rating, even if it retains the same commander or package name.
@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
@@ -27,6 +28,11 @@ DEFAULT_VALIDATION_DIRECTORY = Path(__file__).resolve().parents[3] / "data/build
 VALIDATION_MAX_AGE_DAYS = 7
 FUTURE_TOLERANCE_SECONDS = 300
 SOURCE = "edhpowerlevel.com"
+RESTRICTION_CATEGORIES = (
+    "game_changers", "extra_turns", "chaining_extra_turns", "mass_land_denial",
+    "early_combos", "late_combos",
+)
+RESTRICTION_CHECK_METHOD = "edhpowerlevel_page"
 _VALIDATION_DIRECTORY = ContextVar("build_style_validation_directory", default=DEFAULT_VALIDATION_DIRECTORY)
 
 
@@ -78,6 +84,36 @@ def _deck_identity(deck: dict) -> tuple[str, int]:
     return cardlist_hash(deck["cards"]), count
 
 
+def _commander_keys(names: Any) -> tuple[str, ...]:
+    if (not isinstance(names, (list, tuple)) or not names
+            or any(not isinstance(name, str) or not name.strip() for name in names)):
+        raise ValueError("External restriction checks require full commander names")
+    keys = tuple(sorted(card_key(name) for name in names))
+    if len(set(keys)) != len(keys):
+        raise ValueError("External restriction checks contain duplicate commander names")
+    return keys
+
+
+def _deck_commander_names(deck: dict) -> list[str]:
+    commanders = deck.get("commanders")
+    if not isinstance(commanders, list) or any(not isinstance(card, dict) for card in commanders):
+        raise ValueError("External restriction checks require the deck's commander roles")
+    names = [card.get("name") for card in commanders]
+    keys = _commander_keys(names)
+    counts = _card_counts(deck["cards"])
+    if any(counts[key] != 1 for key in keys):
+        raise ValueError("External restriction commanders must each appear once in the checked list")
+    return names
+
+
+def validation_record_key(deck: dict) -> str:
+    """Deduplicate an official check by the whole list and commander roles."""
+    sha256, _ = _deck_identity(deck)
+    roles = _commander_keys(_deck_commander_names(deck))
+    digest = hashlib.sha256(json.dumps(roles, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return f"{sha256}.{digest}"
+
+
 def _strict_json(contents: str) -> Any:
     def invalid(value: str) -> None:
         raise ValueError(f"Nonfinite JSON number: {value}")
@@ -89,7 +125,7 @@ def _strict_json(contents: str) -> Any:
 
 def _check_bracket_restrictions(value: Any, deck_names: set[str]) -> dict:
     """Validate optional observed restrictions against the exact checked list."""
-    single_keys = {"game_changers", "extra_turns", "mass_land_denial"}
+    single_keys = {"game_changers", "extra_turns", "chaining_extra_turns", "mass_land_denial"}
     combo_keys = {"early_combos", "late_combos"}
     if not isinstance(value, dict) or set(value) - single_keys - combo_keys:
         raise ValueError("Invalid external bracket restriction categories")
@@ -123,7 +159,87 @@ def _check_bracket_restrictions(value: Any, deck_names: set[str]) -> dict:
     return result
 
 
-def _check_record(record: Any, sha256: str, count: int, deck_names: set[str]) -> dict:
+def _check_restriction_check(value: Any, restrictions: Any, commander_names: Any = None) -> dict:
+    """A numeric observation or partial category list is never a full audit."""
+    if (not isinstance(value, dict) or value.get("status") != "complete"
+            or value.get("method") != RESTRICTION_CHECK_METHOD
+            or not isinstance(restrictions, dict)
+            or set(restrictions) != set(RESTRICTION_CATEGORIES)
+            or not isinstance(value.get("source_script_sha256"), str)
+            or not re.fullmatch(r"[a-f0-9]{64}", value["source_script_sha256"])):
+        raise ValueError("Complete external restriction checks require all categories and page provenance")
+    commanders = _commander_keys(value.get("commander_names"))
+    if commander_names is not None and commanders != _commander_keys(commander_names):
+        raise ValueError("External restriction check belongs to different commander roles")
+    return {"status": "complete", "method": RESTRICTION_CHECK_METHOD,
+            "source_script_sha256": value["source_script_sha256"],
+            "commander_names": [name.strip() for name in value["commander_names"]]}
+
+
+def _preload_cards(source_url: str) -> tuple[list[dict], list[str]]:
+    """Check that a complete audit's public link contains that same whole deck."""
+    payloads = parse_qs(urlparse(source_url).query).get("d", [])
+    if len(payloads) != 1:
+        raise ValueError("External restriction URL needs one exact deck preload")
+    rows = payloads[0].split("~")
+    if len(rows) < 2 or rows[-2:] != ["Z", ""]:
+        raise ValueError("External restriction URL needs a complete deck preload")
+    cards, commanders = [], []
+    commander_section = False
+    for row in rows[:-2]:
+        if not row:
+            if commander_section:
+                raise ValueError("External restriction URL has multiple commander separators")
+            commander_section = True
+            continue
+        match = re.fullmatch(r"([1-9][0-9]*)\s+(.+)", row)
+        if not match:
+            raise ValueError("External restriction URL contains an invalid card row")
+        quantity, name = int(match[1]), match[2]
+        cards.append({"quantity": quantity, "name": name})
+        if commander_section:
+            if quantity != 1:
+                raise ValueError("External restriction URL commanders must each have quantity one")
+            commanders.append(name)
+    _commander_keys(commanders)
+    return cards, commanders
+
+
+def external_restriction_evidence(
+    rating: Any, *, expected_hash: str | None = None, expected_commanders: list[str] | None = None,
+) -> dict | None:
+    """Return current complete official categories from a normalized exact-list record.
+
+    Callers must obtain the record through ``attach_external_validation`` or
+    ``record_external_validation``. Passing an expected hash adds a defensive
+    identity check when attaching the result to another object.
+    """
+    if (not isinstance(rating, dict) or rating.get("status") != "verified"
+            or rating.get("source") != SOURCE or rating.get("card_count") != 100
+            or not isinstance(rating.get("deck_sha256"), str)
+            or not re.fullmatch(r"[a-f0-9]{64}", rating["deck_sha256"])
+            or expected_hash is not None and rating["deck_sha256"] != expected_hash):
+        return None
+    try:
+        checked = datetime.fromisoformat(rating["checked_at"].replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        if (checked.tzinfo is None or checked > now + timedelta(seconds=FUTURE_TOLERANCE_SECONDS)
+                or now - checked >= timedelta(days=VALIDATION_MAX_AGE_DAYS)):
+            return None
+        restrictions = rating.get("bracket_restrictions")
+        proof = _check_restriction_check(rating.get("restriction_check"), restrictions, expected_commanders)
+        cards, commanders = _preload_cards(rating["source_url"])
+        if (cardlist_hash(cards) != rating["deck_sha256"]
+                or _commander_keys(commanders) != _commander_keys(proof["commander_names"])):
+            return None
+        return _check_bracket_restrictions(restrictions, set(_card_counts(cards)))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def _check_record(
+    record: Any, sha256: str, count: int, deck_names: set[str], commander_names: Any = None,
+) -> dict:
     if not isinstance(record, dict) or type(record.get("schema_version")) is not int or record["schema_version"] != 1:
         raise ValueError("Unrecognized external validation record")
     if record.get("deck_sha256") != sha256:
@@ -175,6 +291,14 @@ def _check_record(record: Any, sha256: str, count: int, deck_names: set[str]) ->
             result["score_bracket"] = score_bracket
     if "bracket_restrictions" in record:
         result["bracket_restrictions"] = _check_bracket_restrictions(record["bracket_restrictions"], deck_names)
+    if "restriction_check" in record:
+        result["restriction_check"] = _check_restriction_check(
+            record["restriction_check"], result.get("bracket_restrictions"), commander_names)
+        cards, preload_commanders = _preload_cards(source_url)
+        if cardlist_hash(cards) != sha256:
+            raise ValueError("External restriction URL belongs to another card list")
+        if _commander_keys(preload_commanders) != _commander_keys(result["restriction_check"]["commander_names"]):
+            raise ValueError("External restriction URL belongs to different commander roles")
     result["status"] = "stale" if now - checked >= timedelta(days=VALIDATION_MAX_AGE_DAYS) else "verified"
     return result
 
@@ -186,10 +310,18 @@ def attach_external_validation(
     rating = {"status": "unverified", "source": SOURCE}
     try:
         sha256, count = _deck_identity(deck)
-        path = Path(directory if directory is not None else _VALIDATION_DIRECTORY.get()) / f"{sha256}.json"
+        root = Path(directory if directory is not None else _VALIDATION_DIRECTORY.get())
+        path = root / f"{sha256}.json"
+        try:
+            role_path = root / f"{validation_record_key(deck)}.json"
+            if role_path.exists():
+                path = role_path
+        except ValueError:
+            pass  # Legacy score-only decks need not contain commander roles.
         if path.exists():
-            rating = _check_record(_strict_json(path.read_text(encoding="utf-8")), sha256, count,
-                                   set(_card_counts(deck["cards"])))
+            record = _strict_json(path.read_text(encoding="utf-8"))
+            commanders = _deck_commander_names(deck) if isinstance(record, dict) and "restriction_check" in record else None
+            rating = _check_record(record, sha256, count, set(_card_counts(deck["cards"])), commanders)
     except (ValueError, TypeError, OSError) as error:
         rating["reason"] = str(error)
     deck.setdefault("validation", {})["external_rating"] = rating
@@ -208,9 +340,11 @@ def record_external_validation(
         raise ValueError("Expected external validation observations")
     sha256, count = _deck_identity(deck)
     record = {"schema_version": 1, "deck_sha256": sha256, **values}
-    checked = _check_record(record, sha256, count, set(_card_counts(deck["cards"])))
+    commanders = _deck_commander_names(deck) if "restriction_check" in record else None
+    checked = _check_record(record, sha256, count, set(_card_counts(deck["cards"])), commanders)
     stored = {key: value for key, value in checked.items() if key != "status"}
-    destination = Path(directory) / f"{sha256}.json"
+    record_key = validation_record_key(deck) if "restriction_check" in checked else sha256
+    destination = Path(directory) / f"{record_key}.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:

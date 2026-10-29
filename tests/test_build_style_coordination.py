@@ -75,6 +75,58 @@ def test_watchdog_and_preflight_skip_active_collectors_before_reading_checkpoint
     assert github.dispatches == []
 
 
+@pytest.mark.parametrize("power_validation,expected_inputs", [(False, {"validate_power": "true"}), (True, {})])
+def test_watchdog_alternates_saved_official_checks_with_source_collection(power_validation, expected_inputs):
+    github = GitHub([{"blocked": False, "power_validation": power_validation,
+        "official_validation": {"pending": 100, "checked": 5, "source_blocked": False},
+        "remaining_in_batch": 0, "capacity": {"evaluated_at": NOW.isoformat()}}])
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["dispatched"]
+    assert github.dispatches == [(coordinator.COLLECTOR, expected_inputs)]
+
+
+@pytest.mark.parametrize("retry_at,expected", [
+    ((NOW + timedelta(hours=24)).isoformat(), False),
+    ((NOW - timedelta(seconds=1)).isoformat(), True),
+    ("invalid", False),
+])
+def test_official_source_backoff_does_not_trigger_futile_checks(retry_at, expected):
+    github = GitHub([{"blocked": False, "power_validation": False,
+        "official_validation": {"pending": 100, "checked": 1, "source_blocked": True, "retry_at": retry_at},
+        "remaining_in_batch": 0, "capacity": {"evaluated_at": NOW.isoformat()}}])
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result.get("validate_power", False) is expected
+    assert result["run"] is expected
+    assert github.dispatches == ([(coordinator.COLLECTOR, {"validate_power": "true"})] if expected else [])
+
+
+def test_new_generated_lists_request_official_checks_even_when_source_cycle_is_current():
+    github = GitHub([{"blocked": False, "completed": ["new-commander"],
+        "remaining_in_batch": 0, "capacity": {"evaluated_at": NOW.isoformat()}}])
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["run"] and result["validate_power"]
+    assert github.dispatches == [(coordinator.FRONTEND, {"source_run_id": "100"}),
+                                (coordinator.COLLECTOR, {"validate_power": "true"})]
+
+
+def test_metadata_repair_backoff_can_resume_without_bypassing_source_controls():
+    github = GitHub([{"blocked": False, "official_validation": {"pending": 1, "checked": 1,
+        "metadata_source_blocked": True, "retry_at": (NOW - timedelta(seconds=1)).isoformat()},
+        "remaining_in_batch": 0, "capacity": {"evaluated_at": NOW.isoformat()}}])
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["run"] and result["validate_power"]
+    assert github.dispatches == [(coordinator.COLLECTOR, {"validate_power": "true"})]
+
+
+def test_due_session_retry_resumes_even_when_failed_batch_made_no_progress():
+    github = GitHub([{"blocked": False, "official_validation": {"pending": 10, "checked": 0,
+        "changed_reports": 0, "retry_at": (NOW - timedelta(seconds=1)).isoformat()},
+        "remaining_in_batch": 0, "capacity": {"evaluated_at": NOW.isoformat()}}])
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["run"] and result["validate_power"]
+    assert github.dispatches == [(coordinator.COLLECTOR, {"validate_power": "true"})]
+
+
 def test_watchdog_waits_without_retrying_source_before_known_cooldown_expires():
     github = GitHub([paused()])
     result = coordinator.coordinate(github, "watchdog", now=NOW)

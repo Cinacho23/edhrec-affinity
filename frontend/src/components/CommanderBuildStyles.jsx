@@ -14,6 +14,7 @@ import {
   getComparableProfilePairs,
   getDeckMixtureRows,
   getExternalDeckRating,
+  getExternalDeckRestrictionCheck,
   getGeneratedDeckBracketRepair,
   getGeneratedDeckColorChoices,
   getGeneratedDeckDistinctiveCards,
@@ -85,6 +86,31 @@ function ExternalDeckRating({ rating, deckHash }) {
       ? `72.5–77.5% playability target ${stale ? `was ${result.inTargetRange ? "met" : "not met"} at that check` : result.targetMet ? "met" : "not met"}. `
       : "Playability was not recorded. "}The displayed power bracket uses score thresholds 4.7, 6.7, 7.7 and 9.25. Card restrictions are checked separately.</p>
     {result.source_url ? <p className="build-source-links"><SourceLink url={result.source_url}>Open rated card list</SourceLink></p> : null}
+  </div>;
+}
+
+const RESTRICTION_LABELS = {
+  game_changers: "Game Changers", extra_turns: "Ordinary extra turns",
+  chaining_extra_turns: "Chaining extra turns", mass_land_denial: "Mass land denial",
+  early_combos: "Early combos", late_combos: "Late combos",
+};
+
+function OfficialRestrictionCheck({ deck }) {
+  const check = getExternalDeckRestrictionCheck(deck);
+  if (!check) return null;
+  return <div className="build-official-restrictions" data-status={check.status}>
+    <p><strong>{check.label}.</strong>{check.checkedAt ? <span> Checked {checkedDate(check.checkedAt)}.</span> : null}</p>
+    {check.status === "verified" ? <p className="build-note">The complete EDHPowerLevel analysis covered mass land denial, chaining extra turns, ordinary extra turns, Game Changers, and early and late combos for this exact list and its commanders.</p>
+      : check.status === "conflict" ? <p className="build-note">EDHPowerLevel requires Bracket {check.requiredBracket}, above this list’s calculated Bracket {check.scoreBracket}. The cards need adjustment; the displayed bracket continues to follow the power score.</p>
+        : check.status === "stale" ? <p className="build-note">This complete observation is older than seven days. Recheck the current list before relying on its restrictions.</p>
+          : ["failed", "blocked"].includes(check.status) ? <p className="build-note">The site check did not complete, so restrictions remain unverified.{check.reason ? ` ${check.reason}` : ""}</p>
+            : <p className="build-note">A complete EDHPowerLevel restriction analysis has not been recorded for this exact list and its commanders. Local checks and a numeric power score do not establish external restriction verification.</p>}
+    {check.restrictions ? <details className="build-evidence"><summary>Observed EDHPowerLevel restrictions</summary>
+      <ul>{Object.entries(RESTRICTION_LABELS).map(([key, label]) => <li key={key}><strong>{label}:</strong> {check.restrictions[key].length
+        ? check.restrictions[key].map((entry, index) => <span key={index}>{index ? "; " : ""}{Array.isArray(entry)
+          ? entry.map((name, cardIndex) => <span key={name}>{cardIndex ? " + " : ""}<DeckCardName name={name} /></span>)
+          : <DeckCardName name={entry} />}</span>) : "None reported"}</li>)}</ul>
+    </details> : null}
   </div>;
 }
 
@@ -161,6 +187,7 @@ function GeneratedPackageDeck({ deck, packageNumber }) {
         {powerRating.source_url ? <p className="build-source-links"><SourceLink url={powerRating.source_url}>Power formula source</SourceLink></p> : null}
       </div> : null}
       <ExternalDeckRating rating={validation.external_rating} deckHash={validation.deck_sha256} />
+      <OfficialRestrictionCheck deck={deck} />
       <p className="build-generated-deck__copy-status" role="status" aria-live="polite">{copyStatus}</p>
       <p className="build-note">Paste the card list into Moxfield’s text import. Commander markers are included.</p>
       <div className="build-generated-deck__card-list" tabIndex="0" role="region" aria-label={`Package ${packageNumber} generated deck cards`}>
@@ -206,6 +233,7 @@ function PackageCard({ pkg, index, decks }) {
   const themes = getSupportedThemes(pkg);
   const bracketLabel = getPackageBracketLabel(pkg.generated_deck);
   const distinctiveCards = getGeneratedDeckDistinctiveCards(pkg.generated_deck);
+  const restrictionCheck = getExternalDeckRestrictionCheck(pkg.generated_deck);
   const representatives = (pkg.representative_deck_ids || []).map(
     (id) => decks.find((deck) => deck.id === id)
   ).filter(Boolean);
@@ -215,6 +243,7 @@ function PackageCard({ pkg, index, decks }) {
         <div className="build-package__title"><h4>Package {index + 1}</h4>{bracketLabel ? <span className="build-package__bracket">{bracketLabel}</span> : null}</div>
         <span>{formatNumber(pkg.member_count)} sampled decks</span>
       </div>
+      {restrictionCheck ? <p className="build-package__restriction-status" data-status={restrictionCheck.status}>{restrictionCheck.label}</p> : null}
       <p className="build-small-label">Suggested themes</p>
       <div className="build-theme-list">
         {themes.length ? themes.map((theme) => {

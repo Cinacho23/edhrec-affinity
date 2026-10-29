@@ -44,7 +44,7 @@ def stub_timeout(tmp_path):
         import os, sys
         args = sys.argv[1:]
         assert args[:2] == ["--signal=INT", "--kill-after=30s"]
-        assert args[2] in {"35m", "21m"}
+        assert args[2] in {"35m", "21m", "32m"}
         os.execvp(args[3], args[3:])
     """)
 
@@ -531,4 +531,91 @@ def test_immediate_continuation_retains_source_resource_and_manual_scope_control
             "GITHUB_OUTPUT": str(output), "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
             **env_changes})
     assert result.returncode == 0, result.stderr
-    assert output.read_text().strip() == f"needed={str(expected).lower()}"
+    assert dict(line.split("=", 1) for line in output.read_text().splitlines()) == {
+        "needed": str(expected).lower(), "validate_power": "false"}
+
+
+def test_official_validation_mode_is_paced_bounded_and_uses_saved_observations(tmp_path):
+    workflow = COLLECTOR.read_text()
+    assert "      validate_power:\n" in workflow
+    for name in ("Get current commander index and weekly dataset date", "Continue the resumable catalog queue",
+                 "Rebuild package decks from saved collections"):
+        body, _ = step(COLLECTOR, name)
+        assert "inputs.validate_power != true" in body
+    body, script = step(COLLECTOR, "Check EDHPowerLevel restrictions and repair saved decks")
+    assert "inputs.validate_power == true" in body
+    assert "steps.prepare_power_only.outcome == 'success'" in body
+    assert "continue-on-error: true" in body and "timeout-minutes: 33" in body
+    stub_timeout(tmp_path)
+    stub(tmp_path, "python", """\
+        import json, sys
+        print(json.dumps(sys.argv[1:]))
+    """)
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], text=True, capture_output=True,
+        env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"], "STYLES_DIR": "saved/styles",
+             "RUNNER_TEMP": "scratch", "COMMANDER_SLUGS": "nemata-grove-guardian the-face-of-boe"})
+    assert result.returncode == 0, result.stderr
+    args = json.loads(result.stdout)
+    assert args[0] == "scripts/validate_generated_decks.py"
+    assert args[args.index("--validation-directory") + 1] == "saved/styles/_collection/external-validations"
+    assert args[args.index("--max-runtime-seconds") + 1] == "1800"
+    assert args[args.index("--max-decks") + 1] == "300"
+    assert args[args.index("--check-interval-seconds") + 1] == "5"
+    assert args[-4:] == ["--commander", "nemata-grove-guardian", "--commander", "the-face-of-boe"]
+    assert workflow.index("      - name: Retain checked repository examples") < workflow.index(
+        "      - name: Check EDHPowerLevel restrictions") < workflow.index("      - name: Upload cumulative build-style samples")
+    assert "official-validation-summary.json" in workflow
+
+
+@pytest.mark.parametrize("current_check,blocked,expected_publish", [(True, False, True), (True, True, True), (False, False, False)])
+def test_official_observations_publish_without_faking_collection_progress(tmp_path, current_check, blocked, expected_publish):
+    _, script = step(COLLECTOR, "Include EDHPowerLevel checks in publication progress")
+    root = tmp_path / "data/build-style-artifact"
+    root.mkdir(parents=True)
+    styles = root / "build-styles"
+    (styles / "_collection").mkdir(parents=True)
+    source = {"blocked": False, "resource_limit": False, "publish_needed": False, "no_progress": True,
+        "automatic_continuation_allowed": True, "continuation_needed": False,
+        "source_rate": {"learned_rate": .12}, "scope": {"max_commanders": None}}
+    path = root / "build_style_batch.json"
+    path.write_text(json.dumps(source))
+    observed = {"source": "edhpowerlevel.com", "checked": 10, "changed_reports": 4, "pending": 200,
+        "source_blocked": blocked, "retry_at": "2099-01-01T00:00:00Z" if blocked else None,
+        "continuation_needed": not blocked}
+    target = root / "official-validation-summary.json" if current_check else styles / "_collection/official-validation-summary.json"
+    target.write_text(json.dumps(observed))
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path, text=True, capture_output=True,
+        env={**os.environ, "VALIDATE_POWER": str(current_check).lower(), "STYLES_DIR": str(styles),
+            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]})
+    assert result.returncode == 0, result.stderr
+    actual = json.loads(path.read_text())
+    assert actual["publish_needed"] is expected_publish
+    assert actual["no_progress"] is (not current_check)
+    assert actual["continuation_needed"] is (current_check and not blocked)
+    assert actual["official_validation"]["pending"] == 200
+    assert actual["source_rate"] == source["source_rate"]
+    assert actual["scope"] == source["scope"] and actual["blocked"] is False
+
+
+@pytest.mark.parametrize("current,official,completed,expected", [
+    (False, {"pending": 10}, [], "true"),
+    (True, {"pending": 10}, [], "false"),
+    (False, {"pending": 0}, ["commander"], "true"),
+    (False, {"pending": 10, "source_blocked": True, "retry_at": "2099-01-01T00:00:00Z"}, [], "false"),
+    (False, {"pending": 10, "source_blocked": True, "retry_at": "2000-01-01T00:00:00Z"}, [], "true"),
+    (False, {"pending": 10, "retry_at": "2099-01-01T00:00:00Z"}, [], "false"),
+])
+def test_continuation_alternates_source_and_official_work_and_honors_retry_time(tmp_path, current, official, completed, expected):
+    _, script = step(COLLECTOR, "Decide whether collection can continue immediately")
+    root = tmp_path / "data/build-style-artifact"
+    root.mkdir(parents=True)
+    (root / "build_style_batch.json").write_text(json.dumps({"continuation_needed": True, "no_progress": False,
+        "official_validation": official, "completed": completed}))
+    output = tmp_path / "outputs"
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path, text=True, capture_output=True,
+        env={**os.environ, "TARGETED_COMMANDERS": "", "MAX_COMMANDERS": "0", "SAMPLE_DECKS": "all",
+            "REFRESH_REPORTS": "false", "CURRENT_VALIDATION": str(current).lower(),
+            "GITHUB_REF_NAME": "main", "DEFAULT_BRANCH": "main", "GITHUB_OUTPUT": str(output),
+            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]})
+    assert result.returncode == 0, result.stderr
+    assert dict(line.split("=", 1) for line in output.read_text().splitlines()) == {"needed": "true", "validate_power": expected}
