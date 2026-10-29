@@ -167,11 +167,13 @@ def needs_rebuild(report: dict, *, validation_directory: Path | None = None,
         calculated = validation.get("calculated_power")
         if (not isinstance(calculated, dict) or calculated.get("status") not in {"calculated", "unavailable"}
                 or calculated.get("source") != "local_public_formula"
+                or type(calculated.get("power_formula_version")) is not int
                 or calculated.get("power_formula_version") != POWER_FORMULA_VERSION
                 or calculated.get("algorithm_sha256") != ALGORITHM_SHA256):
             return True
         try:
-            if calculated.get("deck_sha256") != cardlist_hash(deck.get("cards", [])):
+            digest = cardlist_hash(deck.get("cards", []))
+            if calculated.get("deck_sha256") != digest or validation.get("deck_sha256") != digest:
                 return True
         except (ValueError, TypeError):
             return True
@@ -182,8 +184,9 @@ def needs_rebuild(report: dict, *, validation_directory: Path | None = None,
         if calculated["status"] == "calculated":
             score = calculated.get("power_level")
             digest = calculated.get("input_sha256")
+            score_bracket = bracket_for_power_score(score)
             if (isinstance(score, bool) or not isinstance(score, (int, float))
-                    or bracket_for_power_score(score) != calculated.get("score_bracket")
+                    or score_bracket is None or score_bracket != calculated.get("score_bracket")
                     or not isinstance(digest, str) or len(digest) != 64
                     or any(character not in "0123456789abcdef" for character in digest)
                     or _expired_timestamp(calculated.get("checked_at"), now, CACHE_MAX_AGE_DAYS)):

@@ -454,7 +454,7 @@ def test_current_version_with_failed_freshness_remains_retryable(tmp_path):
     assert not rebuild.needs_rebuild(rebuild.read_json(root / "commander.json"))
 
 
-@pytest.mark.parametrize("mode", ["missing", "formula", "hash", "algorithm", "score_bracket", "input_hash"])
+@pytest.mark.parametrize("mode", ["missing", "formula", "hash", "validation_hash", "algorithm", "score_bracket", "negative_score", "input_hash"])
 def test_current_generation_retries_missing_or_invalid_local_power_proof(tmp_path, mode):
     report, inputs, cache = fixture(tmp_path)
     report, _ = rebuild.rebuild_report(report, inputs, MetadataRepository(cache), prefer_playability=False)
@@ -468,10 +468,14 @@ def test_current_generation_retries_missing_or_invalid_local_power_proof(tmp_pat
             power["power_formula_version"] -= 1
         elif mode == "hash":
             power["deck_sha256"] = "0" * 64
+        elif mode == "validation_hash":
+            validation["deck_sha256"] = "0" * 64
         elif mode == "algorithm":
             power["algorithm_sha256"] = "0" * 64
         elif mode == "score_bracket":
             power["score_bracket"] = 5
+        elif mode == "negative_score":
+            power["power_level"], power["score_bracket"] = -1, None
         else:
             power["input_sha256"] = "incomplete"
     assert rebuild.needs_rebuild(report)
