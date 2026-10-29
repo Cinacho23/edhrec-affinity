@@ -362,6 +362,8 @@ def validate_all(root: Path, cache: Path, *, validation_directory: Path | None =
             # family has authoritative checks, then audit all changed lists.
             if repairs:
                 slug, fingerprint, count = repairs[0]
+                print(json.dumps({"event": "edhpowerlevel_repair_started", "commander_slug": slug,
+                    "completed_attempts": count}, separators=(",", ":")), flush=True)
                 save()
                 before = {key for key in by_report[slug]}
                 result = rebuild_fn(root, cache, commanders=[slug], validation_directory=directory,
@@ -373,6 +375,10 @@ def validate_all(root: Path, cache: Path, *, validation_directory: Path | None =
                     changed_reports.add(slug)
                     summary["repaired_reports"] += result["regenerated"]
                     summary["changed_deck_lists"] += result.get("changed_deck_lists", 0)
+                print(json.dumps({"event": "edhpowerlevel_repair_finished", "commander_slug": slug,
+                    "regenerated": result.get("regenerated", 0),
+                    "changed_deck_lists": result.get("changed_deck_lists", 0),
+                    "pending": result.get("pending", 0)}, separators=(",", ":")), flush=True)
                 metadata = result.get("metadata_prefetch", {})
                 if metadata.get("blocked") is True:
                     summary["metadata_source_blocked"] = True
@@ -446,6 +452,13 @@ def validate_all(root: Path, cache: Path, *, validation_directory: Path | None =
                 retry_after = retry_after if type(retry_after) in {int, float} and math.isfinite(retry_after) else 0
                 state.update(source_blocked=True, source_block_reason=summary["source_block_reason"], source_blocked_at=_now(),
                     source_retry_at=_later(max(SOURCE_RETRY_SECONDS, retry_after)))
+            observation = result.get("observation") or {}
+            print(json.dumps({"event": "edhpowerlevel_check", "checked": summary["checked"],
+                "records_written": summary["records_written"], "commanders": sorted(task["commanders"]),
+                "deck_key": task["key"], "status": result.get("status"),
+                "power_level": observation.get("power_level"), "score_bracket": observation.get("score_bracket"),
+                "reported_bracket": observation.get("bracket"), "source_blocked": bool(result.get("source_blocked"))},
+                separators=(",", ":")), flush=True)
             attach(task["commanders"])
             invalid.extend(refresh(set(task["commanders"])))
             save()
