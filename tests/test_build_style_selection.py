@@ -5,6 +5,7 @@ import copy
 import numpy as np
 import pytest
 
+from edhrec_affinity.build_styles import analysis
 from edhrec_affinity.build_styles.analysis import analyze_decks
 
 
@@ -56,6 +57,73 @@ def test_auto_can_find_more_than_three_supported_packages():
     assert [row["components"] for row in result["model_selection"]["candidates"]] == [1, 2, 3, 4]
     assert len(result["packages"]) == 4
     assert all(len(deck["memberships"]) == 4 for deck in result["decks"])
+
+
+def test_default_search_can_select_more_than_eight_supported_packages():
+    result = analyze(package_decks(packages=10, per_package=20), BASE, [])
+    assert result["status"] == "fitted"
+    assert result["package_count"] == 10
+    assert result["model_selection"]["requested_max_components"] is None
+    assert result["model_selection"]["max_components"] == 10
+    assert [row["components"] for row in result["model_selection"]["candidates"]] == list(range(1, 11))
+    assert len(result["packages"]) == 10
+    assert all(len(deck["memberships"]) == 10 for deck in result["decks"])
+
+
+@pytest.mark.parametrize("maximum", [33, 1000])
+def test_explicit_large_ceiling_is_accepted_and_bounded_by_card_evidence(maximum):
+    result = analyze(package_decks(packages=2), BASE, [], max_components=maximum)
+    assert result["model_selection"]["requested_max_components"] == maximum
+    assert result["model_selection"]["max_components"] == 2
+    assert [row["components"] for row in result["model_selection"]["candidates"]] == [1, 2]
+
+
+def test_impossible_effective_support_counts_are_excluded_before_fitting(monkeypatch):
+    attempted = []
+
+    def record_candidate(matrix, components, seed, threshold):
+        attempted.append(components)
+        # Model-quality evaluation is separate from this arithmetic support bound.
+        return {"diagnostic": {"components": components, "eligible": False}}
+
+    monkeypatch.setattr(analysis, "_evaluate_components", record_candidate)
+    result = analyze(package_decks(packages=21, per_package=4), BASE, [])
+    limits = result["model_selection"]["data_limits"]
+    assert limits["usable_decks"] == 84
+    assert limits["matrix_rank"] == 21
+    assert limits["minimum_required_members"] == 5  # ceil(5% of 84), not 4.2.
+    assert limits["maximum_components_by_effective_membership"] == 16
+    assert result["model_selection"]["max_components"] == 16
+    assert attempted == list(range(1, 17))
+    assert result["status"] == "insufficient_data"
+
+
+def test_sparse_rank_probe_uses_data_support_instead_of_a_fixed_package_ceiling(monkeypatch):
+    pytest.importorskip("sklearn")
+    from sklearn.utils import extmath
+
+    requested_ranks = []
+    attempted = []
+    original_svd = extmath.randomized_svd
+
+    def record_rank(matrix, **kwargs):
+        requested_ranks.append(kwargs["n_components"])
+        return original_svd(matrix, **kwargs)
+
+    def record_candidate(matrix, components, seed, threshold):
+        attempted.append(components)
+        return {"diagnostic": {"components": components, "eligible": False}}
+
+    monkeypatch.setattr(extmath, "randomized_svd", record_rank)
+    monkeypatch.setattr(analysis, "_evaluate_components", record_candidate)
+    result = analyze_decks(package_decks(packages=21, per_package=50), BASE, [])
+    limits = result["model_selection"]["data_limits"]
+    assert limits["sparse_matrix"] is True
+    assert limits["usable_decks"] == 1050
+    assert limits["minimum_required_members"] == 53
+    assert limits["maximum_components_by_effective_membership"] == 19
+    assert requested_ranks == [19]
+    assert attempted == list(range(1, 20))
 
 
 def test_homogeneous_sample_keeps_one_shared_package_instead_of_forcing_separation():
@@ -156,7 +224,7 @@ def test_invalid_manual_count_is_rejected(components):
         analyze_decks([], BASE, [], components=components)
 
 
-@pytest.mark.parametrize("maximum", [0, -1, 1.5, True])
+@pytest.mark.parametrize("maximum", [0, -1, 1.5, True, "all"])
 def test_invalid_maximum_is_rejected(maximum):
     with pytest.raises(ValueError, match="max_components must be a positive integer"):
         analyze_decks([], BASE, [], max_components=maximum)
@@ -167,6 +235,7 @@ def test_insufficient_data_keeps_selection_schema_without_fitting():
     assert result["status"] == "insufficient_data"
     assert result["package_count"] == 0
     assert result["model_selection"]["selected_components"] is None
+    assert result["model_selection"]["requested_max_components"] is None
     assert result["model_selection"]["candidates"] == []
     assert result["alternative_models"] == []
 

@@ -256,8 +256,36 @@ def test_offline_cli_writes_an_honest_report_with_insufficient_deck_data(tmp_pat
 
 def test_package_cli_defaults_to_auto_and_accepts_one():
     assert parser().parse_args(["--commander", "ghave"]).components is None
+    assert parser().parse_args(["--commander", "ghave"]).max_components is None
     assert parser().parse_args(["--commander", "ghave", "--components", "auto"]).components is None
     assert parser().parse_args(["--commander", "ghave", "--components", "1"]).components == 1
     assert parser().parse_args(["--commander", "ghave", "--max-components", "12"]).max_components == 12
+    assert parser().parse_args(["--commander", "ghave", "--max-components", "64"]).max_components == 64
+    assert parser().parse_args(["--commander", "ghave", "--components", "64"]).components == 64
+    for value in ("all", "ALL", "0"):
+        assert parser().parse_args(["--commander", "ghave", "--max-components", value]).max_components is None
     with pytest.raises(SystemExit):
         parser().parse_args(["--commander", "ghave", "--components", "0"])
+
+
+@pytest.mark.parametrize("value", ["-1", "1.5", "auto", "unknown"])
+def test_package_cli_rejects_invalid_optional_ceiling(value):
+    with pytest.raises(SystemExit):
+        parser().parse_args(["--commander", "ghave", "--max-components", value])
+
+
+def test_manual_cli_has_no_hidden_32_package_validation(monkeypatch, tmp_path):
+    import edhrec_affinity.build_styles.__main__ as command
+
+    observed = []
+
+    def run_cli(args):
+        observed.append((args.components, args.max_components))
+        return {"profiles": {"profiles": []}, "deck_analysis": {"status": "insufficient_data", "unique_decks": 0},
+                "collection": {"failures": []}}
+
+    monkeypatch.setattr(command, "run", run_cli)
+    monkeypatch.setattr("sys.argv", ["build-styles", "--commander", "ghave", "--components", "64",
+                                    "--max-components", "64", "--output-dir", str(tmp_path)])
+    command.main()
+    assert observed == [(64, 64)]

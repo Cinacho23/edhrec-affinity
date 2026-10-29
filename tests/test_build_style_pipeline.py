@@ -13,7 +13,9 @@ import time
 import httpx
 import pytest
 
-from edhrec_affinity.build_styles.pipeline import atomic_json, evidence_version, run_pipeline, save_evidence
+from edhrec_affinity.build_styles.pipeline import (
+    atomic_json, collection_options, evidence_version, model_policy, run_pipeline, save_evidence,
+)
 from edhrec_affinity.build_styles.analysis import tag_label_policy
 from edhrec_affinity.build_styles.sources import BudgetExpired, SourceBlocked
 from edhrec_affinity.build_styles.eligibility import CommanderBelowMinimum
@@ -27,7 +29,7 @@ def options(tmp_path, **changes):
         min_total_decks=200, refresh_after_days=3, refresh=False, max_commanders=0, max_runtime_seconds=30,
         requests_per_second=40, workers=1, analysis_workers=1, preview_workers=1, max_preview_seconds=10,
         card_metadata_cache=tmp_path / "cards.json", fetch=False, sample_decks=None, seed=42,
-        max_components=8, max_tags=12, min_tag_decks=5, main_tag_decks=15, request_delay=1, source_max_age_hours=72,
+        max_components=None, max_tags=12, min_tag_decks=5, main_tag_decks=15, request_delay=1, source_max_age_hours=72,
         index_max_age_hours=24, target_completion_hours=96, dry_run=False, min_free_disk_gb=0,
         prune_completed_cache=False)
     return argparse.Namespace(**(defaults | changes))
@@ -65,7 +67,8 @@ def saved_analyzer(calls, on_start=None):
             on_start(slug)
         destination = Path(settings["output_dir"]) / "report.json"
         report = {"schema_version": 1, "commander_slug": slug, "commander_name": slug,
-            "generated_at": NOW.isoformat(), "total_edhrec_decks": source["base"]["deck_count"], "collection": source["collection"],
+            "generated_at": NOW.isoformat(), "total_edhrec_decks": source["base"]["deck_count"],
+            "collection": {**source["collection"], "provenance": source.get("provenance", [])},
             "tag_label_policy": source.get("tag_label_policy"),
             "deck_analysis": {"status": "fitted", "unique_decks": source["collection"]["previews_loaded"],
                 "packages": [{"id": 0, "top_cards": []}]}}
@@ -181,6 +184,7 @@ def test_completed_report_refresh_waits_for_the_unfinished_backlog(tmp_path):
     atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": {
         "a-refresh": {"status": "fitted", "coverage_complete": True, "frame_decks": 200,
                       "tag_label_policy": tag_label_policy(),
+                      "model_policy": model_policy(args),
                       "current_previews": 200, "verified_at": old.isoformat()},
     }})
     atomic_json(args.output_dir / "a-refresh.json", {"commander_slug": "a-refresh"})
@@ -283,6 +287,8 @@ def test_analysis_pending_evidence_resumes_without_another_network_collection(tm
     assert result["collected"] == []
     assert result["completed"] == ["a"]
     assert checkpoint(args)["commanders"]["a"]["status"] == "fitted"
+    assert checkpoint(args)["commanders"]["a"]["analysis_version"] == evidence_version(
+        source, collection_options(args, "a", args.max_preview_seconds))
 
 
 def seed_pending_inputs(args, slugs):
@@ -482,6 +488,104 @@ def test_model_configuration_change_reanalyzes_even_when_source_content_is_ident
     args.max_components = 4
     execute(args, rows("a"), collect, saved_analyzer(analyzed))
     assert analyzed == ["a", "a"]
+
+
+def test_uncapped_upgrade_reuses_saved_sample_and_preserves_source_times(tmp_path):
+    args = options(tmp_path, max_components=8, fetch=True)
+    analyzed = []
+    source_date = NOW - timedelta(hours=4)
+    source = evidence("existing", checked=source_date)
+    source["provenance"] = [{"url": "https://json.edhrec.com/pages/commanders/existing.json",
+                             "fetched_at": source_date.isoformat(), "sha256": "original-source"}]
+    execute(args, rows("existing"), lambda *_, **__: source, saved_analyzer(analyzed))
+    before = checkpoint(args)["commanders"]["existing"].copy()
+    preview = args.output_dir / "_collection/previews/existing.json.gz"
+    preview.parent.mkdir(parents=True, exist_ok=True)
+    preview.write_bytes(b"retained parsed deck checkpoint")
+    args.max_components = None
+    args.max_commanders = 1
+    calls = []
+
+    def cached_inputs(settings, **_):
+        calls.append(settings.commander)
+        assert settings.fetch is False
+        assert settings.source_max_age_hours is settings.index_max_age_hours is None
+        assert settings.collection_state.read_bytes() == b"retained parsed deck checkpoint"
+        return {**source, "collection": {**source["collection"], "new_previews_attempted": 0}}
+
+    result = execute(args, rows("untouched", "existing"), cached_inputs, saved_analyzer(analyzed),
+                     checked=NOW + timedelta(hours=1))
+    record = checkpoint(args)["commanders"]["existing"]
+    assert calls == result["reanalyzed_from_cache"] == result["completed"] == ["existing"]
+    assert result["collected"] == [] and result["new_previews_attempted"] == 0
+    assert analyzed == ["existing", "existing"]
+    assert record["analysis_version"] != before["analysis_version"]
+    assert record["model_policy"] == model_policy(args)
+    assert record["verified_at"] == before["verified_at"]
+    assert record["last_collection_at"] == before["last_collection_at"]
+    assert record["collection_dataset_sha256"] == before["collection_dataset_sha256"]
+    saved = json.loads((args.output_dir / "existing.json").read_text())
+    assert saved["collection"]["dataset_sha256"] == "stable-dataset"
+    assert saved["collection"]["freshness"]["oldest_verified_at"] == source_date.isoformat()
+    assert saved["collection"]["provenance"] == source["provenance"]
+    assert preview.read_bytes() == b"retained parsed deck checkpoint"
+
+
+@pytest.mark.parametrize("failure", ["missing", "different_dataset", "partial", "missing_ranking", "missing_metadata"])
+def test_missing_upgrade_inputs_keep_report_and_retry_source_queue_in_later_run(tmp_path, failure):
+    args = options(tmp_path, max_components=8, fetch=True)
+    analyzed = []
+    execute(args, rows("a"), lambda *_, **__: evidence("a"), saved_analyzer(analyzed))
+    report_path = args.output_dir / "a.json"
+    published = report_path.read_bytes()
+    before = checkpoint(args)["commanders"]["a"].copy()
+    args.max_components = None
+    calls = []
+
+    def unusable_cached_inputs(settings, **_):
+        calls.append(settings.fetch)
+        assert settings.fetch is False
+        if failure == "missing":
+            raise FileNotFoundError("No retained base profile")
+        result = evidence("a", new_attempts=0,
+                          dataset="changed-dataset" if failure == "different_dataset" else "stable-dataset",
+                          complete=failure != "partial")
+        if failure == "missing_ranking":
+            result["failures"] = [{"ranking_bracket": 3, "error": "Not cached"}]
+        if failure == "missing_metadata":
+            result["metadata_summary"] = {"missing": 1}
+        return result
+
+    first = execute(args, rows("a"), unusable_cached_inputs, saved_analyzer(analyzed))
+    assert calls == [False]  # No fallback request or repeated visit in this batch.
+    assert first["completed"] == [] and len(first["model_upgrades_deferred"]) == 1
+    assert first["continuation_needed"] is True
+    assert report_path.read_bytes() == published
+    pending = checkpoint(args)["commanders"]["a"]
+    assert pending["model_upgrade_needs_collection"] is True
+    assert pending["verified_at"] == before["verified_at"]
+    assert pending["last_collection_at"] == before["last_collection_at"]
+
+    def next_source_visit(settings, **_):
+        calls.append(settings.fetch)
+        assert settings.fetch is True
+        assert settings.source_max_age_hours == 72 and settings.index_max_age_hours == 24
+        return evidence("a", new_attempts=0)
+
+    second = execute(args, rows("a"), next_source_visit, saved_analyzer(analyzed))
+    assert calls == [False, True]
+    assert second["completed"] == ["a"]
+    assert analyzed == ["a", "a"]
+    assert checkpoint(args)["commanders"]["a"]["model_policy"] == model_policy(args)
+    assert "model_upgrade_needs_collection" not in checkpoint(args)["commanders"]["a"]
+
+
+def test_uncapped_options_change_the_input_fingerprint(tmp_path):
+    args = options(tmp_path, max_components=8)
+    source = evidence("a")
+    capped = evidence_version(source, args)
+    args.max_components = None
+    assert evidence_version(source, args) != capped
 
 
 def test_label_policy_upgrade_is_collected_before_new_commanders_without_resetting_previews(tmp_path):
@@ -728,6 +832,7 @@ def test_completion_estimates_preserve_fresh_evidence_without_a_deadline(tmp_pat
     observed = (NOW - timedelta(hours=4)).isoformat()
     record = {"status": "fitted", "coverage_complete": True, "frame_decks": 5,
               "tag_label_policy": tag_label_policy(),
+              "model_policy": model_policy(args),
               "current_previews": 5, "verified_at": observed, "analyzed_at": observed, "last_collection_at": observed}
     atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": {"a": record},
         "pipeline": {"version": 1, "cycle_started_at": (NOW - timedelta(days=2)).isoformat(),

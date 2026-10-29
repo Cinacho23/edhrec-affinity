@@ -262,6 +262,19 @@ def parse_components(value: str) -> int | None:
     return number
 
 
+def parse_max_components(value: str) -> int | None:
+    """An optional operational ceiling; automatic discovery is uncapped by default."""
+    if value.casefold() == "all" or value == "0":
+        return None
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Use all, 0, or a positive integer package-search ceiling") from error
+    if number < 1:
+        raise argparse.ArgumentTypeError("Use all, 0, or a positive integer package-search ceiling")
+    return number
+
+
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(description="Experimental EDHREC tag-profile and unlabeled-deck build discovery")
     cli.add_argument("--commander", required=True, help="EDHREC commander slug")
@@ -301,8 +314,8 @@ def parser() -> argparse.ArgumentParser:
                      help="Revalidate unchanged deck versions using the current EDHREC index; retain original observation dates")
     cli.add_argument("--components", type=parse_components, default=None,
                      help="auto (default) selects a supported package count; or specify a positive integer")
-    cli.add_argument("--max-components", type=int, default=8,
-                     help="Upper search bound for automatic package selection; the data can impose a smaller limit")
+    cli.add_argument("--max-components", type=parse_max_components, default=None,
+                     help="all (default) searches every data-supported count; optionally set a positive ceiling (0 also means all)")
     cli.add_argument("--seed", type=int, default=42)
     cli.add_argument("--min-deck-cards", type=int, default=90)
     cli.add_argument("--min-card-support", type=int, default=2)
@@ -329,10 +342,8 @@ def main() -> None:
                 (not math.isfinite(value) or value <= 0) for value in
                 (args.source_max_age_hours, args.index_max_age_hours))):
         cli.error("Use 1–64 preview workers and positive finite source-age windows")
-    if (not 1 <= args.max_components <= 32 or
-        args.components is not None and not 1 <= args.components <= 32 or
-        args.min_tag_decks < 1 or args.min_card_support < 2):
-        cli.error("Use 1–32 maximum/components, a positive tag minimum, and card support of at least 2")
+    if args.min_tag_decks < 1 or args.min_card_support < 2:
+        cli.error("Use a positive tag minimum and card support of at least 2")
     if not 0 < args.membership <= 1 or not 0 <= args.similarity <= 1 or not 1 <= args.min_deck_cards <= 100:
         cli.error("Invalid similarity, membership, or minimum deck size")
     try:

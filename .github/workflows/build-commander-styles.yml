@@ -20,9 +20,9 @@ on:
         type: string
         default: "all"
       max_components:
-        description: "Automatic package-count search ceiling (1–32)"
-        type: number
-        default: 8
+        description: "Automatic package search: all (default), or an optional positive ceiling"
+        type: string
+        default: "all"
       refresh:
         description: "Resample selected commanders that already have fitted reports"
         type: boolean
@@ -176,7 +176,7 @@ jobs:
           COMMANDER_SLUGS: ${{ inputs.commanders }}
           MAX_COMMANDERS: ${{ inputs.max_commanders || 0 }}
           SAMPLE_DECKS: ${{ inputs.sample_decks || 'all' }}
-          MAX_COMPONENTS: ${{ inputs.max_components || 8 }}
+          MAX_COMPONENTS: ${{ inputs.max_components || 'all' }}
           REFRESH_REPORTS: ${{ inputs.refresh }}
         run: |
           set -euo pipefail

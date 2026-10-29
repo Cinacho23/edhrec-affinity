@@ -62,8 +62,11 @@ function PackageSummaries({ commander, selectedTag }) {
     return commander.package_count > 0 ? <p className="muted build-discovery-card__package-note">Package tags and brackets are unavailable in this summary. Open the report for details.</p> : null;
   }
   if (!commander.packages.length) return null;
-  return <div className="build-discovery-card__packages">
-    <p className="build-discovery-card__package-label">Auto-selected packages · suggested tags</p>
+  return <details className="build-discovery-card__packages">
+    <summary>
+      <span>{formatNumber(commander.packages.length)} {commander.packages.length === 1 ? "package" : "packages"} · tags &amp; brackets</span>
+      <span className="build-discovery-card__package-toggle" aria-hidden="true" />
+    </summary>
     <ul>{commander.packages.map((pkg, index) => {
       const tags = getSupportedThemes(pkg);
       const bracket = getPackageBracketLabel(pkg.generated_deck);
@@ -79,7 +82,7 @@ function PackageSummaries({ commander, selectedTag }) {
         }) : <span className="muted">No supported tag label</span>}</div>
       </li>;
     })}</ul>
-  </div>;
+  </details>;
 }
 
 export default function BuildDiscoveryPage() {
@@ -231,7 +234,7 @@ export default function BuildDiscoveryPage() {
               {packageTags.map((tag) => <option key={tag.value} value={tag.value}>{tag.label} ({formatNumber(tag.count)} {tag.count === 1 ? "commander" : "commanders"})</option>)}
             </select>
           </label>
-          <p id="build-discovery-package-tag-note" className="muted">Show commanders with this suggested tag on at least one auto-selected package. Their other packages remain visible.</p>
+          <p id="build-discovery-package-tag-note" className="muted">Show commanders with this suggested tag on at least one auto-selected package. Expand package details to see matching tags and brackets.</p>
         </div>
         <div className="build-discovery-filters__ranges">
           {COUNT_FILTERS.map((range) => <CountRange key={range.minKey} {...range} filters={filters} onChange={updateFilter} />)}

@@ -17,8 +17,8 @@ The package-tag filter matches a suggested tag on any package in the selected
 automatic model. Options count distinct commanders across all current reports;
 general commander profiles, source deck tags and alternative models do not
 qualify a match. A selected tag combines with the other filters and stays in
-the URL. Matching tags are highlighted while all packages for each matching
-commander remain visible.
+the URL. Matching tags are highlighted in each matching commander's expandable
+package details.
 
 Discovery cards include commander thumbnails, name hover/focus previews and a
 keyboard/touch disclosure for reading full card images. Partners and all card
@@ -26,6 +26,8 @@ faces remain separate and readable. The index includes compact summaries of
 each selected package's suggested tags and generated-deck bracket. Current
 external bracket observations retain their dated verification; native guidance
 is labeled estimated. Missing labels and brackets remain explicitly unavailable.
+Package details start collapsed on Build Discovery; the Auto-selected package
+count stays visible, and expanding the disclosure shows all tags and brackets.
 These summaries use saved reports and catalog images, so publishing them does
 not require recollecting decklists or fetching every full report in the browser.
 
@@ -36,10 +38,13 @@ Coverage, sample size and collection date are shown. The collection queue includ
 The analyzer evaluates K from 1 through a data-supported maximum:
 
 ```text
-maximum K = min(configured ceiling, usable decks // 4, feature count, matrix rank)
+minimum support = max(3, ceil(0.05 × usable decks))
+maximum K = min(usable decks // 4, usable decks // minimum support, feature count, matrix rank)
 ```
 
-The default configured ceiling is eight and can be changed with `--max-components`. Each candidate uses four initializations and three seeded 80/20 deck splits. Candidate diagnostics include held-out reconstruction error, support and consistency.
+There is no configured package-count ceiling by default. `--max-components all` (or `0`) searches every count that could pass the existing data and support requirements. An optional positive integer imposes a ceiling for a particular experiment; neither automatic nor manual requests have a separate 32-package limit. Each candidate uses four initializations and three seeded 80/20 deck splits. Candidate diagnostics include held-out reconstruction error, support and consistency, together with the requested ceiling (`null` when uncapped) and actual tested maximum.
+
+Uncapped does not mean unlimited accepted packages: summed relative memberships total one per deck, so the existing 5% effective-support requirement permits at most 20 packages, and small samples permit fewer. Counts above that mathematical bound cannot pass support and are skipped before fitting. Stability, rank and held-out performance can select a much smaller count. Removing the configured ceiling preserves these evidence checks rather than forcing extra packages.
 
 The explicit conservative selection rule is:
 
@@ -69,7 +74,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev,prototype]"
 .venv/bin/python -m edhrec_affinity.build_styles \
   --commander ghave-guru-of-spores --fetch \
-  --components auto --max-components 8 \
+  --components auto --max-components all \
   --output-dir data/prototypes/build-styles/ghave
 ```
 
@@ -81,9 +86,11 @@ The collector defaults to `--sample-decks all`, with no preview-count ceiling. A
 
 Collected evidence, reports and pipeline records retain their version-2 `tag_label_policy`, containing population fractions and evidence floors without commander-specific totals. Reports and evidence separately record `tag_label_thresholds` with the baseline denominator and effective count cutoffs. A policy change schedules existing reports for an upgrade before untouched commanders, using saved deck previews and the shared source request limiter to load missing tag profiles. This does not restart deck sampling or invent newer source observation dates. Legacy or corrupt pending inputs must return through collection before the new policy is certified.
 
+Model policy version 8 records the optional package-count ceiling and queues older reports for analysis again. Complete samples first reconstruct inputs from retained parsed previews, source profiles and cached metadata with network access disabled; source verification and collection timestamps are preserved. If saved inputs are missing or no longer reproduce the published dataset, the old report remains available and that commander returns to ordinary source collection on a later run. Pending model inputs receive the current model/options fingerprint before resuming. Existing collection and model-worker time budgets remain in force, so upgrading the catalog can span several resumable batches without resetting deck coverage.
+
 A package is a recurring card pattern across collected decks, and one deck can mix several patterns. Each selectable count is fitted separately: package numbers do not identify the same strategy across models. Each package gets its own generated 100-card example. Generated card lists and Moxfield exports omit category tags; internal role checks can still recognize multiple functions for construction and primers.
 
-Collections above 1,000 usable lists use sparse card matrices and a rank probe up to the model-count ceiling. All usable decks still enter model fitting. The optional quadratic near-copy diagnostic is omitted at that size (reported as unavailable); exact-copy filtering remains active. This avoids dense full-rank decompositions and pairwise comparisons growing with the uncapped index.
+Collections above 1,000 usable lists use sparse card matrices and a rank probe up to the data-supported search bound. All usable decks still enter model fitting. The optional quadratic near-copy diagnostic is omitted at that size (reported as unavailable); exact-copy filtering remains active. This avoids dense full-rank decompositions and pairwise comparisons growing with the uncapped index.
 
 ## Data access and quality
 

@@ -493,8 +493,10 @@ def test_batch_supports_explicit_eligible_commander_and_offline_dry_run(tmp_path
         batch.select_commanders(batch_args(tmp_path, "--commanders", "unknown"))
 
 
-def test_batch_passes_automatic_model_and_dated_cache_then_resumes(tmp_path):
-    args = batch_args(tmp_path, "--max-commanders", "1", "--sample-decks", "40", "--max-components", "6")
+@pytest.mark.parametrize("maximum", [None, 6, 64])
+def test_batch_passes_automatic_model_and_dated_cache_then_resumes(tmp_path, maximum):
+    optional_ceiling = [] if maximum is None else ["--max-components", str(maximum)]
+    args = batch_args(tmp_path, "--max-commanders", "1", "--sample-decks", "40", *optional_ceiling)
     calls = []
 
     def runner(parsed):
@@ -504,7 +506,7 @@ def test_batch_passes_automatic_model_and_dated_cache_then_resumes(tmp_path):
     summary = batch.run_batch(args, runner=runner)
     assert summary["completed"] == ["commander-a"]
     assert calls[0].components is None
-    assert calls[0].max_components == 6
+    assert calls[0].max_components == maximum
     assert calls[0].min_tag_decks == 5 and calls[0].main_tag_decks == 15
     assert calls[0].sample_decks == 40
     assert calls[0].no_html and not calls[0].fetch

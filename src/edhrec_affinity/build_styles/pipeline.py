@@ -24,6 +24,18 @@ from .eligibility import CommanderBelowMinimum, commander_is_eligible, valid_dec
 from .sources import BudgetExpired, CommanderAliasCatalog, PreviewTransport, RequestLimiter, SourceBlocked, source_time
 
 
+MODEL_VERSION = 8
+
+
+def model_policy(options: argparse.Namespace) -> dict:
+    """Analysis policy stored separately from observation freshness."""
+    return {"version": MODEL_VERSION, "max_components": options.max_components}
+
+
+class CachedModelUpgradeUnavailable(ValueError):
+    """Saved inputs cannot safely reproduce a published model's source sample."""
+
+
 def atomic_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -46,8 +58,8 @@ def evidence_version(evidence: dict, options: argparse.Namespace | None = None) 
                 for key, card in evidence.get("metadata", {}).items()}
     contents = {"deck_dataset_sha256": evidence["collection"].get("dataset_sha256"),
                 "base": evidence["base"], "profiles": evidence["ranking_profiles"], "metadata": metadata,
-                # Version 7 adds commander-population shares to tag evidence.
-                "model_version": 7, "tag_label_policy": evidence.get("tag_label_policy"),
+                # Version 8 removes the configured package-count ceiling.
+                "model_version": MODEL_VERSION, "tag_label_policy": evidence.get("tag_label_policy"),
                 "options": {key: getattr(options, key, None) for key in
                     ("seed", "components", "max_components", "min_deck_cards", "min_card_support", "membership", "similarity",
                      "min_tag_decks", "main_tag_decks", "min_tag_fraction", "main_tag_fraction", "max_tags")}}
@@ -158,6 +170,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     from .card_metadata import MetadataRepository
 
     now = now or (lambda: datetime.now(timezone.utc))
+    current_model_policy = model_policy(args)
     started, observed_at = monotonic(), now()
     root = args.output_dir / "_collection"
     root.mkdir(parents=True, exist_ok=True)
@@ -205,6 +218,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         cycle["upstream_snapshot_date"] = upstream_date
     cycle_complete = all(state["commanders"].get(slug, {}).get("status") in {"fitted", "insufficient_data"}
                          and state["commanders"][slug].get("tag_label_policy") == label_policy
+                         and state["commanders"][slug].get("model_policy") == current_model_policy
                          and state["commanders"][slug].get("coverage_complete")
                          and not state["commanders"][slug].get("unavailable_previews")
                          and (verified := source_time(state["commanders"][slug].get("verified_at"))) is not None
@@ -220,7 +234,9 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                          "sample_decks": args.sample_decks, "refresh": args.refresh},
                "automatic_continuation_allowed": (not args.commanders and not args.max_commanders
                                                    and args.sample_decks is None and not args.refresh),
-               "min_total_decks": minimum, "tag_label_policy": label_policy, "skipped": [],
+               "min_total_decks": minimum, "tag_label_policy": label_policy,
+               "model_policy": current_model_policy, "model_upgrades_deferred": [],
+               "reanalyzed_from_cache": [], "skipped": [],
                "completed": [], "collected": [], "failures": [], "blocked": False,
                "dry_run": args.dry_run, "publish_needed": False, "continuation_needed": False,
                "no_progress": True, "time_budget_reached": False, "new_previews_attempted": 0,
@@ -237,6 +253,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         verified = source_time(record.get("verified_at"))
         return (args.refresh or record.get("status") not in {"fitted", "insufficient_data"}
                 or record.get("tag_label_policy") != label_policy
+                or record.get("model_policy") != current_model_policy
                 or not record.get("coverage_complete") or verified is None
                 or not (args.output_dir / f"{slug}.json").exists()
                 or (verified - now()).total_seconds() > 300
@@ -248,7 +265,9 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         # Finish queued models and upgrade existing reports before expanding
         # the catalog. Policy upgrades reuse their saved preview checkpoints.
         phase = (0 if record.get("status") == "analysis_pending" else
-                 1 if record.get("coverage_complete") and published and record.get("tag_label_policy") != label_policy else
+                 1 if record.get("coverage_complete") and published and
+                     (record.get("tag_label_policy") != label_policy
+                      or record.get("model_policy") != current_model_policy) else
                  3 if record.get("coverage_complete") and published else 2)
         frame = valid_deck_count(record.get("frame_decks")) or valid_deck_count(rows_by_slug[slug].get("total_decks"))
         loaded = valid_deck_count(record.get("current_previews")) or 0
@@ -370,11 +389,15 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         if record.get("status") == "analysis_pending" and evidence_path.exists():
             try:
                 with gzip.open(evidence_path, "rt", encoding="utf-8") as handle:
-                    pending_policy = json.load(handle).get("tag_label_policy")
+                    pending = json.load(handle)
+                    pending_policy = pending.get("tag_label_policy")
             except (OSError, EOFError, ValueError, TypeError, AttributeError):
                 pending_policy = None
             if pending_policy == label_policy:
-                analysis_queue.append((slug, evidence_path, collection_options(args, slug, args.max_preview_seconds)))
+                options = collection_options(args, slug, args.max_preview_seconds)
+                pending["analysis_version"] = evidence_version(pending, options)
+                save_evidence(evidence_path, pending)
+                analysis_queue.append((slug, evidence_path, options))
                 queue.remove(slug)
     visits, visited_count = {}, 0
 
@@ -384,7 +407,9 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
             item.pop("cache_file", None)
         atomic_json(args.output_dir / f"{slug}.json", report)
         record = state["commanders"][slug]
-        record.update(status=result["status"], analysis_version=result["version"], analyzed_at=now().isoformat())
+        record.update(status=result["status"], analysis_version=result["version"],
+                      model_policy=current_model_policy, analyzed_at=now().isoformat())
+        record.pop("model_upgrade_needs_collection", None)
         record.pop("analysis_deferred_reason", None)
         record.pop("retry_after", None)
         record["tag_label_policy"] = report.get("tag_label_policy")
@@ -414,6 +439,19 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                         visited_count += 1
                     visits[slug] = visits.get(slug, 0) + 1
                     options = collection_options(args, slug, remaining_time)
+                    previous = state["commanders"].get(slug, {})
+                    options.cache_only_model_upgrade = bool(
+                        not args.refresh and previous.get("coverage_complete")
+                        and previous.get("tag_label_policy") == label_policy
+                        and previous.get("model_policy") != current_model_policy
+                        and not previous.get("model_upgrade_needs_collection")
+                        and (args.output_dir / f"{slug}.json").exists())
+                    if options.cache_only_model_upgrade:
+                        # A model-policy change does not refresh its sources.
+                        # Reuse parsed previews and source pages, even if old;
+                        # their actual timestamps and freshness remain visible.
+                        options.fetch = False
+                        options.source_max_age_hours = options.index_max_age_hours = None
                     state["commanders"].setdefault(slug, {}).update(
                         status="collecting", attempted_at=now().isoformat(), cache_snapshot="rolling")
                     future = network_pool.submit(collector, options, limiter=limiter, preview_transport=transport,
@@ -439,23 +477,37 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                         result = future.result()
                         if is_collection:
                             collection = result["collection"]
+                            if getattr(context, "cache_only_model_upgrade", False):
+                                previous_report = json.loads((args.output_dir / f"{slug}.json").read_text())
+                                previous_collection = previous_report.get("collection", {})
+                                expected_dataset = (previous_collection.get("analysis_dataset_sha256")
+                                                    or previous_collection.get("dataset_sha256"))
+                                if (not collection.get("complete") or not expected_dataset
+                                        or collection.get("dataset_sha256") != expected_dataset
+                                        or result.get("metadata_summary", {}).get("missing")
+                                        or any("tag" in failure or "ranking_bracket" in failure
+                                               for failure in result.get("failures", []))):
+                                    raise CachedModelUpgradeUnavailable("Saved inputs do not reproduce the complete published sample, profiles and card rules")
                             if result.get("metadata_summary", {}).get("blocked"):
                                 limiter.block("Card metadata source access restriction", kind="access_restriction")
                             if result.get("blocked") or limiter.blocked:
                                 raise SourceBlocked("Source access restriction or rate limit; shared workers stopped")
                             new_attempts = int(collection.get("new_previews_attempted", 0))
                             summary["new_previews_attempted"] += new_attempts
-                            summary["collected"].append(slug)
+                            cache_only_upgrade = getattr(context, "cache_only_model_upgrade", False)
+                            summary["reanalyzed_from_cache" if cache_only_upgrade else "collected"].append(slug)
                             record.update(frame_decks=collection.get("frame_decks") or 0,
                                 collection_dataset_sha256=collection.get("dataset_sha256"),
                                 current_previews=collection.get("fresh_previews", collection.get("previews_loaded", 0)),
                                 unavailable_previews=collection.get("unavailable_previews", 0),
                                 coverage_complete=collection.get("complete") is True and collection.get("target_mode") == "all",
-                                tag_label_policy=result.get("tag_label_policy"),
-                                last_collection_at=now().isoformat())
+                                tag_label_policy=result.get("tag_label_policy"))
+                            if not cache_only_upgrade:
+                                record["last_collection_at"] = now().isoformat()
                             freshness = collection.get("freshness", {})
-                            record["verified_at"] = (freshness.get("oldest_verified_at") or freshness.get("oldest_source_at")
-                                                     or (freshness.get("index_source_at") if collection.get("complete") else None))
+                            if not cache_only_upgrade:
+                                record["verified_at"] = (freshness.get("oldest_verified_at") or freshness.get("oldest_source_at")
+                                                         or (freshness.get("index_source_at") if collection.get("complete") else None))
                             if new_attempts or collection.get("reconciliation", {}).get("refreshed_index"):
                                 summary["no_progress"] = False
                             destination = args.output_dir / f"{slug}.json"
@@ -470,6 +522,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                     refresh_unchanged_report_metadata(report, result.get("metadata_summary", {}))
                                     atomic_json(destination, report)
                                     record["status"] = report["deck_analysis"]["status"]
+                                    record["model_policy"] = current_model_policy
                                     summary["completed"].append(slug)
                                     summary.update(publish_needed=True, no_progress=False)
                                 else:
@@ -530,6 +583,14 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                         record.update(status="blocked", retry_after=state["blocked_until"])
                         summary["failures"].append({"commander_slug": slug, "error": str(error)})
                     except (OSError, ValueError, KeyError, TypeError, RuntimeError, httpx.HTTPError) as error:
+                        if is_collection and getattr(context, "cache_only_model_upgrade", False):
+                            # Retry through the ordinary shared source queue on
+                            # a later run, preserving the usable published report.
+                            record.update(status="collecting", model_upgrade_needs_collection=True)
+                            summary["model_upgrades_deferred"].append({"commander_slug": slug, "reason": str(error)})
+                            summary["no_progress"] = False  # The durable retry route has changed.
+                            checkpoint()
+                            continue
                         record.update(status="analysis_pending" if not is_collection else "failed",
                                       retry_after=(now() + timedelta(minutes=30)).isoformat())
                         summary["failures"].append({"commander_slug": slug, "error": str(error)})
