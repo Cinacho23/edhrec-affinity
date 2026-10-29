@@ -922,6 +922,8 @@ def _generate_one(package, model_decks, source_decks, base, profiles, metadata, 
     if prepared.get("status") == "unavailable":
         return {**prepared, "distinctive_cards": _distinctive_coverage(
             _distinctive_targets(package, prepared, metadata), {}, metadata, unavailable=True)}
+    if "known_score_restrictions" not in prepared:
+        prepared["known_score_restrictions"] = _package_observed_restrictions(package, metadata)
     commander_keys, package_id, weights = prepared["commander_keys"], prepared["package_id"], prepared["weights"]
     pool, support = prepared["pool"], prepared["support"]
     target, bracket_source = prepared["target"], prepared["bracket_source"]
@@ -1111,7 +1113,8 @@ def _assemble_generated_deck(package, counts, prepared, metadata, *, anchor, cor
     statistics["highest_average_lift"] = {"name": highest_lift["name"], "lift": highest_lift["average_lift"]} if highest_lift else None
     export = "\n".join(f"{row['quantity']} {row['name']}" +
                        (" *CMDR*" if row["primary_role"] == "Commander" else "") for row in rows) + "\n"
-    plain = "~".join(f"{row['quantity']} {row['name']}" for row in rows) + "~Z~"
+    plain = ("~".join(f"{row['quantity']} {row['name']}" for row in rows if row["primary_role"] != "Commander")
+             + "~~" + "~".join(f"1 {row['name']}" for row in commander_rows) + "~Z~")
     validation.update({"bracket": bracket, "external_url": "https://edhpowerlevel.com?d=" + quote_plus(plain),
                        "scope": "Construction rules checked with supplied card metadata; not playtested or certified for a bracket."})
     if color_choices:
@@ -1134,7 +1137,31 @@ def _attach_calculated_power(deck, metadata, commander_keys):
     rating = calculate_power_rating(deck["cards"], metadata,
         commanders=[metadata[key]["name"] for key in commander_keys])
     deck["validation"]["calculated_power"] = rating
+    _mark_restriction_validation(deck)
     return rating
+
+
+def _mark_restriction_validation(deck):
+    """Only a complete current site observation verifies the final card list."""
+    from .external_validation import cardlist_hash, external_restriction_evidence
+
+    validation = deck.setdefault("validation", {})
+    digest = cardlist_hash(deck["cards"])
+    rating = validation.get("external_rating", {})
+    evidence = external_restriction_evidence(rating, expected_hash=digest,
+        expected_commanders=[row["name"] for row in deck.get("commanders", [])])
+    result = {"status": "verified" if evidence is not None else "pending",
+              "source": "edhpowerlevel.com", "deck_sha256": digest,
+              "categories": list(_SCORE_RESTRICTION_NAMES)}
+    if evidence is not None:
+        result.update(checked_at=rating["checked_at"],
+                      source_script_sha256=rating["restriction_check"]["source_script_sha256"],
+                      method="edhpowerlevel_page")
+    else:
+        result.update(method="local_fallback",
+            note="Local restriction checks are provisional. This exact final card list still requires a complete EDHPowerLevel restriction check, including land denial, chaining extra turns and qualifying combos.")
+    validation["restriction_validation"] = result
+    return result
 
 
 def _construction_power_rating(deck, metadata, commander_keys):
@@ -1142,8 +1169,10 @@ def _construction_power_rating(deck, metadata, commander_keys):
     from .external_validation import attach_external_validation
     from .power_brackets import verified_score_bracket
 
+    deck.setdefault("commanders", [{"name": metadata[key]["name"], "quantity": 1} for key in commander_keys])
     calculated = _attach_calculated_power(deck, metadata, commander_keys)
     external = attach_external_validation(deck)
+    _mark_restriction_validation(deck)
     target = verified_score_bracket(external)
     if target is not None:
         return external, target, "verified"
@@ -1164,21 +1193,93 @@ def _bracket_excess(counts, target):
 _SCORE_RESTRICTION_NAMES = ("game_changers", "extra_turns", "mass_land_denial", "early_combos", "late_combos", "chaining_extra_turns")
 
 
-def _observed_bracket_restrictions(rating, metadata):
+def _observed_bracket_restrictions(rating, metadata, *, audited_keys=()):
     """Use only named restrictions observed for this exact external card list."""
+    from .external_validation import external_restriction_evidence
+
     observed = rating.get("bracket_restrictions", {})
     canonical = lambda name: card_key(metadata.get(card_key(name), {}).get("name", name))
-    return {name: ({canonical(card) for card in observed.get(name, [])} if index < 3 else
-                   [frozenset(canonical(card) for card in group) for group in observed.get(name, [])])
-            for index, name in enumerate(_SCORE_RESTRICTION_NAMES[:5])}
+    result = {name: ([frozenset(canonical(card) for card in group) for group in observed.get(name, [])]
+                     if name in {"early_combos", "late_combos"} else
+                     {canonical(card) for card in observed.get(name, [])})
+              for name in _SCORE_RESTRICTION_NAMES}
+    complete = external_restriction_evidence(rating) is not None
+    if not complete:
+        # Historical records used extra_turns for the site's restricted chaining
+        # list. Keep their positive evidence without certifying missing groups.
+        result["chaining_extra_turns"].update(result["extra_turns"])
+    result["_audited_cards"] = set(audited_keys) if complete else set()
+    result["_observation_sources"] = ([{key: deepcopy(rating[key]) for key in
+        ("deck_sha256", "checked_at", "source", "restriction_check") if key in rating}]
+        if rating.get("status") == "verified" and observed else [])
+    return result
+
+
+def _merge_observed_restrictions(first, second):
+    """Carry observed exclusions, never a different list's verified status."""
+    result = deepcopy(first)
+    for name in (*_SCORE_RESTRICTION_NAMES, "_audited_cards", "_observation_sources"):
+        values = second.get(name, [] if name in {"early_combos", "late_combos", "_observation_sources"} else set())
+        if isinstance(values, set):
+            result.setdefault(name, set()).update(values)
+        else:
+            result.setdefault(name, []).extend(group for group in values if group not in result[name])
+    return result
+
+
+def _package_observed_restrictions(package, metadata):
+    from .external_validation import attach_external_validation
+
+    existing = package.get("generated_deck", {})
+    checked = {"cards": existing.get("cards", []), "card_count": existing.get("card_count", 100),
+               "commanders": existing.get("commanders", [])}
+    rating = attach_external_validation(checked)
+    if rating.get("status") != "verified":
+        rating = {}
+    keys = {card_key(metadata.get(card_key(row["name"]), {}).get("name", row["name"]))
+            for row in existing.get("cards", [])}
+    return _observed_bracket_restrictions(rating, metadata, audited_keys=keys)
+
+
+def _restriction_card_flags(key, metadata, restrictions):
+    local = (*_bracket_flags(metadata[key]), _chainable_extra_turn(metadata[key]))
+    names = ("game_changers", "extra_turns", "mass_land_denial", "chaining_extra_turns")
+    # Complete site observations can clear a local false positive (including
+    # the site's MLD whitelist) for audited cards. New cards use local fallback.
+    audited = key in restrictions.get("_audited_cards", ())
+    return tuple(key in restrictions[name] or (not audited and flag)
+                 for name, flag in zip(names, local))
+
+
+def _preserves_observed_candidate_restrictions(deck, restrictions):
+    """Never offer an alternate that restores an observed disallowed group."""
+    if not restrictions:
+        return True
+    from .power_brackets import verified_score_bracket
+
+    validation = deck.get("validation", {})
+    target = verified_score_bracket(validation.get("external_rating"))
+    calculated = validation.get("calculated_power", {})
+    if target is None and calculated.get("status") == "calculated":
+        target = calculated["score_bracket"]
+    if target is None:
+        target = validation["bracket"]["target"]
+    counts = Counter()
+    for row in deck["cards"]:
+        counts[card_key(row["name"])] += row.get("quantity", 1)
+    single = ("game_changers", "extra_turns", "mass_land_denial")
+    flags = (*[sum(quantity for key, quantity in counts.items() if key in restrictions[name]) for name in single],
+             *[sum(group <= counts.keys() for group in restrictions[name]) for name in ("early_combos", "late_combos")],
+             sum(quantity for key, quantity in counts.items() if key in restrictions["chaining_extra_turns"]))
+    return all(_score_restriction_checks(flags, target).values())
 
 
 def _score_restriction_counts(counts, metadata, restrictions):
     values = [0, 0, 0]
     for key, quantity in counts.items():
-        for index, flag in enumerate(_bracket_flags(metadata[key])):
-            values[index] += quantity * (flag or key in restrictions[_SCORE_RESTRICTION_NAMES[index]])
-    chainable = sum(quantity * (_chainable_extra_turn(metadata[key]) or key in restrictions["extra_turns"])
+        for index, flag in enumerate(_restriction_card_flags(key, metadata, restrictions)[:3]):
+            values[index] += quantity * flag
+    chainable = sum(quantity * _restriction_card_flags(key, metadata, restrictions)[3]
                     for key, quantity in counts.items())
     return (*values, *[sum(group <= counts.keys() for group in restrictions[name])
                        for name in _SCORE_RESTRICTION_NAMES[3:5]], chainable)
@@ -1216,9 +1317,7 @@ def _strict_bracket_replacements(counts, prepared, metadata, target, restriction
     core_weights = Counter()
     for row in targets:
         core_weights[row.get("identity")] += row["weight"]
-    card_flags = {key: (*[flag or key in restrictions[name] for flag, name in
-                            zip(_bracket_flags(metadata[key]), _SCORE_RESTRICTION_NAMES)],
-                       _chainable_extra_turn(metadata[key]) or key in restrictions["extra_turns"])
+    card_flags = {key: _restriction_card_flags(key, metadata, restrictions)
                   for key in set(incoming_pool) | counts.keys()}
     beam = [(counts.copy(), [], 0.0)]
     seen = {tuple(sorted(counts.items()))}
@@ -1338,7 +1437,10 @@ def _repair_score_bracket(option, package, counts, prepared, profiles, metadata,
               "checked_at": rating["checked_at"], "rating_kind": rating_kind,
               "source": rating["source"], "source_url": rating["source_url"], "swap_details": [],
               "from_cards": [{"name": row["name"], "quantity": row["quantity"]} for row in option["cards"]]}
-    restrictions = _observed_bracket_restrictions(rating, metadata)
+    restrictions = _merge_observed_restrictions(
+        prepared.get("known_score_restrictions", _observed_bracket_restrictions({}, metadata)),
+        _observed_bracket_restrictions(rating, metadata, audited_keys=counts.keys()))
+    repair["restriction_observation_sources"] = deepcopy(restrictions["_observation_sources"])
     repair["observed_restrictions"] = deepcopy(rating.get("bracket_restrictions", {}))
     repair["original_rule_checks"] = _score_restriction_checks(
         _score_restriction_counts(counts, metadata, restrictions), score_target)
@@ -1367,6 +1469,7 @@ def _repair_score_bracket(option, package, counts, prepared, profiles, metadata,
                 land_changes=land_changes, land_swaps=land_swaps)
             _apply_score_bracket_checks(result, flags, checks, score_target)
             attach_external_validation(result)
+            _mark_restriction_validation(result)
             if all_swaps:
                 note = ("The original exact-list power score selected the initial construction target. "
                         "Every replacement list was recalculated when complete fresh inputs were available; "
@@ -1394,12 +1497,8 @@ def _repair_score_bracket(option, package, counts, prepared, profiles, metadata,
         next_rating, next_target, next_kind = _construction_power_rating(option, metadata, prepared["commander_keys"])
         if next_target is not None:
             rating, score_target, rating_kind = next_rating, next_target, next_kind
-            following = _observed_bracket_restrictions(rating, metadata)
-            for name, values in following.items():
-                if isinstance(values, set):
-                    restrictions[name].update(values)
-                else:
-                    restrictions[name].extend(group for group in values if group not in restrictions[name])
+            following = _observed_bracket_restrictions(rating, metadata, audited_keys=counts.keys())
+            restrictions = _merge_observed_restrictions(restrictions, following)
     else:
         repair["reason"] = "The score/bracket adjustment reached its bounded iteration limit without a consistent final target."
     # A later failed step never publishes a partially repaired card list.
@@ -1479,6 +1578,7 @@ def _repair_existing_package_deck(existing, package, memberships, decks, base, p
     if prepared.get("status") == "unavailable":
         return None
     prepared.setdefault("distinctive_targets", _distinctive_targets(package, prepared, metadata))
+    prepared.setdefault("known_score_restrictions", _package_observed_restrictions(package, metadata))
 
     def counts_for(value):
         result = Counter()
@@ -1529,7 +1629,8 @@ def _repair_existing_package_deck(existing, package, memberships, decks, base, p
     observations = deepcopy(current_rating if current_target is not None else history)
     observations["bracket_restrictions"] = (current_rating.get("bracket_restrictions", {})
         if current_target is not None else history.get("observed_restrictions", {}))
-    restrictions = _observed_bracket_restrictions(observations, metadata)
+    restrictions = _merge_observed_restrictions(prepared["known_score_restrictions"],
+        _observed_bracket_restrictions(observations, metadata, audited_keys=counts.keys()))
     flags = _score_restriction_counts(counts, metadata, restrictions)
     checks = _score_restriction_checks(flags, target)
     if not all(checks.values()):
@@ -1557,6 +1658,7 @@ def _repair_existing_package_deck(existing, package, memberships, decks, base, p
     for swap in history.get("swap_details", []):
         retained["primer"] += f"\nPreviously replaced [[{swap['out']}]] with [[{swap['in']}]]."
     attach_external_validation(retained)
+    _mark_restriction_validation(retained)
     return retained
 
 
@@ -1568,6 +1670,8 @@ def _generate_package_decks(analysis, decks, base, profiles, card_metadata=None,
     records. Missing metadata returns an unavailable result rather than an
     unverifiable generated list. The supplied analysis is updated and returned.
     """
+    from .external_validation import cardlist_hash
+
     metadata = _indexed_metadata if _indexed_metadata is not None else _metadata_index(card_metadata,
         commander_alias_groups=commander_card_alias_groups(base.get("commander_name_groups", [])))
     models = [(analysis.get("packages", []),
@@ -1577,10 +1681,12 @@ def _generate_package_decks(analysis, decks, base, profiles, card_metadata=None,
     cache, source_context = {}, {}
     for packages, memberships, components in models:
         for package in packages:
+            existing = package.get("generated_deck", {})
+            existing_identity = cardlist_hash(existing["cards"]) if existing.get("status") == "generated" else None
             identity = (package.get("id", 0), package.get("name"),
                         tuple((row.get("name"), repr(row.get("relative_weight"))) for row in package.get("top_cards", []) if isinstance(row, dict)),
                         tuple(tag.get("tag_slug") for tag in package.get("tag_suggestions", [])),
-                        tuple((row.get("id"), tuple(row.get("weights", []))) for row in memberships))
+                        tuple((row.get("id"), tuple(row.get("weights", []))) for row in memberships), existing_identity)
             if identity not in cache:
                 context = {"source_context": source_context}
                 seed = _repair_existing_package_deck(package.get("generated_deck"), package, memberships,
@@ -1796,11 +1902,14 @@ def _generate_package_deck_candidates(analysis, decks, base, profiles, card_meta
             if option["status"] == "generated" and identity not in seen:
                 candidates.append(option)
                 seen.add(identity)
+    known = context.get("prepared", {}).get("known_score_restrictions")
+    candidates = [option for option in candidates if _preserves_observed_candidate_restrictions(option, known)]
     candidates.sort(key=lambda option: (_score_repair_priority(option), *(-value for value in _core_preference(option)),
                                        option["statistics"]["mana_quality"]["structural_risk_score"],
                                        -option["statistics"]["anchor_membership"],
                                        -option["statistics"]["weighted_consensus_score"], option["statistics"]["anchor_deck_id"]))
     repairs = _feedback_repairs(candidates, package, memberships, decks, base, profiles, metadata, context)
+    repairs = [option for option in repairs if _preserves_observed_candidate_restrictions(option, known)]
     # Preserve explicit repair experiments even if their extra lands score worse
     # under the native heuristic. Their success requires an independent rating.
     repair_slots = min(len(repairs), max(0, max_candidates - 1))

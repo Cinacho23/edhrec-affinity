@@ -229,6 +229,72 @@ export function getGeneratedDeckPowerRating(deck, now = Date.now()) {
   return { ...calculated, scoreBracket, kind: "local", label: "local power estimate" };
 }
 
+const OFFICIAL_RESTRICTION_CATEGORIES = [
+  "game_changers", "extra_turns", "chaining_extra_turns", "mass_land_denial", "early_combos", "late_combos",
+];
+
+function restrictionCardKey(value) {
+  return typeof value === "string" ? value.normalize("NFKC").replaceAll("’", "'").trim().toLowerCase() : "";
+}
+
+export function getExternalDeckRestrictionCheck(deck, now = Date.now()) {
+  if (deck?.status !== "generated") return null;
+  const validation = deck.validation || {};
+  const expectedHash = validation.deck_sha256;
+  const rating = getExternalDeckRating(validation.external_rating, now, expectedHash);
+  const proof = rating?.restriction_check;
+  const restrictions = rating?.bracket_restrictions;
+  const commanders = Array.isArray(deck.commanders) ? deck.commanders.map((card) => restrictionCardKey(card?.name)).sort() : [];
+  const observedCommanders = Array.isArray(proof?.commander_names) ? proof.commander_names.map(restrictionCardKey).sort() : [];
+  const sameCommanders = commanders.length > 0 && commanders.every(Boolean)
+    && commanders.length === new Set(commanders).size && commanders.length === observedCommanders.length
+    && commanders.every((name, index) => name === observedCommanders[index]);
+  const deckCards = Array.isArray(deck.cards) ? deck.cards : [];
+  const deckNames = new Set(deckCards.map((card) => restrictionCardKey(card?.name)));
+  const completeList = deckCards.length > 0 && deckCards.every((card) => restrictionCardKey(card?.name)
+    && Number.isSafeInteger(card.quantity ?? 1) && (card.quantity ?? 1) >= 1)
+    && deckCards.reduce((count, card) => count + (card.quantity ?? 1), 0) === 100
+    && commanders.every((name) => deckCards.filter((card) => restrictionCardKey(card.name) === name)
+      .reduce((count, card) => count + (card.quantity ?? 1), 0) === 1);
+  const validNames = (names, combo = false) => Array.isArray(names) && (!combo || names.length >= 2)
+    && names.every((name) => typeof name === "string" && name.trim() && deckNames.has(restrictionCardKey(name)))
+    && new Set(names.map(restrictionCardKey)).size === names.length;
+  const categoriesComplete = restrictions && typeof restrictions === "object" && !Array.isArray(restrictions)
+    && Object.keys(restrictions).length === OFFICIAL_RESTRICTION_CATEGORIES.length
+    && OFFICIAL_RESTRICTION_CATEGORIES.every((key) => Object.hasOwn(restrictions, key)
+      && (key.endsWith("_combos")
+        ? Array.isArray(restrictions[key]) && restrictions[key].every((names) => validNames(names, true))
+        : validNames(restrictions[key])));
+  let officialUrl = false;
+  try {
+    const url = new URL(rating?.source_url);
+    officialUrl = url.protocol === "https:" && url.hostname === "edhpowerlevel.com" && !url.username && !url.password
+      && (!url.port || url.port === "443") && ["", "/"].includes(url.pathname) && Boolean(url.searchParams.get("d"));
+  } catch { /* An invalid link cannot establish provenance. */ }
+  const complete = /^[a-f0-9]{64}$/.test(expectedHash || "") && rating?.deck_sha256 === expectedHash
+    && rating?.source === "edhpowerlevel.com" && rating.card_count === 100 && officialUrl
+    && proof?.status === "complete" && proof.method === "edhpowerlevel_page"
+    && /^[a-f0-9]{64}$/.test(proof.source_script_sha256 || "") && completeList && sameCommanders && categoriesComplete;
+  if (complete) {
+    const status = rating.status === "stale" ? "stale"
+      : rating.scoreBracket !== null && rating.reportedBracket !== null && rating.reportedBracket > rating.scoreBracket
+        ? "conflict" : "verified";
+    return { status, label: status === "verified" ? "EDHPowerLevel restrictions checked"
+      : status === "conflict" ? "EDHPowerLevel restriction conflict" : "EDHPowerLevel restriction check expired",
+    checkedAt: rating.checked_at, restrictions, scoreBracket: rating.scoreBracket,
+    requiredBracket: rating.reportedBracket, sourceUrl: rating.source_url };
+  }
+  const attempt = validation.external_validation_attempt;
+  const attemptedAt = observedTimestamp(attempt?.checked_at, now);
+  if (/^[a-f0-9]{64}$/.test(expectedHash || "") && attempt?.deck_sha256 === expectedHash
+      && ["failed", "blocked"].includes(attempt.status) && Number.isFinite(attemptedAt)
+      && Number.isFinite(now) && now - attemptedAt < BUILD_EVIDENCE_MAX_AGE_MS) {
+    return { status: attempt.status, label: "EDHPowerLevel restriction check incomplete", checkedAt: attempt.checked_at,
+      reason: typeof attempt.reason === "string" && attempt.reason.trim() ? attempt.reason : null };
+  }
+  return { status: "pending", label: "EDHPowerLevel restrictions pending" };
+}
+
 export function getPackageBracketLabel(deck, now = Date.now()) {
   if (deck?.status !== "generated") return null;
   const rating = getGeneratedDeckPowerRating(deck, now);

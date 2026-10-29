@@ -50,6 +50,9 @@ dev = [
 prototype = [
     "scikit-learn>=1.4",
 ]
+validation = [
+    "playwright>=1.55,<2",
+]
 
 # Tell setuptools to look for packages inside the src/ folder.
 #

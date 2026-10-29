@@ -3,7 +3,7 @@ import test from "node:test";
 
 import {
   bracketForBuildPowerScore, formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildCollectionProgress, getBuildModel, getBuildModelOptions, getBuildSourceFreshness, getBuildThemeEvidence, getComparableProfilePairs,
-  getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getGeneratedDeckBracketRepair, getGeneratedDeckColorChoices, getGeneratedDeckDistinctiveCards, getGeneratedDeckExport, getGeneratedDeckGroups, getGeneratedDeckPowerAlignment, getGeneratedDeckPowerRating, getPackageBracketLabel, getSupportedThemes, hasBuildStylePopulation, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
+  getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getExternalDeckRestrictionCheck, getGeneratedDeckBracketRepair, getGeneratedDeckColorChoices, getGeneratedDeckDistinctiveCards, getGeneratedDeckExport, getGeneratedDeckGroups, getGeneratedDeckPowerAlignment, getGeneratedDeckPowerRating, getPackageBracketLabel, getSupportedThemes, hasBuildStylePopulation, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
 } from "./buildStyleUtils.js";
 
 test("bracket repair displays the prior score separately from the changed list's rating", () => {
@@ -548,4 +548,91 @@ test("stale, foreign-list or unsupported local calculations never acquire a curr
   }
   assert.equal(getPackageBracketLabel({ ...deck, validation: { calculated_power } }, now), "Power bracket unverified");
   assert.equal(getGeneratedDeckPowerRating({ ...deck, status: "unavailable" }, now), null);
+});
+
+function officiallyCheckedDeck() {
+  const deck_sha256 = "a".repeat(64);
+  const cards = [{ name: "Ghave, Guru of Spores", quantity: 1 }, { name: "Forest", quantity: 98 }, { name: "Sol Ring", quantity: 1 }];
+  return { status: "generated", cards, commanders: [cards[0]], validation: { deck_sha256,
+    external_rating: { status: "verified", source: "edhpowerlevel.com", checked_at: "2026-10-29T12:00:00Z", card_count: 100,
+      power_level: 6.5, playability_pct: 74.5, bracket: 2, deck_sha256,
+      source_url: "https://edhpowerlevel.com/?d=98+Forest~1+Sol+Ring~~1+Ghave%2C+Guru+of+Spores~Z~",
+      restriction_check: { status: "complete", method: "edhpowerlevel_page", source_script_sha256: "b".repeat(64), commander_names: ["Ghave, Guru of Spores"] },
+      bracket_restrictions: { game_changers: [], extra_turns: [], chaining_extra_turns: [], mass_land_denial: [], early_combos: [], late_combos: [] } } } };
+}
+
+test("only a complete current official page observation certifies restriction coverage", () => {
+  const now = Date.parse("2026-10-29T13:00:00Z");
+  const deck = officiallyCheckedDeck();
+  const check = getExternalDeckRestrictionCheck(deck, now);
+  assert.equal(check.status, "verified");
+  assert.equal(check.label, "EDHPowerLevel restrictions checked");
+  assert.equal(check.requiredBracket, 2);
+  assert.deepEqual(check.restrictions, deck.validation.external_rating.bracket_restrictions);
+  const scoreOnly = structuredClone(deck);
+  delete scoreOnly.validation.external_rating.restriction_check;
+  assert.equal(getExternalDeckRestrictionCheck(scoreOnly, now).status, "pending");
+  assert.equal(getGeneratedDeckPowerRating(scoreOnly, now).kind, "external");
+  for (const change of [
+    { method: "local" }, { source_script_sha256: undefined }, { status: "partial" },
+    { commander_names: ["Sol Ring"] }, { commander_names: [] },
+  ]) {
+    const invalid = structuredClone(deck);
+    Object.assign(invalid.validation.external_rating.restriction_check, change);
+    assert.equal(getExternalDeckRestrictionCheck(invalid, now).status, "pending");
+  }
+});
+
+test("official restrictions keep chaining turns distinct and expose score conflicts", () => {
+  const now = Date.parse("2026-10-29T13:00:00Z");
+  const deck = officiallyCheckedDeck();
+  deck.validation.external_rating.bracket = 4;
+  deck.validation.external_rating.bracket_restrictions.chaining_extra_turns = ["Sol Ring"];
+  deck.validation.external_rating.bracket_restrictions.early_combos = [["Sol Ring", "Ghave, Guru of Spores"]];
+  const check = getExternalDeckRestrictionCheck(deck, now);
+  assert.equal(check.status, "conflict");
+  assert.equal(check.requiredBracket, 4);
+  assert.equal(check.scoreBracket, 2);
+  assert.deepEqual(check.restrictions.extra_turns, []);
+  assert.deepEqual(check.restrictions.chaining_extra_turns, ["Sol Ring"]);
+  assert.equal(getPackageBracketLabel(deck, now), "Power 6.50 · Bracket 2 · EDHPowerLevel");
+});
+
+test("incomplete category sets or foreign cards never become official restriction verification", () => {
+  const now = Date.parse("2026-10-29T13:00:00Z");
+  for (const edit of [
+    (deck) => { delete deck.validation.external_rating.bracket_restrictions.chaining_extra_turns; },
+    (deck) => { deck.validation.external_rating.bracket_restrictions.extra_turns = ["Missing card"]; },
+    (deck) => { deck.validation.external_rating.bracket_restrictions.early_combos = [["Sol Ring"]]; },
+    (deck) => { deck.validation.external_rating.bracket_restrictions.mass_land_denial = ["Sol Ring", " SOL RING "]; },
+    (deck) => { deck.validation.external_rating.bracket_restrictions.extra_unknown_category = []; },
+    (deck) => { deck.validation.external_rating.deck_sha256 = "c".repeat(64); },
+    (deck) => { deck.validation.external_rating.source = "local"; },
+    (deck) => { deck.validation.external_rating.source_url = "https://edhpowerlevel.com.evil.example/?d=deck"; },
+    (deck) => { deck.commanders = [{ name: "Sol Ring" }]; },
+    (deck) => { deck.cards = []; },
+    (deck) => { delete deck.validation.deck_sha256; },
+  ]) {
+    const deck = officiallyCheckedDeck();
+    edit(deck);
+    assert.equal(getExternalDeckRestrictionCheck(deck, now).status, "pending");
+  }
+});
+
+test("official check dates expire and failed attempts remain bound to the current list", () => {
+  const now = Date.parse("2026-10-29T13:00:00Z");
+  const deck = officiallyCheckedDeck();
+  assert.equal(getExternalDeckRestrictionCheck(deck, now + 7 * 24 * 3600 * 1000).status, "stale");
+  delete deck.validation.external_rating.restriction_check;
+  deck.validation.external_validation_attempt = { status: "failed", checked_at: "2026-10-29T12:30:00Z",
+    deck_sha256: deck.validation.deck_sha256, reason: "Combo analysis did not finish." };
+  assert.equal(getExternalDeckRestrictionCheck(deck, now).status, "failed");
+  assert.equal(getExternalDeckRestrictionCheck(deck, now).reason, "Combo analysis did not finish.");
+  deck.validation.external_validation_attempt.status = "blocked";
+  assert.equal(getExternalDeckRestrictionCheck(deck, now).status, "blocked");
+  deck.validation.external_validation_attempt.deck_sha256 = "c".repeat(64);
+  assert.equal(getExternalDeckRestrictionCheck(deck, now).status, "pending");
+  deck.validation.external_validation_attempt.deck_sha256 = deck.validation.deck_sha256;
+  assert.equal(getExternalDeckRestrictionCheck(deck, now + 7 * 24 * 3600 * 1000).status, "pending");
+  assert.equal(getExternalDeckRestrictionCheck({ status: "unavailable" }, now), null);
 });

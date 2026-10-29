@@ -1224,6 +1224,153 @@ def attach_score_record(data, monkeypatch, directory, *, power=6.09, bracket=4, 
     return original
 
 
+def attach_complete_restriction_record(data, monkeypatch, directory, *, restrictions=None,
+                                       power=6.71, bracket=4, days=0):
+    from edhrec_affinity.build_styles import external_validation
+
+    original = generate(deepcopy(data))
+    evidence = {category: [] for category in external_validation.RESTRICTION_CATEGORIES}
+    evidence.update(restrictions or {})
+    external_validation.record_external_validation(original, {
+        "source": "edhpowerlevel.com", "source_url": original["validation"]["external_url"],
+        "card_count": 100, "checked_at": (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
+        "playability_pct": 75, "bracket": bracket, "power_level": power,
+        "bracket_restrictions": evidence,
+        "restriction_check": {"status": "complete", "method": "edhpowerlevel_page",
+                              "source_script_sha256": "a" * 64, "commander_names": ["Commander"]},
+    }, directory)
+    real_attach = external_validation.attach_external_validation
+    monkeypatch.setattr(external_validation, "attach_external_validation", lambda deck: real_attach(deck, directory))
+    return original
+
+
+def test_generated_site_link_preserves_commander_roles_separately_from_main_deck():
+    from edhrec_affinity.build_styles.external_validation import _preload_cards, cardlist_hash
+
+    result = generate(fixture())
+    rows, commanders = _preload_cards(result["validation"]["external_url"])
+    assert commanders == ["Commander"]
+    assert cardlist_hash(rows) == cardlist_hash(result["cards"])
+
+
+def test_complete_site_named_land_denial_repairs_a_card_missed_by_local_text_in_all_models(monkeypatch, tmp_path):
+    data = fixture()
+    rename_fixture_card(data, "Core 0", "Vorinclex, Voice of Hunger")
+    # This actual class of untapping restriction is absent from the local MLD
+    # regex; only the exact official observation establishes it here.
+    data[4]["vorinclex, voice of hunger"]["oracle_text"] = (
+        "Whenever an opponent taps a land for mana, that land doesn't untap during its controller's next untap step.")
+    original = attach_complete_restriction_record(data, monkeypatch, tmp_path,
+        restrictions={"mass_land_denial": ["Vorinclex, Voice of Hunger"]})
+    generate_package_decks(*data, prefer_playability=True)
+    for package in [*data[0]["packages"], *data[0]["alternative_models"][0]["packages"]]:
+        result = package["generated_deck"]
+        assert "Vorinclex, Voice of Hunger" not in {row["name"] for row in result["cards"]}
+        assert result["statistics"]["score_bracket_repair"]["swap_details"][0]["restrictions"] == ["mass_land_denial"]
+        assert result["validation"]["bracket"]["recommended"] == 3
+        assert result["validation"]["restriction_validation"]["status"] == "pending"
+        assert result["validation"]["external_rating"]["status"] == "unverified"
+        assert result["card_count"] == original["card_count"] == 100 and result["validation"]["valid"]
+
+
+def test_complete_site_absence_clears_a_local_land_denial_false_positive(monkeypatch, tmp_path):
+    data = fixture()
+    rename_fixture_card(data, "Core 0", "Charitable Levy")
+    data[4]["charitable levy"]["oracle_text"] = "Each player sacrifices half the lands they control."
+    original = attach_complete_restriction_record(data, monkeypatch, tmp_path, bracket=3)
+    assert original["validation"]["bracket"]["recommended"] == 4
+    result = generate(data)
+    assert result["cards"] == original["cards"]
+    assert result["validation"]["bracket"]["recommended"] == 3
+    assert result["validation"]["bracket"]["mass_land_denial_count"] == 0
+    assert result["validation"]["restriction_validation"]["status"] == "verified"
+    assert result["validation"]["restriction_validation"]["source_script_sha256"] == "a" * 64
+
+
+def test_complete_site_ordinary_turn_is_not_treated_as_chaining(monkeypatch, tmp_path):
+    data = fixture()
+    rename_fixture_card(data, "Core 0", "Part the Waterveil")
+    data[4]["part the waterveil"]["oracle_text"] = "Take an extra turn after this one. Exile Part the Waterveil."
+    original = attach_complete_restriction_record(data, monkeypatch, tmp_path, bracket=3,
+        restrictions={"extra_turns": ["Part the Waterveil"]})
+    result = generate(data)
+    assert result["cards"] == original["cards"]
+    assert result["validation"]["bracket"]["extra_turn_count"] == 1
+    assert result["validation"]["bracket"]["chainable_extra_turn_count"] == 0
+    assert result["validation"]["restriction_validation"]["status"] == "verified"
+
+
+def test_complete_site_chaining_and_qualified_combos_require_a_new_final_list_check(monkeypatch, tmp_path):
+    data = fixture()
+    # Synthetic metadata intentionally offers no heuristic evidence for these.
+    original = attach_complete_restriction_record(data, monkeypatch, tmp_path,
+        restrictions={"chaining_extra_turns": ["Core 0"],
+                      "early_combos": [["Core 1", "Core 2"]], "late_combos": [["Core 3", "Core 4"]]})
+    result = generate(data)
+    names = {row["name"] for row in result["cards"]}
+    assert "Core 0" not in names and not {"Core 1", "Core 2"} <= names
+    assert {"Core 3", "Core 4"} <= names
+    assert result["validation"]["bracket"]["observed_early_combo_count"] == 0
+    assert result["validation"]["bracket"]["observed_late_combo_count"] == 1
+    assert result["validation"]["restriction_validation"]["status"] == "pending"
+    assert result["validation"]["restriction_validation"]["deck_sha256"] != original["validation"]["deck_sha256"]
+    assert "restriction_check" not in result["validation"]["external_rating"]
+
+
+@pytest.mark.parametrize("days", [0, 8])
+def test_legacy_numeric_or_stale_complete_records_cannot_certify_final_restrictions(monkeypatch, tmp_path, days):
+    data = fixture()
+    if days:
+        attach_complete_restriction_record(data, monkeypatch, tmp_path, days=days,
+            restrictions={"mass_land_denial": ["Core 0"]})
+    else:
+        attach_score_record(data, monkeypatch, tmp_path, bracket=3, power=6.71)
+    result = generate(data)
+    assert result["validation"]["restriction_validation"]["status"] == "pending"
+    assert "Core 0" in {row["name"] for row in result["cards"]}
+
+
+def test_repaired_list_becomes_verified_only_after_its_own_complete_page_observation(monkeypatch, tmp_path):
+    from edhrec_affinity.build_styles import external_validation
+
+    data = fixture()
+    attach_complete_restriction_record(data, monkeypatch, tmp_path,
+        restrictions={"mass_land_denial": ["Core 0"]})
+    first = generate(data)
+    assert first["validation"]["restriction_validation"]["status"] == "pending"
+    external_validation.record_external_validation(first, {
+        "source": "edhpowerlevel.com", "source_url": first["validation"]["external_url"],
+        "card_count": 100, "checked_at": datetime.now(timezone.utc).isoformat(),
+        "playability_pct": 75, "bracket": 3, "power_level": 6.71,
+        "bracket_restrictions": {category: [] for category in external_validation.RESTRICTION_CATEGORIES},
+        "restriction_check": {"status": "complete", "method": "edhpowerlevel_page",
+                              "source_script_sha256": "a" * 64, "commander_names": ["Commander"]},
+    }, tmp_path)
+    second = generate(data)
+    assert second["cards"] == first["cards"]
+    assert second["validation"]["restriction_validation"]["status"] == "verified"
+    assert second["validation"]["external_rating"]["status"] == "verified"
+
+
+@pytest.mark.parametrize("fresh_local_inputs", [False, True])
+def test_alternate_candidates_never_restore_officially_observed_disallowed_cards_or_combos(
+        monkeypatch, tmp_path, fresh_local_inputs):
+    data = fixture()
+    if fresh_local_inputs:
+        fresh_power_inputs(data)
+    original = attach_complete_restriction_record(data, monkeypatch, tmp_path,
+        restrictions={"mass_land_denial": ["Core 0"], "early_combos": [["Core 1", "Core 2"]]})
+    data[0]["packages"][0]["generated_deck"] = deepcopy(original)
+    candidates = generate_package_deck_candidates(*data, max_candidates=8)
+    if fresh_local_inputs:
+        assert candidates
+    for candidate in candidates:
+        names = {row["name"] for row in candidate["cards"]}
+        assert "Core 0" not in names and not {"Core 1", "Core 2"} <= names
+        assert candidate["validation"]["restriction_validation"]["status"] == "pending"
+        assert candidate["statistics"]["score_bracket_repair"]["restriction_observation_sources"][0]["restriction_check"]["method"] == "edhpowerlevel_page"
+
+
 def test_restore_balance_land_sacrifice_text_is_mass_land_denial():
     from edhrec_affinity.build_styles.deckbuilding import _bracket_flags
 

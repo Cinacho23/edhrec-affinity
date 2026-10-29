@@ -41,7 +41,7 @@ from edhrec_affinity.build_styles.deckbuilding import (
 )
 from edhrec_affinity.build_styles.eligibility import commander_is_eligible
 from edhrec_affinity.build_styles.external_validation import (
-    attach_external_validation, cardlist_hash, external_validation_directory,
+    attach_external_validation, cardlist_hash, external_restriction_evidence, external_validation_directory,
 )
 from edhrec_affinity.build_styles.power_brackets import (
     POWER_SCORE_BRACKET_POLICY_VERSION, bracket_for_power_score, verified_score_bracket,
@@ -126,7 +126,7 @@ def score_repair_observations(report: dict, validation_directory: Path | None = 
         deck = package.get("generated_deck", {})
         if deck.get("status") != "generated":
             continue
-        checked_deck = {"cards": deck.get("cards")}
+        checked_deck = {"cards": deck.get("cards"), "commanders": deck.get("commanders", [])}
         if "card_count" in deck:
             checked_deck["card_count"] = deck["card_count"]
         rating = attach_external_validation(checked_deck, validation_directory) if validation_directory is not None else attach_external_validation(checked_deck)
@@ -139,6 +139,7 @@ def score_repair_observations(report: dict, validation_directory: Path | None = 
         evidence = {key: rating[key] for key in
                     ("deck_sha256", "checked_at", "power_level", "bracket", "score_bracket")}
         evidence.update(bracket_restrictions=rating.get("bracket_restrictions", {}),
+                        restriction_check=rating.get("restriction_check", {}),
                         native_bracket=native_bracket, policy_version=POWER_SCORE_BRACKET_POLICY_VERSION)
         fingerprint = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False,
                                                 allow_nan=False, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -723,6 +724,7 @@ def refresh_existing_report_power(job: dict) -> dict:
             calculated = deepcopy(seen[identity])
             validation.update(deck_sha256=digest, calculated_power=calculated)
             external = attach_external_validation(deck, directory)
+            official_evidence = external_restriction_evidence(external, expected_hash=digest)
             target = verified_score_bracket(external)
             kind = "verified" if target is not None else "local"
             if target is None and calculated.get("status") == "calculated":
@@ -736,19 +738,26 @@ def refresh_existing_report_power(job: dict) -> dict:
                 alignment = {"status": "pending", "score_bracket": target,
                     "deck_sha256": digest, "rating_kind": kind, "rule_checks": {},
                     "note": "The numeric power was refreshed for this unchanged card list. Full deck reconstruction and any required card replacements are still queued."}
-                counts = Counter()
-                for row in deck["cards"]:
-                    card = indexed.get(card_key(row["name"]))
-                    if card is None:
-                        break
-                    counts[card_key(card["name"])] += row.get("quantity", 1)
-                else:
-                    guidance = _bracket_validation(counts, indexed, target, "unchanged_list_power_review")
-                    alignment.update(minimum_checked_bracket=guidance["recommended"],
-                                     rule_checks=guidance["rule_checks"])
-                    if guidance["recommended"] > target:
+                if official_evidence is not None:
+                    alignment.update(minimum_checked_bracket=external["bracket"],
+                                     official_restrictions=official_evidence)
+                    if external["bracket"] > target:
                         alignment.update(status="known_mismatch",
-                            note="This unchanged list still contains checked card restrictions above its numeric power bracket. Card replacements are queued; this score refresh has not repaired the deck.")
+                            note="EDHPowerLevel found restrictions above this exact list's numeric power bracket. Card replacements and a new site check are pending.")
+                else:
+                    counts = Counter()
+                    for row in deck["cards"]:
+                        card = indexed.get(card_key(row["name"]))
+                        if card is None:
+                            break
+                        counts[card_key(card["name"])] += row.get("quantity", 1)
+                    else:
+                        guidance = _bracket_validation(counts, indexed, target, "unchanged_list_power_review")
+                        alignment.update(minimum_checked_bracket=guidance["recommended"],
+                                         rule_checks=guidance["rule_checks"])
+                        if guidance["recommended"] > target:
+                            alignment.update(status="known_mismatch",
+                                note="This unchanged list still contains checked card restrictions above its numeric power bracket. Card replacements are queued; this score refresh has not repaired the deck.")
                 validation["power_alignment"] = alignment
             elif not entry_pending:
                 validation.pop("power_alignment", None)

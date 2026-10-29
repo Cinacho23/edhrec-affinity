@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from urllib.parse import quote_plus
 
 import pytest
 import httpx
@@ -158,6 +159,7 @@ def test_scores_only_uses_cached_current_lists_without_reconstruction_or_network
     assert result["scored_decks"] == 2 and result["scoring_pending"] == 0
     assert result["regenerated"] == result["blocked"] == 0 and result["pending"] == 1
     assert result["network_enabled"] is False and result["metadata_prefetch"]["enabled"] is False
+
     assert result["score_refresh"]["cache_only"] and result["score_refresh"]["requests"] == 0
     assert updated["deck_generation"]["version"] == 1
     assert updated["deck_generation"]["full_rebuild_pending"] and rebuild.needs_rebuild(updated)
@@ -172,6 +174,32 @@ def test_scores_only_uses_cached_current_lists_without_reconstruction_or_network
         assert new["validation"]["power_alignment"]["status"] == "pending"
         assert new["validation"]["external_rating"]["status"] == "unverified"
     assert (Path(result["backup_dir"]) / "power-refresh/commander.json").read_bytes() == original
+
+
+def test_score_pass_retains_complete_official_restriction_conflict_when_local_rules_miss_it(tmp_path):
+    from edhrec_affinity.build_styles.external_validation import RESTRICTION_CATEGORIES
+    report, _, cache = fixture(tmp_path)
+    root, directory = tmp_path / "styles", tmp_path / "ratings"
+    for _, package in rebuild.packages(report):
+        package["generated_deck"]["commanders"] = [{"name": "Commander", "quantity": 1}]
+    deck = report["deck_analysis"]["packages"][0]["generated_deck"]
+    main = "~".join(f"{row['quantity']} {row['name']}" for row in deck["cards"] if row["name"] != "Commander")
+    restrictions = {key: [] for key in RESTRICTION_CATEGORIES}
+    restrictions["mass_land_denial"] = ["Weak Card"]
+    record_external_validation(deck, {"source": "edhpowerlevel.com", "checked_at": datetime.now(timezone.utc).isoformat(),
+        "card_count": 100, "playability_pct": 75, "power_level": 6.1, "bracket": 4,
+        "source_url": "https://edhpowerlevel.com/?d=" + quote_plus(main + "~~1 Commander~Z~"),
+        "bracket_restrictions": restrictions,
+        "restriction_check": {"status": "complete", "method": "edhpowerlevel_page",
+            "source_script_sha256": "a" * 64, "commander_names": ["Commander"]}}, directory)
+    write(root / "commander.json", report)
+    rebuild.rebuild_all(root, cache, scores_only=True, validation_directory=directory)
+    updated = rebuild.read_json(root / "commander.json")
+    for _, package in rebuild.packages(updated):
+        alignment = package["generated_deck"]["validation"]["power_alignment"]
+        assert alignment["status"] == "known_mismatch"
+        assert alignment["minimum_checked_bracket"] == 4 and alignment["score_bracket"] == 2
+        assert alignment["official_restrictions"]["mass_land_denial"] == ["Weak Card"]
 
 
 def test_unchanged_score_proofs_are_idempotent_and_do_not_report_false_progress(tmp_path):

@@ -128,3 +128,27 @@
   .build-package { padding: .8rem; }
   .build-package__header { flex-wrap: wrap; }
 }
+
+.build-package__restriction-status {
+  color: var(--muted);
+  font-size: 0.76rem;
+  margin: 0.25rem 0 0.75rem;
+}
+.build-package__restriction-status[data-status="conflict"],
+.build-package__restriction-status[data-status="failed"],
+.build-package__restriction-status[data-status="blocked"] {
+  color: var(--warning);
+}
+.build-official-restrictions {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-xs);
+  margin: 1rem 0;
+  padding: 0.75rem;
+  font-size: .78rem;
+}
+.build-official-restrictions[data-status="conflict"] {
+  border-color: var(--warning);
+}
+.build-official-restrictions > p:first-child {
+  margin-top: 0;
+}
