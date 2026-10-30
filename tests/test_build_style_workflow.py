@@ -66,7 +66,7 @@ def test_scheduled_collection_uses_source_freshness_without_a_completion_deadlin
     assert args[args.index("--freshness-target-hours") + 1] == "96"
     assert args[args.index("--max-runtime-seconds") + 1] == "1800"
     assert args[args.index("--worker-grace-seconds") + 1] == "120"
-    assert args[args.index("--workers") + 1] == "1"
+    assert args[args.index("--workers") + 1] == "2"
     assert args[args.index("--preview-workers") + 1] == "16"
     assert args[args.index("--min-total-decks") + 1] == "200"
     assert args[args.index("--max-components") + 1] == "all"
@@ -561,6 +561,7 @@ def test_official_validation_mode_is_paced_bounded_and_uses_saved_observations(t
     assert args[args.index("--max-runtime-seconds") + 1] == "1800"
     assert args[args.index("--max-decks") + 1] == "300"
     assert args[args.index("--check-interval-seconds") + 1] == "5"
+    assert args[args.index("--workers") + 1] == "2"
     assert args[-4:] == ["--commander", "nemata-grove-guardian", "--commander", "the-face-of-boe"]
     assert workflow.index("      - name: Retain checked repository examples") < workflow.index(
         "      - name: Check EDHPowerLevel restrictions") < workflow.index("      - name: Upload cumulative build-style samples")

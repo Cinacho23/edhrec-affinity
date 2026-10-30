@@ -68,8 +68,11 @@ export, discovery cards and individual commander package views. Older evidence
 remains stored. A visible browser tab refreshes published results and checks the
 collector’s GitHub execution status every two minutes.
 
-Downloads and model processes run independently, using compact public JSON or
-React preview data and one adaptive shared request ceiling. The collector learns
+Two collection workers claim commanders from opposite ends of the current
+priority queue. Each keeps its commander through partial collection and analysis;
+saved claims and parsed lists resume after a restart. Downloads and model
+processes run independently, using compact public JSON or React preview data and
+one adaptive shared request ceiling. The collector learns
 an operating rate below EDHREC's throttling threshold and remembers it across jobs.
 Build Discovery reports the fastest collection estimate at that rate and a
 projection from measured throughput, rather than imposing a fixed deadline. Daily
@@ -79,6 +82,14 @@ shows index verification, deck coverage, pending analysis, and unknown/stale dat
 Full automated collection relies on the repository owner's stated permission
 from EDHREC; access restrictions and server cooldowns stop all source workers.
 Rate learning preserves existing decks and their original source-check dates.
+
+EDHPowerLevel checks also use two opposite-end workers, keeping each commander's
+Auto and numbered package models together through repairs and final checks.
+All checks share one request gate and source cooldown. Collection and validation
+batches alternate under one workflow lock, with one coordinator publishing the
+cumulative checkpoint, so concurrent workers cannot overwrite another batch's
+reports. More workers overlap useful work without multiplying either service's
+request allowance.
 
 Every supported package can generate a native 100-card deck using learned card
 preferences and the sampled card pool, with untagged card lists,

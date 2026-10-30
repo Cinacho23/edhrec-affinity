@@ -278,8 +278,58 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     if args.max_commanders:
         queue = queue[:args.max_commanders]
     summary["selected"] = list(queue)
+    # A single coordinator owns this queue and its durable claims. Opposite
+    # ends apply within the current priority phase: refreshing a completed
+    # report must not jump ahead of unfinished collection or model upgrades.
+    two_ended = args.workers > 1
+    directions = {worker: "top" if worker % 2 == 0 else "bottom" for worker in range(args.workers)}
+    assignments = {}
+    saved_assignments = cycle.get("collection_workers", {})
+    saved_cooldown = source_time(state.get("blocked_until"))
+    if two_ended and isinstance(saved_assignments, dict):
+        for worker in directions:
+            slug = saved_assignments.get(str(worker))
+            if (isinstance(slug, str) and slug in rows_by_slug and slug not in assignments.values()
+                    and (slug in queue or saved_cooldown is not None and saved_cooldown > now())
+                    and state["commanders"].get(slug, {}).get("status")
+                    in {"collecting", "blocked", "analysis_pending"}):
+                assignments[worker] = slug
+    summary["worker_assignments"] = [{"worker": worker, "direction": directions[worker],
+        "commander_slug": slug, "resumed": True} for worker, slug in assignments.items()]
+    summary["collection_strategy"] = "opposite_ends" if two_ended else "priority_queue"
+
+    def release_assignment(slug):
+        for worker, assigned in list(assignments.items()):
+            if assigned == slug:
+                del assignments[worker]
+
+    def next_commander(worker):
+        if worker in assignments:
+            # A partial frame retains its worker, including while its durable
+            # evidence is being analyzed. It cannot be claimed from the other
+            # end, and its worker cannot skip to a different commander.
+            slug = assignments[worker]
+            if slug not in queue:
+                return None
+            queue.remove(slug)
+            return slug
+        available = [slug for slug in queue if slug not in assignments.values()]
+        if not available:
+            return None
+        phase = collection_priority(available[0])[0]
+        candidates = [slug for slug in available if collection_priority(slug)[0] == phase]
+        slug = candidates[-1] if two_ended and directions[worker] == "bottom" else candidates[0]
+        queue.remove(slug)
+        if two_ended:
+            assignments[worker] = slug
+        summary["worker_assignments"].append({"worker": worker, "direction": directions[worker],
+                                               "commander_slug": slug})
+        return slug
 
     def checkpoint():
+        cycle["collection_workers"] = {str(worker): slug for worker, slug in assignments.items()}
+        summary["collection_workers"] = [{"worker": worker, "direction": directions[worker],
+            "commander_slug": assignments.get(worker)} for worker in directions]
         elapsed = max(0.0, monotonic() - started)
         planning_rows = [row for row in rows if not (
             state["commanders"].get(row["commander_slug"], {}).get("status") == "ineligible"
@@ -414,6 +464,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         record.pop("retry_after", None)
         record["tag_label_policy"] = report.get("tag_label_policy")
         summary["completed"].append(slug)
+        release_assignment(slug)
         summary.update(publish_needed=True, no_progress=False)
         evidence_path.unlink(missing_ok=True)
         shutil.rmtree(root / "analyzed" / slug, ignore_errors=True)
@@ -424,21 +475,32 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
             while queue or network_jobs or analysis_queue or model_jobs:
                 elapsed = monotonic() - started
                 remaining_time = args.max_runtime_seconds - elapsed if args.max_runtime_seconds else float("inf")
-                accepting = remaining_time > 0 and not summary["blocked"]
+                accepting = remaining_time > 0 and not summary["blocked"] and not limiter.blocked
                 if accepting and shutil.disk_usage(root).free < args.min_free_disk_gb * 1024 ** 3:
                     summary["resource_limit"] = "Insufficient local disk for another durable collection checkpoint"
                     accepting = False
                 if remaining_time <= 0:
                     summary["time_budget_reached"] = True
-                while (accepting and queue and len(network_jobs) < args.workers
-                       and (deadline is None or monotonic() < deadline)):
-                    slug = queue.pop(0)
+                active_collection_workers = {getattr(context, "collection_worker", 0)
+                    for _, context in network_jobs.values()}
+                for worker in directions:
+                    if (not accepting or not queue or len(network_jobs) >= args.workers or limiter.blocked
+                            or (deadline is not None and monotonic() >= deadline)):
+                        break
+                    if worker in active_collection_workers:
+                        continue
+                    slug = next_commander(worker)
+                    if slug is None:
+                        continue
                     if args.max_commanders and visited_count >= args.max_commanders and slug not in visits:
+                        release_assignment(slug)
                         continue
                     if slug not in visits:
                         visited_count += 1
                     visits[slug] = visits.get(slug, 0) + 1
                     options = collection_options(args, slug, remaining_time)
+                    options.collection_worker = worker
+                    options.collection_direction = directions[worker]
                     previous = state["commanders"].get(slug, {})
                     options.cache_only_model_upgrade = bool(
                         not args.refresh and previous.get("coverage_complete")
@@ -454,6 +516,9 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                         options.source_max_age_hours = options.index_max_age_hours = None
                     state["commanders"].setdefault(slug, {}).update(
                         status="collecting", attempted_at=now().isoformat(), cache_snapshot="rolling")
+                    # Record a claim before launching work. An interrupted run
+                    # resumes the same commander from its parsed deck cache.
+                    checkpoint()
                     future = network_pool.submit(collector, options, limiter=limiter, preview_transport=transport,
                                                  metadata_lock=metadata_lock, metadata_provider=repository,
                                                  commander_alias_provider=commander_aliases)
@@ -524,6 +589,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                     record["status"] = report["deck_analysis"]["status"]
                                     record["model_policy"] = current_model_policy
                                     summary["completed"].append(slug)
+                                    release_assignment(slug)
                                     summary.update(publish_needed=True, no_progress=False)
                                 else:
                                     evidence_path = root / "evidence" / f"{slug}.json.gz"
@@ -549,6 +615,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                     record.pop("retry_after", None)
                                 else:
                                     record.update(status="failed", retry_after=(now() + timedelta(minutes=30)).isoformat())
+                                    release_assignment(slug)
                             if args.prune_completed_cache:
                                 previews = context.cache_dir / "previews"
                                 if previews.is_dir() and not previews.is_symlink():
@@ -556,6 +623,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                         else:
                             publish_analysis(slug, context, result)
                     except CommanderBelowMinimum as error:
+                        release_assignment(slug)
                         record.update(status="ineligible", observed_total_decks=error.count,
                                       eligibility_checked_at=now().isoformat(),
                                       retry_after=(now() + timedelta(hours=args.index_max_age_hours)).isoformat())
@@ -587,12 +655,14 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                             # Retry through the ordinary shared source queue on
                             # a later run, preserving the usable published report.
                             record.update(status="collecting", model_upgrade_needs_collection=True)
+                            release_assignment(slug)
                             summary["model_upgrades_deferred"].append({"commander_slug": slug, "reason": str(error)})
                             summary["no_progress"] = False  # The durable retry route has changed.
                             checkpoint()
                             continue
                         record.update(status="analysis_pending" if not is_collection else "failed",
                                       retry_after=(now() + timedelta(minutes=30)).isoformat())
+                        release_assignment(slug)
                         summary["failures"].append({"commander_slug": slug, "error": str(error)})
                     checkpoint()
                 if (args.max_runtime_seconds and monotonic() - started

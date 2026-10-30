@@ -215,7 +215,7 @@ jobs:
                 --main-tag-decks 15 --min-tag-decks 5
                 --main-tag-fraction 0.03 --min-tag-fraction 0.01
                 --max-runtime-seconds 1800 --worker-grace-seconds 120
-                --pipeline --workers 1 --preview-workers 16 --analysis-workers 2
+                --pipeline --workers 2 --preview-workers 16 --analysis-workers 2
                 --requests-per-second "${REQUESTS_PER_SECOND}"
                 --source-max-age-hours 72 --refresh-after-days 3
                 --freshness-target-hours 96 --prune-completed-cache)
@@ -281,7 +281,7 @@ jobs:
           args=(--build-styles-dir "${STYLES_DIR}"
                 --card-metadata-cache data/raw/build-style-card-metadata.json
                 --validation-directory "${STYLES_DIR}/_collection/external-validations"
-                --max-runtime-seconds 1800 --max-decks 300 --check-interval-seconds 5
+                --max-runtime-seconds 1800 --max-decks 300 --check-interval-seconds 5 --workers 2
                 --summary data/build-style-artifact/official-validation-summary.json
                 --backup-dir "${RUNNER_TEMP}/official-validation-backups")
           if [[ -n "${COMMANDER_SLUGS}" ]]; then

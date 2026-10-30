@@ -108,6 +108,155 @@ def test_complete_collection_is_saved_analyzed_and_published_separately(tmp_path
     assert json.loads((args.output_dir / "a.json").read_text())["collection"]["analysis_current"] is True
 
 
+@pytest.mark.parametrize("count", [1, 5, 6])
+def test_two_workers_claim_opposite_ends_and_meet_without_duplicates(tmp_path, count):
+    args = options(tmp_path, workers=2, analysis_workers=2)
+    inventory = rows(*[f"commander-{index:02}" for index in range(count)])
+    barrier = threading.Barrier(min(2, count))
+    active, calls, limiters = set(), [], []
+    lock = threading.Lock()
+
+    def collect(settings, **dependencies):
+        slug = settings.commander
+        with lock:
+            assert slug not in active
+            active.add(slug)
+            calls.append(slug)
+            limiters.append(dependencies["limiter"])
+            first_claim = len(calls) <= min(2, count)
+        if first_claim:
+            barrier.wait(timeout=5)
+        with lock:
+            active.remove(slug)
+        return evidence(slug)
+
+    result = execute(args, inventory, collect, saved_analyzer([]))
+    assignments = result["worker_assignments"]
+    assert assignments[0] == {"worker": 0, "direction": "top", "commander_slug": "commander-00"}
+    if count > 1:
+        assert assignments[1] == {"worker": 1, "direction": "bottom",
+                                  "commander_slug": f"commander-{count - 1:02}"}
+    assert len(calls) == len(set(calls)) == count
+    assert set(result["completed"]) == {row["commander_slug"] for row in inventory}
+    assert len({id(limiter) for limiter in limiters}) == 1
+    assert result["collection_strategy"] == "opposite_ends"
+    assert checkpoint(args)["pipeline"]["collection_workers"] == {}
+
+
+def test_opposite_workers_complete_their_partial_frame_and_analysis_before_moving_on(tmp_path):
+    args = options(tmp_path, workers=2, analysis_workers=2)
+    visits, worker_current = {}, {}
+    lock = threading.Lock()
+
+    def collect(settings, **_):
+        slug, worker = settings.commander, settings.collection_worker
+        with lock:
+            previous = worker_current.get(worker)
+            if previous and previous != slug:
+                # Publication, rather than merely a completed preview visit,
+                # releases the claim for this worker's next commander.
+                assert (args.output_dir / f"{previous}.json").exists()
+            worker_current[worker] = slug
+            visits[slug] = visits.get(slug, 0) + 1
+            loaded = min(200, 50 * visits[slug])
+        return evidence(slug, frame=200, loaded=loaded, new_attempts=50,
+                        complete=loaded == 200, dataset=f"{slug}-{loaded}")
+
+    result = execute(args, rows("a", "b", "c", "d", "e"), collect, saved_analyzer([]))
+    assert set(result["completed"]) == {"a", "b", "c", "d", "e"}
+    assert visits == {slug: 4 for slug in visits}
+    assert len(result["worker_assignments"]) == 5
+
+
+def test_opposite_worker_claims_resume_saved_partial_decks_after_a_run_budget(tmp_path):
+    args = options(tmp_path, workers=2, analysis_workers=2, max_runtime_seconds=2)
+    barrier, lock = threading.Barrier(2), threading.Lock()
+    ticks = [0]
+
+    def partial(settings, **_):
+        settings.collection_state.parent.mkdir(parents=True, exist_ok=True)
+        settings.collection_state.write_bytes(settings.commander.encode())
+        barrier.wait(timeout=5)
+        with lock:
+            ticks[0] += 1
+        return evidence(settings.commander, frame=200, loaded=50, new_attempts=50, complete=False)
+
+    first = execute(args, rows("a", "b", "c", "z"), partial, saved_analyzer([]),
+                    monotonic=lambda: ticks[0])
+    assert first["time_budget_reached"]
+    assert checkpoint(args)["pipeline"]["collection_workers"] == {"0": "a", "1": "z"}
+    calls = []
+
+    def resumed(settings, **_):
+        calls.append((settings.collection_worker, settings.commander))
+        if settings.commander in {"a", "z"}:
+            assert settings.collection_state.read_bytes() == settings.commander.encode()
+        return evidence(settings.commander, frame=200, loaded=200, new_attempts=150)
+
+    second = execute(options(tmp_path, workers=2, analysis_workers=2), rows("a", "b", "c", "z"),
+                     resumed, saved_analyzer([]))
+    assert set(calls[:2]) == {(0, "a"), (1, "z")}
+    assert set(second["completed"]) == {"a", "b", "c", "z"}
+    assert checkpoint(args)["pipeline"]["collection_workers"] == {}
+
+
+def test_bottom_worker_uses_the_unfinished_priority_phase_before_completed_refreshes(tmp_path):
+    args = options(tmp_path, workers=2, analysis_workers=2)
+    old = NOW - timedelta(days=2)
+    atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": {
+        "z-refresh": {"status": "fitted", "coverage_complete": True, "frame_decks": 200,
+                      "tag_label_policy": tag_label_policy(), "model_policy": model_policy(args),
+                      "current_previews": 200, "verified_at": old.isoformat()}}})
+    atomic_json(args.output_dir / "z-refresh.json", {"commander_slug": "z-refresh"})
+    result = execute(args, rows("a", "b", "c", "z-refresh"),
+                     lambda settings, **_: evidence(settings.commander), saved_analyzer([]))
+    assert [assignment["commander_slug"] for assignment in result["worker_assignments"][:2]] == ["a", "c"]
+
+
+def test_saved_claims_outside_a_scoped_batch_cannot_reserve_all_worker_slots(tmp_path):
+    args = options(tmp_path, workers=2, max_commanders=1)
+    atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1,
+        "pipeline": {"collection_workers": {"0": "y", "1": "z"}}, "commanders": {
+            "y": {"status": "collecting"}, "z": {"status": "collecting"}}})
+    calls = []
+
+    def collect(settings, **_):
+        calls.append(settings.commander)
+        return evidence(settings.commander)
+
+    result = execute(args, rows("a", "y", "z"), collect, saved_analyzer([]))
+    assert result["completed"] == calls == ["a"]
+
+
+def test_rate_block_from_one_end_stops_both_and_preserves_claims_for_cooldown(tmp_path):
+    args = options(tmp_path, workers=2)
+    barrier, blocked_event = threading.Barrier(2), threading.Event()
+    calls = []
+
+    def blocked(settings, **dependencies):
+        calls.append(settings.commander)
+        limiter = dependencies["limiter"]
+        barrier.wait(timeout=5)
+        if settings.collection_worker == 0:
+            limiter.record_throttle(now=NOW)
+            limiter.block("HTTP 429 rate limit", kind="rate_limit")
+            blocked_event.set()
+        else:
+            assert blocked_event.wait(timeout=5)
+        limiter.wait()
+        pytest.fail("A blocked shared limiter cannot issue another source request")
+
+    first = execute(args, rows("a", "b", "c", "z"), blocked, saved_analyzer([]))
+    assert set(calls) == {"a", "z"}
+    assert first["blocked"] and not first["continuation_needed"]
+    assert first["source_rate"]["throttles"] == 1
+    assert checkpoint(args)["pipeline"]["collection_workers"] == {"0": "a", "1": "z"}
+    execute(args, rows("a", "b", "c", "z"),
+            lambda *_, **__: pytest.fail("The shared cooldown must stop both workers"),
+            saved_analyzer([]), checked=NOW + timedelta(minutes=30))
+    assert checkpoint(args)["pipeline"]["collection_workers"] == {"0": "a", "1": "z"}
+
+
 def chunked_collector(ticks, progress, calls, *, frames=None):
     """One virtual second represents one finite preview-collection visit."""
     def collect(settings, **_):
@@ -196,8 +345,9 @@ def test_completed_report_refresh_waits_for_the_unfinished_backlog(tmp_path):
     assert "a-refresh" not in calls
 
 
-def test_pipeline_collects_only_commanders_with_at_least_200_total_decks(tmp_path):
-    args, collected = options(tmp_path), []
+@pytest.mark.parametrize("workers", [1, 2])
+def test_pipeline_collects_only_commanders_with_at_least_200_total_decks(tmp_path, workers):
+    args, collected = options(tmp_path, workers=workers), []
     inventory = [{"commander_slug": slug, "total_decks": count}
                  for slug, count in [("rare", 6), ("low", 199), ("eligible", 200), ("unknown", None)]]
 

@@ -71,6 +71,8 @@ def checker(calls, *, before=None):
 
 
 def run(root, tmp_path, check_fn, **kwargs):
+    if "monotonic" not in kwargs:
+        kwargs.update(virtual_clock())
     return queue.validate_all(root, tmp_path / "metadata.json", check_fn=check_fn,
         current_discovery_only=False, max_runtime_seconds=60, **kwargs)
 
@@ -152,8 +154,11 @@ def test_new_hash_stays_pending_when_check_limit_reached_after_repair(tmp_path):
     deck = final["deck_analysis"]["packages"][0]["generated_deck"]
     assert deck["validation"]["external_rating"]["status"] == "unverified"
     assert deck["validation"]["restriction_validation"]["status"] == "pending"
+    state = queue.read_json(root / "_collection/official-validation-queue.json")
+    assert state["repair_attempts"]["commander"]["attempts"] == 1
     resumed = run(root, tmp_path, checker([]), rebuild_fn=lambda *_a, **_kw: pytest.fail("Repaired aligned deck"))
     assert resumed["checked"] == 1 and resumed["pending"] == 0
+    assert queue.read_json(root / "_collection/official-validation-queue.json")["repair_attempts"] == {}
 
 
 def test_site_access_block_stops_globally_and_survives_resume(tmp_path):
@@ -354,3 +359,366 @@ def test_invalid_queue_bounds_are_rejected_before_network(tmp_path, kwargs):
     root, _ = fixture(tmp_path)
     with pytest.raises(ValueError):
         queue.validate_all(root, tmp_path / "metadata.json", check_fn=lambda *_a, **_kw: pytest.fail("Network"), **kwargs)
+
+
+def virtual_clock():
+    """Advance pacing time without delaying concurrency-focused queue tests."""
+    import threading
+    value, lock = [0.0], threading.Lock()
+
+    def now():
+        with lock:
+            return value[0]
+
+    def sleep(seconds):
+        with lock:
+            value[0] += seconds
+
+    return {"monotonic": now, "sleep": sleep}
+
+
+def test_two_workers_claim_opposite_ends_and_meet_without_overlap(tmp_path):
+    import threading
+    for slug in ("a-first", "b-middle", "c-middle", "z-last"):
+        root, _ = fixture(tmp_path, slug=slug, card=slug)
+    barrier, calls, lock = threading.Barrier(2), [], threading.Lock()
+    normal_check = checker(calls)
+
+    def check(deck, **kwargs):
+        with lock:
+            first_pair = len(calls) < 2
+        if first_pair:
+            barrier.wait(timeout=5)
+        return normal_check(deck, **kwargs)
+
+    result = run(root, tmp_path, check, workers=2, **virtual_clock())
+    assert result["errors"] == []
+    assert result["checked"] == result["verified"] == 4
+    assert result["pending"] == 0 and result["peak_in_flight"] == 2
+    claims = result["commander_claims"]
+    assert [(item["worker"], item["commander_slug"]) for item in claims[:2]] == [(1, "a-first"), (2, "z-last")]
+    assert sorted(item["commander_slug"] for item in claims) == ["a-first", "b-middle", "c-middle", "z-last"]
+    assert len(calls) == len(set(calls))
+
+
+def test_parallel_worker_keeps_commander_through_repair_and_recheck(tmp_path):
+    import threading
+    root, report = fixture(tmp_path, slug="a-conflict", card="Bad Card")
+    sibling = deepcopy(report["deck_analysis"]["packages"][0])
+    sibling["generated_deck"]["cards"][-1]["name"] = "Sibling Card"
+    report["deck_analysis"]["alternative_models"][0]["packages"].append(sibling)
+    write(root / "a-conflict.json", report)
+    for slug in ("b-middle", "c-middle", "z-last"):
+        fixture(tmp_path, slug=slug, card=slug)
+    events, threads, lock = [], {}, threading.Lock()
+    normal_check = checker([])
+    main_thread = threading.get_ident()
+
+    def check(deck, **kwargs):
+        name = deck["cards"][-1]["name"]
+        with lock:
+            events.append(("check", name, threading.get_ident()))
+            threads.setdefault(name, set()).add(threading.get_ident())
+        return normal_check(deck, **kwargs)
+
+    def repair(*_args, **_kwargs):
+        assert threading.get_ident() == main_thread
+        events.append(("repair", "a-conflict", main_thread))
+        saved = queue.read_json(root / "a-conflict.json")
+        for _, package in queue.packages(saved):
+            if package["generated_deck"]["cards"][-1]["name"] == "Bad Card":
+                package["generated_deck"]["cards"][-1]["name"] = "Good Card"
+        write(root / "a-conflict.json", saved)
+        return {"regenerated": 1, "changed_deck_lists": 2}
+
+    result = run(root, tmp_path, check, workers=2, rebuild_fn=repair, **virtual_clock())
+    assert result["errors"] == [] and result["pending"] == result["conflicts"] == 0
+    assert result["repaired_reports"] == 1
+    owner = next(iter(threads["Bad Card"]))
+    assert threads["Sibling Card"] == threads["Good Card"] == {owner}
+    owner_events = [(kind, name) for kind, name, worker in events if worker == owner]
+    assert owner_events.index(("check", "Good Card")) > owner_events.index(("check", "Bad Card"))
+    for index, (kind, name) in enumerate(owner_events):
+        if name in {"b-middle", "c-middle"}:
+            assert index > owner_events.index(("check", "Good Card"))
+
+
+def test_parallel_contexts_start_check_and_close_on_their_own_thread(tmp_path):
+    import threading
+    for slug in ("a-first", "z-last"):
+        root, _ = fixture(tmp_path, slug=slug, card=slug)
+    barrier, contexts = threading.Barrier(2), []
+
+    class Context:
+        def __enter__(self):
+            self.owner, self.closed = threading.get_ident(), False
+            contexts.append(self)
+            return self
+
+        def __exit__(self, *_args):
+            assert threading.get_ident() == self.owner
+            self.closed = True
+
+    normal_check = checker([])
+
+    def check(deck, **kwargs):
+        assert kwargs["checker"].owner == threading.get_ident()
+        barrier.wait(timeout=5)
+        return normal_check(deck, **kwargs)
+
+    result = run(root, tmp_path, check, workers=2, checker_factory=Context, **virtual_clock())
+    assert result["errors"] == [] and result["checked"] == 2
+    assert len({context.owner for context in contexts}) == 2
+    assert all(context.closed for context in contexts)
+
+
+def test_parallel_duplicate_families_share_one_exact_role_check(tmp_path):
+    root, report = fixture(tmp_path, slug="a-first")
+    report["commander_slug"] = "z-last"
+    write(root / "z-last.json", report)
+    calls = []
+    result = run(root, tmp_path, checker(calls), workers=2, **virtual_clock())
+    assert result["errors"] == []
+    assert result["checked"] == result["verified"] == len(calls) == 1
+    assert result["pending"] == 0
+    for slug in ("a-first", "z-last"):
+        current = queue.read_json(root / f"{slug}.json")
+        assert current["deck_analysis"]["packages"][0]["generated_deck"]["validation"]["restriction_validation"]["status"] == "verified"
+
+
+def test_outdated_inflight_result_cannot_verify_a_changed_deck(tmp_path):
+    root, _ = fixture(tmp_path)
+    old = queue.read_json(root / "commander.json")
+    old_hash = cardlist_hash(old["deck_analysis"]["packages"][0]["generated_deck"]["cards"])
+
+    def replace_while_checking():
+        current = queue.read_json(root / "commander.json")
+        for _, package in queue.packages(current):
+            package["generated_deck"]["cards"][-1]["name"] = "Replacement Card"
+        write(root / "commander.json", current)
+
+    result = run(root, tmp_path, checker([], before=replace_while_checking), max_decks=1)
+    current = queue.read_json(root / "commander.json")
+    deck = current["deck_analysis"]["packages"][0]["generated_deck"]
+    assert result["stale_results"] == result["pending"] == 1
+    assert result["verified"] == 0
+    assert deck["validation"]["restriction_validation"]["status"] == "pending"
+    assert deck["validation"]["restriction_validation"]["deck_sha256"] != old_hash
+
+
+def test_parallel_source_block_cancels_other_worker_before_its_check(tmp_path, monkeypatch):
+    import threading
+    from edhrec_affinity.build_styles import official_checker
+    for slug in ("a-first", "z-last"):
+        root, _ = fixture(tmp_path, slug=slug, card=slug)
+    stopped, first_admission, lock = threading.Event(), [True], threading.Lock()
+
+    class Gate:
+        blocked, reason, retry_after_seconds = False, None, 0
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def acquire(self, **_kwargs):
+            with lock:
+                first = first_admission[0]
+                first_admission[0] = False
+            if first:
+                return True
+            assert stopped.wait(timeout=5)
+            return False
+
+        def stop(self, reason, retry_after_seconds=0):
+            self.blocked, self.reason, self.retry_after_seconds = True, reason, retry_after_seconds
+            stopped.set()
+
+    monkeypatch.setattr(official_checker, "SharedCheckAdmission", Gate)
+    calls = []
+
+    def blocked(deck, **_kwargs):
+        calls.append(cardlist_hash(deck["cards"]))
+        return {"status": "blocked", "source_blocked": True, "reason": "HTTP 429", "retry_after_seconds": 120000}
+
+    result = run(root, tmp_path, blocked, workers=2)
+    assert result["errors"] == [] and result["checked"] == len(calls) == 1
+    assert result["source_blocked"] and result["pending"] == 2
+    state = queue.read_json(root / "_collection/official-validation-queue.json")
+    retry_at = datetime.fromisoformat(state["source_retry_at"])
+    assert (retry_at - datetime.now(timezone.utc)).total_seconds() > 119000
+    resumed = run(root, tmp_path, lambda *_args, **_kwargs: pytest.fail("Retried blocked source"), workers=2)
+    assert resumed["checked"] == 0 and resumed["source_blocked"]
+
+
+@pytest.mark.parametrize("workers", [0, 3, True, 1.5])
+def test_invalid_worker_count_is_rejected_before_network(tmp_path, workers):
+    root, _ = fixture(tmp_path)
+    with pytest.raises(ValueError, match="workers"):
+        run(root, tmp_path, lambda *_args, **_kwargs: pytest.fail("Network"), workers=workers)
+
+
+def test_two_inflight_source_blocks_retain_longest_server_cooldown(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ALL_COMPLETED, wait as real_wait
+    from edhrec_affinity.build_styles import official_checker
+    for slug in ("a-first", "z-last"):
+        root, _ = fixture(tmp_path, slug=slug, card=slug)
+    barrier = threading.Barrier(2)
+    # Both requests were admitted before either backend response arrived.
+    monkeypatch.setattr(official_checker.SharedCheckAdmission, "acquire", lambda *_a, **_kw: True)
+    monkeypatch.setattr(queue, "wait", lambda futures, **_kw:
+        real_wait(futures, timeout=5, return_when=ALL_COMPLETED))
+
+    def blocked(deck, **_kwargs):
+        barrier.wait(timeout=5)
+        delay = 172800 if deck["cards"][-1]["name"] == "a-first" else 90000
+        return {"status": "blocked", "source_blocked": True, "reason": "HTTP 429",
+                "retry_after_seconds": delay}
+
+    result = run(root, tmp_path, blocked, workers=2)
+    assert result["checked"] == 2 and result["source_blocked"] and result["errors"] == []
+    state = queue.read_json(root / "_collection/official-validation-queue.json")
+    retry_at = datetime.fromisoformat(state["source_retry_at"])
+    assert (retry_at - datetime.now(timezone.utc)).total_seconds() > 172000
+
+
+def test_interrupted_middle_family_resumes_before_new_endpoints(tmp_path):
+    root, middle = fixture(tmp_path, slug="b-middle", card="Middle Card")
+    alternative = deepcopy(middle["deck_analysis"]["alternative_models"][0]["packages"][0])
+    alternative["generated_deck"]["cards"][-1]["name"] = "Middle Alternative"
+    middle["deck_analysis"]["alternative_models"][0]["packages"].append(alternative)
+    write(root / "b-middle.json", middle)
+    for slug in ("a-first", "z-last"):
+        fixture(tmp_path, slug=slug, card=slug)
+    state_path = root / "_collection/official-validation-queue.json"
+    write(state_path, {"schema_version": 1, "source_blocked": False, "check_attempts": {},
+        "repair_attempts": {}, "worker_claims": {"1": "b-middle"},
+        "family_order": ["a-first", "b-middle", "z-last"]})
+    first_calls = []
+    first = run(root, tmp_path, checker(first_calls), max_decks=1)
+    assert first["commander_claims"][0]["commander_slug"] == "b-middle"
+    assert first["commander_claims"][0]["resumed"] is True
+    assert first["active_claims"] == {"1": "b-middle"}
+    state = queue.read_json(state_path)
+    assert state["worker_claims"] == {"1": "b-middle"}
+    assert state["family_order"] == ["a-first", "b-middle", "z-last"]
+    second_calls = []
+    second = run(root, tmp_path, checker(second_calls), max_decks=1)
+    assert second["commander_claims"][0]["commander_slug"] == "b-middle"
+    assert second["commander_claims"][0]["resumed"] is True
+    assert second_calls and second_calls != first_calls
+    expected = validation_record_key(alternative["generated_deck"])
+    assert second_calls == [expected]
+    assert "b-middle" not in second["active_claims"].values()
+
+
+def test_stale_deferred_and_duplicate_saved_claims_release_lanes(tmp_path):
+    root, report = fixture(tmp_path, slug="a-first", card="First Card")
+    fixture(tmp_path, slug="z-last", card="Last Card")
+    state_path = root / "_collection/official-validation-queue.json"
+    write(state_path, {"schema_version": 1, "source_blocked": False, "check_attempts": {},
+        "repair_attempts": {}, "worker_claims": {"1": "removed-commander", "2": "a-first", "3": "a-first"},
+        "family_order": ["removed-commander", "a-first", "a-first", "z-last"]})
+    result = run(root, tmp_path, checker([]), workers=2)
+    assert result["errors"] == [] and result["pending"] == 0
+    assert result["active_claims"] == {}
+    assert sum(claim["commander_slug"] == "a-first" for claim in result["commander_claims"]) == 1
+    assert queue.read_json(state_path)["family_order"] == ["a-first", "z-last"]
+
+
+def test_fresh_conflict_priority_replaces_old_order_after_owned_family(tmp_path):
+    root, _ = fixture(tmp_path, slug="a-safe", card="Safe Card")
+    _, middle = fixture(tmp_path, slug="b-owned", card="Middle Card")
+    _, conflict = fixture(tmp_path, slug="z-conflict", card="Bad Card")
+    deck = conflict["deck_analysis"]["packages"][0]["generated_deck"]
+    record_external_validation(deck, observation(deck, conflict=True), root / "_collection/external-validations")
+    state_path = root / "_collection/official-validation-queue.json"
+    write(state_path, {"schema_version": 1, "source_blocked": False, "check_attempts": {},
+        "repair_attempts": {}, "worker_claims": {"1": "b-owned"},
+        "family_order": ["a-safe", "b-owned", "z-conflict"]})
+    repairs, calls = [], []
+
+    def unchanged(*_args, **kwargs):
+        repairs.extend(kwargs["commanders"])
+        return {"regenerated": 1, "changed_deck_lists": 0}
+
+    result = run(root, tmp_path, checker(calls), max_decks=1, rebuild_fn=unchanged)
+    assert result["errors"] == []
+    assert calls == [validation_record_key(middle["deck_analysis"]["packages"][0]["generated_deck"])]
+    assert repairs == ["z-conflict"]
+    claims = result["commander_claims"]
+    assert [(item["commander_slug"], item["resumed"]) for item in claims[:2]] == [
+        ("b-owned", True), ("z-conflict", False)]
+    assert queue.read_json(state_path)["family_order"][0] == "z-conflict"
+
+
+def test_repair_joining_an_inflight_identity_publishes_both_families(tmp_path):
+    import threading
+    root, _ = fixture(tmp_path, slug="a-repaired", card="Bad Card")
+    fixture(tmp_path, slug="z-checking", card="Good Card")
+    good_started, repaired = threading.Event(), threading.Event()
+    calls = []
+    normal_check = checker(calls)
+
+    def check(deck, **kwargs):
+        if deck["cards"][-1]["name"] == "Good Card":
+            good_started.set()
+            assert repaired.wait(timeout=5)
+        return normal_check(deck, **kwargs)
+
+    def repair(*_args, **kwargs):
+        assert kwargs["commanders"] == ["a-repaired"]
+        assert good_started.wait(timeout=5)
+        report = queue.read_json(root / "a-repaired.json")
+        for _, package in queue.packages(report):
+            package["generated_deck"]["cards"][-1]["name"] = "Good Card"
+        write(root / "a-repaired.json", report)
+        repaired.set()
+        return {"regenerated": 1, "changed_deck_lists": 2}
+
+    result = run(root, tmp_path, check, workers=2, rebuild_fn=repair, **virtual_clock())
+    assert result["errors"] == [] and result["checked"] == 2
+    assert len(calls) == len(set(calls)) == 2
+    assert result["pending"] == result["conflicts"] == 0
+    for slug in ("a-repaired", "z-checking"):
+        report = queue.read_json(root / f"{slug}.json")
+        for _, package in queue.packages(report):
+            validation = package["generated_deck"]["validation"]
+            assert validation["restriction_validation"]["status"] == "verified"
+            assert validation["external_rating"]["status"] == "verified"
+
+
+def test_successful_final_check_resets_lineage_for_an_independent_conflict(tmp_path):
+    root, _ = fixture(tmp_path, card="Bad Card")
+    state_path = root / "_collection/official-validation-queue.json"
+    write(state_path, {"schema_version": 1, "source_blocked": False, "check_attempts": {},
+        "repair_attempts": {"commander": {"attempts": 1, "started_at": queue._now(),
+            "generation_version": queue.GENERATION_VERSION}},
+        "repair_retry_at": {"commander": "2000-01-01T00:00:00Z"}})
+    repairs = []
+
+    def repair(*_args, **kwargs):
+        repairs.extend(kwargs["commanders"])
+        report = queue.read_json(root / "commander.json")
+        for _, package in queue.packages(report):
+            package["generated_deck"]["cards"][-1]["name"] = "Good Card"
+        write(root / "commander.json", report)
+        return {"regenerated": 1, "changed_deck_lists": 2}
+
+    first = run(root, tmp_path, checker([]), rebuild_fn=repair, max_decks=2)
+    assert first["errors"] == [] and first["checked"] == 2
+    assert first["pending"] == first["conflicts"] == 0
+    state = queue.read_json(state_path)
+    assert "commander" not in state["repair_attempts"]
+    assert "commander" not in state["repair_retry_at"]
+    # A later independent list change reintroduces a known conflict. Fresh
+    # observations are reusable, but an old exhausted lineage cannot block it.
+    report = queue.read_json(root / "commander.json")
+    for _, package in queue.packages(report):
+        package["generated_deck"]["cards"][-1]["name"] = "Bad Card"
+    write(root / "commander.json", report)
+    second = run(root, tmp_path, lambda *_args, **_kwargs: pytest.fail("Rechecked fresh exact evidence"),
+                 rebuild_fn=repair)
+    assert second["errors"] == [] and second["repaired_reports"] == 1
+    assert second["pending"] == second["conflicts"] == 0
+    assert repairs == ["commander", "commander"]
+    assert queue.read_json(state_path)["repair_attempts"] == {}

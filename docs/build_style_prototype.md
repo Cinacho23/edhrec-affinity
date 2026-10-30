@@ -355,7 +355,37 @@ Build Discovery starts fresh under a minimum of 200 total EDHREC decks per comma
 
 The October 2026 catalog contains 6,750 commanders; 3,374 currently have at least 200 total decks and qualify for collection. This population count is separate from the number of usable previews sampled. Every available deck-index ID for an eligible commander is targeted, without an eventual preview-count ceiling. A fresh source page that drops below 200 is skipped before preview collection and fitting, and its eligibility is checked again after the index cache interval. An eligible commander can still have insufficient usable evidence for packages.
 
-The **Update commander build styles** workflow uses `--pipeline`: rolling 30-minute batches collect one commander at a time, with up to sixteen preview workers and two independent model processes. Saved partials and untouched commanders are ordered by estimated remaining work, so near-complete collections finish before broad catalog sweeps. Finished reports due for refresh follow unfinished work. A progressed slice returns according to the same priority; the five-minute safety slice does not send it behind the full catalog. Model fitting can run while collection starts for the next commander. All source workers share one adaptive request budget. The configured ceiling is 40 starts per second, initially ramping from two; it is not multiplied by the worker count or treated as EDHREC's actual limit. An HTTP 429 stops the batch immediately and records an operating ceiling 25% below the rate at that response. Later jobs start and ramp within the learned ceiling. Further throttling lowers it again; concurrent responses to the same block do not compound the reduction. Network errors reduce the current rate, while 401/403 stop collection without inferring a rate. Server Retry-After and the existing minimum cooldown remain enforced across jobs. The repository owner confirmed permission for automated EDHREC collection on October 21, 2026. No alternate route is used to evade access restrictions.
+The **Update commander build styles** workflow uses `--pipeline`: rolling
+30-minute batches use two commander collection workers, preview downloads, and
+two independent model processes. The commander queue retains its existing
+priority phases: saved model work and upgrades, unfinished collection, then
+finished reports due for refresh. Within the highest available phase, the first
+worker claims from the front and the second from the back of the ordering by
+estimated remaining work. A near-complete commander and a larger unfinished
+commander can therefore advance together without making routine refreshes jump
+ahead of unfinished collection.
+
+A worker keeps its commander through partial collection slices and final
+analysis publication before claiming another. Claims are saved in
+`_collection/state.json` alongside parsed deck checkpoints, so a restart resumes
+unfinished work rather than duplicating another worker's commander. Once the
+two ends meet, active collection and model work must still finish before the
+queue is complete. Model fitting can overlap the other worker's collection.
+Only the coordinator updates shared queue state and publishes finished reports.
+The existing `--workers 1` option retains sequential queue behavior for local
+experiments; `--workers 2` enables opposite-end ownership.
+
+All source workers share one adaptive request budget. The configured ceiling is
+40 starts per second, initially ramping from two; it is not multiplied by either
+commander or preview worker counts, and is not treated as EDHREC's actual limit.
+An HTTP 429 stops the batch immediately and records an operating ceiling 25%
+below the rate at that response. Later jobs start and ramp within the learned
+ceiling. Further throttling lowers it again; concurrent responses to the same
+block do not compound the reduction. Network errors reduce the current rate,
+while 401/403 stop collection without inferring a rate. Server Retry-After and
+the existing minimum cooldown remain enforced across jobs. The repository owner
+confirmed permission for automated EDHREC collection on October 21, 2026. No
+alternate route is used to evade access restrictions.
 
 A shared transport discovers the site's public page format once. Legacy Next.js pages supply a build ID for compact JSON; current App Router pages supply a React stream at the same public preview URL with the `RSC: 1` rendering header. The parser reads JSON records without executing page scripts, and rediscovers the format after a deployment invalidates it. Access blocks never cause a fallback around the block. One current preview measured 301 KB as HTML and 42 KB as a React stream; this is an observation about that payload, not a promised network speedup. Unsupported data formats remain retryable and preserve prior usable cache entries; they do not permanently exclude decks or masquerade as rate limits.
 
@@ -389,7 +419,7 @@ Run the rolling full collector under the existing source-access permission:
 
 ```sh
 .venv/bin/python scripts/build_site_build_styles.py --pipeline --fetch \
-  --workers 1 --preview-workers 16 --analysis-workers 2 \
+  --workers 2 --preview-workers 16 --analysis-workers 2 \
   --requests-per-second 40 --sample-decks all \
   --min-total-decks 200 --source-max-age-hours 72 \
   --index-max-age-hours 24 --refresh-after-days 3 \
@@ -429,14 +459,33 @@ Two completed repair attempts bound a lineage; interrupted metadata or runtime
 work does not consume those attempts.
 
 Each validation batch permits at most 300 actual deck checks inside a 30-minute
-budget, with at least five seconds between sequential checks and a 120-second
-per-deck timeout. Successful observations and report updates are saved
-immediately. Known official conflicts take priority, followed by suspected
-local conflicts. Within that ordering, never-checked lists precede expired
-observations, so early alphabetic commanders cannot monopolize rechecks while
-later commanders still have no coverage. Automatic continuation alternates a
-validation batch with a normal collection batch to preserve source freshness.
-Newly generated lists trigger another validation pass.
+budget, with a 120-second per-deck timeout. The CLI defaults to `--workers 2`;
+`--workers 1` remains available for a sequential local run. Both workers use one
+stable commander ordering, built from known official conflicts, suspected local
+conflicts, whether a family has never been checked, and commander slug. The first
+worker takes the front and the second takes the back. This gives the far end of
+the catalog coverage while the first worker addresses higher-priority families.
+Each claimed commander stays with its worker through all Auto and numbered
+models, any required repair, and checks of every changed final list. A shared
+set prevents duplicate requests for identical lists and command-zone roles.
+
+Each browser runs on its own dedicated worker thread. One shared gate enforces
+at least five seconds between actual check starts across both workers; parallel
+browsers do not each get their own five-second request allowance. The coordinator
+alone updates reports, repair state, and the durable queue; successful
+observations are saved immediately. Active commander claims, retry records, and
+exact-list observations survive restarts. The next batch restores unfinished
+families before claiming new endpoints, without treating obsolete lists as
+current work.
+
+Automatic continuation alternates a validation batch with a normal collection
+batch to preserve source freshness. Both stages retain the same workflow lock,
+one restored cumulative checkpoint, and one final artifact publisher. They do
+not run simultaneously against shared reports: collection can replace a whole
+commander analysis, while validation can repair its generated decks, so separate
+snapshot writers could discard newer work. This rollout adds concurrency within
+each stage without multiplying either service's request budget or claiming a
+twofold network speedup. Newly generated lists trigger another validation pass.
 
 HTTP 401, 403, or 429 from the website/backend stops the entire external queue.
 The saved source retry time is at least 24 hours away and honors a longer
@@ -463,7 +512,7 @@ For a local run after restoring the cumulative artifact and card metadata cache:
 .venv/bin/python scripts/validate_generated_decks.py \
   --build-styles-dir data/build-style-artifact/build-styles \
   --card-metadata-cache data/raw/build-style-card-metadata.json \
-  --max-runtime-seconds 1800 --max-decks 300
+  --workers 2 --max-runtime-seconds 1800 --max-decks 300
 ```
 
 `--commander` restricts a local experiment; the workflow's blank commander input
