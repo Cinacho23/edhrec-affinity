@@ -13,6 +13,9 @@ concurrency:
   group: commander-build-style-watchdog
   cancel-in-progress: false
 
+env:
+  BUILD_STYLE_DISTRIBUTED_RUNNERS: ${{ vars.BUILD_STYLE_DISTRIBUTED_RUNNERS || '0' }}
+
 jobs:
   check:
     name: Recover an idle collector without restoring decks

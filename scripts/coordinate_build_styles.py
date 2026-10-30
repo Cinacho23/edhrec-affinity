@@ -22,6 +22,8 @@ import tempfile
 
 
 COLLECTOR = "build-commander-styles.yml"
+DISTRIBUTED_COLLECTOR = "collect-distributed-build-styles.yml"
+COLLECTORS = (COLLECTOR, DISTRIBUTED_COLLECTOR)
 COOLDOWN = "resume-build-styles.yml"
 FRONTEND = "deploy-frontend.yml"
 ENVIRONMENT = "build-style-cooldown"
@@ -74,12 +76,15 @@ class GitHub:
 
     def runs(self):
         if self._runs is None:
-            self._runs = self.api(f"{self.root}/actions/workflows/{COLLECTOR}/runs?per_page=30")["workflow_runs"]
+            runs = [run for workflow in COLLECTORS for run in self.api(
+                f"{self.root}/actions/workflows/{workflow}/runs?per_page=30")["workflow_runs"]]
+            self._runs = sorted({run["id"]: run for run in runs}.values(), key=lambda run: run["id"], reverse=True)
         return self._runs
 
-    def trusted(self, run, workflow=COLLECTOR):
+    def trusted(self, run, workflow=None):
+        workflows = COLLECTORS if workflow is None else (workflow,)
         return (run.get("head_branch") == self.default_branch and not str(run.get("event", "")).startswith("pull_request")
-                and str(run.get("path", "")).split("@", 1)[0].endswith(f"/{workflow}"))
+                and any(str(run.get("path", "")).split("@", 1)[0].endswith(f"/{name}") for name in workflows))
 
     def active(self, excluding=None):
         return any(self.trusted(run) and run.get("status") in ACTIVE and run["id"] != excluding
@@ -167,6 +172,25 @@ def automatic_continuation_allowed(summary):
             and not scope.get("refresh") and scope.get("sample_decks") is None)
 
 
+def distributed_runners(value=None):
+    """Explicit repository rollout control; zero/one retains the legacy route."""
+    value = os.environ.get("BUILD_STYLE_DISTRIBUTED_RUNNERS", "0") if value is None else value
+    if isinstance(value, bool) or not re.fullmatch(r"\d+", str(value)) or not 0 <= int(value) <= 16:
+        raise ValueError("Distributed runner count must be an integer from 0 to 16")
+    return int(value)
+
+
+def dispatch_collector(client, result, *, runners=None):
+    count = distributed_runners(runners)
+    if count >= 2:
+        client.dispatch(DISTRIBUTED_COLLECTOR, {"runners": str(count), "pilot": "false"})
+        result.pop("validate_power", None)  # Distributed source and power jobs run together.
+        result["distributed_runners"] = count
+    else:
+        client.dispatch(COLLECTOR, {"validate_power": "true"} if result.get("validate_power") else None)
+    result["dispatched"] = True
+
+
 def block_reason(snapshot, older):
     summary = snapshot.summary
     explicit = summary.get("block_reason")
@@ -211,6 +235,17 @@ def decision(snapshot, *, now, older=(), allow_bounded=False):
         return {"run": False, "reason": "Previous collection reached a resource limit"}
     if allow_bounded and not automatic_continuation_allowed(summary):
         return {"run": True, "reason": "An explicit collector request follows the previous bounded batch"}
+    distributed = summary.get("distributed")
+    if isinstance(distributed, dict):
+        if distributed.get("systemic_block"):
+            return {"run": False, "reason": "Distributed workers reported a systemic source restriction"}
+        if summary.get("continuation_needed") is True and not summary.get("no_progress"):
+            return {"run": True, "reason": "Distributed collection and power work continue together"}
+        if distributed.get("missing_workers") or distributed.get("invalid_workers"):
+            return {"run": False, "reason": "Distributed checkpoints need review before continuation"}
+        checked = timestamp((summary.get("capacity") or {}).get("evaluated_at"))
+        if checked is None or checked + timedelta(days=1) > now:
+            return {"run": False, "reason": "Distributed batch is bounded, idle, or made no progress"}
     official = summary.get("official_validation")
     if isinstance(official, dict):
         pending = official.get("pending")
@@ -421,9 +456,11 @@ def merge_recovery_controls(state, summary, *, source_run_id, checkpoint_run_id,
 
 
 def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, attempt=0,
-               recovery_run_id=None, power_only=False):
+               recovery_run_id=None, power_only=False, route_distributed=False, runner_count=None):
     if power_only and (mode != "preflight" or recovery_run_id):
         raise ValueError("Power-only readiness is available only for preflight without checkpoint recovery")
+    if route_distributed and (mode != "preflight" or power_only or recovery_run_id):
+        raise ValueError("Distributed redirection is only available for ordinary full-catalog preflight")
     if mode == "prepare-cooldown":
         # The collector dispatches immediately after immutable artifact upload,
         # before its own final bookkeeping steps finish.
@@ -457,7 +494,10 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
                     downstream[f"{name}_error"] = str(error)
     if client.active(excluding=current_run_id):
         return {"run": False, "reason": "A collector is already running or queued", **downstream}
-    if prefetched is not None:
+    if mode == "continue":
+        latest = client.source(source_run_id, allow_uploaded=True)
+        snapshots = iter(())
+    elif prefetched is not None:
         latest, snapshots = candidate, prefetched
     else:
         snapshots = iter(client.snapshots())
@@ -477,9 +517,13 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
             client.dispatch(COOLDOWN, {"source_run_id": str(origin.run_id), "attempt": str(attempt + 1)})
             result["requeued"] = True
         return result
-    if mode in {"watchdog", "resume"} and result["run"]:
-        client.dispatch(COLLECTOR, {"validate_power": "true"} if result.get("validate_power") else None)
-        result["dispatched"] = True
+    if mode == "preflight" and route_distributed and result["run"] and distributed_runners() >= 2:
+        dispatch_collector(client, result, runners=runner_count)
+        result.update(run=False, redirected=True, reason="Full-catalog collection moved to distributed workers")
+    elif mode in {"watchdog", "resume", "continue"} and result["run"]:
+        if mode == "continue" and (latest is None or not latest.durable):
+            raise ValueError("Continuation requires the exact uploaded collector checkpoint")
+        dispatch_collector(client, result, runners=runner_count)
     if latest is not None:
         result["snapshot"] = latest.summary
     return {**result, **downstream}
@@ -487,7 +531,7 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("preflight", "watchdog", "prepare-cooldown", "resume", "outcome", "recover-control", "publish", "publication", "queue-cooldown", "prepare-power-only"))
+    parser.add_argument("mode", choices=("preflight", "watchdog", "prepare-cooldown", "resume", "continue", "outcome", "recover-control", "publish", "publication", "queue-cooldown", "prepare-power-only"))
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--current-run-id", type=int, default=int(os.environ.get("GITHUB_RUN_ID", "0")))
     parser.add_argument("--source-run-id", type=int)
@@ -497,11 +541,14 @@ def main():
     parser.add_argument("--restored-run-id", type=int)
     parser.add_argument("--state-file", type=Path)
     parser.add_argument("--power-only", action="store_true")
+    parser.add_argument("--route-distributed", action="store_true")
+    parser.add_argument("--distributed-runners", type=int,
+                        help="Retain the current distributed generation's approved runner count on continuation")
     args = parser.parse_args()
     try:
         if not 0 <= args.attempt <= MAX_WAIT_ATTEMPTS:
             raise ValueError("Invalid cooldown attempt")
-        if args.mode in {"prepare-cooldown", "resume"} and not args.source_run_id:
+        if args.mode in {"prepare-cooldown", "resume", "continue"} and not args.source_run_id:
             raise ValueError("A source collector run is required")
         if args.recovery_run_id and args.mode not in {"preflight", "recover-control"}:
             raise ValueError("Checkpoint recovery is available only for an explicit collector request")
@@ -564,7 +611,8 @@ def main():
         else:
             result = coordinate(GitHub(args.repository), args.mode, now=datetime.now(timezone.utc),
                 current_run_id=args.current_run_id, source_run_id=args.source_run_id, attempt=args.attempt,
-                recovery_run_id=args.recovery_run_id, power_only=args.power_only)
+                recovery_run_id=args.recovery_run_id, power_only=args.power_only,
+                route_distributed=args.route_distributed, runner_count=args.distributed_runners)
         snapshot = result.pop("snapshot", {})
         if args.mode == "preflight" and not result["run"] and args.summary_file is not None:
             snapshot.update(publish_needed=False, continuation_needed=False, preflight_skipped=True,

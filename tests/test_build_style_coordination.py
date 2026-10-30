@@ -75,6 +75,72 @@ def test_watchdog_and_preflight_skip_active_collectors_before_reading_checkpoint
     assert github.dispatches == []
 
 
+def test_real_client_combines_both_trusted_collector_histories_and_active_jobs():
+    client = object.__new__(coordinator.GitHub)
+    client.default_branch, client.root, client._runs = "main", "repos/owner/repo", None
+    paths = {
+        coordinator.COLLECTOR: [{"id": 100, "status": "completed"}],
+        coordinator.DISTRIBUTED_COLLECTOR: [{"id": 102, "status": "in_progress"}],
+    }
+
+    def api(endpoint):
+        workflow = endpoint.split("/workflows/", 1)[1].split("/", 1)[0]
+        return {"workflow_runs": [{**run, "head_branch": "main", "event": "workflow_dispatch",
+                "path": f".github/workflows/{workflow}"} for run in paths[workflow]]}
+
+    client.api = api
+    assert [run["id"] for run in client.runs()] == [102, 100]
+    assert all(client.trusted(run) for run in client.runs())
+    assert client.active() and not client.active(excluding=102)
+
+
+@pytest.mark.parametrize("count", [2, 16])
+def test_watchdog_routes_collection_and_official_work_to_approved_distributed_runners(monkeypatch, count):
+    monkeypatch.setenv("BUILD_STYLE_DISTRIBUTED_RUNNERS", str(count))
+    github = GitHub([{"blocked": False, "official_validation": {"pending": 100, "checked": 5}}])
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["dispatched"] and result["distributed_runners"] == count
+    assert "validate_power" not in result
+    assert github.dispatches == [(coordinator.DISTRIBUTED_COLLECTOR, {"runners": str(count), "pilot": "false"})]
+
+
+def test_distributed_summary_continues_collection_and_power_together_without_alternation():
+    github = GitHub([{"distributed": {"runners": 4, "systemic_block": False},
+        "continuation_needed": True, "no_progress": False,
+        "official_validation": {"pending": 100, "checked": 5}}])
+    result = coordinator.coordinate(github, "continue", source_run_id=100, now=NOW, runner_count=4)
+    assert result["run"] and "validate_power" not in result
+    assert github.dispatches == [(coordinator.DISTRIBUTED_COLLECTOR, {"runners": "4", "pilot": "false"})]
+
+
+@pytest.mark.parametrize("summary", [
+    {"distributed": {"pilot": True}, "automatic_continuation_allowed": False},
+    {"distributed": {"systemic_block": True}, "continuation_needed": True, "no_progress": False},
+    {"distributed": {"missing_workers": ["1"]}, "continuation_needed": False},
+    {"distributed": {}, "continuation_needed": False, "no_progress": True},
+])
+def test_distributed_pilot_blocks_and_missing_checkpoints_do_not_auto_restart(summary):
+    github = GitHub([summary])
+    result = coordinator.coordinate(github, "continue", source_run_id=100, now=NOW, runner_count=2)
+    assert not result["run"] and github.dispatches == []
+
+
+def test_normal_legacy_preflight_redirects_only_when_explicitly_routed(monkeypatch):
+    monkeypatch.setenv("BUILD_STYLE_DISTRIBUTED_RUNNERS", "16")
+    github = GitHub([{"blocked": False}])
+    assert coordinator.coordinate(github, "preflight", now=NOW)["run"]
+    assert github.dispatches == []
+    result = coordinator.coordinate(github, "preflight", route_distributed=True, now=NOW)
+    assert not result["run"] and result["redirected"]
+    assert github.dispatches == [(coordinator.DISTRIBUTED_COLLECTOR, {"runners": "16", "pilot": "false"})]
+
+
+@pytest.mark.parametrize("value", ["-1", "17", "2.5", "nan", True])
+def test_distributed_runner_rollout_configuration_fails_closed(value):
+    with pytest.raises(ValueError, match="runner count"):
+        coordinator.distributed_runners(value)
+
+
 @pytest.mark.parametrize("power_validation,expected_inputs", [(False, {"validate_power": "true"}), (True, {})])
 def test_watchdog_alternates_saved_official_checks_with_source_collection(power_validation, expected_inputs):
     github = GitHub([{"blocked": False, "power_validation": power_validation,

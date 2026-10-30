@@ -100,10 +100,11 @@ def analyze_saved_evidence(path: Path, options: dict) -> dict:
     """Spawn-safe worker: reads a durable input and never fetches source data."""
     from threadpoolctl import threadpool_limits
     from .__main__ import analyze_evidence
+    from .external_validation import external_validation_directory
 
     with gzip.open(path, "rt", encoding="utf-8") as handle:
         evidence = json.load(handle)
-    with threadpool_limits(limits=1):
+    with threadpool_limits(limits=1), external_validation_directory(options.get("validation_directory")):
         report = analyze_evidence(argparse.Namespace(**options), evidence)
     result = {"slug": report["commander_slug"], "report": str(Path(options["output_dir"]) / "report.json"),
               "status": report["deck_analysis"]["status"], "version": evidence["analysis_version"]}
@@ -147,6 +148,7 @@ def collection_options(args, slug: str, remaining_seconds: float):
     options.collection_state = args.output_dir / "_collection" / "previews" / f"{slug}.json.gz"
     options.output_dir = args.output_dir / "_collection" / "analyzed" / slug
     options.card_metadata_cache = args.card_metadata_cache
+    options.validation_directory = args.output_dir / "_collection" / "external-validations"
     options.fetch, options.sample_decks, options.seed = args.fetch, args.sample_decks, args.seed
     options.max_components, options.max_tags, options.min_tag_decks = args.max_components, args.max_tags, args.min_tag_decks
     options.min_tag_fraction = getattr(args, "min_tag_fraction", 0.01)

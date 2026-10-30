@@ -112,7 +112,10 @@ export async function loadBuildStyleIndex({ signal } = {}) {
   return index;
 }
 
-const BUILD_COLLECTOR_RUNS_URL = "https://api.github.com/repos/Cinacho23/edhrec-affinity/actions/workflows/build-commander-styles.yml/runs?per_page=1&branch=main";
+const BUILD_COLLECTOR_RUNS_URL = "https://api.github.com/repos/Cinacho23/edhrec-affinity/actions/runs?per_page=20&branch=main";
+const BUILD_COLLECTOR_WORKFLOWS = new Set([
+  ".github/workflows/build-commander-styles.yml", ".github/workflows/collect-distributed-build-styles.yml",
+]);
 let buildCollectorRetryAt = 0;
 
 export async function loadBuildCollectorExecution({ signal, now = Date.now() } = {}) {
@@ -134,7 +137,12 @@ export async function loadBuildCollectorExecution({ signal, now = Date.now() } =
       return null;
     }
     const payload = await response.json();
-    const run = Array.isArray(payload?.workflow_runs) ? payload.workflow_runs[0] : null;
+    const active = new Set(["in_progress", "queued", "requested", "waiting", "pending"]);
+    const runs = Array.isArray(payload?.workflow_runs) ? payload.workflow_runs.filter((run) =>
+      BUILD_COLLECTOR_WORKFLOWS.has(run?.path?.split("@")[0]) && run.head_branch === "main"
+      && typeof run.event === "string" && !run.event.startsWith("pull_request")) : [];
+    runs.sort((left, right) => Number(active.has(right.status)) - Number(active.has(left.status)) || right.id - left.id);
+    const run = runs[0] ?? null;
     const timestamp = (value) => typeof value === "string" && Number.isFinite(Date.parse(value))
       && Date.parse(value) <= now + 5 * 60 * 1000 ? value : null;
     const createdAt = timestamp(run?.created_at);

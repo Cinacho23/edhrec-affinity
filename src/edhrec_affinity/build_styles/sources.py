@@ -317,6 +317,8 @@ class RequestLimiter:
         self._block_kind: str | None = None
         self._blocked_event = threading.Event()
         self._started_at: float | None = None
+        self._source_started_at: str | None = None
+        self._source_completed_at: str | None = None
         self._requests_started = 0
         self._successful_responses = 0
         self._failures = 0
@@ -351,6 +353,7 @@ class RequestLimiter:
                 "observed_requests_per_second": max(0, self._requests_started - 1) / elapsed if elapsed else 0.0,
                 "retry_after_seconds": max(0.0, self._retry_after_until - self.monotonic()),
                 "elapsed_seconds": elapsed, "blocked": self.blocked,
+                "started_at": self._source_started_at, "completed_at": self._source_completed_at,
                 "block_kind": self._block_kind,
                 "throttles": self._throttles,
                 "last_throttle": dict(self._last_throttle) if self._last_throttle else None,
@@ -380,6 +383,7 @@ class RequestLimiter:
             current = self.monotonic()
             if self._started_at is None:
                 self._started_at = current
+                self._source_started_at = datetime.now(timezone.utc).isoformat()
             self._requests_started += 1
             self._next_request = current + self.delay
 
@@ -413,6 +417,7 @@ class RequestLimiter:
 
     def record_success(self) -> None:
         with self._lock:
+            self._source_completed_at = datetime.now(timezone.utc).isoformat()
             self._successes += 1
             self._successful_responses += 1
             if self._successes % self.ramp_after == 0:
@@ -420,6 +425,7 @@ class RequestLimiter:
 
     def record_failure(self, *, cooldown: float = 5.0) -> None:
         with self._lock:
+            self._source_completed_at = datetime.now(timezone.utc).isoformat()
             self._successes = 0
             self._failures += 1
             self._deferrals += 1
@@ -434,6 +440,7 @@ class RequestLimiter:
         reduction once per worker. A new job can learn a further lower ceiling.
         """
         with self._lock:
+            self._source_completed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
             if self._throttles:
                 return
             rate_before = 1 / self.delay

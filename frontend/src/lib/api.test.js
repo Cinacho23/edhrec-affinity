@@ -123,12 +123,13 @@ test("optional collector status validates public main-branch runs and constructs
   const previousFetch = globalThis.fetch;
   const now = Date.parse("2026-10-23T11:30:00Z");
   const run = { id: 39936571861, status: "in_progress", conclusion: null, head_branch: "main",
+    path: ".github/workflows/build-commander-styles.yml", event: "workflow_dispatch",
     created_at: "2026-10-23T10:05:00Z", run_started_at: "2026-10-23T10:06:00Z", updated_at: "2026-10-23T10:06:00Z",
     html_url: "https://untrusted.invalid/" };
   try {
     for (const status of ["in_progress", "queued", "completed"]) {
       globalThis.fetch = async (url, options) => {
-        assert.equal(url, "https://api.github.com/repos/Cinacho23/edhrec-affinity/actions/workflows/build-commander-styles.yml/runs?per_page=1&branch=main");
+        assert.equal(url, "https://api.github.com/repos/Cinacho23/edhrec-affinity/actions/runs?per_page=20&branch=main");
         assert.equal(options.credentials, "omit");
         assert.equal(options.cache, "no-store");
         return { ok: true, json: async () => ({ workflow_runs: [{ ...run, status }] }) };
@@ -152,6 +153,25 @@ test("optional collector status validates public main-branch runs and constructs
     assert.equal(await loadBuildCollectorExecution({ now }), null);
     globalThis.fetch = async () => { throw new DOMException("Canceled", "AbortError"); };
     await assert.rejects(loadBuildCollectorExecution({ now }), { name: "AbortError" });
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("collector execution finds the running distributed VM workflow among unrelated and newer completed jobs", async () => {
+  const previousFetch = globalThis.fetch;
+  const now = Date.parse("2026-10-23T11:30:00Z");
+  const base = { head_branch: "main", created_at: "2026-10-23T11:00:00Z", event: "workflow_dispatch" };
+  try {
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ workflow_runs: [
+      { ...base, id: 103, path: ".github/workflows/deploy-frontend.yml", status: "in_progress" },
+      { ...base, id: 102, path: ".github/workflows/build-commander-styles.yml", status: "completed", conclusion: "success" },
+      { ...base, id: 101, path: ".github/workflows/collect-distributed-build-styles.yml", status: "in_progress" },
+      { ...base, id: 104, path: ".github/workflows/collect-distributed-build-styles.yml", status: "in_progress", event: "pull_request" },
+    ] }) });
+    const result = await loadBuildCollectorExecution({ now });
+    assert.equal(result.runId, 101);
+    assert.equal(result.status, "in_progress");
   } finally {
     globalThis.fetch = previousFetch;
   }

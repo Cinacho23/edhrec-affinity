@@ -1285,6 +1285,7 @@ def read_build_collection_progress(directories: list[Path]) -> dict[str, Any] | 
                          "effective_requests_per_second"),
         "measured_request_rate": ("successful_responses", "requests_started", "failures", "cooldowns",
                                   "current_requests_per_second", "observed_requests_per_second", "elapsed_seconds"),
+        "distributed": ("runners", "active_workers", "blocked_workers", "pilot"),
     }
     for directory in directories:
         for path, checkpoint in ((directory / "_collection/state.json", True),
