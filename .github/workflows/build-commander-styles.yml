@@ -52,6 +52,7 @@ concurrency:
 
 env:
   STYLES_DIR: data/build-style-artifact/build-styles
+  BUILD_STYLE_DISTRIBUTED_RUNNERS: ${{ vars.BUILD_STYLE_DISTRIBUTED_RUNNERS || '0' }}
   # One adaptive limiter applies across all collection workers. This is its
   # ceiling, not its startup rate; source blocks stop the entire batch.
   REQUESTS_PER_SECOND: ${{ vars.BUILD_STYLE_REQUESTS_PER_SECOND || '40' }}
@@ -76,6 +77,10 @@ jobs:
           RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
           POWER_ONLY: ${{ inputs.power_only }}
           VALIDATE_POWER: ${{ inputs.validate_power }}
+          COMMANDER_SLUGS: ${{ inputs.commanders }}
+          MAX_COMMANDERS: ${{ inputs.max_commanders || 0 }}
+          SAMPLE_DECKS: ${{ inputs.sample_decks || 'all' }}
+          REFRESH_REPORTS: ${{ inputs.refresh }}
         run: |
           args=(preflight --summary-file data/build-style-artifact/build_style_batch.json)
           if [[ -n "${RECOVERY_RUN_ID}" ]]; then
@@ -83,6 +88,8 @@ jobs:
           fi
           if [[ "${POWER_ONLY}" == "true" || "${VALIDATE_POWER:-false}" == "true" ]]; then
             args+=(--power-only)
+          elif [[ -z "${RECOVERY_RUN_ID}" && -z "${COMMANDER_SLUGS:-}" && "${MAX_COMMANDERS:-0}" == "0" && "${SAMPLE_DECKS:-all}" == "all" && "${REFRESH_REPORTS:-false}" != "true" ]]; then
+            args+=(--route-distributed)
           fi
           python3 scripts/coordinate_build_styles.py "${args[@]}"
       - name: Retain a skipped-run summary
@@ -548,11 +555,7 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           VALIDATE_POWER: ${{ steps.continuation.outputs.validate_power }}
         run: |
-          args=(--ref "${DEFAULT_BRANCH}")
-          if [[ "${VALIDATE_POWER:-false}" == "true" ]]; then
-            args+=(-f validate_power=true)
-          fi
-          gh workflow run build-commander-styles.yml "${args[@]}"
+          python3 scripts/coordinate_build_styles.py continue --source-run-id "${GITHUB_RUN_ID}"
 
       - name: Fail the run after preserving collection progress
         if: always() && steps.collect_styles.outcome == 'failure' && steps.collection_status.outputs.status != 'rate_limit_paused'

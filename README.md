@@ -68,28 +68,45 @@ export, discovery cards and individual commander package views. Older evidence
 remains stored. A visible browser tab refreshes published results and checks the
 collector’s GitHub execution status every two minutes.
 
-Two collection workers claim commanders from opposite ends of the current
-priority queue. Each keeps its commander through partial collection and analysis;
-saved claims and parsed lists resume after a restart. Downloads and model
-processes run independently, using compact public JSON or React preview data and
-one adaptive shared request ceiling. The collector learns
-an operating rate below EDHREC's throttling threshold and remembers it across jobs.
-Build Discovery reports the fastest collection estimate at that rate and a
-projection from measured throughput, rather than imposing a fixed deadline. Daily
+The distributed collector partitions eligible commanders across separate
+GitHub-hosted Ubuntu VMs. Each VM owns its queue, parsed lists, learned request
+rate and cooldown; two local workers claim its commanders from opposite ends.
+Saved claims resume after a restart. Downloads and model processes run
+independently, using compact public JSON or React preview data. Build Discovery
+reports the combined operating ceiling and measured throughput, rather than
+imposing a fixed deadline. Daily
 deck-index checks add changed/new versions and remove deleted entries while
 preserving unchanged lists and their original download dates. The site separately
 shows index verification, deck coverage, pending analysis, and unknown/stale data.
 Full automated collection relies on the repository owner's stated permission
-from EDHREC; access restrictions and server cooldowns stop all source workers.
+from EDHREC. An individual throttle preserves that VM's cooldown; access
+restrictions or throttling across multiple VMs stop automatic continuation.
 Rate learning preserves existing decks and their original source-check dates.
 
 EDHPowerLevel checks also use two opposite-end workers, keeping each commander's
 Auto and numbered package models together through repairs and final checks.
-All checks share one request gate and source cooldown. Collection and validation
-batches alternate under one workflow lock, with one coordinator publishing the
-cumulative checkpoint, so concurrent workers cannot overwrite another batch's
-reports. More workers overlap useful work without multiplying either service's
-request allowance.
+All checks share one request gate and source cooldown on a separate VM while
+EDHREC collection continues. One merger publishes the cumulative checkpoint;
+power observations attach only to exact deck lists, and repair proposals replace
+reports only when their parent hashes still match. Newer collection reports win.
+
+`Collect commander builds on distributed runners` starts with a bounded
+two-machine pilot. It requires distinct, stable public IPv4 addresses verified
+by two HTTPS services, at least ten minutes of overlapping actual EDHREC
+requests, at least 600 successes per VM, at least 0.8 successful requests/second
+per VM and 1.8 combined, no throttles or blocks, and valid uploaded checkpoints.
+Missing evidence fails the rollout gate. A passing pilot measures that observed
+pair; it does not establish EDHREC's rate-limit scope for every machine.
+Only after reviewing that saved result may `BUILD_STYLE_DISTRIBUTED_RUNNERS` be
+set to 16. Full runs then continue with the approved pool size; the pilot never
+scales itself. The legacy, distributed, watchdog and resume workflows share the
+same coordinator and collection lock.
+
+Each VM receives only its assigned source archive plus shared card metadata.
+The merger validates ownership and archive hashes before publishing. Missing
+machine results retain the original shard and stop automatic continuation.
+Streaming cache merges, disk telemetry and a 2 GiB reserve protect the canonical
+checkpoint; worker results remain separately recoverable if a merge fails.
 
 Every supported package can generate a native 100-card deck using learned card
 preferences and the sampled card pool, with untagged card lists,
@@ -100,7 +117,7 @@ Collector batches continue after durable checkpoint uploads. A separate protecte
 GitHub environment waits through confirmed HTTP 429 cooldowns before resuming;
 its 60-minute wait timer is configured outside the workflow. A metadata-only
 ten-minute watchdog recovers idle work without downloading the full dataset.
-Collection focuses on one commander at a time, using saved progress and remaining
+Each collection worker retains its commander, using saved progress and remaining
 work to finish reports promptly. Completed checkpoints explicitly trigger website
 publication, including collections started by GitHub Actions itself.
 Access restrictions remain distinct from rate-limit pauses.

@@ -21,6 +21,9 @@ concurrency:
   group: commander-build-style-cooldown
   cancel-in-progress: false
 
+env:
+  BUILD_STYLE_DISTRIBUTED_RUNNERS: ${{ vars.BUILD_STYLE_DISTRIBUTED_RUNNERS || '0' }}
+
 jobs:
   inspect:
     name: Verify the saved rate-limit pause and free wait timer

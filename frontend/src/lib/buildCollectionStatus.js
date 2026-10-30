@@ -26,6 +26,11 @@ export function getBuildCollectorStatus(progress, now = Date.now()) {
   if (!Number.isFinite(updated) || !Number.isFinite(now) || updated > now + FUTURE_TOLERANCE_MS
       || !progress?.capacity || typeof progress.capacity !== "object") return null;
   const capacity = progress.capacity;
+  const machines = Number.isSafeInteger(progress.distributed?.runners)
+    && progress.distributed.runners >= 2 && progress.distributed.runners <= 16 ? progress.distributed.runners : null;
+  const blockedMachines = machines && Number.isSafeInteger(progress.distributed?.blocked_workers)
+    && progress.distributed.blocked_workers >= 0 && progress.distributed.blocked_workers <= machines
+    ? progress.distributed.blocked_workers : null;
   const control = progress.rate_control;
   const learnedRate = positive(control?.learned_rate);
   const learned = learnedRate !== null && (capacity.rate_limit_learned === true
@@ -54,16 +59,16 @@ export function getBuildCollectorStatus(progress, now = Date.now()) {
     }
   }
   const hasRecordedCooldown = Number.isFinite(cooldownAt) && !progress.resource_limit;
-  const canProject = !paused || hasRecordedCooldown;
+  const canProject = (!paused || hasRecordedCooldown) && !(blockedMachines > 0);
   const observedAt = capacity.observed_rate_at ?? control?.observed_rate_at;
   const observedTimestamp = typeof observedAt === "string" ? Date.parse(observedAt) : NaN;
   return {
     updatedAt: progress.updated_at, stale, paused, complete,
     label: complete ? "Last published collection complete" : paused && Number.isFinite(cooldownAt) && cooldownAt > now
       ? "Last published batch: source cooldown" : paused ? "Last published batch stopped" : "Last published batch",
-    learned, operatingRate, configuredRate, observedRate, remaining,
+    learned, operatingRate, configuredRate, observedRate, remaining, machines, blockedMachines,
     observedRateAt: Number.isFinite(observedTimestamp) && observedTimestamp <= now + FUTURE_TOLERANCE_MS ? observedAt : null,
-    minimumSeconds: learned && (remaining !== 0 || complete) ? nonnegative(capacity.estimated_minimum_seconds) : null,
+    minimumSeconds: learned && !(blockedMachines > 0) && (remaining !== 0 || complete) ? nonnegative(capacity.estimated_minimum_seconds) : null,
     projectedSeconds: canProject && (remaining !== 0 || complete) ? nonnegative(capacity.measured_projection_seconds) : null,
     projectedFinishAt: canProject && typeof capacity.projected_finish_at === "string"
       && Number.isFinite(Date.parse(capacity.projected_finish_at)) ? capacity.projected_finish_at : null,

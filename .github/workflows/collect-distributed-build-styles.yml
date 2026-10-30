@@ -1,0 +1,663 @@
+name: Collect commander builds on distributed runners
+run-name: "Distributed collector (${{ inputs.runners || vars.BUILD_STYLE_DISTRIBUTED_RUNNERS || 2 }} runners${{ inputs.pilot && ', pilot' || '' }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: "Separate Ubuntu VMs; 0 uses the approved repository setting or two"
+        type: number
+        default: 0
+      pilot:
+        description: "Bounded two-machine throughput and distinct-egress pilot; never automatically scales"
+        type: boolean
+        default: true
+      collect_seconds:
+        description: "Source-work budget per VM; 0 means 900 for pilot or 5400 for full collection"
+        type: number
+        default: 0
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: commander-build-style-samples
+  cancel-in-progress: false
+
+env:
+  STYLES_DIR: data/build-style-artifact/build-styles
+  BUILD_STYLE_DISTRIBUTED_RUNNERS: ${{ vars.BUILD_STYLE_DISTRIBUTED_RUNNERS || '0' }}
+  REQUESTS_PER_SECOND: ${{ vars.BUILD_STYLE_REQUESTS_PER_SECOND || '40' }}
+
+jobs:
+  plan:
+    name: Restore one canonical checkpoint and partition owned work
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      run: ${{ steps.ready.outputs.run }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      runners: ${{ steps.plan.outputs.runners }}
+      collect_seconds: ${{ steps.plan.outputs.collect_seconds }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Check active collectors and source controls
+        id: ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/coordinate_build_styles.py preflight --summary-file data/build-style-artifact/build_style_batch.json
+      - name: Set up Python
+        if: steps.ready.outputs.run == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install analysis dependencies
+        if: steps.ready.outputs.run == 'true'
+        run: python -m pip install -e ".[prototype]"
+      - name: Restore canonical samples once
+        if: steps.ready.outputs.run == 'true'
+        uses: ./.github/actions/restore-build-styles
+        with:
+          destination: ${{ env.STYLES_DIR }}
+          run-id: ${{ steps.ready.outputs.restore_run_id }}
+      - name: Restore shared card rules cache
+        if: steps.ready.outputs.run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: data/raw/build-style-card-metadata.json
+          key: distributed-build-style-cards-${{ github.run_id }}
+          restore-keys: build-style-cards-
+      - name: Retain checked examples
+        if: steps.ready.outputs.run == 'true'
+        run: python scripts/seed_build_style_validations.py --source data/build-styles/validations --destination "${STYLES_DIR}/_collection/external-validations"
+      - name: Get the current index and partition commander ownership
+        id: plan
+        if: steps.ready.outputs.run == 'true'
+        env:
+          REQUESTED_RUNNERS: ${{ inputs.runners || 0 }}
+          PILOT: ${{ inputs.pilot }}
+          COLLECT_SECONDS: ${{ inputs.collect_seconds || 0 }}
+        run: |
+          set -euo pipefail
+          mkdir -p data/distributed-plan/shared
+          curl --fail --silent --show-error --retry 2 \
+            https://cinacho23.github.io/edhrec-affinity/data/latest/commanders/index.json \
+            --output data/distributed-plan/shared/commander_index.json
+          if ! curl --fail --silent --show-error --retry 2 \
+            https://cinacho23.github.io/edhrec-affinity/data/latest/site_manifest.json \
+            --output data/distributed-plan/shared/site_manifest.json; then
+            rm -f data/distributed-plan/shared/site_manifest.json
+          fi
+          python - <<'PY'
+          import json, os
+          from datetime import date
+          from pathlib import Path
+          pilot = os.environ.get("PILOT") == "true"
+          approved = int(os.environ.get("BUILD_STYLE_DISTRIBUTED_RUNNERS", "0"))
+          runners = int(os.environ["REQUESTED_RUNNERS"]) or approved or 2
+          seconds = int(os.environ["COLLECT_SECONDS"]) or (900 if pilot else 5400)
+          if not 2 <= runners <= 16 or pilot and runners != 2:
+              raise SystemExit("Use exactly two pilot VMs, or 2–16 approved full collectors")
+          if not pilot and runners > 2 and approved < runners:
+              raise SystemExit("Larger pools require the repository setting approved after the two-machine pilot")
+          if not 600 <= seconds <= 18000 or pilot and seconds > 1800:
+              raise SystemExit("Use 600–18000 seconds, or at most 1800 for a bounded pilot")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"runners={runners}\ncollect_seconds={seconds}\n")
+          Path("data/distributed-plan/shared/config.json").write_text(json.dumps({"runners": runners, "collect_seconds": seconds, "pilot": pilot}))
+          weekly = Path("data/distributed-plan/shared/site_manifest.json")
+          if weekly.exists():
+              try:
+                  snapshot = Path(json.loads(weekly.read_text())["processed_dir"]).name
+                  if date.fromisoformat(snapshot).isoformat() != snapshot:
+                      raise ValueError("Noncanonical upstream date")
+                  Path("data/distributed-plan/shared/dataset-date.txt").write_text(snapshot)
+              except (ValueError, KeyError, TypeError):
+                  print("::warning::No valid upstream date; retaining the saved source cycle")
+          PY
+          args=(plan --build-styles-dir "${STYLES_DIR}"
+                --commander-index data/distributed-plan/shared/commander_index.json
+                --output-dir data/distributed-plan --generation "${GITHUB_RUN_ID}")
+          runners="$(python -c 'import json; print(json.load(open("data/distributed-plan/shared/config.json"))["runners"])')"
+          args+=(--runners "${runners}")
+          if [[ "${PILOT}" == "true" ]]; then args+=(--pilot); fi
+          python scripts/distributed_build_styles.py "${args[@]}"
+          cp data/distributed-plan/manifest.json data/distributed-plan/shared/manifest.json
+          if [[ -f data/raw/build-style-card-metadata.json ]]; then
+            cp data/raw/build-style-card-metadata.json data/distributed-plan/shared/card-metadata.json
+          fi
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          manifest = json.loads(Path("data/distributed-plan/manifest.json").read_text())
+          matrix = {"include": [{"id": row["id"], "archive": row["archive"]} for row in manifest["workers"]]}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("matrix=" + json.dumps(matrix, separators=(",", ":")) + "\n")
+          PY
+      - name: Upload immutable canonical baseline
+        if: steps.ready.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-base-${{ github.run_id }}
+          path: ${{ env.STYLES_DIR }}/
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 1
+      - name: Upload shared manifest and card metadata
+        if: steps.ready.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-shared-${{ github.run_id }}
+          path: data/distributed-plan/shared/
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload owned input shard 0
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 0
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-0
+          path: data/distributed-plan/shard-0.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 1
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-1
+          path: data/distributed-plan/shard-1.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 2
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-2
+          path: data/distributed-plan/shard-2.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 3
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 3
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-3
+          path: data/distributed-plan/shard-3.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 4
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 4
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-4
+          path: data/distributed-plan/shard-4.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 5
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-5
+          path: data/distributed-plan/shard-5.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 6
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 6
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-6
+          path: data/distributed-plan/shard-6.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 7
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 7
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-7
+          path: data/distributed-plan/shard-7.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 8
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 8
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-8
+          path: data/distributed-plan/shard-8.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 9
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 9
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-9
+          path: data/distributed-plan/shard-9.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 10
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 10
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-10
+          path: data/distributed-plan/shard-10.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 11
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 11
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-11
+          path: data/distributed-plan/shard-11.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 12
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 12
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-12
+          path: data/distributed-plan/shard-12.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 13
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 13
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-13
+          path: data/distributed-plan/shard-13.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 14
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 14
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-14
+          path: data/distributed-plan/shard-14.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload owned input shard 15
+        if: steps.ready.outputs.run == 'true' && fromJSON(steps.plan.outputs.runners) > 15
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-15
+          path: data/distributed-plan/shard-15.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Retain skipped-run summary
+        if: steps.ready.outputs.run == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-style-summary-${{ github.run_id }}
+          path: data/build-style-artifact/build_style_batch.json
+          retention-days: 7
+
+  collect:
+    name: Collect owned shard ${{ matrix.id }} on a separate VM
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      SHARD_ID: ${{ matrix.id }}
+      COLLECT_SECONDS: ${{ needs.plan.outputs.collect_seconds }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install analysis dependencies
+        run: python -m pip install -e ".[prototype]"
+      - name: Download only this VM's owned inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: distributed-input-${{ github.run_id }}-${{ matrix.id }}
+          path: data/distributed-input
+      - name: Download shared manifest and card metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: distributed-shared-${{ github.run_id }}
+          path: data/distributed-shared
+      - name: Extract this VM's disjoint commander shard
+        id: extract
+        run: |
+          set -euo pipefail
+          python scripts/distributed_build_styles.py extract \
+            --archive "data/distributed-input/${{ matrix.archive }}" \
+            --manifest data/distributed-shared/manifest.json --worker "${SHARD_ID}" \
+            --destination "${STYLES_DIR}"
+          ln "data/distributed-input/${{ matrix.archive }}" "data/distributed-shared/${{ matrix.archive }}"
+          mkdir -p data/raw data/distributed-result
+          if [[ -f data/distributed-shared/card-metadata.json ]]; then
+            cp data/distributed-shared/card-metadata.json data/raw/build-style-card-metadata.json
+          fi
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path("data/distributed-shared")
+          manifest = json.loads((root / "manifest.json").read_text())
+          worker = next(row for row in manifest["workers"] if row["id"] == os.environ["SHARD_ID"])
+          owned = set(worker["commanders"])
+          rows = json.loads((root / "commander_index.json").read_text())
+          selected = [row for row in rows if row["commander_slug"] in owned]
+          if {row["commander_slug"] for row in selected} != owned:
+              raise SystemExit("The owned shard and commander index do not match")
+          (root / "owned-commander-index.json").write_text(json.dumps(selected))
+          PY
+      - name: Capture this machine's initial public egress
+        if: steps.extract.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python scripts/check_distributed_pilot.py capture \
+            --output data/distributed-result/egress-before.json --phase before \
+            --run-id "${GITHUB_RUN_ID}" --job-id "${GITHUB_JOB}-${SHARD_ID}" --shard-id "${SHARD_ID}"
+      - name: Upload early machine identity evidence
+        if: always() && steps.extract.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-machine-${{ github.run_id }}-${{ matrix.id }}
+          path: data/distributed-result/egress-before.json
+          if-no-files-found: warn
+          retention-days: 1
+      - name: Collect and analyze this owned commander queue
+        id: collect
+        if: steps.extract.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 330
+        run: |
+          set -euo pipefail
+          sample_date="$(TZ=America/Toronto date +%F)"
+          extra=(--prune-completed-cache)
+          if [[ -f data/distributed-shared/dataset-date.txt ]]; then
+            extra+=(--upstream-snapshot-date "$(cat data/distributed-shared/dataset-date.txt)")
+          fi
+          timeout --signal=INT --kill-after=30s "$((COLLECT_SECONDS + 180))s" \
+            python scripts/build_site_build_styles.py --fetch --pipeline \
+              --commander-index data/distributed-shared/owned-commander-index.json \
+              --output-dir "${STYLES_DIR}" --snapshot-date "${sample_date}" \
+              --max-runtime-seconds "${COLLECT_SECONDS}" --worker-grace-seconds 120 \
+              --workers 2 --preview-workers 16 --analysis-workers 2 \
+              --requests-per-second "${REQUESTS_PER_SECOND}" --sample-decks all --max-components all \
+              --min-total-decks 200 --main-tag-decks 15 --min-tag-decks 5 \
+              --main-tag-fraction 0.03 --min-tag-fraction 0.01 \
+              --source-max-age-hours 72 --refresh-after-days 3 --freshness-target-hours 96 \
+              --card-metadata-cache data/raw/build-style-card-metadata.json "${extra[@]}"
+      - name: Capture final public egress and checkpoint owned results
+        if: always() && steps.extract.outcome == 'success'
+        env:
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+        run: |
+          set -euo pipefail
+          python scripts/check_distributed_pilot.py capture \
+            --output data/distributed-result/egress-after.json --phase after \
+            --run-id "${GITHUB_RUN_ID}" --job-id "${GITHUB_JOB}-${SHARD_ID}" --shard-id "${SHARD_ID}" \
+            || echo "::warning::Final egress capture failed; preserving the collection checkpoint"
+          exit_code=0
+          if [[ "${COLLECT_OUTCOME}" != "success" ]]; then exit_code=1; fi
+          python scripts/distributed_build_styles.py checkpoint \
+            --manifest data/distributed-shared/manifest.json --worker "${SHARD_ID}" \
+            --build-styles-dir "${STYLES_DIR}" --output-dir data/distributed-result --exit-code "${exit_code}"
+          if [[ -f data/raw/build-style-card-metadata.json ]]; then
+            cp data/raw/build-style-card-metadata.json data/distributed-result/card-metadata.json
+          fi
+      - name: Upload only this VM's durable results and evidence
+        if: always() && steps.extract.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-result-${{ github.run_id }}-${{ matrix.id }}
+          path: data/distributed-result/
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 1
+
+  power:
+    name: Check saved package decks while EDHREC VMs collect
+    needs: plan
+    if: needs.plan.outputs.run == 'true' && inputs.pilot != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install actual-site validation dependencies
+        run: |
+          python -m pip install -e ".[prototype,validation]"
+          python -m playwright install --with-deps chromium
+      - name: Download immutable saved-deck baseline
+        uses: actions/download-artifact@v4
+        with:
+          name: distributed-base-${{ github.run_id }}
+          path: ${{ env.STYLES_DIR }}
+      - name: Download shared manifest and card metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: distributed-shared-${{ github.run_id }}
+          path: data/distributed-shared
+      - name: Snapshot exact baseline hashes for conflict-safe proposals
+        id: snapshot
+        run: |
+          set -euo pipefail
+          mkdir -p data/raw data/distributed-power
+          if [[ -f data/distributed-shared/card-metadata.json ]]; then
+            cp data/distributed-shared/card-metadata.json data/raw/build-style-card-metadata.json
+          fi
+          python scripts/distributed_power_deltas.py snapshot \
+            --build-styles-dir "${STYLES_DIR}" --manifest data/distributed-shared/manifest.json \
+            --output data/distributed-power/baseline.json
+      - name: Check, repair and recheck exact deck lists on EDHPowerLevel
+        id: validate
+        continue-on-error: true
+        timeout-minutes: 33
+        run: |
+          timeout --signal=INT --kill-after=30s 32m \
+            python scripts/validate_generated_decks.py --build-styles-dir "${STYLES_DIR}" \
+              --card-metadata-cache data/raw/build-style-card-metadata.json \
+              --validation-directory "${STYLES_DIR}/_collection/external-validations" \
+              --workers 2 --max-runtime-seconds 1800 --max-decks 1000 \
+              --summary data/distributed-power/official-validation-summary.json \
+              --backup-dir "${STYLES_DIR}/_collection/official-validation-backups"
+      - name: Export exact observations and guarded report proposals
+        if: always() && steps.snapshot.outcome == 'success'
+        run: |
+          set -euo pipefail
+          python scripts/distributed_power_deltas.py export \
+            --build-styles-dir "${STYLES_DIR}" --snapshot data/distributed-power/baseline.json \
+            --output-dir data/distributed-power \
+            --summary data/distributed-power/official-validation-summary.json
+          if [[ -f data/raw/build-style-card-metadata.json ]]; then
+            cp data/raw/build-style-card-metadata.json data/distributed-power/card-metadata.json
+          fi
+      - name: Upload power observations without replacing source checkpoints
+        if: always() && steps.snapshot.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-power-${{ github.run_id }}
+          path: data/distributed-power/
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge owned checkpoints and publish one canonical generation
+    needs: [plan, collect, power]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install merge dependencies
+        run: python -m pip install -e ".[prototype]"
+      - name: Download the unchanged canonical baseline
+        uses: actions/download-artifact@v4
+        with:
+          name: distributed-base-${{ github.run_id }}
+          path: ${{ env.STYLES_DIR }}
+      - name: Download original owned shards for interrupted-machine fallback
+        uses: actions/download-artifact@v4
+        with:
+          pattern: distributed-input-${{ github.run_id }}-*
+          path: data/distributed-inputs
+          merge-multiple: true
+      - name: Download the pinned generation manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: distributed-shared-${{ github.run_id }}
+          path: data/distributed-shared
+      - name: Download completed machine results and public-egress evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: distributed-result-${{ github.run_id }}-*
+          path: data/distributed-results
+      - name: Download parallel power observations if available
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: distributed-power-${{ github.run_id }}
+          path: data/distributed-power
+      - name: Merge only each machine's assigned commander state
+        id: merged
+        run: |
+          set -euo pipefail
+          mkdir -p data/distributed-results data/distributed-power data/raw
+          python scripts/distributed_build_styles.py merge \
+            --base "${STYLES_DIR}" --manifest data/distributed-shared/manifest.json \
+            --results data/distributed-results --inputs data/distributed-inputs \
+            --output-summary data/build-style-artifact/build_style_batch.json --generation "${GITHUB_RUN_ID}"
+      - name: Apply power results only to exact or unchanged parent lists
+        if: steps.merged.outcome == 'success'
+        run: |
+          set -euo pipefail
+          if [[ -f data/distributed-power/power-delta.tar.gz ]]; then
+            python scripts/distributed_power_deltas.py apply \
+              --build-styles-dir "${STYLES_DIR}" --manifest data/distributed-shared/manifest.json \
+              --archive data/distributed-power/power-delta.tar.gz \
+              --output-summary data/build-style-artifact/power-delta-merge.json
+          fi
+          python scripts/distributed_power_deltas.py merge-metadata \
+            --base data/distributed-shared/card-metadata.json \
+            --inputs data/distributed-results --output data/raw/build-style-card-metadata.json
+          if [[ -f data/distributed-power/card-metadata.json ]]; then
+            mkdir -p data/distributed-results/power-metadata
+            cp data/distributed-power/card-metadata.json data/distributed-results/power-metadata/card-metadata.json
+            python scripts/distributed_power_deltas.py merge-metadata \
+              --base data/raw/build-style-card-metadata.json \
+              --inputs data/distributed-results/power-metadata --output data/raw/build-style-card-metadata.json
+          fi
+      - name: Assess the two-machine pilot without automatically increasing runners
+        if: inputs.pilot == true && steps.merged.outcome == 'success'
+        run: |
+          python scripts/check_distributed_pilot.py assess \
+            --manifest data/distributed-shared/manifest.json --summaries-dir data/distributed-results \
+            --output data/build-style-artifact/distributed-pilot.json
+      - name: Include guarded power and pilot results in the publication summary
+        if: steps.merged.outcome == 'success'
+        env:
+          PILOT: ${{ inputs.pilot }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path("data/build-style-artifact")
+          path = root / "build_style_batch.json"
+          summary = json.loads(path.read_text())
+          power = root / "power-delta-merge.json"
+          if power.exists():
+              merged = json.loads(power.read_text())
+              summary["parallel_power_merge"] = merged
+              if merged.get("reports_applied", 0) or merged.get("reports_attached", 0):
+                  summary["publish_needed"] = True
+          official = Path("data/distributed-power/official-validation-summary.json")
+          if official.exists():
+              summary["official_validation"] = json.loads(official.read_text())
+              (root / "official-validation-summary.json").write_text(official.read_text())
+              checked = summary["official_validation"].get("checked", 0)
+              if checked:
+                  summary["no_progress"] = False
+              if (checked and summary["official_validation"].get("pending", 0) > 0
+                      and summary.get("automatic_continuation_allowed") is not False
+                      and not summary.get("distributed", {}).get("systemic_block")
+                      and not summary.get("official_validation", {}).get("source_blocked")):
+                  summary["continuation_needed"] = True
+          pilot = root / "distributed-pilot.json"
+          if pilot.exists():
+              gate = json.loads(pilot.read_text())
+              summary.setdefault("distributed", {})["pilot_gate"] = gate
+              (Path(os.environ["STYLES_DIR"]) / "_collection/distributed-pilot.json").write_text(json.dumps(gate))
+          if os.environ.get("PILOT") == "true":
+              summary.update(automatic_continuation_allowed=False, continuation_needed=False)
+          path.write_text(json.dumps(summary, allow_nan=False))
+          PY
+      - name: Save merged current card rules cache
+        if: steps.merged.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: data/raw/build-style-card-metadata.json
+          key: build-style-cards-distributed-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload the single canonical cumulative checkpoint
+        id: checkpoint
+        if: always() && steps.merged.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-styles-distributed-${{ github.run_id }}
+          path: ${{ env.STYLES_DIR }}/
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 2
+      - name: Upload the canonical summary and pilot evidence
+        id: summary
+        if: always() && steps.merged.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-style-summary-${{ github.run_id }}
+          path: |
+            data/build-style-artifact/build_style_batch.json
+            data/build-style-artifact/distributed-pilot.json
+            data/build-style-artifact/power-delta-merge.json
+            data/build-style-artifact/official-validation-summary.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Publish the immutable distributed checkpoint
+        if: steps.checkpoint.outcome == 'success' && steps.summary.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/coordinate_build_styles.py publish --source-run-id "${GITHUB_RUN_ID}"
+      - name: Continue approved full collection from this uploaded generation
+        if: inputs.pilot != true && steps.checkpoint.outcome == 'success' && steps.summary.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/coordinate_build_styles.py continue --source-run-id "${GITHUB_RUN_ID}" --distributed-runners "${{ needs.plan.outputs.runners }}"

@@ -371,6 +371,8 @@ def test_export_publishes_compact_checkpoint_rate_and_eta_without_internal_state
                          "last_throttle": {"at": "2026-10-23T02:47:17Z", "rate_before": 2, "rate_after": 1.5,
                                            "raw_response": "private debug content"}},
         "measured_request_rate": {"successful_responses": 128, "elapsed_seconds": 65.4},
+        "distributed": {"runners": 16, "active_workers": 15, "blocked_workers": 1, "pilot": False,
+                        "public_ips": ["private-network-receipt"]},
         "selected": ["private-queue-entry"],
     }
     write_json(processed / "build-styles/_collection/state.json", {
@@ -387,6 +389,7 @@ def test_export_publishes_compact_checkpoint_rate_and_eta_without_internal_state
     assert "/private" not in json.dumps(public)
     assert "selected" not in public and "commanders" not in public
     assert "raw_response" not in public["rate_control"]["last_throttle"]
+    assert public["distributed"] == {"runners": 16, "active_workers": 15, "blocked_workers": 1, "pilot": False}
 
 
 def test_progress_export_chooses_latest_valid_snapshot_and_tolerates_bad_optional_state(tmp_path):

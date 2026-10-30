@@ -30,6 +30,27 @@ test("configured maximum remains distinct from a provisional learned operating r
   assert.equal(result2.observedRate, 1.333);
 });
 
+test("distributed status uses the combined ceiling and reports independent machines", () => {
+  const source = progress();
+  source.distributed = { runners: 16 };
+  source.capacity.effective_requests_per_second = 16 * 1.318359375;
+  source.rate_control = { learned_rate: 16 * 1.318359375,
+    effective_requests_per_second: 16 * 1.318359375, status: "independent_workers" };
+  const result = getBuildCollectorStatus(source, NOW);
+  assert.equal(result.machines, 16);
+  assert.equal(result.operatingRate, 21.09375);
+  source.distributed.blocked_workers = 1;
+  const partial = getBuildCollectorStatus(source, NOW);
+  assert.equal(partial.blockedMachines, 1);
+  assert.equal(partial.minimumSeconds, null);
+  assert.equal(partial.projectedSeconds, null);
+  assert.equal(partial.projectedFinishAt, null);
+  for (const runners of [0, 1, 17, "16", null]) {
+    source.distributed.runners = runners;
+    assert.equal(getBuildCollectorStatus(source, NOW).machines, null);
+  }
+});
+
 test("known cooldowns retain conditional projections while indefinite pauses defer them", () => {
   const source = { ...progress(), blocked: true, blocked_until: "2026-10-23T03:47:17Z" };
   const result = getBuildCollectorStatus(source, NOW);
