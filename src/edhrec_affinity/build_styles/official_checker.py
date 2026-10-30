@@ -12,6 +12,7 @@ from email.utils import parsedate_to_datetime
 import hashlib
 import math
 import re
+import threading
 import time
 from urllib.parse import urlencode, urlparse
 
@@ -173,13 +174,68 @@ def parse_observation(deck: dict, snapshot: dict, *, source_url: str, script_sha
                 'commander_names':[c['name'] for c in deck['commanders']]}}
 
 
-class OfficialDeckChecker:
-    """One paced browser session, reusable across a bounded checkpoint batch."""
-    def __init__(self, *, min_interval_seconds: float = 5):
+class SharedCheckAdmission:
+    """One request-start clock and source stop signal for every browser worker."""
+
+    def __init__(self, *, min_interval_seconds=5, monotonic=time.monotonic, sleep=time.sleep):
+        if not math.isfinite(min_interval_seconds) or min_interval_seconds < 0:
+            raise ValueError('Check interval must be a finite nonnegative number')
         self.min_interval_seconds = max(5, min_interval_seconds)
-        self._last_started = None
-        self._blocked = None
+        self._monotonic, self._sleep = monotonic, sleep
+        self._lock = threading.Lock()
+        self._next_start = None
+        self._reason = None
         self._retry_after_seconds = 0
+
+    @property
+    def blocked(self):
+        with self._lock:
+            return self._reason is not None
+
+    @property
+    def reason(self):
+        with self._lock:
+            return self._reason
+
+    @property
+    def retry_after_seconds(self):
+        with self._lock:
+            return self._retry_after_seconds
+
+    def stop(self, reason, retry_after_seconds=0):
+        if type(retry_after_seconds) not in {int, float} or not math.isfinite(retry_after_seconds):
+            retry_after_seconds = 0
+        with self._lock:
+            self._reason = self._reason or str(reason or 'EDHPowerLevel access stopped')
+            self._retry_after_seconds = max(self._retry_after_seconds, retry_after_seconds)
+
+    def acquire(self, *, timeout_seconds=120):
+        """Admit one start, or return false on a shared block or expired budget.
+
+        Only actual admissions advance the clock. Waiting workers poll briefly
+        so a source block stops them without waiting out the entire interval.
+        """
+        deadline = self._monotonic() + max(0, timeout_seconds)
+        while True:
+            with self._lock:
+                now = self._monotonic()
+                if self._reason is not None or now >= deadline:
+                    return False
+                delay = max(0, (self._next_start or now) - now)
+                if delay == 0:
+                    self._next_start = now + self.min_interval_seconds
+                    return True
+                remaining = deadline - now
+            self._sleep(min(delay, remaining, 0.1))
+
+
+class OfficialDeckChecker:
+    """One thread-owned browser session, with admission shared across workers."""
+    def __init__(self, *, min_interval_seconds: float = 5, admission=None, admission_managed=False):
+        self._admission = admission if admission is not None else SharedCheckAdmission(
+            min_interval_seconds=min_interval_seconds)
+        self.min_interval_seconds = self._admission.min_interval_seconds
+        self._admission_managed = admission_managed
         self._browser = None
         self._playwright = None
 
@@ -208,15 +264,17 @@ class OfficialDeckChecker:
         checked_at = datetime.now(timezone.utc).isoformat()
         result = {'status':'failed', 'source_blocked':False, 'checked_at':checked_at,
                   'deck_sha256':cardlist_hash(deck['cards'])}
+        def blocked_result():
+            return {**result, 'status':'blocked', 'source_blocked':True, 'reason':self._admission.reason,
+                    'retry_after_seconds':self._admission.retry_after_seconds}
         page = None
         try:
             url = deck_url(deck)
-            if self._blocked:
-                return {**result, 'status':'blocked', 'source_blocked':True, 'reason':self._blocked,
-                        'retry_after_seconds':self._retry_after_seconds}
-            if self._last_started is not None:
-                time.sleep(max(0, self.min_interval_seconds - (time.monotonic() - self._last_started)))
-            self._last_started = time.monotonic()
+            if self._admission.blocked:
+                return blocked_result()
+            if not self._admission_managed and not self._admission.acquire(timeout_seconds=timeout_seconds):
+                return blocked_result() if self._admission.blocked else {
+                    **result, 'reason':'EDHPowerLevel request admission exceeded the remaining time budget'}
             deadline = time.monotonic() + timeout_seconds
             page = self._context.new_page()
             scripts = {}
@@ -224,9 +282,9 @@ class OfficialDeckChecker:
             def response_seen(response):
                 parsed = urlparse(response.url)
                 if parsed.hostname in {_SOURCE, _BACKEND} and response.status in {401, 403, 429}:
-                    self._blocked = f'EDHPowerLevel returned HTTP {response.status}; the external validation queue stopped'
-                    self._retry_after_seconds = max(self._retry_after_seconds,
-                        _retry_delay(getattr(response, 'headers', {}).get('retry-after')))
+                    self._admission.stop(
+                        f'EDHPowerLevel returned HTTP {response.status}; the external validation queue stopped',
+                        retry_after_seconds=_retry_delay(getattr(response, 'headers', {}).get('retry-after')))
                 if parsed.hostname == _BACKEND and response.status == 200:
                     try:
                         payload = response.json()
@@ -242,12 +300,13 @@ class OfficialDeckChecker:
                     except Exception:
                         pass
             page.on('response', response_seen)
+            if self._admission.blocked:
+                return blocked_result()
             page.goto(url, wait_until='domcontentloaded', timeout=min(timeout_seconds * 1000, 60000))
             snapshot = None
             while time.monotonic() < deadline:
-                if self._blocked:
-                    return {**result, 'status':'blocked', 'source_blocked':True, 'reason':self._blocked,
-                            'retry_after_seconds':self._retry_after_seconds}
+                if self._admission.blocked:
+                    return blocked_result()
                 snapshot = page.evaluate(_SNAPSHOT_JS)
                 if backend_completed and snapshot.get('groups') and (snapshot.get('state') or {}).get('loading') == 'hidden':
                     break
@@ -261,12 +320,13 @@ class OfficialDeckChecker:
             values = parse_observation(deck, snapshot or {}, source_url=url,
                 script_sha256=next(iter(scripts.values())),
                 checked_at=datetime.now(timezone.utc).isoformat())
+            if self._admission.blocked:
+                return blocked_result()
             observation = record_external_validation(deck, values, validation_directory)
             return {**result, 'status':'verified', 'checked_at':observation['checked_at'], 'observation':observation}
         except Exception as error:
-            if self._blocked:
-                return {**result, 'status':'blocked', 'source_blocked':True, 'reason':self._blocked,
-                        'retry_after_seconds':self._retry_after_seconds}
+            if self._admission.blocked:
+                return blocked_result()
             return {**result, 'reason':f'{type(error).__name__}: {error}'}
         finally:
             if page is not None:

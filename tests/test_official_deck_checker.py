@@ -1,11 +1,14 @@
 """A partial or mismatched website result must never certify a generated list."""
 from datetime import datetime, timezone
+import threading
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
 from edhrec_affinity.build_styles.external_validation import record_external_validation, external_restriction_evidence
-from edhrec_affinity.build_styles.official_checker import OfficialDeckChecker, deck_url, parse_observation
+from edhrec_affinity.build_styles.official_checker import (
+    OfficialDeckChecker, SharedCheckAdmission, deck_url, parse_observation,
+)
 
 
 def deck():
@@ -122,3 +125,75 @@ def test_cleanup_after_failed_browser_startup_is_safe_and_idempotent():
     checker=OfficialDeckChecker()
     checker.__exit__(None,None,None)
     checker.__exit__(None,None,None)
+
+
+def test_shared_admission_paces_every_worker_and_does_not_reserve_expired_starts():
+    clock = [0.0]
+    def sleep(seconds):
+        clock[0] += seconds
+    gate = SharedCheckAdmission(min_interval_seconds=5, monotonic=lambda:clock[0], sleep=sleep)
+    assert gate.acquire(timeout_seconds=10)
+    assert clock[0] == 0
+    assert not gate.acquire(timeout_seconds=2)
+    assert clock[0] == pytest.approx(2)
+    assert gate.acquire(timeout_seconds=10)
+    assert clock[0] == pytest.approx(5)
+    assert gate.acquire(timeout_seconds=10)
+    assert clock[0] == pytest.approx(10)
+
+
+def test_shared_source_stop_interrupts_another_waiting_worker():
+    waiting, release = threading.Event(), threading.Event()
+    def sleep(_seconds):
+        waiting.set()
+        assert release.wait(2)
+    gate = SharedCheckAdmission(sleep=sleep)
+    assert gate.acquire(timeout_seconds=10)
+    result = []
+    worker = threading.Thread(target=lambda:result.append(gate.acquire(timeout_seconds=10)))
+    worker.start()
+    assert waiting.wait(2)
+    gate.stop('HTTP 429', retry_after_seconds=100)
+    gate.stop('HTTP 403', retry_after_seconds=200)
+    release.set()
+    worker.join(2)
+    assert not worker.is_alive() and result == [False]
+    assert gate.reason == 'HTTP 429' and gate.retry_after_seconds == 200
+
+
+def test_browser_source_block_stops_other_browser_before_navigation(tmp_path):
+    gate = SharedCheckAdmission()
+    class Page:
+        def on(self,event,callback):self.callback=callback
+        def goto(self,*args,**kwargs):
+            self.callback(type('Response',(),{'url':'https://edhpowerlevel.com/', 'status':429,
+                'headers':{'retry-after':'123'}})())
+            raise RuntimeError('Navigation interrupted')
+        def close(self):pass
+    first = OfficialDeckChecker(admission=gate, admission_managed=True)
+    first._context = type('Context',(),{'new_page':lambda _:Page()})()
+    second = OfficialDeckChecker(admission=gate, admission_managed=True)
+    second._context = type('Context',(),{'new_page':lambda _:pytest.fail('Navigated after source block')})()
+    assert first.check(deck(),validation_directory=tmp_path)['status'] == 'blocked'
+    result = second.check(deck(),validation_directory=tmp_path)
+    assert result['status'] == 'blocked' and result['retry_after_seconds'] == 123
+
+
+def test_inflight_browser_does_not_publish_proof_after_another_worker_blocks(tmp_path):
+    gate = SharedCheckAdmission()
+    class Page:
+        url = deck_url(deck())
+        def on(self,event,callback):self.callback=callback
+        def goto(self,*args,**kwargs):
+            self.callback(type('Response',(),{'url':'https://edhpowerlevel.com/js/main-test.js',
+                'status':200,'body':lambda _:b'bracket-tracker Restricted Extra Turn Cards'})())
+            self.callback(type('Response',(),{'url':'https://getcards-4zjvieuafa-uc.a.run.app',
+                'status':200,'json':lambda _:{'data':[], 'combo':{'results':{'included':[]}}}})())
+        def evaluate(self,*args):
+            gate.stop('HTTP 429 observed by the other worker')
+            return snapshot()
+        def close(self):pass
+    checker = OfficialDeckChecker(admission=gate, admission_managed=True)
+    checker._context = type('Context',(),{'new_page':lambda _:Page()})()
+    assert checker.check(deck(),validation_directory=tmp_path)['status'] == 'blocked'
+    assert not list(tmp_path.iterdir())
