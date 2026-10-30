@@ -57,9 +57,23 @@ runs:
             continue
           fi
           staging="$(mktemp -d "${RUNNER_TEMP}/build-style-restore.XXXXXX")"
-          if ! gh run download "${run_id}" --name "${artifact_name}" --dir "${staging}"; then
-            echo "::warning::Could not download ${artifact_name}; trying an earlier checkpoint."
+          downloaded="false"
+          # Large checkpoints can hit transient artifact-storage timeouts. Retry
+          # the same immutable upload before considering an older checkpoint.
+          for attempt in 1 2 3; do
+            if gh run download "${run_id}" --name "${artifact_name}" --dir "${staging}"; then
+              downloaded="true"
+              break
+            fi
             rm -rf "${staging}"
+            if [[ "${attempt}" -lt 3 ]]; then
+              echo "::warning::Download of ${artifact_name} failed (attempt ${attempt}/3); retrying the same checkpoint."
+              sleep "$((attempt * 5))"
+              staging="$(mktemp -d "${RUNNER_TEMP}/build-style-restore.XXXXXX")"
+            fi
+          done
+          if [[ "${downloaded}" != "true" ]]; then
+            echo "::warning::Could not download ${artifact_name} after 3 attempts; trying an earlier checkpoint."
             continue
           fi
           # A failed or cancelled run can still have uploaded a complete,
