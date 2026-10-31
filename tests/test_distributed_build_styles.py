@@ -108,6 +108,39 @@ def test_scaling_preserves_partial_ownership_and_balances_unstarted_work(tmp_pat
     assert all(worker["source_rate"]["learned_rate"] == core.SEED_REQUEST_RATE for worker in manifest["workers"] if worker["id"] != "1")
 
 
+@pytest.mark.parametrize("completed_count", [16, 19])
+def test_completed_samples_balance_offline_work_independently_of_unequal_network_loads(tmp_path, completed_count):
+    network = {"a-network": 10000, "b-network": 6000, "c-network": 3000, "d-network": 2500,
+               "new-network": 4000}
+    completed = {f"completed-{number:02}": 200 for number in range(completed_count)}
+    base, index, state = setup(tmp_path, totals=network | completed)
+    state["distributed"] = {"workers": {}}
+    for number, slug in enumerate(list(network)[:4]):
+        state["commanders"][slug] = {"status": "collecting", "coverage_complete": False,
+                                      "frame_decks": network[slug], "current_previews": 100}
+        state["distributed"]["workers"][str(number)] = {"commanders": [slug]}
+    for slug in completed:
+        state["commanders"][slug] = {"status": "fitted", "coverage_complete": True,
+                                      "frame_decks": 200, "current_previews": 200}
+    write(base / core.STATE, state)
+    network_index = tmp_path / "network-index.json"
+    write(network_index, [row for row in core.read_json(index) if row["commander_slug"] in network])
+    network_only = core.plan(base, network_index, tmp_path / "network-plan", 4, "network-only")
+    manifest = core.plan(base, index, tmp_path / "plan", 4, "with-offline-repairs")
+    counts = [len(set(worker["commanders"]) & set(completed)) for worker in manifest["workers"]]
+    assert sum(counts) == completed_count
+    assert max(counts) - min(counts) <= 1
+    assert all(count >= completed_count // 4 for count in counts)
+    claims = [slug for worker in manifest["workers"] for slug in worker["commanders"]]
+    assert len(claims) == len(set(claims)) == len(network) + completed_count
+    assert len({worker["estimated_remaining_requests"] for worker in manifest["workers"]}) > 1
+    for worker, original in zip(manifest["workers"], network_only["workers"]):
+        assert [slug for slug in worker["commanders"] if slug in network] == original["commanders"]
+        assert worker["estimated_remaining_requests"] == original["estimated_remaining_requests"]
+        if int(worker["id"]) < 4:
+            assert list(network)[int(worker["id"])] in worker["commanders"]
+
+
 def test_pilot_avoids_model_backlog_small_frames_and_saved_retries(tmp_path):
     base, index, state = setup(tmp_path)
     state["commanders"]["a-large"] = {"status": "analysis_pending", "current_previews": 1}

@@ -14,7 +14,8 @@ import httpx
 import pytest
 
 from edhrec_affinity.build_styles.pipeline import (
-    atomic_json, collection_options, evidence_version, model_policy, run_pipeline, save_evidence,
+    COMMANDER_IDENTITY_VERSION, atomic_json, collection_options, evidence_version, model_policy, run_pipeline,
+    save_evidence,
 )
 from edhrec_affinity.build_styles.analysis import tag_label_policy
 from edhrec_affinity.build_styles.sources import BudgetExpired, SourceBlocked
@@ -42,7 +43,8 @@ def rows(*slugs):
 def evidence(slug, *, frame=5, loaded=5, attempted=None, new_attempts=None, complete=True,
              mode="all", dataset="stable-dataset", checked=NOW):
     attempted = loaded if attempted is None else attempted
-    return {"slug": slug, "card": {"name": slug}, "base": {"commander_names": [slug], "deck_count": 200},
+    return {"slug": slug, "card": {"name": slug},
+        "base": {"commander_names": [slug], "commander_name_groups": [[slug]], "deck_count": 200},
         "profiles": [], "ranking_profiles": [], "decks": [], "metadata": {}, "metadata_summary": {},
         "tag_label_policy": tag_label_policy(),
         "failures": [], "imported_count": 0, "blocked": False, "provenance": [],
@@ -679,6 +681,220 @@ def test_uncapped_upgrade_reuses_saved_sample_and_preserves_source_times(tmp_pat
     assert saved["collection"]["freshness"]["oldest_verified_at"] == source_date.isoformat()
     assert saved["collection"]["provenance"] == source["provenance"]
     assert preview.read_bytes() == b"retained parsed deck checkpoint"
+
+
+def seed_legacy_commander_identity(args, slug, card):
+    """A complete source sample whose old analysis mistook DFC faces for partners."""
+    observed = NOW - timedelta(hours=4)
+    source = evidence(slug, checked=observed, new_attempts=0)
+    source["card"] = card
+    source["base"]["commander_names"] = card["names"]
+    source["base"]["commander_name_groups"] = [card["names"]]
+    source["provenance"] = [{"url": f"https://json.edhrec.com/pages/commanders/{slug}.json",
+                             "fetched_at": observed.isoformat(), "sha256": "original-source"}]
+    state_path = args.output_dir / "_collection/state.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {"schema_version": 1, "commanders": {}}
+    state["commanders"][slug] = {
+        "status": "insufficient_data", "coverage_complete": True, "frame_decks": 5,
+        "current_previews": 5, "verified_at": observed.isoformat(), "analyzed_at": observed.isoformat(),
+        "last_collection_at": observed.isoformat(), "collection_dataset_sha256": "stable-dataset",
+        "analysis_version": "legacy-identity-model", "tag_label_policy": tag_label_policy(),
+        "model_policy": model_policy(args),
+    }
+    atomic_json(state_path, state)
+    atomic_json(args.output_dir / f"{slug}.json", {
+        "schema_version": 1, "commander_slug": slug, "commander_name": card["name"],
+        "generated_at": observed.isoformat(), "total_edhrec_decks": 200,
+        "collection": {**source["collection"], "analysis_dataset_sha256": "stable-dataset",
+                       "provenance": source["provenance"]},
+        "tag_label_policy": tag_label_policy(),
+        "deck_analysis": {"status": "insufficient_data", "unique_decks": 0, "packages": []},
+    })
+    atomic_json(args.output_dir / f"_collection/sources/{slug}/base.json", {
+        "container": {"json_dict": {"card": card}}})
+    preview = args.output_dir / f"_collection/previews/{slug}.json.gz"
+    preview.parent.mkdir(parents=True, exist_ok=True)
+    preview.write_bytes(b"retained parsed deck checkpoint")
+    return source
+
+
+def dfc_identity_card():
+    return {"name": "Plargg, Dean of Chaos", "names": ["Plargg, Dean of Chaos", "Augusta, Dean of Order"],
+            "layout": "modal_dfc"}
+
+
+def corrected_identity_evidence(source):
+    front = source["card"]["name"]
+    return {**source, "base": {**source["base"], "commander_names": [front],
+                               "commander_name_groups": [[front], [" // ".join(source["card"]["names"])]]}}
+
+
+def test_identity_upgrade_repairs_only_split_faces_from_cache_once_without_changing_source_dates(tmp_path):
+    args = options(tmp_path, fetch=True)
+    source = seed_legacy_commander_identity(args, "dfc", dfc_identity_card())
+    seed_legacy_commander_identity(args, "ordinary", {"name": "Ordinary Commander", "names": ["Ordinary Commander"]})
+    seed_legacy_commander_identity(args, "partners", {
+        "name": "First Commander // Second Commander", "names": ["First Commander", "Second Commander"],
+        "layout": "normal", "cards": [{"name": "First Commander"}, {"name": "Second Commander"}]})
+    previous = checkpoint(args)
+    calls, analyzed = [], []
+
+    def cached_inputs(settings, **dependencies):
+        calls.append(settings.commander)
+        assert settings.commander == "dfc"
+        assert settings.fetch is False
+        assert settings.source_max_age_hours is settings.index_max_age_hours is None
+        assert settings.collection_state.read_bytes() == b"retained parsed deck checkpoint"
+        assert dependencies["limiter"].stats["requests_started"] == 0
+        return corrected_identity_evidence(source)
+
+    result = execute(args, rows("dfc", "ordinary", "partners"), cached_inputs, saved_analyzer(analyzed))
+    record = checkpoint(args)["commanders"]["dfc"]
+    assert calls == analyzed == result["reanalyzed_from_cache"] == result["completed"] == ["dfc"]
+    assert result["collected"] == [] and result["new_previews_attempted"] == 0
+    assert result["measured_request_rate"]["requests_started"] == 0
+    assert record["commander_identity_version"] == COMMANDER_IDENTITY_VERSION
+    assert record["model_policy"] == previous["commanders"]["dfc"]["model_policy"] == model_policy(args)
+    assert model_policy(args)["version"] == 8
+    for key in ("verified_at", "last_collection_at", "collection_dataset_sha256"):
+        assert record[key] == previous["commanders"]["dfc"][key]
+    for slug in ("ordinary", "partners"):
+        assert checkpoint(args)["commanders"][slug] == previous["commanders"][slug]
+    saved = json.loads((args.output_dir / "dfc.json").read_text())
+    assert saved["deck_analysis"]["status"] == "fitted"
+    assert saved["collection"]["freshness"] == source["collection"]["freshness"]
+    assert saved["collection"]["provenance"] == source["provenance"]
+    second = execute(args, rows("dfc", "ordinary", "partners"),
+                     lambda *_, **__: pytest.fail("The repaired identity must not reanalyze on every run"),
+                     saved_analyzer(analyzed))
+    assert second["selected"] == second["completed"] == []
+    assert analyzed == ["dfc"]
+
+
+def test_identity_repair_marks_an_already_normalized_unchanged_model_without_refitting(tmp_path):
+    args = options(tmp_path, fetch=True)
+    source = corrected_identity_evidence(seed_legacy_commander_identity(args, "dfc", dfc_identity_card()))
+    state = checkpoint(args)
+    version = evidence_version(source, collection_options(args, "dfc", 30))
+    state["commanders"]["dfc"]["analysis_version"] = version
+    atomic_json(args.output_dir / "_collection/state.json", state)
+    calls = []
+
+    def cached_inputs(settings, **_):
+        calls.append(settings.fetch)
+        return source
+
+    result = execute(args, rows("dfc"), cached_inputs,
+                     lambda *_, **__: pytest.fail("An unchanged normalized model must reuse its saved result"))
+    assert calls == [False]
+    assert result["reanalyzed_from_cache"] == result["completed"] == ["dfc"]
+    assert result["new_previews_attempted"] == 0
+    assert checkpoint(args)["commanders"]["dfc"]["commander_identity_version"] == COMMANDER_IDENTITY_VERSION
+    assert checkpoint(args)["commanders"]["dfc"]["analysis_version"] == version
+
+
+def test_short_identity_repair_preserves_both_sticky_frames_and_their_parsed_decks(tmp_path):
+    args = options(tmp_path, fetch=True, workers=2, analysis_workers=2, max_runtime_seconds=2)
+    source = seed_legacy_commander_identity(args, "m-dfc", dfc_identity_card())
+    state = checkpoint(args)
+    state["pipeline"] = {"collection_workers": {"0": "a-partial", "1": "z-partial"}}
+    for slug in ("a-partial", "z-partial"):
+        state["commanders"][slug] = {"status": "collecting", "coverage_complete": False,
+                                      "frame_decks": 200, "current_previews": 50}
+        path = args.output_dir / f"_collection/previews/{slug}.json.gz"
+        path.write_bytes(f"retained {slug} decks".encode())
+    atomic_json(args.output_dir / "_collection/state.json", state)
+    calls, analyzed, ticks = [], [], [0]
+    lock, partials = threading.Lock(), threading.Barrier(2)
+
+    def collect(settings, **_):
+        slug = settings.commander
+        with lock:
+            calls.append((settings.collection_worker, slug))
+        if slug == "m-dfc":
+            assert settings.fetch is False
+            assert checkpoint(args)["pipeline"]["collection_workers"] == {"0": "a-partial", "1": "z-partial"}
+            return corrected_identity_evidence(source)
+        assert settings.collection_state.read_bytes() == f"retained {slug} decks".encode()
+        partials.wait(timeout=5)
+        with lock:
+            ticks[0] += 1
+        return evidence(slug, frame=200, loaded=100, new_attempts=50, complete=False)
+
+    inventory = rows("a-partial", "m-dfc", "z-partial")
+    result = execute(args, inventory, collect, saved_analyzer(analyzed), monotonic=lambda: ticks[0])
+    assert calls[0] == (0, "m-dfc")
+    assert set(calls[1:]) == {(0, "a-partial"), (1, "z-partial")}
+    assert result["reanalyzed_from_cache"] == analyzed == ["m-dfc"]
+    assert checkpoint(args)["pipeline"]["collection_workers"] == {"0": "a-partial", "1": "z-partial"}
+    resumed = []
+
+    def finish(settings, **_):
+        resumed.append((settings.collection_worker, settings.commander))
+        assert settings.collection_state.read_bytes() == f"retained {settings.commander} decks".encode()
+        return evidence(settings.commander, frame=200, loaded=200, new_attempts=100)
+
+    second = execute(options(tmp_path, fetch=True, workers=2, analysis_workers=2), inventory,
+                     finish, saved_analyzer([]))
+    assert set(resumed) == {(0, "a-partial"), (1, "z-partial")}
+    assert set(second["completed"]) == {"a-partial", "z-partial"}
+    assert checkpoint(args)["pipeline"]["collection_workers"] == {}
+
+
+@pytest.mark.parametrize("failure", ["missing", "different_dataset"])
+def test_identity_upgrade_preserves_report_when_complete_saved_inputs_cannot_be_reproduced(tmp_path, failure):
+    args = options(tmp_path, fetch=True)
+    source = seed_legacy_commander_identity(args, "dfc", dfc_identity_card())
+    path = args.output_dir / "dfc.json"
+    previous = path.read_bytes()
+    calls = []
+
+    def unusable_cached_inputs(settings, **_):
+        calls.append(settings.fetch)
+        assert settings.fetch is False
+        if failure == "missing":
+            raise FileNotFoundError("No retained parsed preview inputs")
+        result = corrected_identity_evidence(source)
+        result["collection"] = {**result["collection"], "dataset_sha256": "different-dataset"}
+        return result
+
+    result = execute(args, rows("dfc"), unusable_cached_inputs, saved_analyzer([]))
+    assert calls == [False]
+    assert result["completed"] == [] and len(result["model_upgrades_deferred"]) == 1
+    assert path.read_bytes() == previous
+    assert checkpoint(args)["commanders"]["dfc"].get("commander_identity_version") != COMMANDER_IDENTITY_VERSION
+    assert checkpoint(args)["commanders"]["dfc"]["model_upgrade_needs_collection"] is True
+
+
+def test_pending_split_face_evidence_is_normalized_before_its_analysis_fingerprint(tmp_path):
+    args = options(tmp_path, fetch=True)
+    source = seed_legacy_commander_identity(args, "dfc", dfc_identity_card())
+    source["analysis_version"] = "old-split-face-fingerprint"
+    path = args.output_dir / "_collection/evidence/dfc.json.gz"
+    save_evidence(path, source)
+    state = checkpoint(args)
+    state["commanders"]["dfc"]["status"] = "analysis_pending"
+    atomic_json(args.output_dir / "_collection/state.json", state)
+    observed, analyzed = [], []
+
+    def inspect_saved_input(path, settings):
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            pending = json.load(handle)
+        assert pending["base"]["commander_names"] == ["Plargg, Dean of Chaos"]
+        assert ["Plargg, Dean of Chaos"] in pending["base"]["commander_name_groups"]
+        assert all(len(group) == 1 for group in pending["base"]["commander_name_groups"])
+        assert pending["analysis_version"] == evidence_version(pending, argparse.Namespace(**settings))
+        assert pending["collection"] == source["collection"]
+        observed.append(pending)
+        return saved_analyzer(analyzed)(path, settings)
+
+    result = execute(args, rows("dfc"),
+                     lambda *_, **__: pytest.fail("Durable model evidence must not trigger HTTP collection"),
+                     inspect_saved_input)
+    assert result["completed"] == analyzed == ["dfc"]
+    assert len(observed) == 1
+    assert checkpoint(args)["commanders"]["dfc"]["analysis_version"] == observed[0]["analysis_version"]
+    assert checkpoint(args)["commanders"]["dfc"]["commander_identity_version"] == COMMANDER_IDENTITY_VERSION
 
 
 @pytest.mark.parametrize("failure", ["missing", "different_dataset", "partial", "missing_ranking", "missing_metadata"])

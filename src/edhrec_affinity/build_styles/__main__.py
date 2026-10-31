@@ -15,8 +15,8 @@ from .analysis import analyze_decks, compare_profiles, tag_label_policy, tag_lab
 from .collection import collect_previews, parse_sample_decks
 from .eligibility import MIN_COMMANDER_DECKS, require_eligible_commander, validate_minimum
 from .sources import (
-    Cache, CommanderAliasCatalog, RequestLimiter, SourceBlocked, checked_identifier,
-    commander_card_alias_groups, commander_printing_ids, enrich_commander_name_groups,
+    Cache, CommanderAliasCatalog, RequestLimiter, SourceBlocked, card_key, checked_identifier,
+    commander_back_names, commander_card_alias_groups, commander_names, commander_printing_ids, enrich_commander_name_groups,
     import_decks, parse_profile,
 )
 
@@ -45,7 +45,7 @@ def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transpor
         # analysis can still proceed, or record an honest insufficient sample.
         base = parse_profile(payload, "all", "All builds", allow_empty=True)
         label_thresholds = tag_label_thresholds(base.get("deck_count"), label_policy)
-        base["commander_names"] = card.get("names") or [card["name"]]
+        base["commander_names"] = commander_names(card)
         aliases = commander_alias_provider or CommanderAliasCatalog(root.parent)
         base["commander_name_groups"] = aliases.groups(card)
         # Sparse partner pages can omit the tag panel entirely. Their deck
@@ -133,18 +133,41 @@ def collect_evidence(args: argparse.Namespace, *, limiter=None, preview_transpor
                 metadata, metadata_summary = (metadata_provider.load(names, fetch=args.fetch, **alias_options) if metadata_provider else
                                                load_card_metadata(names, args.card_metadata_cache, fetch=args.fetch, **alias_options))
             base["commander_name_groups"] = enrich_commander_name_groups(base, metadata)
-        return {"slug": slug, "card": card, "base": base, "profiles": profiles, "tag_label_policy": label_policy,
+        return normalize_commander_evidence({"slug": slug, "card": card, "base": base, "profiles": profiles, "tag_label_policy": label_policy,
                 "tag_label_thresholds": label_thresholds,
                 "ranking_profiles": ranking_profiles, "decks": decks, "collection": collection,
                 "metadata": metadata, "metadata_summary": metadata_summary,
                 "failures": failures, "imported_count": imported_count,
-                "blocked": cache.blocked or bool(metadata_summary.get("blocked")), "provenance": cache.provenance}
+                "blocked": cache.blocked or bool(metadata_summary.get("blocked")), "provenance": cache.provenance})
     finally:
         cache.close()
 
 
+def normalize_commander_evidence(evidence: dict) -> dict:
+    """Normalize saved commander roles in place, without any source requests."""
+    card = evidence.get("card")
+    if not isinstance(card, dict) or not (card.get("name") or card.get("names")):
+        return evidence  # Legacy imports can supply explicit roles without a source card.
+    base = dict(evidence["base"])
+    base["commander_names"] = commander_names(card)
+    known = CommanderAliasCatalog(cards=[card]).groups(card)
+    count = len(base["commander_names"])
+    previous = base.get("commander_name_groups", [])
+    previous = previous if isinstance(previous, list) else []
+    # Old pending inputs can contain two-face role configurations. Retain only
+    # complete role equivalents and never a known standalone back-face alias.
+    forbidden = commander_back_names(card)
+    known.extend(group for group in previous if isinstance(group, list) and len(group) == count
+                 and not any(isinstance(name, str) and card_key(name) in forbidden for name in group))
+    base["commander_name_groups"] = known
+    base["commander_name_groups"] = enrich_commander_name_groups(base, evidence.get("metadata", {}))
+    evidence["base"] = base
+    return evidence
+
+
 def analyze_evidence(args: argparse.Namespace, evidence: dict) -> dict:
     """CPU work over a saved input; no EDHREC or Scryfall requests in this phase."""
+    normalize_commander_evidence(evidence)
     slug, card, base = evidence["slug"], evidence["card"], evidence["base"]
     require_eligible_commander(base.get("deck_count"), getattr(args, "min_total_decks", MIN_COMMANDER_DECKS))
     label_policy = tag_label_policy(args.min_tag_decks, args.main_tag_decks, args.max_tags,

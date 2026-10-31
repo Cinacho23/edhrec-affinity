@@ -52,7 +52,7 @@ from edhrec_affinity.build_styles.power_scoring import (
 from edhrec_affinity.build_styles.pipeline import shutdown_executor
 from edhrec_affinity.build_styles.sources import (
     CommanderAliasCatalog, card_key, checked_identifier, commander_card_alias_groups,
-    commander_printing_ids, enrich_commander_name_groups, parse_profile,
+    commander_names, commander_printing_ids, enrich_commander_name_groups, parse_profile,
 )
 
 
@@ -289,10 +289,22 @@ def load_inputs(root: Path, report: dict, aliases: CommanderAliasCatalog) -> dic
         if evidence.get("slug") != slug:
             raise RebuildBlocked("Saved evidence contains a different commander")
         digest = _check_decks(report, evidence.get("decks", []))
-        return {"base": deepcopy(evidence["base"]), "profiles": evidence["ranking_profiles"],
+        base = deepcopy(evidence["base"])
+        card = evidence.get("card")
+        source_path = root / "_collection" / "sources" / slug / "base.json"
+        if card is None and source_path.exists():
+            card = read_json(source_path)["container"]["json_dict"]["card"]
+        if card is not None:
+            if card.get("url") and card["url"] != f"/commanders/{slug}":
+                raise RebuildBlocked("Saved base profile contains a different commander")
+            # Old evidence can have mistaken a DFC's two faces for partners.
+            # Re-read roles from the saved card instead of trusting that list.
+            base["commander_names"] = commander_names(card)
+            base["commander_name_groups"] = aliases.groups(card)
+        return {"base": base, "profiles": evidence["ranking_profiles"],
                 "decks": evidence["decks"], "metadata": evidence.get("metadata", {}),
                 "dataset_sha256": digest, "source": "saved_analysis_evidence",
-                "printing_ids": commander_printing_ids(evidence.get("card", {}))}
+                "printing_ids": commander_printing_ids(card or {})}
 
     preview_path = root / "_collection" / "previews" / f"{slug}.json.gz"
     source_root = root / "_collection" / "sources" / slug
@@ -322,7 +334,7 @@ def load_inputs(root: Path, report: dict, aliases: CommanderAliasCatalog) -> dic
     if card.get("url") and card["url"] != f"/commanders/{slug}":
         raise RebuildBlocked("Saved base profile contains a different commander")
     base = parse_profile(payload, "all", "All builds", allow_empty=True)
-    base["commander_names"] = card.get("names") or [card["name"]]
+    base["commander_names"] = commander_names(card)
     base["commander_name_groups"] = aliases.groups(card)
     # Reuse exactly the ranking pages selected for the old generated decks,
     # never every incidental JSON file in the source directory.
