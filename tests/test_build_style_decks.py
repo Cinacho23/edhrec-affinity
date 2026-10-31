@@ -1,6 +1,7 @@
 """Construction safety and data-driven choices, independent of the NMF fitter."""
 
 from copy import deepcopy
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 import re
 
@@ -1208,6 +1209,65 @@ def score_repair_fixture():
     for package in [*data[0]["packages"], *data[0]["alternative_models"][0]["packages"]]:
         package["top_cards"] = [{"name": "Restore Balance"}]
     return data
+
+
+@pytest.mark.parametrize("conflict", ["mass_land_denial", "early_combos"])
+@pytest.mark.parametrize("protect_core", [True, False])
+def test_large_repair_pool_materializes_only_ranked_beam_lists(conflict, protect_core):
+    from edhrec_affinity.build_styles import deckbuilding
+
+    analysis, decks, base, profiles, metadata = fixture()
+    # Thousands of interchangeable observed replacements must not require a
+    # complete Counter copy and sorted-list identity for every comparison.
+    incoming = [f"Replacement {index:04}" for index in range(2000)]
+    metadata.update({card_key(name): metadata_card(name) for name in incoming})
+    copies = []
+
+    class TrackedCounts(Counter):
+        def copy(self):
+            copies.append(True)
+            return type(self)(self)
+
+    counts = TrackedCounts({"commander": 1, **{card_key(row["name"]): row["quantity"]
+                                              for row in decks[0]["cards"]}})
+    restrictions = deckbuilding._observed_bracket_restrictions({}, metadata)
+    restrictions[conflict] = ([frozenset({"core 0", "core 1"})] if conflict == "early_combos" else {"core 0"})
+    prepared = {"commander_keys": ["commander"], "commander_color_choices": [], "colors": {"G"},
+                "pool": set(metadata), "support": {card_key(name): 1 for name in incoming},
+                "distinctive_targets": [{"identity": ("name", "core 1"), "weight": 1}] if protect_core else []}
+    repaired, swaps = deckbuilding._strict_bracket_replacements(counts, prepared, metadata, 2, restrictions)
+    assert swaps == [{"out": "Core 0", "in": incoming[0], "reason": "score_bracket_repair",
+                      "restrictions": [conflict]}]
+    assert repaired["core 1"] == 1 and "core 0" not in repaired
+    assert deckbuilding._validate(repaired, ["commander"], metadata, prepared["pool"])["valid"]
+    assert all(deckbuilding._score_restriction_checks(
+        deckbuilding._score_restriction_counts(repaired, metadata, restrictions), 2).values())
+    assert sum(repaired.values()) == sum(counts.values()) == 100
+    assert len(copies) < 200
+
+
+def test_repair_ranked_stream_skips_higher_support_land_that_loses_required_color_source():
+    from edhrec_affinity.build_styles import deckbuilding
+
+    _, decks, _, _, metadata = fixture()
+    metadata.update({
+        "restricted land": metadata_card("Restricted Land", types="Land", cmc=0, produced_mana=["G"]),
+        "wastes": metadata_card("Wastes", types="Basic Land — Wastes", colors=[], cmc=0),
+        "colorless alternative": metadata_card("Colorless Alternative", types="Land", colors=[], cmc=0),
+    })
+    counts = Counter({"commander": 1, **{card_key(row["name"]): row["quantity"]
+                                          for row in decks[0]["cards"]}})
+    counts.update({"forest": -12, "wastes": 11, "restricted land": 1})
+    restrictions = deckbuilding._observed_bracket_restrictions({}, metadata)
+    restrictions["mass_land_denial"] = {"restricted land"}
+    prepared = {"commander_keys": ["commander"], "commander_color_choices": [], "colors": {"G"},
+                "pool": set(metadata), "support": {"colorless alternative": 2, "forest": 1},
+                "distinctive_targets": []}
+    repaired, swaps = deckbuilding._strict_bracket_replacements(counts, prepared, metadata, 2, restrictions)
+    assert swaps[0]["out"] == "Restricted Land" and swaps[0]["in"] == "Forest"
+    assert "colorless alternative" not in repaired
+    assert deckbuilding._mana_diagnostics(repaired, metadata, ["commander"])["colored_land_sources"] == {"G": 25}
+    assert deckbuilding._validate(repaired, ["commander"], metadata, prepared["pool"])["valid"]
 
 
 def attach_score_record(data, monkeypatch, directory, *, power=6.09, bracket=4, days=0, **values):

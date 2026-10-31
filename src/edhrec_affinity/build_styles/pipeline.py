@@ -28,7 +28,8 @@ from .sources import (
 
 
 MODEL_VERSION = 8
-COMMANDER_IDENTITY_VERSION = 1
+# Also retry the first face repair when previews use a verified canonical front.
+COMMANDER_IDENTITY_VERSION = 2
 
 
 def model_policy(options: argparse.Namespace) -> dict:

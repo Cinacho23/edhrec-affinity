@@ -16,7 +16,7 @@ from .collection import collect_previews, parse_sample_decks
 from .eligibility import MIN_COMMANDER_DECKS, require_eligible_commander, validate_minimum
 from .sources import (
     Cache, CommanderAliasCatalog, RequestLimiter, SourceBlocked, card_key, checked_identifier,
-    commander_back_names, commander_card_alias_groups, commander_names, commander_printing_ids, enrich_commander_name_groups,
+    commander_back_names, commander_card_alias_groups, commander_display_name, commander_names, commander_printing_ids, enrich_commander_name_groups,
     import_decks, parse_profile,
 )
 
@@ -227,7 +227,7 @@ def analyze_evidence(args: argparse.Namespace, evidence: dict) -> dict:
     report = {
         "schema_version": 1, "prototype_version": 3,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "commander_name": card["name"], "commander_slug": slug,
+        "commander_name": commander_display_name(card, metadata), "commander_slug": slug,
         "total_edhrec_decks": base["deck_count"],
         # Preserve the collection policy, including its absence on legacy saved
         # evidence. New options alone cannot certify profiles never collected.

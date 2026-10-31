@@ -729,7 +729,8 @@ def corrected_identity_evidence(source):
                                "commander_name_groups": [[front], [" // ".join(source["card"]["names"])]]}}
 
 
-def test_identity_upgrade_repairs_only_split_faces_from_cache_once_without_changing_source_dates(tmp_path):
+@pytest.mark.parametrize("previous_identity_version", [None, 1])
+def test_identity_upgrade_repairs_only_split_faces_from_cache_once_without_changing_source_dates(tmp_path, previous_identity_version):
     args = options(tmp_path, fetch=True)
     source = seed_legacy_commander_identity(args, "dfc", dfc_identity_card())
     seed_legacy_commander_identity(args, "ordinary", {"name": "Ordinary Commander", "names": ["Ordinary Commander"]})
@@ -737,6 +738,9 @@ def test_identity_upgrade_repairs_only_split_faces_from_cache_once_without_chang
         "name": "First Commander // Second Commander", "names": ["First Commander", "Second Commander"],
         "layout": "normal", "cards": [{"name": "First Commander"}, {"name": "Second Commander"}]})
     previous = checkpoint(args)
+    if previous_identity_version is not None:
+        previous["commanders"]["dfc"]["commander_identity_version"] = previous_identity_version
+        atomic_json(args.output_dir / "_collection/state.json", previous)
     calls, analyzed = [], []
 
     def cached_inputs(settings, **dependencies):

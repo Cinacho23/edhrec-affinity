@@ -33,16 +33,17 @@ function slugs(reports, filters, now = NOW) {
   return filterBuildDiscoveryCommanders(reports, filters, now).map((entry) => entry.commander_slug);
 }
 
-test("default ranks most Auto packages first, then analyzed decks and deterministic names", () => {
+test("default ranks most analyzed decks first, then deterministic names", () => {
   const reports = [
     report("z", { package_count: 2, unique_decks: 5000 }),
     report("b", { unique_decks: 500 }), report("a", { unique_decks: 500 }),
     report("c", { unique_decks: 600 }), report("d", { package_count: 8, unique_decks: 150 }),
   ];
-  assert.equal(DEFAULT_BUILD_DISCOVERY_FILTERS.sortBy, "package_count");
+  assert.equal(DEFAULT_BUILD_DISCOVERY_FILTERS.sortBy, "unique_decks");
   assert.equal(DEFAULT_BUILD_DISCOVERY_FILTERS.direction, "desc");
-  assert.deepEqual(slugs(reports), ["d", "c", "a", "b", "z"]);
-  assert.deepEqual(slugs(reports, { direction: "asc" }), ["z", "c", "a", "b", "d"]);
+  assert.deepEqual(slugs(reports), ["z", "c", "a", "b", "d"]);
+  assert.deepEqual(slugs(reports, { direction: "asc" }), ["d", "a", "b", "c", "z"]);
+  assert.deepEqual(slugs(reports, { sortBy: "package_count" }), ["d", "c", "a", "b", "z"]);
 });
 
 test("word search ignores case and accents and matches name and slug together", () => {
@@ -55,14 +56,14 @@ test("word search ignores case and accents and matches name and slug together", 
   assert.deepEqual(slugs(reports, { query: "hope missing" }), []);
 });
 
-test("package tags filter by exact supported slug or display name across all Auto packages", () => {
+test("package tags filter by exact main-tag slug or display name across all Auto packages", () => {
   const reports = [
     report("multiple", { packages: [
-      { tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] },
-      { tag_suggestions: [{ tag_slug: "p1-p1-counters", tag_name: "+1/+1 Counters" }] },
+      { tag_suggestions: [{ support_tier: "main", tag_slug: "tokens", tag_name: "Tokens" }] },
+      { tag_suggestions: [{ support_tier: "main", tag_slug: "p1-p1-counters", tag_name: "+1/+1 Counters" }] },
     ] }),
-    report("general", { packages: [{ tag_suggestions: [{ tag_slug: "counters", tag_name: "Counters" }] }] }),
-    report("negative", { packages: [{ tag_suggestions: [{ tag_slug: "m1-m1-counters", tag_name: "-1/-1 Counters" }] }] }),
+    report("general", { packages: [{ tag_suggestions: [{ support_tier: "main", tag_slug: "counters", tag_name: "Counters" }] }] }),
+    report("negative", { packages: [{ tag_suggestions: [{ support_tier: "main", tag_slug: "m1-m1-counters", tag_name: "-1/-1 Counters" }] }] }),
     report("untagged"),
   ];
   assert.deepEqual(slugs(reports, { packageTag: "p1-p1-counters" }), ["multiple"]);
@@ -73,7 +74,7 @@ test("package tags filter by exact supported slug or display name across all Aut
   assert.equal(slugs(reports, { packageTag: "" }).length, reports.length);
 });
 
-test("main and supporting package tags both remain searchable and count toward tag options", () => {
+test("package tag filters and option counts require a main tag on at least one Auto package", () => {
   const reports = [
     report("main", { packages: [{ tag_suggestions: [{
       tag_slug: "tokens", tag_name: "Tokens", support_tier: "main", deck_count: 20,
@@ -81,20 +82,44 @@ test("main and supporting package tags both remain searchable and count toward t
     report("supporting", { packages: [{ tag_suggestions: [{
       tag_slug: "tokens", tag_name: "Tokens", support_tier: "supporting", deck_count: 5,
     }] }] }),
+    report("mixed", { packages: [
+      { tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens", support_tier: "supporting" }] },
+      { tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens", support_tier: "main" }] },
+      { tag_suggestions: [{ tag_slug: "counters", tag_name: "Counters", support_tier: "supporting" }] },
+    ] }),
   ];
-  assert.deepEqual(slugs(reports, { packageTag: "tokens" }).sort(), ["main", "supporting"]);
+  assert.deepEqual(slugs(reports, { packageTag: "tokens" }), ["main", "mixed"]);
+  assert.deepEqual(slugs(reports, { packageTag: "counters" }), []);
   assert.deepEqual(getBuildDiscoveryPackageTags(reports), [{ value: "tokens", label: "Tokens", count: 2 }]);
+  assert.equal(getBuildDiscoveryPackageTags(reports)[0].count, slugs(reports, { packageTag: "tokens" }).length);
+});
+
+test("missing and unknown package tiers never qualify even with high deck counts or prevalence", () => {
+  const reports = [undefined, null, "supporting", "support", "Main", "MAIN", "unknown", "", 1, true]
+    .map((support_tier, index) => report(`tier-${index}`, { packages: [{ tag_suggestions: [{
+      tag_slug: "tokens", tag_name: "Tokens", support_tier, deck_count: 10000, deck_fraction: 1,
+    }] }] }));
+  reports.push(report("missing-tier", { packages: [{ tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] }] }));
+  assert.deepEqual(slugs(reports, { packageTag: "tokens" }), []);
+  assert.deepEqual(getBuildDiscoveryPackageTags(reports), []);
+  assert.equal(slugs(reports, { packageTag: "" }).length, reports.length);
+});
+
+test("tag equality remains available for displaying and highlighting supporting tags", () => {
+  const supporting = { tag_slug: "tokens", tag_name: "Tokens", support_tier: "supporting" };
+  assert.equal(matchesBuildDiscoveryPackageTag(supporting, "tokens"), true);
+  assert.equal(matchesBuildDiscoveryPackageTag(supporting, "TOKENS"), true);
 });
 
 test("package tag equality normalizes accents, apostrophes, spacing and case without substring matching", () => {
-  const tag = { tag_slug: "dragons-approach", tag_name: "Drágon’s Approach" };
+  const tag = { support_tier: "main", tag_slug: "dragons-approach", tag_name: "Drágon’s Approach" };
   for (const value of ["dragons-approach", "DRAGONS-APPROACH", "Dragon's Approach", "  DRÁGON’S   APPROACH  "]) {
     assert.equal(matchesBuildDiscoveryPackageTag(tag, value), true, value);
   }
   for (const value of ["Dragon", "Approach", "dragons", "dragons-approach-more"]) {
     assert.equal(matchesBuildDiscoveryPackageTag(tag, value), false, value);
   }
-  for (const malformed of [undefined, null, "Tokens", 2, [], {}, { tag_slug: 3, tag_name: false }]) {
+  for (const malformed of [undefined, null, "Tokens", 2, [], {}, { support_tier: "main", tag_slug: 3, tag_name: false }]) {
     assert.equal(matchesBuildDiscoveryPackageTag(malformed, "tokens"), false);
     assert.equal(matchesBuildDiscoveryPackageTag(malformed, ""), true);
   }
@@ -103,14 +128,14 @@ test("package tag equality normalizes accents, apostrophes, spacing and case wit
 test("package tag options count distinct commanders, deduplicate package labels and prefer slug values", () => {
   const reports = [
     report("first", { packages: [
-      { tag_suggestions: [{ tag_name: "Tokens" }, { tag_slug: "tokens", tag_name: "Tokens" }] },
-      { tag_suggestions: [{ tag_slug: "TOKENS", tag_name: "Tókens" }, { tag_slug: "aristocrats", tag_name: "Aristocrats" }] },
+      { tag_suggestions: [{ support_tier: "main", tag_name: "Tokens" }, { support_tier: "main", tag_slug: "tokens", tag_name: "Tokens" }] },
+      { tag_suggestions: [{ support_tier: "main", tag_slug: "TOKENS", tag_name: "Tókens" }, { support_tier: "main", tag_slug: "aristocrats", tag_name: "Aristocrats" }] },
     ] }),
     report("second", { packages: [{ tag_suggestions: [
-      { tag_slug: "tokens", tag_name: "Tokens" }, { tag_name: "Dragon's Approach" },
+      { support_tier: "main", tag_slug: "tokens", tag_name: "Tokens" }, { support_tier: "main", tag_name: "Dragon's Approach" },
     ] }] }),
-    report("second", { packages: [{ tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] }] }),
-    report("third", { packages: [{ tag_suggestions: [{ tag_name: "Dragon’s Approach" }, { tag_slug: "unnamed" }] }] }),
+    report("second", { packages: [{ tag_suggestions: [{ support_tier: "main", tag_slug: "tokens", tag_name: "Tokens" }] }] }),
+    report("third", { packages: [{ tag_suggestions: [{ support_tier: "main", tag_name: "Dragon’s Approach" }, { support_tier: "main", tag_slug: "unnamed" }] }] }),
   ];
   const original = structuredClone(reports);
   assert.deepEqual(getBuildDiscoveryPackageTags(reports), [
@@ -124,7 +149,7 @@ test("package tag options count distinct commanders, deduplicate package labels 
 
 test("package tag options retain distinct slug identities even when their display names collide", () => {
   const reports = [report("a", { packages: [{ tag_suggestions: [
-    { tag_slug: "one", tag_name: "Shared label" }, { tag_slug: "two", tag_name: "Shared label" },
+    { support_tier: "main", tag_slug: "one", tag_name: "Shared label" }, { support_tier: "main", tag_slug: "two", tag_name: "Shared label" },
   ] }] })];
   assert.deepEqual(getBuildDiscoveryPackageTags(reports), [
     { value: "one", label: "Shared label", count: 1 },
@@ -134,11 +159,11 @@ test("package tag options retain distinct slug identities even when their displa
 
 test("every package tag option count equals its exact filter result for incomplete and colliding labels", () => {
   const reports = [
-    report("slugged", { packages: [{ tag_suggestions: [{ tag_slug: "p1-p1-counters", tag_name: "+1/+1 Counters" }] }] }),
-    report("name-only", { packages: [{ tag_suggestions: [{ tag_name: "+1/+1 Counters" }] }] }),
-    report("collision", { packages: [{ tag_suggestions: [{ tag_slug: "another-counters", tag_name: "+1/+1 Counters" }] }] }),
-    report("slug-only", { packages: [{ tag_suggestions: [{ tag_slug: "tokens" }] }] }),
-    report("label-later", { packages: [{ tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] }] }),
+    report("slugged", { packages: [{ tag_suggestions: [{ support_tier: "main", tag_slug: "p1-p1-counters", tag_name: "+1/+1 Counters" }] }] }),
+    report("name-only", { packages: [{ tag_suggestions: [{ support_tier: "main", tag_name: "+1/+1 Counters" }] }] }),
+    report("collision", { packages: [{ tag_suggestions: [{ support_tier: "main", tag_slug: "another-counters", tag_name: "+1/+1 Counters" }] }] }),
+    report("slug-only", { packages: [{ tag_suggestions: [{ support_tier: "main", tag_slug: "tokens" }] }] }),
+    report("label-later", { packages: [{ tag_suggestions: [{ support_tier: "main", tag_slug: "tokens", tag_name: "Tokens" }] }] }),
   ];
   const options = getBuildDiscoveryPackageTags(reports);
   for (const option of options) {
@@ -154,15 +179,15 @@ test("every package tag option count equals its exact filter result for incomple
 test("package tag filters ignore profile, source, alternative-model and malformed metadata", () => {
   const reports = [
     report("other-fields", {
-      profiles: [{ tag_slug: "tokens", tag_name: "Tokens" }],
-      tag_profiles: [{ tag_slug: "tokens", tag_name: "Tokens" }],
-      sources: [{ tag_slug: "tokens", tag_name: "Tokens" }],
-      alternative_models: [{ packages: [{ tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] }] }],
-      packages: [{ closest_profiles: [{ tag_slug: "tokens", tag_name: "Tokens" }] }],
+      profiles: [{ support_tier: "main", tag_slug: "tokens", tag_name: "Tokens" }],
+      tag_profiles: [{ support_tier: "main", tag_slug: "tokens", tag_name: "Tokens" }],
+      sources: [{ support_tier: "main", tag_slug: "tokens", tag_name: "Tokens" }],
+      alternative_models: [{ packages: [{ tag_suggestions: [{ support_tier: "main", tag_slug: "tokens", tag_name: "Tokens" }] }] }],
+      packages: [{ closest_profiles: [{ support_tier: "main", tag_slug: "tokens", tag_name: "Tokens" }] }],
     }),
-    ...[null, {}, "tokens", 1, [null, {}, { tag_suggestions: {} }, { tag_suggestions: [null, "tokens", [], { tag_name: 4 }] }]]
+    ...[null, {}, "tokens", 1, [null, {}, { tag_suggestions: {} }, { tag_suggestions: [null, "tokens", [], { support_tier: "main", tag_name: 4 }] }]]
       .map((packages, index) => report(`malformed-${index}`, { packages })),
-    report("valid", { packages: [{ tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] }] }),
+    report("valid", { packages: [{ tag_suggestions: [{ support_tier: "main", tag_slug: "tokens", tag_name: "Tokens" }] }] }),
   ];
   assert.deepEqual(slugs(reports, { packageTag: "tokens" }), ["valid"]);
   assert.deepEqual(getBuildDiscoveryPackageTags([null, [], ...reports]), [{ value: "tokens", label: "Tokens", count: 1 }]);
@@ -170,7 +195,7 @@ test("package tag filters ignore profile, source, alternative-model and malforme
 });
 
 test("package tag combines with search, ranges, statuses and sorting without changing source records", () => {
-  const tagged = { packages: [{ tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens" }] }] };
+  const tagged = { packages: [{ tag_suggestions: [{ support_tier: "main", tag_slug: "tokens", tag_name: "Tokens" }] }] };
   const reports = [
     report("lower", { ...tagged, commander_name: "Ghave", unique_decks: 250 }),
     report("higher", { ...tagged, commander_name: "Ghave", unique_decks: 400 }),
@@ -257,8 +282,8 @@ test("analysis status can combine with coverage, freshness, and counts", () => {
 });
 
 test("invalid enum values safely fall back to unrestricted filters and default ordering", () => {
-  const reports = [report("a", { package_count: 1 }), report("b", { package_count: 6 })];
-  assert.deepEqual(slugs(reports, { status: "invented", coverage: "invented", freshness: "invented", sortBy: "invented", direction: "invented" }), ["b", "a"]);
+  const reports = [report("a", { package_count: 1, unique_decks: 500 }), report("b", { package_count: 6 })];
+  assert.deepEqual(slugs(reports, { status: "invented", coverage: "invented", freshness: "invented", sortBy: "invented", direction: "invented" }), ["a", "b"]);
 });
 
 test("all numeric sort options keep invalid values last in both directions", () => {
@@ -322,7 +347,7 @@ test("URL filters round trip count ranges, accented search, statuses and sorting
     ...DEFAULT_BUILD_DISCOVERY_FILTERS,
     query: "Dánitha & counters", packageTag: "+1/+1 Counters", minPackages: "2", maxPackages: "8", minAnalyzed: "200", maxAnalyzed: "3000",
     minTotalDecks: "250", maxTotalDecks: "10000", minProfiles: "0", maxProfiles: "12",
-    status: "fitted", coverage: "complete", freshness: "needs_refresh", sortBy: "unique_decks", direction: "asc",
+    status: "fitted", coverage: "complete", freshness: "needs_refresh", sortBy: "package_count", direction: "asc",
   };
   const params = buildDiscoverySearchParams({ ...filters, unrecognized: "ignored" });
   assert.equal(params.has("unrecognized"), false);
@@ -344,7 +369,7 @@ test("URL helpers default invalid enum values but retain invalid count text for 
   assert.equal(filters.status, "all");
   assert.equal(filters.coverage, "all");
   assert.equal(filters.freshness, "all");
-  assert.equal(filters.sortBy, "package_count");
+  assert.equal(filters.sortBy, "unique_decks");
   assert.equal(filters.direction, "desc");
   assert.equal(filters.minAnalyzed, "abc");
   assert.equal(filters.maxPackages, "-1");

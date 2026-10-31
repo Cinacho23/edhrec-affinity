@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 import hashlib
+from itertools import product
 import json
 import math
 from pathlib import Path
@@ -127,6 +128,39 @@ def commander_back_names(card: dict) -> set[str]:
     return set().union(*(role["backs"] for role in _commander_roles(card)))
 
 
+def commander_display_name(card: dict, metadata: dict | None = None) -> str:
+    """Show known front/back spellings without adding commander roles.
+
+    A physical card's source faces take precedence over its canonical printing
+    name, preserving Secret Lair display names. Metadata can supply a missing
+    whole spelling only when it independently identifies that front name.
+    """
+    from .card_metadata import metadata_aliases
+
+    displayed = []
+    for role in _commander_roles(card):
+        whole = next((name for name in role["aliases"] if " // " in name), None)
+        if whole is None and isinstance(metadata, dict):
+            matches = {}
+            for candidate in metadata.values():
+                if not isinstance(candidate, dict) or not isinstance(candidate.get("name"), str):
+                    continue
+                try:
+                    known = metadata_aliases({"layout": "normal", "card_faces": [], **candidate})
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    continue
+                if card_key(role["name"]) in known and " // " in candidate["name"]:
+                    oracle_id = candidate.get("oracle_id")
+                    identity = ("oracle", oracle_id) if isinstance(oracle_id, str) and oracle_id else ("name", card_key(candidate["name"]))
+                    matches.setdefault(identity, set()).add(candidate["name"])
+            if len(matches) == 1:
+                spellings = next(iter(matches.values()))
+                if len(spellings) == 1:
+                    whole = next(iter(spellings))
+        displayed.append(whole or role["name"])
+    return " // ".join(displayed)
+
+
 def _commander_name_groups(card: dict) -> list[list[str]]:
     """Read verified complete configurations, with front/whole DFC aliases."""
     try:
@@ -245,7 +279,7 @@ def commander_printing_ids(card: dict) -> dict[str, str]:
 
 
 def enrich_commander_name_groups(base: dict, metadata: dict) -> list[list[str]]:
-    """Add only a complete, independently verified canonical configuration.
+    """Add complete canonical front/whole configurations with identity proof.
 
     An input dictionary key alone never proves a rename. Each display name
     must be a strict Scryfall metadata alias or have an existing unambiguous
@@ -302,12 +336,26 @@ def enrich_commander_name_groups(base: dict, metadata: dict) -> list[list[str]]:
         if len(matches) != 1:
             return groups
         identity, card = next(iter(matches.items()))
-        resolved.append((identity, card["name"]))
-    canonical_names = [name for _, name in resolved]
-    if (len({identity for identity, _ in resolved}) == len(names)
-            and len({card_key(name) for name in canonical_names}) == len(names)
-            and frozenset(card_key(name) for name in canonical_names) not in seen):
-        groups.append(canonical_names)
+        spellings = [card["name"]]
+        # Scryfall's whole DFC name and its canonical front are both valid
+        # spellings of one physical card. An alternate printing's verified
+        # front can resolve to either one in actual EDHREC previews. Back
+        # faces and split/Room halves are excluded by metadata_aliases.
+        faces = card.get("card_faces")
+        if isinstance(faces, list) and faces and isinstance(faces[0], dict):
+            front = faces[0].get("name")
+            if (isinstance(front, str) and front.strip()
+                    and card_key(front) in metadata_aliases({"layout": "normal", "card_faces": [], **card})
+                    and card_key(front) != card_key(card["name"])):
+                spellings.append(front)
+        resolved.append((identity, spellings))
+    if len({identity for identity, _ in resolved}) != len(names):
+        return groups
+    for configuration in product(*(spellings for _, spellings in resolved)):
+        keys = frozenset(card_key(name) for name in configuration)
+        if len(keys) == len(names) and keys not in seen:
+            groups.append(list(configuration))
+            seen.add(keys)
     return groups
 
 

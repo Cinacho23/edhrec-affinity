@@ -15,6 +15,7 @@ from collections import Counter
 from copy import deepcopy
 from functools import wraps
 from itertools import product
+from heapq import heappop, heappush
 import math
 import re
 from urllib.parse import quote_plus
@@ -1319,6 +1320,23 @@ def _strict_bracket_replacements(counts, prepared, metadata, target, restriction
         core_weights[row.get("identity")] += row["weight"]
     card_flags = {key: _restriction_card_flags(key, metadata, restrictions)
                   for key in set(incoming_pool) | counts.keys()}
+    # A repair can compare thousands of observed cards against several beam
+    # states. Card properties stay fixed throughout that search.
+    traits = {key: (_metadata_identity(metadata[key]), _is_land(metadata[key]),
+                    frozenset(functional_tags(metadata[key])), _copy_limit(metadata[key]),
+                    _type_bucket(metadata[key]), _curve_bucket(metadata[key]))
+              for key in card_flags}
+    buckets = {}
+    for key in incoming_pool:
+        identity, land, roles, _, kind, curve = traits[key]
+        signature = (land, roles, kind, curve, card_flags[key],
+                     identity if core_counts[identity] or core_weights[identity] else None,
+                     key if any(key in group for category in _SCORE_RESTRICTION_NAMES[3:5]
+                                for group in restrictions[category]) else None)
+        buckets.setdefault(signature, []).append(key)
+    # Members share every rank term except support/name, already sorted above.
+    # A heap merges these exact ranked streams until four valid lists survive.
+    buckets = list(buckets.values())
     beam = [(counts.copy(), [], 0.0)]
     seen = {tuple(sorted(counts.items()))}
     for _ in range(sum(counts.values()) - len(commanders)):
@@ -1328,7 +1346,9 @@ def _strict_bracket_replacements(counts, prepared, metadata, target, restriction
             excess = _bracket_excess(current_flags, target)
             if not any(excess):
                 return current, swaps
-            identities = Counter(_metadata_identity(metadata[key]) for key in current for _ in range(current[key]))
+            excess_total = sum(excess)
+            restriction_updates = {}
+            identities = Counter(traits[key][0] for key in current for _ in range(current[key]))
             current_core = _distinctive_score(targets, current, metadata)
             roles = Counter(role for key, quantity in current.items() if key not in commanders
                             for role in functional_tags(metadata[key]) for _ in range(quantity))
@@ -1336,62 +1356,98 @@ def _strict_bracket_replacements(counts, prepared, metadata, target, restriction
                 if outgoing in commanders:
                     continue
                 old = metadata[outgoing]
-                without = current.copy()
-                without[outgoing] -= 1
-                if not without[outgoing]:
-                    del without[outgoing]
-                if sum(_bracket_excess(_score_restriction_counts(without, metadata, restrictions), target)) >= sum(excess):
+                outgoing_identity, outgoing_land, old_roles, _, old_type, old_curve = traits[outgoing]
+                remaining_keys = current.keys() - {outgoing} if current[outgoing] == 1 else current.keys()
+                without_flags = (*[value - flag for value, flag in zip(current_flags[:3], card_flags[outgoing])],
+                                 *[sum(group <= remaining_keys for group in restrictions[name])
+                                   for name in _SCORE_RESTRICTION_NAMES[3:5]],
+                                 current_flags[5] - card_flags[outgoing][3])
+                if sum(_bracket_excess(without_flags, target)) >= excess_total:
                     continue
-                old_roles = set(functional_tags(old))
+                combo_baselines, combo_completers = [], []
+                for category in _SCORE_RESTRICTION_NAMES[3:5]:
+                    baseline, completers = 0, Counter()
+                    for group in restrictions[category]:
+                        missing = group - remaining_keys
+                        if not missing:
+                            baseline += 1
+                        elif len(missing) == 1:
+                            completers[next(iter(missing))] += 1
+                    combo_baselines.append(baseline)
+                    combo_completers.append(completers)
                 local = []
-                for incoming in incoming_pool:
-                    card = metadata[incoming]
-                    if outgoing == incoming or _is_land(card) != _is_land(old):
+
+                def offer(bucket_index, position, prefix, distance, next_excess):
+                    members = buckets[bucket_index]
+                    while position < len(members):
+                        incoming = members[position]
+                        identity, _, _, copy_limit, _, _ = traits[incoming]
+                        if (incoming != outgoing
+                                and identities[identity] - (outgoing_identity == identity) < copy_limit):
+                            rank = (*prefix, -support.get(incoming, 0), incoming)
+                            heappush(local, (rank, bucket_index, position, distance, next_excess))
+                            return
+                        position += 1
+
+                for bucket_index, members in enumerate(buckets):
+                    incoming = members[0]
+                    identity, incoming_land, incoming_roles, _, incoming_type, incoming_curve = traits[incoming]
+                    if incoming_land != outgoing_land:
                         continue
-                    identity = _metadata_identity(card)
-                    if identities[identity] - (_metadata_identity(old) == identity) >= _copy_limit(card):
-                        continue
-                    incoming_roles = set(functional_tags(card))
                     if any(roles[role] - (role in old_roles) + (role in incoming_roles) < floor
                            for role, floor in role_floors.items()):
                         continue
+                    combo_counts = tuple(baseline + completers[incoming]
+                                         for baseline, completers in zip(combo_baselines, combo_completers))
+                    exchange = card_flags[outgoing], card_flags[incoming], combo_counts
+                    if exchange not in restriction_updates:
+                        next_flags = (*[value - old + new for value, old, new in
+                                        zip(current_flags[:3], card_flags[outgoing], card_flags[incoming])],
+                                      *combo_counts,
+                                      current_flags[5] - card_flags[outgoing][3] + card_flags[incoming][3])
+                        next_excess = _bracket_excess(next_flags, target)
+                        restriction_updates[exchange] = (next_excess, sum(next_excess) < excess_total
+                            and all(after <= before for before, after in zip(excess, next_excess)))
+                    next_excess, reduces_restrictions = restriction_updates[exchange]
+                    if not reduces_restrictions:
+                        continue
+                    lost = outgoing_identity != identity and identities[outgoing_identity] == 1
+                    gained = outgoing_identity != identity and identities[identity] == 0
+                    core = (current_core[0] - lost * core_counts[outgoing_identity] + gained * core_counts[identity],
+                            current_core[1] - lost * core_weights[outgoing_identity] + gained * core_weights[identity])
+                    distance = (len(old_roles ^ incoming_roles) + (old_type != incoming_type)
+                                + abs(old_curve - incoming_curve))
+                    prefix = (initial_core[0] - core[0], initial_core[1] - core[1], sum(next_excess),
+                              shape_cost + distance)
+                    offer(bucket_index, 0, prefix, distance, next_excess)
+                # Only four valid replacements enter this outgoing card's beam.
+                # Rank the same scalar criteria first, then build/check complete
+                # lists in that order, including seen-state and mana exclusions.
+                accepted = 0
+                while local:
+                    rank, bucket_index, position, distance, next_excess = heappop(local)
+                    incoming = buckets[bucket_index][position]
+                    offer(bucket_index, position + 1, rank[:-2], distance, next_excess)
                     candidate = current.copy()
                     candidate[outgoing] -= 1
                     if not candidate[outgoing]:
                         del candidate[outgoing]
                     candidate[incoming] += 1
-                    next_flags = (*[value - old + new for value, old, new in
-                                    zip(current_flags[:3], card_flags[outgoing], card_flags[incoming])],
-                                  *[sum(group <= candidate.keys() for group in restrictions[name])
-                                    for name in _SCORE_RESTRICTION_NAMES[3:5]],
-                                  current_flags[5] - card_flags[outgoing][3] + card_flags[incoming][3])
-                    next_excess = _bracket_excess(next_flags, target)
-                    if (sum(next_excess) >= sum(excess)
-                            or any(after > before for before, after in zip(excess, next_excess))):
-                        continue
                     identity_counts = tuple(sorted(candidate.items()))
                     if identity_counts in seen:
                         continue
-                    if _is_land(old):
+                    if outgoing_land:
                         mana = _mana_diagnostics(candidate, metadata, commanders, color_choices)
                         if any(mana["colored_land_sources"].get(color, 0) < floor for color, floor in source_floors.items()):
                             continue
-                    outgoing_identity = _metadata_identity(old)
-                    lost = outgoing_identity != identity and identities[outgoing_identity] == 1
-                    gained = outgoing_identity != identity and identities[identity] == 0
-                    core = (current_core[0] - lost * core_counts[outgoing_identity] + gained * core_counts[identity],
-                            current_core[1] - lost * core_weights[outgoing_identity] + gained * core_weights[identity])
-                    distance = (len(old_roles ^ incoming_roles) + (_type_bucket(old) != _type_bucket(card))
-                                + abs(_curve_bucket(old) - _curve_bucket(card)))
-                    rank = (initial_core[0] - core[0], initial_core[1] - core[1], sum(next_excess),
-                            shape_cost + distance, -support.get(incoming, 0), incoming)
                     removed_restrictions = [name for name, before, after in zip(
                         _SCORE_RESTRICTION_NAMES, excess, next_excess) if after < before]
-                    swap = {"out": old["name"], "in": card["name"], "reason": "score_bracket_repair",
+                    swap = {"out": old["name"], "in": metadata[incoming]["name"], "reason": "score_bracket_repair",
                             "restrictions": removed_restrictions}
-                    local.append((rank, candidate, [*swaps, swap], shape_cost + distance, identity_counts))
-                for row in sorted(local, key=lambda row: row[0])[:4]:
-                    following.append(row)
+                    following.append((rank, candidate, [*swaps, swap], shape_cost + distance, identity_counts))
+                    accepted += 1
+                    if accepted == 4:
+                        break
         if not following:
             return None
         following.sort(key=lambda row: row[0])
