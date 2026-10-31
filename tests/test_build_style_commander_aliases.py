@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from edhrec_affinity.build_styles.__main__ import collect_evidence, parser
 from edhrec_affinity.build_styles.analysis import prepare_decks
 from edhrec_affinity.build_styles.sources import (
@@ -337,3 +339,103 @@ def test_joined_dfc_constituent_and_real_partner_remain_two_cards():
     assert commander_names(card) == [FRONT, "Partner"]
     assert groups_as_sets(CommanderAliasCatalog().groups(card)) == {
         frozenset([FRONT, "Partner"]), frozenset([whole, "Partner"])}
+
+
+@pytest.mark.parametrize("alternate_front,alternate_back,front,back", [
+    ("The Three Weird Sisters", "Fiends of Darkest Night", "Henrika Domnathi", "Henrika, Infernal Seer"),
+    ("Doric, Nature's Warden", "Doric, Owlbear Avenger", "Casal, Lurkwood Pathfinder", "Casal, Pathbreaker Owlbear"),
+])
+def test_verified_alternate_dfc_accepts_canonical_front_and_whole_but_never_back(
+        alternate_front, alternate_back, front, back):
+    from copy import deepcopy
+    from edhrec_affinity.build_styles.__main__ import normalize_commander_evidence
+    card = {"name": alternate_front, "names": [alternate_front, alternate_back], "layout": "transform"}
+    canonical = verified_name_metadata(f"{front} // {back}", "physical-oracle", alternate_front)
+    canonical.update(layout="transform", card_faces=[{"name": front}, {"name": back}])
+    evidence = {"card": card, "base": {"commander_names": [alternate_front, alternate_back]},
+                "metadata": {card_key(canonical["name"]): canonical}}
+    normalize_commander_evidence(evidence)
+    base = evidence["base"]
+    assert base["commander_names"] == [alternate_front]
+    assert groups_as_sets(base["commander_name_groups"]) == {
+        frozenset([alternate_front]), frozenset([f"{alternate_front} // {alternate_back}"]),
+        frozenset([front]), frozenset([f"{front} // {back}"]),
+    }
+    normalized = deepcopy(evidence)
+    normalize_commander_evidence(evidence)
+    assert evidence == normalized
+    for spelling in (front, f"{front} // {back}"):
+        deck = {"id": spelling, "commanders": [spelling], "cards": [
+            {"name": "Forest", "quantity": 99}, {"name": canonical["name"], "quantity": 1}]}
+        kept, rejected, _ = prepare_decks([deck], base["commander_names"], commander_name_groups=base["commander_name_groups"])
+        assert len(kept) == 1 and not rejected and kept[0]["card_count"] == 100
+        assert card_key(canonical["name"]) not in kept[0]["counts"]
+    for actual in ([back], [alternate_back], [front, back]):
+        deck = {"id": "back", "commanders": actual, "cards": [{"name": "Forest", "quantity": 99}]}
+        assert not prepare_decks([deck], base["commander_names"], commander_name_groups=base["commander_name_groups"])[0]
+
+
+def test_verified_canonical_front_expansion_preserves_every_partner_role():
+    alternate, front, back = "Alternate Front", "Canonical Front", "Canonical Back"
+    canonical = verified_name_metadata(f"{front} // {back}", "dfc-oracle", alternate)
+    canonical.update(layout="transform", card_faces=[{"name": front}, {"name": back}])
+    partner = verified_name_metadata("Partner", "partner-oracle")
+    base = {"commander_names": [alternate, "Partner"]}
+    groups = enrich_commander_name_groups(base, {"dfc": canonical, "partner": partner})
+    assert groups_as_sets(groups) == {
+        frozenset([alternate, "Partner"]), frozenset([front, "Partner"]), frozenset([canonical["name"], "Partner"])}
+    assert all(len(group) == 2 and back not in group for group in groups)
+    assert enrich_commander_name_groups(base, {"dfc": canonical}) == [[alternate, "Partner"]]
+    partner["oracle_id"] = canonical["oracle_id"]
+    assert enrich_commander_name_groups(base, {"dfc": canonical, "partner": partner}) == [[alternate, "Partner"]]
+
+
+def test_canonical_front_expansion_requires_strict_metadata_front_and_rename_proof():
+    canonical = verified_name_metadata("Canonical Front // Canonical Back", "dfc-oracle", "Alternate")
+    canonical.update(layout="transform", card_faces=[{"name": "Canonical Front"}, {"name": "Canonical Back"}])
+    base = {"commander_names": ["Alternate"]}
+    canonical["name_aliases"][0]["oracle_id"] = "wrong-oracle"
+    assert enrich_commander_name_groups(base, {"Alternate": canonical}) == [["Alternate"]]
+    canonical["name_aliases"][0]["oracle_id"] = "dfc-oracle"
+    canonical["layout"] = "split"
+    assert enrich_commander_name_groups(base, {"Alternate": canonical}) == [["Alternate"], [canonical["name"]]]
+    canonical["layout"] = "room"
+    assert enrich_commander_name_groups(base, {"Alternate": canonical}) == [["Alternate"], [canonical["name"]]]
+
+
+def test_display_uses_complete_physical_faces_without_changing_legal_roles():
+    from edhrec_affinity.build_styles.sources import commander_display_name, commander_names
+    card = faced_card()
+    assert commander_display_name(card) == f"{FRONT} // {BACK}"
+    assert commander_names(card) == [FRONT]
+    assert commander_display_name({"name": "Normal", "names": ["Normal"]}) == "Normal"
+    card.update(name=f"{FRONT} // {BACK} // Partner", names=[FRONT, BACK, "Partner"], layout="normal")
+    card["cards"].append({"name": "Partner", "layout": "normal", "id": PARTNER_ID})
+    assert commander_display_name(card) == f"{FRONT} // {BACK} // Partner"
+    assert commander_names(card) == [FRONT, "Partner"]
+
+
+def test_display_can_use_verified_metadata_whole_name_and_preserves_source_flavor_faces():
+    from edhrec_affinity.build_styles.sources import commander_display_name
+    metadata = verified_name_metadata("Canonical Front // Canonical Back", "oracle", FRONT)
+    metadata.update(layout="transform", card_faces=[{"name": "Canonical Front"}, {"name": "Canonical Back"}])
+    assert commander_display_name({"name": FRONT}, {FRONT: metadata}) == metadata["name"]
+    assert commander_display_name(faced_card(), {FRONT: metadata}) == f"{FRONT} // {BACK}"
+    assert commander_display_name({"name": "Unrelated"}, {"Unrelated": metadata}) == "Unrelated"
+    duplicate = {**metadata, "oracle_id": "different-oracle", "name_aliases": [
+        {**metadata["name_aliases"][0], "oracle_id": "different-oracle"}]}
+    assert commander_display_name({"name": FRONT}, {"one": metadata, "two": duplicate}) == FRONT
+
+
+def test_analysis_report_shows_whole_dfc_display_name(tmp_path):
+    from edhrec_affinity.build_styles.__main__ import analyze_evidence
+    root = tmp_path / "sources" / "blitzwing-cruel-tormentor"
+    root.mkdir(parents=True)
+    card = faced_card()
+    card.update(num_decks=200, url="/commanders/blitzwing-cruel-tormentor")
+    (root / "base.json").write_text(json.dumps({"container": {"json_dict": {"card": card, "cardlists": []}}}))
+    args = parser().parse_args(["--commander", "blitzwing-cruel-tormentor", "--cache-dir", str(root), "--sample-decks", "0"])
+    evidence = collect_evidence(args)
+    report = analyze_evidence(args, evidence)
+    assert report["commander_name"] == f"{FRONT} // {BACK}"
+    assert evidence["base"]["commander_names"] == [FRONT]

@@ -8,7 +8,7 @@ export const DEFAULT_BUILD_DISCOVERY_FILTERS = Object.freeze({
   minTotalDecks: "", maxTotalDecks: "",
   minProfiles: "", maxProfiles: "",
   status: "all", coverage: "all", freshness: "all",
-  sortBy: "package_count", direction: "desc",
+  sortBy: "unique_decks", direction: "desc",
 });
 
 export const BUILD_DISCOVERY_SORT_OPTIONS = [
@@ -92,10 +92,11 @@ function tagKey(value) {
   return searchable(tagText(value)).replace(/\s+/g, " ");
 }
 
-function packageTags(commander) {
+function mainPackageTags(commander) {
   if (!Array.isArray(commander?.packages)) return [];
   return commander.packages.flatMap((pkg) => Array.isArray(pkg?.tag_suggestions) ? pkg.tag_suggestions : [])
     .filter((tag) => tag && typeof tag === "object" && !Array.isArray(tag)
+      && tag.support_tier === "main"
       && (tagText(tag.tag_slug) || tagText(tag.tag_name)));
 }
 
@@ -107,14 +108,14 @@ export function matchesBuildDiscoveryPackageTag(tag, selectedTag) {
     && [tag.tag_slug, tag.tag_name].some((value) => tagKey(value) === selected));
 }
 
-/** List primary-model package tags and the number of distinct commanders carrying each tag. */
+/** List main tags on primary-model packages and their distinct commander counts. */
 export function getBuildDiscoveryPackageTags(commanders) {
   const occurrences = (Array.isArray(commanders) ? commanders : [])
     .filter((commander) => commander && typeof commander === "object" && !Array.isArray(commander))
     .flatMap((commander) => {
       const identity = tagKey(commander.commander_slug) ? `slug:${tagKey(commander.commander_slug)}`
         : tagKey(commander.commander_name) ? `name:${tagKey(commander.commander_name)}` : commander;
-      return packageTags(commander).map((tag) => ({
+      return mainPackageTags(commander).map((tag) => ({
         commander: identity,
         slug: tagText(tag.tag_slug),
         name: tagText(tag.tag_name),
@@ -190,7 +191,7 @@ export function filterBuildDiscoveryCommanders(commanders, filters = {}, now = D
     })).filter(({ commander, progress, freshness }) => {
       const search = searchable(`${commander.commander_name || ""} ${commander.commander_slug || ""}`);
       if (!words.every((word) => search.includes(word))) return false;
-      if (tagKey(settings.packageTag) && !packageTags(commander).some((tag) => matchesBuildDiscoveryPackageTag(tag, settings.packageTag))) return false;
+      if (tagKey(settings.packageTag) && !mainPackageTags(commander).some((tag) => matchesBuildDiscoveryPackageTag(tag, settings.packageTag))) return false;
       for (const range of ranges) {
         const value = count(commander[range.field]);
         if (value === null || (range.minimum !== null && value < range.minimum)

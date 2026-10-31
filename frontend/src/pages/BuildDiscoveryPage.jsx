@@ -235,7 +235,7 @@ export default function BuildDiscoveryPage() {
               {packageTags.map((tag) => <option key={tag.value} value={tag.value}>{tag.label} ({formatNumber(tag.count)} {tag.count === 1 ? "commander" : "commanders"})</option>)}
             </select>
           </label>
-          <p id="build-discovery-package-tag-note" className="muted">Show commanders with this suggested tag on at least one auto-selected package. Expand package details to see matching tags and brackets.</p>
+          <p id="build-discovery-package-tag-note" className="muted">Show commanders with this main tag on at least one auto-selected package. Supporting tags do not qualify. Expand package details to see tags and brackets.</p>
         </div>
         <div className="build-discovery-filters__ranges">
           {COUNT_FILTERS.map((range) => <CountRange key={range.minKey} {...range} filters={filters} onChange={updateFilter} />)}
