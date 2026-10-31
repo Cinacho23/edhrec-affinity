@@ -166,3 +166,174 @@ def test_canonical_configuration_can_follow_existing_unambiguous_edhrec_card_ali
     assert enrich_commander_name_groups(base, metadata)[-1] == [BRINELIN, YOSHIMARU]
     metadata[card_key(DOGMEAT)] = verified_name_metadata(DOGMEAT, "conflicting-actual-card")
     assert enrich_commander_name_groups(base, metadata) == base["commander_name_groups"]
+
+
+FRONT = "Blitzwing, Cruel Tormentor"
+BACK = "Blitzwing, Adaptive Assailant"
+FRONT_ID = "11111111-1111-1111-1111-111111111111"
+PARTNER_ID = "22222222-2222-2222-2222-222222222222"
+
+
+def faced_card(layout="transform"):
+    return {"name": FRONT, "names": [FRONT, BACK], "layout": layout, "id": FRONT_ID,
+        "cards": [{"name": FRONT, "layout": layout, "id": FRONT_ID},
+                  {"name": BACK, "layout": layout, "id": FRONT_ID}]}
+
+
+def test_face_names_describe_one_physical_commander_and_accept_front_or_whole():
+    from edhrec_affinity.build_styles.sources import commander_names
+    card = faced_card()
+    groups = CommanderAliasCatalog().groups(card)
+    assert commander_names(card) == [FRONT]
+    assert groups_as_sets(groups) == {frozenset([FRONT]), frozenset([f"{FRONT} // {BACK}"])}
+    assert commander_printing_ids(card) == {FRONT: FRONT_ID}
+    deck = {"id": "front", "commanders": [FRONT], "cards": [{"name": "Forest", "quantity": 98},
+        {"name": "Engine", "quantity": 1}, {"name": f"{FRONT} // {BACK}", "quantity": 1}]}
+    kept, rejected, _ = prepare_decks([deck], commander_names(card), commander_name_groups=groups)
+    assert len(kept) == 1 and not rejected and kept[0]["card_count"] == 100
+    assert card_key(f"{FRONT} // {BACK}") not in kept[0]["counts"]
+    whole = {**deck, "id": "whole", "commanders": [f"{FRONT} // {BACK}"]}
+    assert len(prepare_decks([whole], commander_names(card), commander_name_groups=groups)[0]) == 1
+    for actual in ([BACK], [FRONT, BACK], ["Unrelated Commander"]):
+        invalid = {**deck, "commanders": actual}
+        assert prepare_decks([invalid], commander_names(card), commander_name_groups=groups)[1][0]["reason"] == "Commander mismatch"
+
+
+def test_supported_face_layouts_and_partial_printing_hints_never_create_two_roles():
+    from edhrec_affinity.build_styles.sources import commander_names
+    for layout in ("transform", "modal_dfc", "flip", "adventure", "prepare", "meld", "reversible_card"):
+        card = faced_card(layout)
+        assert commander_names(card) == [FRONT]
+        card["cards"] = card["cards"][:1]
+        assert commander_names(card) == [FRONT]
+        assert [f"{FRONT} // {BACK}"] in CommanderAliasCatalog().groups(card)
+        card.pop("cards")
+        assert commander_names(card) == [FRONT]
+
+
+def test_real_partner_with_a_double_faced_card_retains_two_physical_commanders():
+    from edhrec_affinity.build_styles.sources import commander_names
+    card = faced_card()
+    card.update(name=f"{FRONT} // {BACK} // Partner", names=[FRONT, BACK, "Partner"], layout="normal")
+    card["cards"] = [{"name": "Partner", "layout": "normal", "id": PARTNER_ID}, *reversed(card["cards"])]
+    assert commander_names(card) == [FRONT, "Partner"]
+    groups = CommanderAliasCatalog().groups(card)
+    assert groups_as_sets(groups) == {frozenset([FRONT, "Partner"]), frozenset([f"{FRONT} // {BACK}", "Partner"])}
+    assert commander_printing_ids(card) == {FRONT: FRONT_ID, "Partner": PARTNER_ID}
+    deck = {"id": "partner", "commanders": ["Partner", FRONT], "cards": [{"name": "Forest", "quantity": 97}, {"name": "Engine", "quantity": 1}]}
+    assert len(prepare_decks([deck], commander_names(card), commander_name_groups=groups)[0]) == 1
+    assert not prepare_decks([{**deck, "commanders": [BACK, "Partner"]}], commander_names(card), commander_name_groups=groups)[0]
+
+
+def test_partial_partner_printing_hints_cannot_drop_the_missing_commander():
+    from edhrec_affinity.build_styles.sources import commander_names
+    card = pair(BRINELIN, DOGMEAT)
+    card["cards"] = [{"name": BRINELIN, "id": FRONT_ID, "layout": "normal"}]
+    assert commander_names(card) == [BRINELIN, DOGMEAT]
+    assert CommanderAliasCatalog().groups(card) == [[BRINELIN, DOGMEAT]]
+
+
+def test_conflicting_face_printing_identities_fail_closed():
+    import pytest
+    from edhrec_affinity.build_styles.sources import commander_names
+    card = faced_card()
+    card["cards"].append({"name": FRONT, "layout": "transform", "id": PARTNER_ID})
+    with pytest.raises(ValueError, match="conflicting printing"):
+        commander_names(card)
+    assert CommanderAliasCatalog(cards=[card])._names == {}
+
+
+def test_flavor_references_keep_full_face_names_but_never_enable_standalone_backs():
+    card = faced_card()
+    card["flavor_refs"] = [{"name": "Alternate Front // Alternate Back"}, {"name": BACK},
+        {"name": "Alternate Front", "names": ["Alternate Front", "Alternate Back"]}]
+    groups = CommanderAliasCatalog().groups(card)
+    assert ["Alternate Front // Alternate Back"] in groups
+    assert ["Alternate Front"] in groups
+    assert [BACK] not in groups
+
+
+def test_saved_evidence_normalization_is_in_place_idempotent_and_rejects_old_back_alias():
+    from copy import deepcopy
+    from edhrec_affinity.build_styles.__main__ import normalize_commander_evidence
+    evidence = {"card": faced_card(), "base": {"commander_names": [FRONT, BACK],
+        "commander_name_groups": [[FRONT, BACK], [BACK]]}, "metadata": {}}
+    assert normalize_commander_evidence(evidence) is evidence
+    assert evidence["base"]["commander_names"] == [FRONT]
+    assert [BACK] not in evidence["base"]["commander_name_groups"]
+    once = deepcopy(evidence)
+    normalize_commander_evidence(evidence)
+    assert evidence == once
+    legacy = {"base": {"commander_names": [BRINELIN, DOGMEAT]}}
+    assert normalize_commander_evidence(legacy) == legacy
+
+
+def test_collection_normalizes_faces_before_returning_saved_analysis_evidence(tmp_path):
+    from copy import deepcopy
+    from edhrec_affinity.build_styles.__main__ import normalize_commander_evidence
+    root = tmp_path / "sources" / "blitzwing-cruel-tormentor"
+    root.mkdir(parents=True)
+    card = faced_card()
+    card.update(num_decks=200, url="/commanders/blitzwing-cruel-tormentor")
+    (root / "base.json").write_text(json.dumps({"container": {"json_dict": {"card": card, "cardlists": []}}}))
+    args = parser().parse_args(["--commander", "blitzwing-cruel-tormentor", "--cache-dir", str(root), "--sample-decks", "0"])
+    evidence = collect_evidence(args)
+    assert evidence["base"]["commander_names"] == [FRONT]
+    once = deepcopy(evidence)
+    normalize_commander_evidence(evidence)
+    assert evidence == once
+
+
+def test_pending_partner_evidence_drops_back_only_roles_and_keeps_known_renames():
+    from edhrec_affinity.build_styles.__main__ import normalize_commander_evidence
+    from edhrec_affinity.build_styles.sources import commander_back_names
+    card = faced_card()
+    card.update(name=f"{FRONT} // {BACK} // Partner", names=[FRONT, BACK, "Partner"], layout="normal")
+    card["cards"].append({"name": "Partner", "layout": "normal", "id": PARTNER_ID})
+    evidence = {"card": card, "base": {"commander_names": [FRONT, BACK, "Partner"],
+        "commander_name_groups": [[FRONT, BACK, "Partner"], [BACK, "Partner"], [FRONT, "Known Alternate Partner"]]},
+        "metadata": {}}
+    normalize_commander_evidence(evidence)
+    assert evidence["base"]["commander_names"] == [FRONT, "Partner"]
+    assert commander_back_names(card) == {card_key(BACK)}
+    assert [BACK, "Partner"] not in evidence["base"]["commander_name_groups"]
+    assert [FRONT, "Known Alternate Partner"] in evidence["base"]["commander_name_groups"]
+    minimal = {"name": FRONT, "names": None, "layout": "transform"}
+    assert commander_back_names(minimal) == set()
+    normalize_commander_evidence({"card": minimal, "base": {"commander_names": [FRONT]}, "metadata": {}})
+
+
+def test_explicit_dfc_layout_with_one_whole_name_still_identifies_its_back():
+    from edhrec_affinity.build_styles.__main__ import normalize_commander_evidence
+    from edhrec_affinity.build_styles.sources import commander_back_names, commander_names
+    whole = f"{FRONT} // {BACK}"
+    card = {"name": whole, "names": [whole], "layout": "transform"}
+    assert commander_names(card) == [FRONT]
+    assert commander_back_names(card) == {card_key(BACK)}
+    assert groups_as_sets(CommanderAliasCatalog().groups(card)) == {frozenset([whole]), frozenset([FRONT])}
+    evidence = {"card": card, "base": {"commander_names": [whole], "commander_name_groups": [[BACK]]}, "metadata": {}}
+    normalize_commander_evidence(evidence)
+    assert [BACK] not in evidence["base"]["commander_name_groups"]
+
+
+def test_joined_dfc_name_with_separate_face_rows_never_creates_a_third_face():
+    from edhrec_affinity.build_styles.sources import commander_names
+    card = faced_card()
+    whole = f"{FRONT} // {BACK}"
+    card.update(name=whole, names=[whole])
+    assert commander_names(card) == [FRONT]
+    groups = CommanderAliasCatalog().groups(card)
+    assert groups_as_sets(groups) == {frozenset([FRONT]), frozenset([whole])}
+    deck = {"id": "front", "commanders": [FRONT], "cards": [{"name": "Forest", "quantity": 99}]}
+    assert prepare_decks([deck], commander_names(card), commander_name_groups=groups)[0]
+
+
+def test_joined_dfc_constituent_and_real_partner_remain_two_cards():
+    from edhrec_affinity.build_styles.sources import commander_names
+    card = faced_card()
+    whole = f"{FRONT} // {BACK}"
+    card.update(name=f"{whole} // Partner", names=[whole, "Partner"], layout="normal")
+    card["cards"].append({"name": "Partner", "id": PARTNER_ID, "layout": "normal"})
+    assert commander_names(card) == [FRONT, "Partner"]
+    assert groups_as_sets(CommanderAliasCatalog().groups(card)) == {
+        frozenset([FRONT, "Partner"]), frozenset([whole, "Partner"])}

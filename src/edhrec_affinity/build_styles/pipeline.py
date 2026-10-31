@@ -21,10 +21,14 @@ import httpx
 from .capacity import plan_capacity
 from .analysis import tag_label_policy
 from .eligibility import CommanderBelowMinimum, commander_is_eligible, valid_deck_count, validate_minimum
-from .sources import BudgetExpired, CommanderAliasCatalog, PreviewTransport, RequestLimiter, SourceBlocked, source_time
+from .sources import (
+    BudgetExpired, CommanderAliasCatalog, PreviewTransport, RequestLimiter, SourceBlocked,
+    commander_names, source_time,
+)
 
 
 MODEL_VERSION = 8
+COMMANDER_IDENTITY_VERSION = 1
 
 
 def model_policy(options: argparse.Namespace) -> dict:
@@ -210,6 +214,22 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     rows = [row for row in rows if (not requested or row["commander_slug"] in requested)
             and commander_is_eligible(row.get("total_decks"), minimum)]
     rows_by_slug = {row["commander_slug"]: row for row in rows}
+    # Only affected saved inputs need this repair. Ordinary commanders keep
+    # their fitted models and the shared source queue keeps its current work.
+    identity_upgrades = set()
+    for slug in rows_by_slug:
+        record = state["commanders"].get(slug, {})
+        if (record.get("commander_identity_version") == COMMANDER_IDENTITY_VERSION
+                or not record.get("coverage_complete")
+                or not (args.output_dir / f"{slug}.json").is_file()):
+            continue
+        try:
+            card = json.loads((root / "sources" / slug / "base.json").read_text())["container"]["json_dict"]["card"]
+            if commander_names(card) != (card.get("names") or [card.get("name")]):
+                identity_upgrades.add(slug)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            # Missing source inputs continue through their normal refresh path.
+            continue
     cycle = state.setdefault("pipeline", {"version": 1, "cycle_started_at": observed_at.isoformat()})
     cycle_start = source_time(cycle.get("cycle_started_at")) or observed_at
     upstream_date = getattr(args, "upstream_snapshot_date", None)
@@ -221,6 +241,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     cycle_complete = all(state["commanders"].get(slug, {}).get("status") in {"fitted", "insufficient_data"}
                          and state["commanders"][slug].get("tag_label_policy") == label_policy
                          and state["commanders"][slug].get("model_policy") == current_model_policy
+                         and slug not in identity_upgrades
                          and state["commanders"][slug].get("coverage_complete")
                          and not state["commanders"][slug].get("unavailable_previews")
                          and (verified := source_time(state["commanders"][slug].get("verified_at"))) is not None
@@ -238,6 +259,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                                    and args.sample_decks is None and not args.refresh),
                "min_total_decks": minimum, "tag_label_policy": label_policy,
                "model_policy": current_model_policy, "model_upgrades_deferred": [],
+               "commander_identity_upgrades": sorted(identity_upgrades),
                "reanalyzed_from_cache": [], "skipped": [],
                "completed": [], "collected": [], "failures": [], "blocked": False,
                "dry_run": args.dry_run, "publish_needed": False, "continuation_needed": False,
@@ -256,6 +278,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         return (args.refresh or record.get("status") not in {"fitted", "insufficient_data"}
                 or record.get("tag_label_policy") != label_policy
                 or record.get("model_policy") != current_model_policy
+                or slug in identity_upgrades
                 or not record.get("coverage_complete") or verified is None
                 or not (args.output_dir / f"{slug}.json").exists()
                 or (verified - now()).total_seconds() > 300
@@ -269,7 +292,8 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         phase = (0 if record.get("status") == "analysis_pending" else
                  1 if record.get("coverage_complete") and published and
                      (record.get("tag_label_policy") != label_policy
-                      or record.get("model_policy") != current_model_policy) else
+                      or record.get("model_policy") != current_model_policy
+                      or slug in identity_upgrades) else
                  3 if record.get("coverage_complete") and published else 2)
         frame = valid_deck_count(record.get("frame_decks")) or valid_deck_count(rows_by_slug[slug].get("total_decks"))
         loaded = valid_deck_count(record.get("current_previews")) or 0
@@ -306,6 +330,17 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                 del assignments[worker]
 
     def next_commander(worker):
+        # A short, source-free repair may run before a sticky partial frame.
+        # Keep that frame's durable claim so its worker resumes it afterward.
+        repairs = [slug for slug in queue if slug in identity_upgrades
+                   and slug not in assignments.values()
+                   and not args.refresh
+                   and state["commanders"].get(slug, {}).get("tag_label_policy") == label_policy
+                   and not state["commanders"].get(slug, {}).get("model_upgrade_needs_collection")]
+        if repairs:
+            slug = repairs[-1] if two_ended and directions[worker] == "bottom" else repairs[0]
+            queue.remove(slug)
+            return slug
         if worker in assignments:
             # A partial frame retains its worker, including while its durable
             # evidence is being analyzed. It cannot be claimed from the other
@@ -440,10 +475,14 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         evidence_path = root / "evidence" / f"{slug}.json.gz"
         if record.get("status") == "analysis_pending" and evidence_path.exists():
             try:
+                from .__main__ import normalize_commander_evidence
+
                 with gzip.open(evidence_path, "rt", encoding="utf-8") as handle:
                     pending = json.load(handle)
                     pending_policy = pending.get("tag_label_policy")
-            except (OSError, EOFError, ValueError, TypeError, AttributeError):
+                if pending_policy == label_policy:
+                    normalize_commander_evidence(pending)
+            except (OSError, EOFError, ValueError, KeyError, TypeError, AttributeError):
                 pending_policy = None
             if pending_policy == label_policy:
                 options = collection_options(args, slug, args.max_preview_seconds)
@@ -460,7 +499,9 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         atomic_json(args.output_dir / f"{slug}.json", report)
         record = state["commanders"][slug]
         record.update(status=result["status"], analysis_version=result["version"],
-                      model_policy=current_model_policy, analyzed_at=now().isoformat())
+                      model_policy=current_model_policy, analyzed_at=now().isoformat(),
+                      commander_identity_version=COMMANDER_IDENTITY_VERSION)
+        identity_upgrades.discard(slug)
         record.pop("model_upgrade_needs_collection", None)
         record.pop("analysis_deferred_reason", None)
         record.pop("retry_after", None)
@@ -507,7 +548,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                     options.cache_only_model_upgrade = bool(
                         not args.refresh and previous.get("coverage_complete")
                         and previous.get("tag_label_policy") == label_policy
-                        and previous.get("model_policy") != current_model_policy
+                        and (previous.get("model_policy") != current_model_policy or slug in identity_upgrades)
                         and not previous.get("model_upgrade_needs_collection")
                         and (args.output_dir / f"{slug}.json").exists())
                     if options.cache_only_model_upgrade:
@@ -590,6 +631,8 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                     atomic_json(destination, report)
                                     record["status"] = report["deck_analysis"]["status"]
                                     record["model_policy"] = current_model_policy
+                                    record["commander_identity_version"] = COMMANDER_IDENTITY_VERSION
+                                    identity_upgrades.discard(slug)
                                     summary["completed"].append(slug)
                                     release_assignment(slug)
                                     summary.update(publish_needed=True, no_progress=False)

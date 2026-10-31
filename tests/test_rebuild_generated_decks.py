@@ -408,6 +408,93 @@ def test_recover_completed_inputs_from_parsed_previews_and_exact_selected_rankin
         rebuild.load_inputs(root, report, CommanderAliasCatalog(root / "_collection/sources"))
 
 
+@pytest.mark.parametrize("storage", ["evidence", "source_profiles"])
+@pytest.mark.parametrize("single_card", [True, False])
+def test_rebuild_inputs_distinguish_dfc_faces_from_partner_roles(tmp_path, storage, single_card):
+    report, inputs, _ = fixture(tmp_path)
+    root = tmp_path / "build-styles"
+    first_id = "11111111-1111-1111-1111-111111111111"
+    second_id = first_id if single_card else "22222222-2222-2222-2222-222222222222"
+    second_name = "Back Commander" if single_card else "Partner"
+    layout = "transform" if single_card else "normal"
+    card = {"name": "Commander" if single_card else "Commander // Partner",
+            "names": ["Commander", second_name], "layout": layout,
+            "num_decks": 200, "url": "/commanders/commander", "id": first_id,
+            "cards": [{"name": "Commander", "layout": layout, "id": first_id},
+                      {"name": second_name, "layout": layout, "id": second_id}]}
+    payload = {"container": {"json_dict": {"card": card, "cardlists": []}}}
+    if storage == "evidence":
+        # This is precisely the old evidence shape that treated both DFC faces
+        # as separate command-zone cards. Recompute it without changing decks.
+        inputs["base"]["commander_names"] = ["Commander", second_name]
+        inputs["base"]["commander_name_groups"] = [["Commander", second_name]]
+        save_evidence(root, report, inputs)
+        evidence_path = root / "_collection/evidence/commander.json.gz"
+        evidence = rebuild.read_json(evidence_path)
+        write(evidence_path, {**evidence, "card": card})
+    else:
+        write(root / "_collection/previews/commander.json.gz", {
+            "schema_version": 1, "commander_slug": "commander",
+            "frame": [{"urlhash": deck["id"]} for deck in inputs["decks"]],
+            "results": {deck["id"]: {"deck": deck} for deck in inputs["decks"]}})
+        for tag in ("base", "plants", "bracket-3"):
+            write(root / "_collection/sources/commander" / f"{tag}.json", payload)
+    loaded = rebuild.load_inputs(root, report, CommanderAliasCatalog(root / "_collection/sources"))
+    expected = ["Commander"] if single_card else ["Commander", "Partner"]
+    assert loaded["base"]["commander_names"] == expected
+    assert all(len(group) == len(expected) for group in loaded["base"]["commander_name_groups"])
+    assert ["Back Commander"] not in loaded["base"]["commander_name_groups"]
+    assert loaded["printing_ids"] == dict(zip(expected, [first_id, second_id]))
+    assert loaded["decks"] == inputs["decks"]
+    assert loaded["dataset_sha256"] == report["collection"]["dataset_sha256"]
+
+
+def test_evidence_without_card_uses_saved_source_to_correct_dfc_roles(tmp_path):
+    report, inputs, _ = fixture(tmp_path)
+    root = tmp_path / "build-styles"
+    inputs["base"]["commander_names"] = ["Commander", "Back Commander"]
+    inputs["base"]["commander_name_groups"] = [["Commander", "Back Commander"]]
+    save_evidence(root, report, inputs)
+    card = {"name": "Commander", "names": ["Commander", "Back Commander"], "layout": "transform",
+            "url": "/commanders/commander"}
+    write(root / "_collection/sources/commander/base.json", {"container": {"json_dict": {"card": card}}})
+    loaded = rebuild.load_inputs(root, report, CommanderAliasCatalog(root / "_collection/sources"))
+    assert loaded["base"]["commander_names"] == ["Commander"]
+    assert loaded["base"]["commander_name_groups"] == [["Commander"], ["Commander // Back Commander"]]
+    # The rebuild loader corrects its working copy, leaving evidence intact.
+    assert rebuild.read_json(root / "_collection/evidence/commander.json.gz")["base"] == inputs["base"]
+
+
+def test_rebuild_dfc_evidence_generates_one_canonical_commander_and_100_cards(tmp_path, monkeypatch):
+    report, inputs, cache = fixture(tmp_path)
+    root = tmp_path / "build-styles"
+    inputs["base"]["commander_names"] = ["Commander", "Back Commander"]
+    inputs["base"]["commander_name_groups"] = [["Commander", "Back Commander"]]
+    save_evidence(root, report, inputs)
+    evidence_path = root / "_collection/evidence/commander.json.gz"
+    write(evidence_path, {**rebuild.read_json(evidence_path), "card": {
+        "name": "Commander", "names": ["Commander", "Back Commander"], "layout": "transform"}})
+    records = rebuild.read_json(cache)
+    metadata = records["cards"].pop("commander")
+    canonical_name = "Commander // Back Commander"
+    metadata.update(name=canonical_name, layout="transform", card_faces=[
+        {"name": "Commander", "type_line": "Legendary Creature — Fungus", "oracle_text": ""},
+        {"name": "Back Commander", "type_line": "Legendary Creature — Fungus", "oracle_text": ""}])
+    records["cards"][card_key(canonical_name)] = metadata
+    write(cache, records)
+    monkeypatch.setattr("httpx.Client", lambda **_: pytest.fail("DFC rebuild tried HTTP"))
+    loaded = rebuild.load_inputs(root, report, CommanderAliasCatalog(root / "_collection/sources"))
+    result, _ = rebuild.rebuild_report(report, loaded, MetadataRepository(cache), prefer_playability=False,
+                                       validation_directory=tmp_path / "ratings")
+    assert rebuild.learned_analysis(result["deck_analysis"]) == rebuild.learned_analysis(report["deck_analysis"])
+    for _, package in rebuild.packages(result):
+        deck = package["generated_deck"]
+        assert deck["status"] == "generated" and deck["card_count"] == 100
+        assert [row["name"] for row in deck["commanders"]] == [canonical_name]
+        assert sum(row["quantity"] for row in deck["cards"] if row["name"] == canonical_name) == 1
+        assert all(row["name"] != "Back Commander" for row in deck["cards"])
+
+
 def test_rebuild_writes_atomic_report_backup_and_complete_audit_summary(tmp_path):
     report, inputs, cache = fixture(tmp_path)
     root = tmp_path / "build-styles"

@@ -27,30 +27,145 @@ def card_key(name: str) -> str:
     return unicodedata.normalize("NFKC", name).replace("’", "'").strip().casefold()
 
 
-def _commander_name_groups(card: dict) -> list[list[str]]:
-    """Read only EDHREC's explicit equivalent full commander configurations."""
+_SINGLE_CARD_LAYOUTS = frozenset({"transform", "modal_dfc", "flip", "adventure", "prepare", "meld", "reversible_card"})
+_PRINTING_ID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+
+def _role_name_list(card):
+    if not isinstance(card, dict):
+        raise ValueError("Commander card must be an object")
     names = card.get("names") or [card.get("name")]
     if (not isinstance(names, list) or not names
             or any(not isinstance(name, str) or not name.strip() for name in names)
             or len({card_key(name) for name in names}) != len(names)):
+        raise ValueError("Commander page has invalid commander names")
+    return [name.strip() for name in names]
+
+
+def _commander_roles(card):
+    """Separate physical cards from EDHREC's list of their printed faces."""
+    names = _role_name_list(card)
+    display = card.get("name")
+    display = display.strip() if isinstance(display, str) and display.strip() else names[0]
+    parts = card.get("cards", [])
+    parts = parts if isinstance(parts, list) else []
+    named_keys = {card_key(name) for name in names}
+    named_keys.update(card_key(face) for name in names for face in name.split(" // "))
+    candidates = [part for part in parts if isinstance(part, dict)
+                  and isinstance(part.get("name"), str) and card_key(part["name"]) in named_keys]
+    identified = [part for part in candidates if isinstance(part, dict)
+                  and isinstance(part.get("name"), str) and part["name"].strip()
+                  and isinstance(part.get("id"), str) and _PRINTING_ID.fullmatch(part["id"])]
+    groups = {}
+    conflicting_names = {}
+    for part in identified:
+        conflicting_names.setdefault(card_key(part["name"]), set()).add(part["id"].lower())
+    if (card.get("layout") in _SINGLE_CARD_LAYOUTS
+            or any(part.get("layout") in _SINGLE_CARD_LAYOUTS for part in candidates)) and any(
+                len(values) > 1 for values in conflicting_names.values()):
+        raise ValueError("Commander faces have conflicting printing identities")
+    if identified and len(identified) == len(candidates) and not any(len(values) > 1 for values in conflicting_names.values()):
+        for part in identified:
+            groups.setdefault(part["id"].lower(), []).append(part)
+    single = card.get("layout") in _SINGLE_CARD_LAYOUTS
+    if single and len(groups) > 1 and " // " not in display:
+        raise ValueError("Single commander faces have conflicting printing identities")
+    physical = list(groups.values()) if groups else []
+    if not single and physical and not all(
+            card_key(name) in {card_key(part["name"]) for part in identified}
+            or all(card_key(face) in {card_key(part["name"]) for part in identified} for face in name.split(" // "))
+            for name in names):
+        physical = []  # Partial constituent hints cannot erase a real partner.
+    if not physical:
+        if single:
+            physical = [[{"name": name, "layout": card.get("layout")} for name in names]]
+        else:
+            return [{"name": name, "aliases": [name], "backs": set()} for name in names]
+    roles = []
+    for group in physical:
+        face_names = list(dict.fromkeys(part["name"].strip() for part in group))
+        face_layout = single and len(physical) == 1 or any(part.get("layout") in _SINGLE_CARD_LAYOUTS for part in group)
+        if single and len(physical) == 1:
+            face_names.extend(name for name in names if card_key(name) not in {card_key(value) for value in face_names})
+        if face_layout:
+            # A whole Scryfall name is one spelling of these known faces,
+            # never a third face. Only explicit physical-card layout evidence
+            # allows this split; normal partner display names remain intact.
+            face_names = list(dict.fromkeys(face for name in face_names for face in name.split(" // ")))
+        group_keys = {card_key(name) for name in face_names}
+        ordered = [name for name in names if card_key(name) in group_keys]
+        ordered.extend(name for name in face_names if card_key(name) not in {card_key(value) for value in ordered})
+        # EDHREC orders a single card's names front first; a page's own front
+        # display name is stronger than the order of constituent lookup rows.
+        front = display if len(physical) == 1 and " // " not in display and card_key(display) in group_keys else ordered[0]
+        aliases = [front]
+        backs = set()
+        if face_layout and len(ordered) > 1:
+            ordered = [front, *[name for name in ordered if card_key(name) != card_key(front)]]
+            whole = " // ".join(ordered)
+            aliases.append(whole)
+            backs.update(card_key(name) for name in ordered[1:])
+        elif len(physical) == 1 and len(names) == 1 and " // " in names[0]:
+            # A full name supplied as one name is already one physical role.
+            front = names[0]
+            aliases = [front]
+        roles.append({"name": front, "aliases": aliases, "backs": backs})
+    order = {card_key(name): position for position, name in enumerate(names)}
+    roles.sort(key=lambda role: min((order.get(card_key(alias), len(names)) for alias in role["aliases"]), default=len(names)))
+    if len({card_key(role["name"]) for role in roles}) != len(roles):
+        raise ValueError("Commander physical identities collapse to duplicate names")
+    return roles
+
+
+def commander_names(card: dict) -> list[str]:
+    """Return physical commander roles, never one role per printed face."""
+    return [role["name"] for role in _commander_roles(card)]
+
+
+def commander_back_names(card: dict) -> set[str]:
+    """Known standalone back-face keys that cannot fill a commander role."""
+    return set().union(*(role["backs"] for role in _commander_roles(card)))
+
+
+def _commander_name_groups(card: dict) -> list[list[str]]:
+    """Read verified complete configurations, with front/whole DFC aliases."""
+    try:
+        roles = _commander_roles(card)
+    except ValueError:
         return []
-    groups = [list(names)]
+    names = [role["name"] for role in roles]
+    groups = [names]
+    # Each role's whole name is an alias of that same physical card; a back
+    # face by itself never becomes a valid commander configuration.
+    for role_index, role in enumerate(roles):
+        for alias in role["aliases"][1:]:
+            groups.extend([[*group[:role_index], alias, *group[role_index + 1:]] for group in list(groups)])
     references = card.get("flavor_refs", [])
     references = list(references) if isinstance(references, list) else []
     if isinstance(card.get("flavor_ref"), dict):
         references.append(card["flavor_ref"])
+    forbidden_backs = set().union(*(role["backs"] for role in roles))
     for reference in references:
         if not isinstance(reference, dict):
             continue
         aliases = reference.get("names")
+        if len(names) == 1 and isinstance(aliases, list) and len(aliases) > 1 and card.get("layout") in _SINGLE_CARD_LAYOUTS:
+            # References can enumerate the alternate printing's two faces too.
+            aliases = [reference.get("name") or aliases[0]]
         if aliases is None and isinstance(reference.get("name"), str):
-            # A single double-faced card's full name must remain one commander.
             aliases = reference["name"].split(" // ") if len(names) > 1 else [reference["name"]]
         if (isinstance(aliases, list) and len(aliases) == len(names)
                 and all(isinstance(name, str) and name.strip() for name in aliases)
-                and len({card_key(name) for name in aliases}) == len(names)):
+                and len({card_key(name) for name in aliases}) == len(names)
+                and not any(card_key(name) in forbidden_backs for name in aliases)):
             groups.append(list(aliases))
-    return groups
+    unique, seen = [], set()
+    for group in groups:
+        key = frozenset(card_key(name) for name in group)
+        if key not in seen:
+            unique.append(group)
+            seen.add(key)
+    return unique
 
 
 def commander_card_alias_groups(full_configuration_groups: list[list[str]]) -> list[list[str]]:

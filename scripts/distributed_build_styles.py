@@ -333,10 +333,19 @@ def plan(base, index, output_dir, runners, generation, *, pilot=False):
                     assignments[worker].append(slug)
                     claimed.add(slug)
     loads = {worker: sum(remaining(rows[s], records.get(s, {})) for s in slugs) for worker, slugs in assignments.items()}
+    # Completed samples may still need CPU-only model repairs. Balance those
+    # independently of preview requests, which otherwise sends every zero-load
+    # report to the same runner with the smallest unfinished network frame.
+    offline_counts = {worker: sum(remaining(rows[s], records.get(s, {})) == 0 for s in slugs)
+                      for worker, slugs in assignments.items()}
     for slug in sorted(selected - claimed, key=lambda s: (-remaining(rows[s], records.get(s, {})), s)):
-        worker = min(assignments, key=lambda key: (loads[key], len(assignments[key]), int(key)))
+        requests = remaining(rows[slug], records.get(slug, {}))
+        worker = min(assignments, key=lambda key: (
+            offline_counts[key] if requests == 0 else loads[key], len(assignments[key]), int(key)))
         assignments[worker].append(slug)
-        loads[worker] += remaining(rows[slug], records.get(slug, {}))
+        loads[worker] += requests
+        if requests == 0:
+            offline_counts[worker] += 1
     report_hashes = {slug: digest(base / f"{slug}.json") if (base / f"{slug}.json").exists() else None for slug in selected}
     manifest = {"schema_version": 1, "generation": generation, "created_at": now().isoformat(),
         "runners": runners, "pilot": pilot, "min_total_decks": 200,
