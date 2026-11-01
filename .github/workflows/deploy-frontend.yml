@@ -156,7 +156,7 @@ jobs:
       - name: Export sharded frontend data
         shell: bash
         run: |
-          python scripts/export_full_site_data.py \
+          /usr/bin/time -v python -u scripts/export_full_site_data.py \
             --processed-dir "${RESTORED_PROCESSED_DIR}" \
             --output-dir "${FRONTEND_DATA_DIR}" \
             --page-size 500

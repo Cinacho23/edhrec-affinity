@@ -36,6 +36,7 @@ import json
 import math
 import re
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -328,10 +329,10 @@ def read_json_object(path: Path) -> Any:
         return json.load(file)
 
 
-def write_json(path: Path, data: Any, *, compact: bool = False) -> None:
+def write_json(path: Path, data: Any, *, compact: bool = False, sanitize: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    sanitized = sanitize_for_json(data)
+    sanitized = sanitize_for_json(data) if sanitize else data
 
     with path.open("w", encoding="utf-8") as file:
         json.dump(
@@ -1224,49 +1225,86 @@ def reject_nonfinite_constant(value: str) -> None:
     raise ValueError(f"Nonfinite JSON number: {value}")
 
 
+def require_finite_json(value: Any) -> None:
+    """Validate decoded JSON without allocating another serialized report."""
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("Nonfinite JSON number")
+    if isinstance(value, dict):
+        for item in value.values():
+            require_finite_json(item)
+    elif isinstance(value, list):
+        for item in value:
+            require_finite_json(item)
+
+
+def read_build_style_report(path: Path) -> dict[str, Any] | None:
+    """Validate one optional report; invalid samples cannot break affinity export."""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            report = json.load(handle, parse_constant=reject_nonfinite_constant)
+        # The JSON decoder also accepts overflowing exponents (1e999) as
+        # infinity; validate the entire tree before one bad sample can stop
+        # the otherwise independent static affinity export.
+        require_finite_json(report)
+        slug = report["commander_slug"]
+        if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
+            raise ValueError("invalid commander slug")
+        if slug != path.stem:
+            raise ValueError("report commander does not match its filename")
+        datetime.fromisoformat(report["generated_at"].replace("Z", "+00:00"))
+        if not isinstance(report["commander_name"], str) or not report["commander_name"].strip():
+            raise ValueError("missing commander name")
+        if not isinstance(report["profiles"]["profiles"], list):
+            raise ValueError("missing profile list")
+        if any(not isinstance(profile, dict) or not profile.get("tag_slug") or not profile.get("tag_name")
+               for profile in report["profiles"]["profiles"]):
+            raise ValueError("invalid profile entry")
+        analysis = report["deck_analysis"]
+        if analysis["status"] not in {"fitted", "insufficient_data"}:
+            raise ValueError("unknown deck analysis status")
+        if not isinstance(analysis["packages"], list) or not isinstance(analysis["unique_decks"], int):
+            raise ValueError("invalid deck analysis")
+        if analysis["status"] == "fitted" and not analysis["packages"]:
+            raise ValueError("fitted analysis has no packages")
+        if any(not isinstance(package, dict) or "id" not in package or not isinstance(package.get("top_cards"), list)
+               for package in analysis["packages"]):
+            raise ValueError("invalid package entry")
+        # An attempted commander can legitimately have too little data for
+        # either comparison. Preserve that outcome so catalog coverage does
+        # not confuse an insufficient sample with an unprocessed commander.
+        return report
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        print(f"Skipping invalid build-style report {path}: {error}")
+    return None
+
+
+def build_style_report_paths(directory: Path):
+    return sorted(path for path in directory.glob("*.json") if path.stem != "index") if directory.is_dir() else []
+
+
 def read_build_style_reports(directory: Path) -> dict[str, dict[str, Any]]:
-    """Read optional samples independently; a bad sample must not break affinity export."""
+    """Compatibility reader for callers explicitly needing complete reports."""
+    return {path.stem: report for path in build_style_report_paths(directory)
+            if (report := read_build_style_report(path)) is not None}
+
+
+def index_build_style_reports(directory: Path) -> dict[str, dict[str, Any]]:
+    """Keep only selection/discovery fields and paths, never all package trees."""
     reports = {}
-    if not directory.is_dir():
-        return reports
-    for path in sorted(directory.glob("*.json")):
-        if path.stem == "index":
+    for path in build_style_report_paths(directory):
+        report = read_build_style_report(path)
+        if report is None:
             continue
-        try:
-            report = json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_nonfinite_constant)
-            # The JSON decoder also accepts overflowing exponents (1e999) as
-            # infinity; validate the entire tree before one bad sample can stop
-            # the otherwise independent static affinity export.
-            json.dumps(report, allow_nan=False)
-            slug = report["commander_slug"]
-            if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
-                raise ValueError("invalid commander slug")
-            if slug != path.stem:
-                raise ValueError("report commander does not match its filename")
-            datetime.fromisoformat(report["generated_at"].replace("Z", "+00:00"))
-            if not isinstance(report["commander_name"], str) or not report["commander_name"].strip():
-                raise ValueError("missing commander name")
-            if not isinstance(report["profiles"]["profiles"], list):
-                raise ValueError("missing profile list")
-            if any(not isinstance(profile, dict) or not profile.get("tag_slug") or not profile.get("tag_name")
-                   for profile in report["profiles"]["profiles"]):
-                raise ValueError("invalid profile entry")
-            analysis = report["deck_analysis"]
-            if analysis["status"] not in {"fitted", "insufficient_data"}:
-                raise ValueError("unknown deck analysis status")
-            if not isinstance(analysis["packages"], list) or not isinstance(analysis["unique_decks"], int):
-                raise ValueError("invalid deck analysis")
-            if analysis["status"] == "fitted" and not analysis["packages"]:
-                raise ValueError("fitted analysis has no packages")
-            if any(not isinstance(package, dict) or "id" not in package or not isinstance(package.get("top_cards"), list)
-                   for package in analysis["packages"]):
-                raise ValueError("invalid package entry")
-            # An attempted commander can legitimately have too little data for
-            # either comparison. Preserve that outcome so catalog coverage does
-            # not confuse an insufficient sample with an unprocessed commander.
-            reports[slug] = report
-        except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
-            print(f"Skipping invalid build-style report {path}: {error}")
+        collection = report.get("collection", {})
+        reports[path.stem] = {
+            "_report_path": path, "commander_slug": report["commander_slug"],
+            "generated_at": report["generated_at"], "total_edhrec_decks": report.get("total_edhrec_decks"),
+            "deck_analysis": {"status": report["deck_analysis"]["status"]},
+            "collection": {key: collection[key] for key in (
+                "complete", "target_mode", "analysis_current", "dataset_sha256", "analysis_dataset_sha256",
+            ) if key in collection} if isinstance(collection, dict) else {},
+        }
+        del report
     return reports
 
 
@@ -1432,9 +1470,10 @@ def export_build_style_files(
     from edhrec_affinity.build_styles.deck_tags import normalize_report_deck_tags
     seed_dir = seed_dir if seed_dir is not None else Path(__file__).resolve().parents[1] / "data/build-styles"
     policy = read_build_discovery_policy()
-    current_reports = read_build_style_reports(processed_dir / "build-styles")
+    current_reports = index_build_style_reports(processed_dir / "build-styles")
     discovery_slugs = current_build_discovery_slugs(processed_dir / "build-styles", current_reports, policy)
-    reports = read_build_style_reports(seed_dir)
+    reports = index_build_style_reports(seed_dir)
+    print(f"Indexed {len(current_reports)} collected and {len(reports)} seed build-style reports without retaining deck payloads.", flush=True)
     for incoming in (previous_reports or {}, current_reports):
         for slug, report in incoming.items():
             if incoming is current_reports and slug in discovery_slugs:
@@ -1465,8 +1504,13 @@ def export_build_style_files(
         for path in (output_dir / "build-styles").glob("*.json"):
             path.unlink()
     entries = []
-    for slug, report in sorted(reports.items()):
+    published = 0
+    for slug, selected in sorted(reports.items()):
         if slug not in known_slugs:
+            continue
+        source_path = selected.get("_report_path")
+        report = read_build_style_report(source_path) if isinstance(source_path, Path) else selected
+        if report is None:
             continue
         # An archived fit cannot override a newer population check. Keep its
         # evidence available, while making its ineligibility explicit to direct
@@ -1479,9 +1523,16 @@ def export_build_style_files(
             report.setdefault("collection", {})["analysis_current"] = False
         filename = f"build-styles/{slug}.json"
         normalize_report_deck_tags(report)
-        write_json(output_dir / filename, report, compact=True)
+        # File-backed trees came from strict JSON and gained native JSON values.
+        # Keep legacy in-memory callers' sanitization without cloning every
+        # decoded model/card in the production path.
+        write_json(output_dir / filename, report, compact=True, sanitize=not isinstance(source_path, Path))
+        published += 1
+        if published % 100 == 0:
+            print(f"Published {published}/{len(reports)} build-style reports.", flush=True)
         if slug not in eligible_catalog or not commander_is_eligible(
                 report.get("total_edhrec_decks"), policy["min_total_decks"]):
+            del report
             continue
         analysis = report["deck_analysis"]
         entry = {
@@ -1510,6 +1561,7 @@ def export_build_style_files(
             if summary:
                 entry["collection"] = summary
         entries.append(entry)
+        del report, analysis, collection
     index = {
         "schema_version": 1, "coverage": "sampled_commanders", "total_available": len(entries),
         "total_catalog": len(eligible_catalog), "total_pending": len(eligible_catalog) - len(entries),
@@ -1529,6 +1581,7 @@ def export_build_style_files(
     if progress is not None:
         index["collection_progress"] = progress
     write_json(output_dir / "build-styles/index.json", index)
+    print(f"Published {published} complete build-style reports and {len(entries)} discovery entries.", flush=True)
     return {"index_file": "build-styles/index.json", "file_pattern": "build-styles/<commander_slug>.json",
             "commander_count": len(entries), "coverage": "sampled_commanders"}
 
@@ -1580,22 +1633,21 @@ def summarize_build_style_freshness(entries: list[dict[str, Any]], now: datetime
     return result
 
 
-def export_full_site_data(
+def _export_full_site_data(
     processed_dir: Path,
     output_dir: Path,
     page_size: int,
     clean_output: bool,
     build_style_seed_dir: Path | None = None,
+    previous_build_styles: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    # Build samples have their own collection dates and can outlive an affinity
-    # snapshot. Read them before cleaning, then retain only current commanders.
-    previous_build_styles = read_build_style_reports(output_dir / "build-styles")
     if clean_output and output_dir.exists():
         shutil.rmtree(output_dir)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     affinity_path = processed_dir / "affinity_rows_with_trends.json"
+    print("Loading affinity rows and commander metadata.", flush=True)
     df = read_json_records(affinity_path)
     df = normalize_columns(df)
     df = ensure_commander_card_metadata(df, processed_dir / "scryfall_lookup_cache.json")
@@ -1608,9 +1660,11 @@ def export_full_site_data(
         tag_summary_df = pd.read_json(tag_summary_path)
 
     summary_files = copy_summary_files(processed_dir, output_dir)
+    print("Exporting commander, set and tag shards.", flush=True)
     commander_export = export_commander_files(df, output_dir)
     set_export = export_set_files(df, output_dir)
     tag_export = export_tag_files(df, tag_summary_df, output_dir)
+    print("Exporting theme and leaderboard reports.", flush=True)
     theme_bracket_export = export_theme_bracket_files(
         df,
         tag_summary_df,
@@ -1619,6 +1673,7 @@ def export_full_site_data(
     theme_report_export = export_theme_report(df, tag_summary_df, output_dir)
     quirky_builds_export = export_quirky_builds_report(df, tag_summary_df, output_dir)
     leaderboard_export = export_leaderboard_pages(df, output_dir, page_size)
+    print("Exporting complete build-style reports one commander at a time.", flush=True)
     build_style_export = export_build_style_files(
         df, processed_dir, output_dir, previous_build_styles, build_style_seed_dir,
     )
@@ -1649,6 +1704,36 @@ def export_full_site_data(
     write_json(output_dir / "site_manifest.json", manifest)
 
     return manifest
+
+
+def export_full_site_data(
+    processed_dir: Path,
+    output_dir: Path,
+    page_size: int,
+    clean_output: bool,
+    build_style_seed_dir: Path | None = None,
+) -> dict[str, Any]:
+    # Preserve prior commander reports on disk while rebuilding the output.
+    # A sibling directory permits a rename instead of copying gigabytes or
+    # retaining every decoded package/model in memory across affinity export.
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".build-style-export-", dir=output_dir.parent) as temporary:
+        retained = Path(temporary) / "build-styles"
+        previous = output_dir / "build-styles"
+        if previous.is_dir():
+            previous.rename(retained)
+        try:
+            previous_reports = index_build_style_reports(retained)
+            return _export_full_site_data(processed_dir, output_dir, page_size, clean_output,
+                                          build_style_seed_dir, previous_reports)
+        except BaseException:
+            # A failed refresh must not consume the previous published samples.
+            if retained.is_dir():
+                if previous.exists():
+                    shutil.rmtree(previous)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                retained.rename(previous)
+            raise
 
 
 def parse_args() -> argparse.Namespace:
