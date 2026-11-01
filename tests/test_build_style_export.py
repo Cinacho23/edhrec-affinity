@@ -422,6 +422,67 @@ def test_malformed_samples_do_not_prevent_other_exports(tmp_path):
     assert set(exporter.read_build_style_reports(samples)) == {"commander-a"}
 
 
+def test_report_export_releases_full_models_between_commanders(tmp_path, monkeypatch):
+    processed, site = tmp_path / "processed", tmp_path / "site"
+    slugs = [f"commander-{index}" for index in range(24)]
+    for slug in slugs:
+        value = report(slug)
+        value["deck_analysis"]["alternative_models"] = [{"components": 12, "packages": [],
+            "memberships": [{"id": str(index), "weights": [.125] * 8} for index in range(400)]}]
+        write_json(processed / f"build-styles/{slug}.json", value)
+    live, peaks = set(), []
+
+    class TrackedReport(dict):
+        def __init__(self, value):
+            super().__init__(value)
+            live.add(id(self))
+            peaks.append(len(live))
+
+        def __del__(self):
+            live.discard(id(self))
+
+    read = exporter.read_build_style_report
+    sanitize = exporter.sanitize_for_json
+
+    def tracked_read(path):
+        value = read(path)
+        return TrackedReport(value) if value is not None else None
+
+    def without_report_clone(value):
+        if isinstance(value, dict) and "deck_analysis" in value:
+            pytest.fail("Decoded report was recursively cloned for JSON sanitization")
+        return sanitize(value)
+
+    monkeypatch.setattr(exporter, "read_build_style_report", tracked_read)
+    monkeypatch.setattr(exporter, "sanitize_for_json", without_report_clone)
+    monkeypatch.setattr(exporter, "read_build_style_reports", lambda *_: pytest.fail("Exporter retained every full report"))
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": slugs, "total_decks": 200}),
+                                     processed, site, seed_dir=tmp_path / "none")
+    assert max(peaks) <= 1 and not live
+    for slug in slugs:
+        assert json.loads((site / f"build-styles/{slug}.json").read_text()) == json.loads(
+            (processed / f"build-styles/{slug}.json").read_text())
+
+
+@pytest.mark.parametrize("failure_stage", ["index", "affinity"])
+def test_failed_clean_export_restores_previous_reports_from_disk(tmp_path, monkeypatch, failure_stage):
+    site = tmp_path / "site"
+    previous = site / "build-styles/commander-a.json"
+    write_json(previous, report())
+    original = previous.read_bytes()
+
+    def failed_export(*_):
+        assert not previous.exists()
+        assert list(tmp_path.glob(".build-style-export-*/build-styles/commander-a.json"))
+        raise RuntimeError("Export failed")
+
+    monkeypatch.setattr(exporter, "index_build_style_reports" if failure_stage == "index" else "read_json_records", failed_export)
+    with pytest.raises(RuntimeError, match="Export failed"):
+        exporter.export_full_site_data(tmp_path / "processed", site, 10, True, tmp_path / "none")
+    assert previous.read_bytes() == original
+    assert not list(tmp_path.glob(".build-style-export-*"))
+
+
 def test_clean_export_keeps_newest_successful_samples_and_publishes_manifest(tmp_path):
     processed, site, seeds = tmp_path / "processed", tmp_path / "site", tmp_path / "seeds"
     write_json(processed / "affinity_rows_with_trends.json", [{
