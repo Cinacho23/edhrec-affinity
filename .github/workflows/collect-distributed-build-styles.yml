@@ -40,6 +40,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       runners: ${{ steps.plan.outputs.runners }}
       collect_seconds: ${{ steps.plan.outputs.collect_seconds }}
+      metadata_delay_seconds: ${{ steps.plan.outputs.metadata_delay_seconds }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -107,6 +108,9 @@ jobs:
               raise SystemExit("Use 600–18000 seconds, or at most 1800 for a bounded pilot")
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"runners={runners}\ncollect_seconds={seconds}\n")
+              # Share a conservative five metadata requests/second budget
+              # across all source VMs and the separate power-check VM.
+              output.write(f"metadata_delay_seconds={(runners + 1) / 5}\n")
           Path("data/distributed-plan/shared/config.json").write_text(json.dumps({"runners": runners, "collect_seconds": seconds, "pilot": pilot}))
           weekly = Path("data/distributed-plan/shared/site_manifest.json")
           if weekly.exists():
@@ -319,6 +323,7 @@ jobs:
     env:
       SHARD_ID: ${{ matrix.id }}
       COLLECT_SECONDS: ${{ needs.plan.outputs.collect_seconds }}
+      BUILD_STYLE_METADATA_REQUEST_DELAY_SECONDS: ${{ needs.plan.outputs.metadata_delay_seconds }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -438,6 +443,8 @@ jobs:
     if: needs.plan.outputs.run == 'true' && inputs.pilot != true
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      BUILD_STYLE_METADATA_REQUEST_DELAY_SECONDS: ${{ needs.plan.outputs.metadata_delay_seconds }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6

@@ -200,9 +200,68 @@ def test_access_or_rate_limit_stops_without_retry_and_preserves_successful_batch
     assert len(found) == 75
     assert summary["blocked"]
     assert summary["failures"][0]["status_code"] == status_code
+    stop = summary["source_stop"]
+    assert stop["provider"] == "scryfall" and stop["endpoint"] == metadata.COLLECTION_URL
+    assert stop["status_code"] == status_code
+    assert stop["reason"] == ("rate_limit" if status_code == 429 else "access_restriction")
+    assert stop["retry_after_seconds"] == (60 if status_code == 429 else None)
     assert summary["missing"] == names[75:]
     offline, _ = metadata.load_card_metadata(names, cache)
     assert len(offline) == 75
+
+
+def test_repository_remembers_original_stop_across_later_lookups(tmp_path, monkeypatch):
+    attempts = []
+
+    def handler(request):
+        attempts.append(str(request.url))
+        return httpx.Response(429, headers={"Retry-After": "120"})
+
+    client(monkeypatch, handler)
+    repository = metadata.MetadataRepository(tmp_path / "cards.json")
+    _, first = repository.load(["Missing"], fetch=True)
+    expected = dict(first["source_stop"])
+    first["source_stop"]["endpoint"] = "mutated consumer value"
+    _, second = repository.load(["Another missing card"], fetch=True)
+    _, offline = repository.load(["Missing"])
+    assert attempts == [metadata.COLLECTION_URL]
+    assert second["requests"] == offline["requests"] == 0
+    assert second["source_stop"] == offline["source_stop"] == expected
+    assert expected["retry_after_seconds"] == 120
+    observed = datetime.fromisoformat(expected["observed_at"])
+    assert datetime.fromisoformat(expected["retry_at"]) - observed == timedelta(seconds=120)
+
+
+def test_configured_pacing_is_read_once_and_covers_collection_and_named_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUILD_STYLE_METADATA_REQUEST_DELAY_SECONDS", "3.4")
+
+    def handler(request):
+        monkeypatch.setenv("BUILD_STYLE_METADATA_REQUEST_DELAY_SECONDS", "0.1")
+        if request.method == "POST":
+            return httpx.Response(200, json=collection([card("Forest")], ["Missing"]))
+        assert str(request.url).startswith(metadata.NAMED_URL)
+        return httpx.Response(200, json=card("Missing"))
+
+    delays = client(monkeypatch, handler)
+    repository = metadata.MetadataRepository(tmp_path / "cards.json")
+    found, summary = repository.load(["Forest", "Missing"], fetch=True)
+    assert set(found) == {"forest", "missing"}
+    assert delays == [3.4, 3.4]
+    assert summary["request_delay_seconds"] == 3.4
+    assert metadata.MetadataRepository(tmp_path / "override.json", request_delay_seconds=1).request_delay_seconds == 1
+
+
+@pytest.mark.parametrize("configured", ["bad", "nan", "inf", "-1", "0", "0.09", ""])
+def test_invalid_metadata_pacing_environment_is_rejected_before_requests(tmp_path, monkeypatch, configured):
+    monkeypatch.setenv("BUILD_STYLE_METADATA_REQUEST_DELAY_SECONDS", configured)
+    with pytest.raises(ValueError, match="request delay"):
+        metadata.MetadataRepository(tmp_path / "cards.json")
+
+
+@pytest.mark.parametrize("configured", [True, False, 0, -1, .09, float("inf"), float("nan")])
+def test_invalid_explicit_metadata_pacing_is_rejected(tmp_path, configured):
+    with pytest.raises(ValueError, match="request delay"):
+        metadata.MetadataRepository(tmp_path / "cards.json", request_delay_seconds=configured)
 
 
 @pytest.mark.parametrize("response", [

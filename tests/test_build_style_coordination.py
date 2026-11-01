@@ -75,6 +75,44 @@ def test_watchdog_and_preflight_skip_active_collectors_before_reading_checkpoint
     assert github.dispatches == []
 
 
+def test_explicit_access_review_only_prepares_latest_expired_durable_checkpoint():
+    github = GitHub([paused(expiry=NOW - timedelta(hours=1), throttles=0, block_reason="access_restriction")])
+    result = coordinator.coordinate(github, "preflight", now=NOW, access_review_run_id=100)
+    assert result["run"] and result["restore_run_id"] == result["access_review_run_id"] == 100
+    assert github.dispatches == []
+    assert not coordinator.coordinate(github, "watchdog", now=NOW)["run"]
+    for run_id in (99, 101):
+        assert not coordinator.coordinate(github, "preflight", now=NOW, access_review_run_id=run_id)["run"]
+    github.saved[0].durable = False
+    assert not coordinator.coordinate(github, "preflight", now=NOW, access_review_run_id=100)["run"]
+
+
+@pytest.mark.parametrize("summary", [paused(block_reason="access_restriction"),
+    paused(expiry=NOW - timedelta(hours=1), block_reason="rate_limit"),
+    {"blocked": False}, {"blocked": True, "block_reason": "access_restriction"}])
+def test_access_review_rejects_active_cooldowns_missing_evidence_and_other_stop_types(summary):
+    github = GitHub([summary])
+    assert not coordinator.coordinate(github, "preflight", now=NOW, access_review_run_id=100)["run"]
+    assert github.dispatches == []
+
+
+@pytest.mark.parametrize("extra", [{"recovery_run_id": 100}, {"power_only": True}, {"route_distributed": True}])
+def test_access_review_cannot_mix_with_other_recovery_or_power_modes(extra):
+    with pytest.raises(ValueError, match="bounded preflight"):
+        coordinator.coordinate(GitHub(), "preflight", now=NOW, access_review_run_id=100, **extra)
+
+
+def test_confirmed_scryfall429_schedules_timed_pause_without_edhrec_throttle():
+    summary = paused(throttles=0, block_reason="rate_limit", source_stop={"provider": "scryfall",
+                     "status_code": 429, "reason": "rate_limit"})
+    github = GitHub([summary])
+    result = coordinator.queue_cooldown(github, github.saved[0], now=NOW)
+    assert result["cooldown_dispatched"] and github.timer_checks == 1
+    assert github.dispatches == [(coordinator.COOLDOWN, {"source_run_id": "100", "attempt": "0"})]
+    summary["source_stop"]["status_code"] = 403
+    assert not coordinator.actual_rate_limit(summary)
+
+
 def test_real_client_combines_both_trusted_collector_histories_and_active_jobs():
     client = object.__new__(coordinator.GitHub)
     client.default_branch, client.root, client._runs = "main", "repos/owner/repo", None

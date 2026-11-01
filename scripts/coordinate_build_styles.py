@@ -157,9 +157,12 @@ class GitHub:
 
 def actual_rate_limit(summary):
     stats = summary.get("measured_request_rate") or {}
+    stop = summary.get("source_stop") or {}
+    metadata_throttle = (isinstance(stop, dict) and stop.get("provider") == "scryfall"
+                         and stop.get("status_code") == 429 and stop.get("reason") == "rate_limit")
     return (summary.get("blocked") is True and not summary.get("preflight_skipped")
             and summary.get("block_reason") != "access_restriction"
-            and type(stats.get("throttles")) is int and stats["throttles"] > 0)
+            and (metadata_throttle or type(stats.get("throttles")) is int and stats["throttles"] > 0))
 
 
 def automatic_continuation_allowed(summary):
@@ -455,8 +458,27 @@ def merge_recovery_controls(state, summary, *, source_run_id, checkpoint_run_id,
                          "recovered_at": now.isoformat()}
 
 
+def access_review_plan(latest, *, requested_run_id, now):
+    """Permit only checks of the exact latest paused checkpoint, not collection.
+
+    The same runner must subsequently verify ordinary provider responses and
+    audit the restored state before a bounded collector can use that copy.
+    """
+    if latest is None or latest.run_id != requested_run_id or not latest.durable:
+        return {"run": False, "reason": "Access review must name the latest durable collector checkpoint"}
+    if not latest.summary.get("blocked") or latest.summary.get("block_reason") != "access_restriction":
+        return {"run": False, "reason": "Access review requires a saved access restriction"}
+    expiry = timestamp(latest.summary.get("blocked_until"))
+    if expiry is None or expiry > now:
+        return {"run": False, "reason": "Access review must wait for the verified cooldown expiry"}
+    return {"run": True, "restore_run_id": latest.run_id, "access_review_run_id": latest.run_id,
+            "reason": "Review current ordinary provider access before one bounded collection visit"}
+
+
 def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, attempt=0,
-               recovery_run_id=None, power_only=False, route_distributed=False, runner_count=None):
+               recovery_run_id=None, access_review_run_id=None, power_only=False, route_distributed=False, runner_count=None):
+    if access_review_run_id and (mode != "preflight" or recovery_run_id or power_only or route_distributed):
+        raise ValueError("Access review is an explicit bounded preflight without other recovery or power modes")
     if power_only and (mode != "preflight" or recovery_run_id):
         raise ValueError("Power-only readiness is available only for preflight without checkpoint recovery")
     if route_distributed and (mode != "preflight" or power_only or recovery_run_id):
@@ -502,7 +524,9 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
     else:
         snapshots = iter(client.snapshots())
         latest = next(snapshots, None)
-    if mode == "preflight" and power_only:
+    if mode == "preflight" and access_review_run_id:
+        result = access_review_plan(latest, requested_run_id=access_review_run_id, now=now)
+    elif mode == "preflight" and power_only:
         result = power_only_readiness(latest)
     elif mode == "preflight" and recovery_run_id:
         result = recovery_plan(latest, list(snapshots), requested_run_id=recovery_run_id, now=now)
@@ -538,6 +562,7 @@ def main():
     parser.add_argument("--attempt", type=int, default=0)
     parser.add_argument("--summary-file", type=Path)
     parser.add_argument("--recovery-run-id", type=int)
+    parser.add_argument("--access-review-run-id", type=int)
     parser.add_argument("--restored-run-id", type=int)
     parser.add_argument("--state-file", type=Path)
     parser.add_argument("--power-only", action="store_true")
@@ -554,6 +579,9 @@ def main():
             raise ValueError("Checkpoint recovery is available only for an explicit collector request")
         if args.recovery_run_id and os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
             raise ValueError("Checkpoint recovery requires an explicit workflow_dispatch request")
+        if args.access_review_run_id and (args.mode != "preflight" or args.access_review_run_id <= 0
+                or os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"):
+            raise ValueError("Access review requires an explicit workflow_dispatch for a positive checkpoint run")
         if args.power_only and (args.mode != "preflight" or args.recovery_run_id):
             raise ValueError("Power-only readiness is available only for preflight without checkpoint recovery")
         if args.mode == "prepare-power-only":
@@ -612,6 +640,7 @@ def main():
             result = coordinate(GitHub(args.repository), args.mode, now=datetime.now(timezone.utc),
                 current_run_id=args.current_run_id, source_run_id=args.source_run_id, attempt=args.attempt,
                 recovery_run_id=args.recovery_run_id, power_only=args.power_only,
+                access_review_run_id=args.access_review_run_id,
                 route_distributed=args.route_distributed, runner_count=args.distributed_runners)
         snapshot = result.pop("snapshot", {})
         if args.mode == "preflight" and not result["run"] and args.summary_file is not None:

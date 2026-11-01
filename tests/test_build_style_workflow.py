@@ -165,6 +165,52 @@ def test_explicit_recovery_pins_restore_and_merges_source_controls_before_collec
     assert "recover-control" in script and "--restored-run-id" in script
 
 
+def test_access_review_pins_exact_checkpoint_and_preserves_failed_probe_summary():
+    workflow = COLLECTOR.read_text()
+    review, script = step(COLLECTOR, "Review current provider access before one bounded collection visit")
+    assert "continue-on-error" not in review
+    assert '"${RESTORED_RUN_ID}" == "${ACCESS_REVIEW_RUN_ID}"' in script
+    assert '--name "build-style-summary-${ACCESS_REVIEW_RUN_ID}"' in script
+    assert script.index("cp data/build-style-artifact/access-review-source/build_style_batch.json") < script.index("python scripts/review_build_style_access.py")
+    assert "--expected-state-sha256" in script and "--summary-file" in script
+    assert "data/build-style-artifact/access-review.json" in workflow
+    for name in ("Rebuild package decks from saved collections", "Include rebuilt decks in publication progress"):
+        body, _ = step(COLLECTOR, name)
+        assert "inputs.access_review_run_id == ''" in body
+    _, continuation = step(COLLECTOR, "Decide whether collection can continue immediately")
+    assert 'not os.environ.get("ACCESS_REVIEW_RUN_ID", "").strip()' in continuation
+
+
+def test_access_review_collection_is_one_commander_one_stream_and_ten_minutes(tmp_path):
+    _, script = step(COLLECTOR, "Continue the resumable catalog queue")
+    stub_timeout(tmp_path)
+    stub(tmp_path, "python", "import json,sys; print(json.dumps(sys.argv[1:]))")
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], text=True, capture_output=True,
+        env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+             "STYLES_DIR": "saved/styles", "SAMPLE_DATE": "2026-11-01", "MAX_COMMANDERS": "0",
+             "SAMPLE_DECKS": "all", "MAX_COMPONENTS": "all", "REQUESTS_PER_SECOND": "40",
+             "COMMANDER_SLUGS": "", "REFRESH_REPORTS": "false", "ACCESS_REVIEW_RUN_ID": "123"})
+    assert result.returncode == 0, result.stderr
+    args = json.loads(result.stdout)
+    for flag, value in {"--max-commanders": "1", "--max-runtime-seconds": "600", "--workers": "1",
+                        "--preview-workers": "1", "--analysis-workers": "1", "--sample-decks": "all"}.items():
+        assert args[args.index(flag) + 1] == value
+
+
+@pytest.mark.parametrize("extra, accepted", [({}, True), ({"POWER_ONLY": "true"}, False),
+    ({"RECOVERY_RUN_ID": "123"}, False), ({"COMMANDER_SLUGS": "a"}, False), ({"MAX_COMMANDERS": "2"}, False)])
+def test_access_review_preflight_cannot_redirect_to_distributed_or_mix_modes(tmp_path, extra, accepted):
+    _, script = step(COLLECTOR, "Check active collectors and source cooldown")
+    stub(tmp_path, "python3", "import json,sys; print(json.dumps(sys.argv[1:]))")
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], text=True, capture_output=True,
+        env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+             "ACCESS_REVIEW_RUN_ID": "123", "RECOVERY_RUN_ID": "", "POWER_ONLY": "false", **extra})
+    assert (result.returncode == 0) is accepted
+    if accepted:
+        args = json.loads(result.stdout)
+        assert args[-2:] == ["--access-review-run-id", "123"] and "--route-distributed" not in args
+
+
 def test_frontend_routes_an_explicit_source_to_validated_publication_helper(tmp_path):
     _, script = step(DEPLOY, "Inspect collection summary")
     stub(tmp_path, "python3", """\

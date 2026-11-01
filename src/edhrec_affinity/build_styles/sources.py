@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timezone
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 import hashlib
@@ -478,6 +479,7 @@ class RequestLimiter:
         self._next_request = 0.0
         self._blocked_reason: str | None = None
         self._block_kind: str | None = None
+        self._source_stop: dict | None = None
         self._blocked_event = threading.Event()
         self._started_at: float | None = None
         self._source_started_at: str | None = None
@@ -505,6 +507,8 @@ class RequestLimiter:
     @property
     def stats(self) -> dict:
         with self._lock:
+            with self._block_lock:
+                stop, block_kind = deepcopy(self._source_stop), self._block_kind
             elapsed = max(0.0, self.monotonic() - self._started_at) if self._started_at is not None else 0.0
             return {
                 "requests_started": self._requests_started, "successful_responses": self._successful_responses,
@@ -517,7 +521,7 @@ class RequestLimiter:
                 "retry_after_seconds": max(0.0, self._retry_after_until - self.monotonic()),
                 "elapsed_seconds": elapsed, "blocked": self.blocked,
                 "started_at": self._source_started_at, "completed_at": self._source_completed_at,
-                "block_kind": self._block_kind,
+                "block_kind": block_kind, "source_stop": stop,
                 "throttles": self._throttles,
                 "last_throttle": dict(self._last_throttle) if self._last_throttle else None,
             }
@@ -562,20 +566,26 @@ class RequestLimiter:
             self._retry_after_until = max(self._retry_after_until, deadline)
             self._deferrals += 1
 
-    def block(self, reason: str, *, kind: str | None = None) -> None:
+    def block(self, reason: str, *, kind: str | None = None, details: dict | None = None) -> None:
         # Do not wait behind another worker's pacing sleep before announcing an
         # access block. That waiter checks again before issuing its request.
         if kind not in {None, "rate_limit", "access_restriction"}:
             raise ValueError("Unknown source block kind")
+        if details is not None and not isinstance(details, dict):
+            raise ValueError("Source stop details must be an object")
         with self._block_lock:
             # A later response from an already running request can reveal an
             # access restriction after a 429. Never let it become an automatic
             # rate-limit resume, even if another 429 or generic stop follows.
+            upgrade = kind == "access_restriction" and self._block_kind != "access_restriction"
             if (self._block_kind is None or kind == "access_restriction"
                     or kind == self._block_kind):
-                self._blocked_reason = reason
+                if self._blocked_reason is None or upgrade or self._source_stop is None:
+                    self._blocked_reason = reason
                 if kind is not None:
                     self._block_kind = kind
+                if details is not None and (self._source_stop is None or upgrade):
+                    self._source_stop = deepcopy(details)
             self._blocked_event.set()
 
     def record_success(self) -> None:
@@ -655,6 +665,26 @@ def _retry_after_seconds(value: str | None, now: datetime) -> float | None:
     return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
+def source_stop_details(provider: str, endpoint: str, status_code: int, observed_at: datetime, *,
+                        retry_after: str | None = None, reason: str | None = None) -> dict:
+    """Retain a provider's actual stop response without retrying the request."""
+    reason = reason or ("rate_limit" if status_code == 429 else "access_restriction")
+    seconds = _retry_after_seconds(retry_after, observed_at)
+    seconds = seconds if seconds is not None and seconds > 0 else None
+    if seconds is None and reason == "rate_limit":
+        seconds = 60.0
+    retry_at = None
+    if seconds is not None:
+        try:
+            retry_at = (observed_at + timedelta(seconds=seconds)).isoformat()
+        except OverflowError:
+            # An unrepresentable Retry-After cannot establish a safe deadline.
+            seconds = None
+    return {"provider": provider, "endpoint": endpoint, "status_code": status_code,
+            "reason": reason, "observed_at": observed_at.isoformat(),
+            "retry_after_seconds": seconds, "retry_at": retry_at}
+
+
 class Cache:
     def __init__(self, root: Path, *, fetch: bool = False, delay: float = 1.0,
                  max_age_seconds: float | None = None, limiter: RequestLimiter | None = None,
@@ -683,10 +713,10 @@ class Cache:
     def blocked(self) -> bool:
         return self._blocked or bool(self.limiter and self.limiter.blocked)
 
-    def _block(self, reason: str, *, kind: str = "access_restriction") -> None:
+    def _block(self, reason: str, *, kind: str = "access_restriction", details: dict | None = None) -> None:
         self._blocked = True
         if self.limiter is not None:
-            self.limiter.block(reason, kind=kind)
+            self.limiter.block(reason, kind=kind, details=details)
 
     def provenance_for(self, url: str) -> list[dict]:
         with self._provenance_lock:
@@ -740,8 +770,11 @@ class Cache:
                     self.limiter.record_failure()
                 raise
             if response.status_code in {401, 403, 429}:
+                stopped_at = self.now()
+                details = source_stop_details("edhrec", url, response.status_code, stopped_at,
+                                              retry_after=response.headers.get("Retry-After"))
                 self._block(f"HTTP {response.status_code}: {url}",
-                            kind="rate_limit" if response.status_code == 429 else "access_restriction")
+                            kind=details["reason"], details=details)
                 if response.status_code == 429 and self.limiter is not None:
                     self.limiter.record_throttle(now=self.now())
                 retry_after = _retry_after_seconds(response.headers.get("Retry-After"), self.now())
@@ -763,7 +796,9 @@ class Cache:
                 ))
             )
             if challenge:
-                self._block(f"Access challenge from {url}")
+                self._block(f"Access challenge from {url}", details=source_stop_details(
+                    "edhrec", url, response.status_code, self.now(), reason="access_restriction",
+                    retry_after=response.headers.get("Retry-After")))
                 raise SourceBlocked(f"Access challenge from {url}; collection stopped")
             # Validate before caching, so neither a challenge nor an unsupported
             # response can replace a previously usable observation.

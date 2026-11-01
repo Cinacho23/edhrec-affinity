@@ -31,7 +31,7 @@ from uuid import UUID
 import httpx
 
 from edhrec_affinity.tag_scraper import DEFAULT_USER_AGENT
-from .sources import BudgetExpired, card_key
+from .sources import BudgetExpired, card_key, source_stop_details
 
 
 COLLECTION_URL = "https://api.scryfall.com/cards/collection"
@@ -633,12 +633,22 @@ class MetadataRepository:
     """
 
     def __init__(self, cache_path: Path | str = DEFAULT_CACHE_PATH, *, max_age_days: float = 3,
-                 deadline: float | None = None, monotonic=time.monotonic):
+                 deadline: float | None = None, monotonic=time.monotonic,
+                 request_delay_seconds: float | None = None):
         if (isinstance(max_age_days, bool) or not isinstance(max_age_days, (int, float))
                 or not math.isfinite(max_age_days) or max_age_days <= 0):
             raise ValueError("Metadata maximum age must be a positive finite number of days")
         if deadline is not None and not math.isfinite(deadline):
             raise ValueError("Metadata request deadline must be finite")
+        configured_delay = (os.environ.get("BUILD_STYLE_METADATA_REQUEST_DELAY_SECONDS", str(REQUEST_DELAY_SECONDS))
+                            if request_delay_seconds is None else request_delay_seconds)
+        try:
+            delay = float(configured_delay)
+        except (ValueError, TypeError) as error:
+            raise ValueError("Metadata request delay must be finite and at least 0.1 seconds") from error
+        if isinstance(configured_delay, bool) or not math.isfinite(delay) or delay < REQUEST_DELAY_SECONDS:
+            raise ValueError("Metadata request delay must be finite and at least 0.1 seconds")
+        self.request_delay_seconds = delay
         self.deadline, self.monotonic = deadline, monotonic
         self.cache_path = Path(cache_path)
         self.max_age_days = max_age_days
@@ -648,6 +658,7 @@ class MetadataRepository:
         self._lookup: dict[str, dict] = {}
         self._cache_error: str | None = None
         self._blocked_status: int | None = None
+        self._source_stop: dict | None = None
 
     @property
     def blocked(self) -> bool:
@@ -684,6 +695,7 @@ class MetadataRepository:
     ) -> tuple[dict[str, dict], dict[str, Any]]:
         summary: dict[str, Any] = {
             "source_url": COLLECTION_URL, "checked_at": _now(), "network_enabled": fetch,
+            "request_delay_seconds": self.request_delay_seconds,
             "requested": len(requested), "cached": 0, "fetched": 0, "requests": 0,
             "resolved": 0, "missing": [], "not_found": [], "failures": [], "blocked": self.blocked,
             "cache_max_age_days": self.max_age_days, "stale_cached": 0,
@@ -733,7 +745,7 @@ class MetadataRepository:
                             raise BudgetExpired("Metadata run time budget reached; cached batches are retained")
 
                     check_budget()
-                    delay = REQUEST_DELAY_SECONDS
+                    delay = self.request_delay_seconds
                     if self.deadline is not None:
                         delay = min(delay, max(0, self.deadline - self.monotonic()))
                     time.sleep(delay)
@@ -742,6 +754,8 @@ class MetadataRepository:
                     response = client.request(method, url, **kwargs)
                     if response.status_code in {401, 403, 429}:
                         self._blocked_status = response.status_code
+                        self._source_stop = source_stop_details("scryfall", url, response.status_code,
+                            datetime.now(timezone.utc), retry_after=response.headers.get("Retry-After"))
                         summary["blocked"] = True
                         summary["failures"].append({"names": names, "status_code": response.status_code,
                                                     "error": "Access or rate limit response; collection stopped without retry"})
@@ -970,6 +984,8 @@ class MetadataRepository:
         checked_dates = [card["checked_at"] for card in result.values()]
         if checked_dates:
             summary["oldest_checked_at"] = min(checked_dates, key=lambda value: datetime.fromisoformat(value.replace("Z", "+00:00")))
+        if self._source_stop is not None:
+            summary["source_stop"] = copy.deepcopy(self._source_stop)
         return copy.deepcopy(result), summary
 
 

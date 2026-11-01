@@ -414,6 +414,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         cooldown_seconds = max(0.0, (cooldown_until - now()).total_seconds()) if cooldown_until else 0.0
         summary["blocked_until"] = cooldown_until.isoformat() if summary["blocked"] and cooldown_until else None
         summary["block_reason"] = state.get("block_reason") if summary["blocked"] else None
+        summary["source_stop"] = state.get("source_stop") if summary["blocked"] else None
         summary["capacity"] = plan_capacity(planning_rows, target_hours=args.target_completion_hours,
             max_requests_per_second=args.requests_per_second, effective_requests_per_second=effective_ceiling,
             observed_requests_per_second=rate, cooldown_seconds=cooldown_seconds,
@@ -431,7 +432,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         summary["capacity"]["disk_free_bytes"] = shutil.disk_usage(root).free
         summary["elapsed_seconds"] = round(elapsed, 3)
         state["progress"] = {"updated_at": now().isoformat(), "cycle_started_at": cycle_start.isoformat(),
-            **{key: summary.get(key) for key in ("blocked", "blocked_until", "block_reason", "time_budget_reached", "no_progress", "resource_limit")},
+            **{key: summary.get(key) for key in ("blocked", "blocked_until", "block_reason", "source_stop", "time_budget_reached", "no_progress", "resource_limit")},
             "capacity": summary["capacity"], "measured_request_rate": stats,
             "rate_control": {"learned_rate": state.get("source_rate", {}).get("learned_rate"),
                 "last_throttle": state.get("source_rate", {}).get("last_throttle"),
@@ -448,8 +449,8 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     limiter_holder = [None]
     checkpoint()
     cooldown = source_time(state.get("blocked_until"))
-    if cooldown and cooldown > now():
-        summary.update(blocked=True, blocked_until=state["blocked_until"])
+    if state.get("block_reason") == "access_restriction" or cooldown and cooldown > now():
+        summary.update(blocked=True, blocked_until=state.get("blocked_until"))
         checkpoint()
         return summary
     if args.dry_run:
@@ -598,9 +599,21 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                                                for failure in result.get("failures", []))):
                                     raise CachedModelUpgradeUnavailable("Saved inputs do not reproduce the complete published sample, profiles and card rules")
                             if result.get("metadata_summary", {}).get("blocked"):
-                                limiter.block("Card metadata source access restriction", kind="access_restriction")
+                                stop = result["metadata_summary"].get("source_stop")
+                                kind = ("rate_limit" if isinstance(stop, dict) and stop.get("provider") == "scryfall"
+                                        and stop.get("status_code") == 429 else "access_restriction")
+                                limiter.block("Card metadata source stopped", kind=kind, details=stop)
+                                if isinstance(stop, dict) and kind == "rate_limit":
+                                    delay = stop.get("retry_after_seconds")
+                                    if type(delay) in {float, int} and math.isfinite(delay) and delay >= 0:
+                                        limiter.defer(delay)
                             if result.get("blocked") or limiter.blocked:
-                                raise SourceBlocked("Source access restriction or rate limit; shared workers stopped")
+                                stop = limiter.stats.get("source_stop")
+                                if isinstance(stop, dict):
+                                    message = f"{stop.get('provider')} {stop.get('reason')}: HTTP {stop.get('status_code')} at {stop.get('endpoint')}"
+                                else:
+                                    message = "Source access restriction or rate limit; shared workers stopped"
+                                raise SourceBlocked(message)
                             new_attempts = int(collection.get("new_previews_attempted", 0))
                             summary["new_previews_attempted"] += new_attempts
                             cache_only_upgrade = getattr(context, "cache_only_model_upgrade", False)
@@ -694,8 +707,14 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                         cooldown_seconds = max(3600, limiter.stats.get("retry_after_seconds", 0))
                         state["blocked_until"] = (now() + timedelta(seconds=cooldown_seconds)).isoformat()
                         state["block_reason"] = limiter.stats.get("block_kind") or "access_restriction"
+                        stop = limiter.stats.get("source_stop")
+                        if isinstance(stop, dict):
+                            state["source_stop"] = dict(stop)
+                        else:
+                            state.pop("source_stop", None)
                         record.update(status="blocked", retry_after=state["blocked_until"])
-                        summary["failures"].append({"commander_slug": slug, "error": str(error)})
+                        summary["failures"].append({"commander_slug": slug, "error": str(error),
+                                                   **({"source_stop": dict(stop)} if isinstance(stop, dict) else {})})
                     except (OSError, ValueError, KeyError, TypeError, RuntimeError, httpx.HTTPError) as error:
                         if is_collection and getattr(context, "cache_only_model_upgrade", False):
                             # Retry through the ordinary shared source queue on

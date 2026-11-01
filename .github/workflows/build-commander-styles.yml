@@ -39,6 +39,10 @@ on:
         description: "Optional interrupted latest run whose summary survived a missing checkpoint upload"
         type: string
         default: ""
+      access_review_run_id:
+        description: "Review the latest paused checkpoint on one VM, then collect for at most ten minutes"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -56,6 +60,7 @@ env:
   # One adaptive limiter applies across all collection workers. This is its
   # ceiling, not its startup rate; source blocks stop the entire batch.
   REQUESTS_PER_SECOND: ${{ vars.BUILD_STYLE_REQUESTS_PER_SECOND || '40' }}
+  BUILD_STYLE_METADATA_REQUEST_DELAY_SECONDS: '1'
 
 jobs:
   preflight:
@@ -67,6 +72,7 @@ jobs:
       run: ${{ steps.ready.outputs.run }}
       restore_run_id: ${{ steps.ready.outputs.restore_run_id }}
       recovery_run_id: ${{ steps.ready.outputs.recovery_run_id }}
+      access_review_run_id: ${{ steps.ready.outputs.access_review_run_id }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -75,6 +81,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
+          ACCESS_REVIEW_RUN_ID: ${{ inputs.access_review_run_id }}
           POWER_ONLY: ${{ inputs.power_only }}
           VALIDATE_POWER: ${{ inputs.validate_power }}
           COMMANDER_SLUGS: ${{ inputs.commanders }}
@@ -83,12 +90,19 @@ jobs:
           REFRESH_REPORTS: ${{ inputs.refresh }}
         run: |
           args=(preflight --summary-file data/build-style-artifact/build_style_batch.json)
+          if [[ -n "${ACCESS_REVIEW_RUN_ID:-}" ]]; then
+            if [[ -n "${RECOVERY_RUN_ID}" || "${POWER_ONLY}" == "true" || "${VALIDATE_POWER:-false}" == "true" || -n "${COMMANDER_SLUGS:-}" || "${MAX_COMMANDERS:-0}" != "0" || "${SAMPLE_DECKS:-all}" != "all" || "${REFRESH_REPORTS:-false}" == "true" ]]; then
+              echo "::error::Access review requires the default collection scope without recovery or power modes."
+              exit 1
+            fi
+            args+=(--access-review-run-id "${ACCESS_REVIEW_RUN_ID}")
+          fi
           if [[ -n "${RECOVERY_RUN_ID}" ]]; then
             args+=(--recovery-run-id "${RECOVERY_RUN_ID}")
           fi
           if [[ "${POWER_ONLY}" == "true" || "${VALIDATE_POWER:-false}" == "true" ]]; then
             args+=(--power-only)
-          elif [[ -z "${RECOVERY_RUN_ID}" && -z "${COMMANDER_SLUGS:-}" && "${MAX_COMMANDERS:-0}" == "0" && "${SAMPLE_DECKS:-all}" == "all" && "${REFRESH_REPORTS:-false}" != "true" ]]; then
+          elif [[ -z "${ACCESS_REVIEW_RUN_ID:-}" && -z "${RECOVERY_RUN_ID}" && -z "${COMMANDER_SLUGS:-}" && "${MAX_COMMANDERS:-0}" == "0" && "${SAMPLE_DECKS:-all}" == "all" && "${REFRESH_REPORTS:-false}" != "true" ]]; then
             args+=(--route-distributed)
           fi
           python3 scripts/coordinate_build_styles.py "${args[@]}"
@@ -148,6 +162,28 @@ jobs:
           python3 scripts/coordinate_build_styles.py recover-control \
             --recovery-run-id "${RECOVERY_RUN_ID}" --restored-run-id "${RESTORED_RUN_ID}" \
             --state-file "${STYLES_DIR}/_collection/state.json"
+
+      - name: Review current provider access before one bounded collection visit
+        id: access_review
+        if: needs.preflight.outputs.access_review_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCESS_REVIEW_RUN_ID: ${{ needs.preflight.outputs.access_review_run_id }}
+          RESTORED_RUN_ID: ${{ steps.restored_styles.outputs['run-id'] }}
+        run: |
+          set -euo pipefail
+          [[ "${RESTORED_RUN_ID}" == "${ACCESS_REVIEW_RUN_ID}" ]] || { echo "::error::Restored checkpoint differs from reviewed run."; exit 1; }
+          mkdir -p data/build-style-artifact/access-review-source
+          gh run download "${ACCESS_REVIEW_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
+            --name "build-style-summary-${ACCESS_REVIEW_RUN_ID}" \
+            --dir data/build-style-artifact/access-review-source
+          cp data/build-style-artifact/access-review-source/build_style_batch.json data/build-style-artifact/build_style_batch.json
+          state_hash="$(sha256sum "${STYLES_DIR}/_collection/state.json" | cut -d ' ' -f 1)"
+          python scripts/review_build_style_access.py --build-styles-dir "${STYLES_DIR}" \
+            --source-run-id "${ACCESS_REVIEW_RUN_ID}" --restored-run-id "${RESTORED_RUN_ID}" \
+            --summary-file data/build-style-artifact/access-review-source/build_style_batch.json \
+            --expected-state-sha256 "${state_hash}" \
+            --output data/build-style-artifact/access-review.json
 
       - name: Retain checked repository examples alongside accumulated observations
         run: |
@@ -213,16 +249,28 @@ jobs:
           SAMPLE_DECKS: ${{ inputs.sample_decks || 'all' }}
           MAX_COMPONENTS: ${{ inputs.max_components || 'all' }}
           REFRESH_REPORTS: ${{ inputs.refresh }}
+          ACCESS_REVIEW_RUN_ID: ${{ needs.preflight.outputs.access_review_run_id }}
         run: |
           set -euo pipefail
+          runtime=1800
+          workers=2
+          preview_workers=16
+          analysis_workers=2
+          if [[ -n "${ACCESS_REVIEW_RUN_ID:-}" ]]; then
+            MAX_COMMANDERS=1
+            runtime=600
+            workers=1
+            preview_workers=1
+            analysis_workers=1
+          fi
           args=(--fetch --commander-index data/build-style-artifact/commander_index.json
                 --output-dir "${STYLES_DIR}" --snapshot-date "${SAMPLE_DATE}"
                 --max-commanders "${MAX_COMMANDERS}" --sample-decks "${SAMPLE_DECKS}"
                 --max-components "${MAX_COMPONENTS}" --min-total-decks 200
                 --main-tag-decks 15 --min-tag-decks 5
                 --main-tag-fraction 0.03 --min-tag-fraction 0.01
-                --max-runtime-seconds 1800 --worker-grace-seconds 120
-                --pipeline --workers 2 --preview-workers 16 --analysis-workers 2
+                --max-runtime-seconds "${runtime}" --worker-grace-seconds 120
+                --pipeline --workers "${workers}" --preview-workers "${preview_workers}" --analysis-workers "${analysis_workers}"
                 --requests-per-second "${REQUESTS_PER_SECOND}"
                 --source-max-age-hours 72 --refresh-after-days 3
                 --freshness-target-hours 96 --prune-completed-cache)
@@ -255,7 +303,7 @@ jobs:
 
       - name: Rebuild package decks from saved collections
         id: rebuild_decks
-        if: always() && inputs.validate_power != true && (steps.collect_styles.outcome != 'skipped' || steps.prepare_power_only.outcome == 'success')
+        if: always() && inputs.access_review_run_id == '' && inputs.validate_power != true && (steps.collect_styles.outcome != 'skipped' || steps.prepare_power_only.outcome == 'success')
         continue-on-error: true
         timeout-minutes: 22
         env:
@@ -337,7 +385,7 @@ jobs:
           PY
 
       - name: Include rebuilt decks in publication progress
-        if: always() && inputs.validate_power != true && (steps.collect_styles.outcome != 'skipped' || steps.prepare_power_only.outcome == 'success')
+        if: always() && inputs.access_review_run_id == '' && inputs.validate_power != true && (steps.collect_styles.outcome != 'skipped' || steps.prepare_power_only.outcome == 'success')
         env:
           METADATA_CACHE_SAVED: ${{ steps.verify_card_metadata.outputs.verified == 'true' }}
         run: |
@@ -466,6 +514,7 @@ jobs:
             data/build-style-artifact/build_style_batch.json
             data/build-style-artifact/deck-rebuild-summary.json
             data/build-style-artifact/official-validation-summary.json
+            data/build-style-artifact/access-review.json
           if-no-files-found: ignore
           retention-days: 7
 
@@ -500,6 +549,7 @@ jobs:
           SAMPLE_DECKS: ${{ inputs.sample_decks || 'all' }}
           REFRESH_REPORTS: ${{ inputs.refresh }}
           CURRENT_VALIDATION: ${{ inputs.validate_power }}
+          ACCESS_REVIEW_RUN_ID: ${{ needs.preflight.outputs.access_review_run_id }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           python - <<'PY'
@@ -535,6 +585,7 @@ jobs:
               and not (summary.get("deck_rebuild") or {}).get("metadata_source_blocked")
               and not summary.get("no_progress")
               and not os.environ.get("TARGETED_COMMANDERS", "").strip()
+              and not os.environ.get("ACCESS_REVIEW_RUN_ID", "").strip()
               and os.environ.get("MAX_COMMANDERS", "0") == "0"
               and os.environ.get("SAMPLE_DECKS", "all") == "all"
               and os.environ.get("REFRESH_REPORTS", "false") != "true"

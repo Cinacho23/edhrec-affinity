@@ -95,6 +95,57 @@ def test_plan_is_disjoint_balanced_and_enforces_population_minimum(tmp_path):
     assert core.load_manifest(inputs / "manifest.json") == manifest
 
 
+def test_checkpoint_and_merge_preserve_original_provider_stop_diagnostics(tmp_path):
+    base, inputs, manifest = planned(tmp_path)
+    stop = {"provider": "scryfall", "endpoint": "https://api.scryfall.com/cards/collection",
+            "status_code": 403, "reason": "access_restriction", "observed_at": core.now().isoformat(),
+            "retry_after_seconds": None, "retry_at": None}
+    for worker in manifest["workers"]:
+        root, results, _ = run_worker(tmp_path, inputs, manifest, worker["id"], blocked=worker["id"] == "0", access=True)
+        if worker["id"] == "0":
+            state = core.read_json(root / core.STATE)
+            state["source_stop"] = stop
+            write(root / core.STATE, state)
+            pipeline = core.read_json(root.parent / "build_style_batch.json")
+            pipeline["source_stop"] = stop
+            write(root.parent / "build_style_batch.json", pipeline)
+        receipt = core.checkpoint(inputs / "manifest.json", worker["id"], root, results)
+        if worker["id"] == "0":
+            assert receipt["source_control"]["source_stop"] == stop
+    summary = merge(tmp_path, base, inputs)
+    state = core.read_json(base / core.STATE)
+    assert state["distributed"]["workers"]["0"]["source_stop"] == stop
+    assert summary["source_stop"] == state["source_stop"] == {"worker_id": "0", **stop}
+    assert summary["source_stops"] == state["source_stops"] == [{"worker_id": "0", **stop}]
+    assert summary["blocked"] and summary["block_reason"] == "access_restriction"
+    assert summary["measured_request_rate"]["throttles"] == 0
+
+
+def test_single_metadata429_keeps_worker_cooldown_and_provider_without_changing_edhrec_throttles(tmp_path):
+    base, inputs, manifest = planned(tmp_path)
+    stop = {"provider": "scryfall", "endpoint": "https://api.scryfall.com/cards/collection",
+            "status_code": 429, "reason": "rate_limit", "observed_at": core.now().isoformat(),
+            "retry_after_seconds": 120.0, "retry_at": (core.now() + timedelta(seconds=120)).isoformat()}
+    for worker in manifest["workers"]:
+        root, results, _ = run_worker(tmp_path, inputs, manifest, worker["id"], blocked=worker["id"] == "0")
+        if worker["id"] == "0":
+            state = core.read_json(root / core.STATE)
+            state["source_stop"] = stop
+            write(root / core.STATE, state)
+        core.checkpoint(inputs / "manifest.json", worker["id"], root, results)
+    summary = merge(tmp_path, base, inputs)
+    state = core.read_json(base / core.STATE)
+    assert not summary["blocked"] and summary["source_stop"] is None
+    assert state["distributed"]["workers"]["0"]["source_stop"] == stop
+    assert summary["source_stops"] == [{"worker_id": "0", **stop}]
+    assert summary["measured_request_rate"]["throttles"] == 0
+    next_plan = tmp_path / "next-plan"
+    core.plan(base, tmp_path / "index.json", next_plan, 2, "next-run")
+    with tarfile.open(next_plan / "shard-0.tar.gz") as archive:
+        next_state = json.load(archive.extractfile(core.STATE))
+    assert next_state["source_stop"] == stop and next_state["block_reason"] == "rate_limit"
+
+
 def test_scaling_preserves_partial_ownership_and_balances_unstarted_work(tmp_path):
     base, index, state = setup(tmp_path)
     state["commanders"]["a-large"] = {"status": "collecting", "current_previews": 100}
@@ -251,6 +302,28 @@ def test_correlated_throttles_stop_global_automatic_collection(tmp_path):
     summary = merge(tmp_path, base, inputs)
     assert summary["blocked"] and summary["block_reason"] == "rate_limit"
     assert summary["distributed"]["systemic_block"]
+    assert not summary["continuation_needed"]
+
+
+def test_correlated_metadata429s_pause_pool_without_reducing_edhrec_rate(tmp_path):
+    base, inputs, manifest = planned(tmp_path)
+    for worker in manifest["workers"]:
+        root, results, _ = run_worker(tmp_path, inputs, manifest, worker["id"], blocked=True)
+        stop = {"provider": "scryfall", "status_code": 429, "reason": "rate_limit",
+                "observed_at": core.now().isoformat()}
+        state = core.read_json(root / core.STATE)
+        state["source_stop"] = stop
+        write(root / core.STATE, state)
+        pipeline = core.read_json(root.parent / "build_style_batch.json")
+        pipeline["source_stop"] = stop
+        write(root.parent / "build_style_batch.json", pipeline)
+        core.checkpoint(inputs / "manifest.json", worker["id"], root, results)
+    summary = merge(tmp_path, base, inputs)
+    state = core.read_json(base / core.STATE)
+    assert summary["blocked"] and summary["block_reason"] == "rate_limit"
+    assert summary["source_stop"]["provider"] == "scryfall"
+    assert summary["measured_request_rate"]["throttles"] == 0
+    assert state["source_rate"]["learned_rate"] == core.SEED_REQUEST_RATE
     assert not summary["continuation_needed"]
 
 

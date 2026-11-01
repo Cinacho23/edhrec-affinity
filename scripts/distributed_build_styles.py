@@ -364,6 +364,9 @@ def plan(base, index, output_dir, runners, generation, *, pilot=False):
         expiry = timestamp(control.get("blocked_until")) or global_cooldown
         if expiry and expiry > now():
             worker_state.update(blocked_until=expiry.isoformat(), block_reason=control.get("block_reason") or state.get("block_reason") or "rate_limit")
+            for key in ("source_stop", "source_stops"):
+                if key in control or key in state:
+                    worker_state[key] = deepcopy(control.get(key, state.get(key)))
         item = {"id": worker, "archive": f"shard-{worker}.tar.gz", "commanders": slugs,
             "estimated_remaining_requests": loads[worker], "source_rate": worker_state["source_rate"]}
         manifest["workers"].append(item)
@@ -434,7 +437,8 @@ def checkpoint(manifest_path, worker_id, workroot, output_dir, *, exit_code=0):
             "checkpoint": {"archive": archive.name, "sha256": digest(archive), "valid": True,
                            "files": count, "used_fallback": fallback, "fallback_reason": reason},
             "pipeline_summary": pipeline, "machine": machine,
-            "source_control": {key: deepcopy(state.get(key)) for key in ("source_rate", "blocked_until", "block_reason")}}
+            "source_control": {key: deepcopy(state.get(key)) for key in
+                               ("source_rate", "blocked_until", "block_reason", "source_stop", "source_stops")}}
         atomic_json(output_dir / f"shard-{worker['id']}-summary.json", summary)
         return summary
     finally:
@@ -556,7 +560,7 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
             merged["commanders"].update(deepcopy(worker_state["commanders"]))
             controls[worker["id"]] = {"commanders": worker["commanders"], "generation": manifest["generation"],
                 "updated_at": now().isoformat(), **{key: deepcopy(worker_state.get(key)) for key in
-                    ("source_rate", "blocked_until", "block_reason", "pipeline")}}
+                    ("source_rate", "blocked_until", "block_reason", "source_stop", "source_stops", "pipeline")}}
             actual = not summary["checkpoint"].get("used_fallback")
             if actual:
                 actual_summaries.append(summary)
@@ -596,20 +600,38 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
         distributed.update(schema_version=1, generation=manifest["generation"], runners=manifest["runners"],
                            pilot=manifest["pilot"], updated_at=now().isoformat())
         active_controls = [controls[w["id"]] for w in manifest["workers"]]
+        # Retain the provider's original safe diagnostic instead of reducing a
+        # metadata429 or HTTP403 to an indistinguishable global stop message.
+        # These are observations, not permission to clear or reinterpret stops.
+        source_stops = [{"worker_id": worker["id"], **deepcopy(stop)}
+            for worker in manifest["workers"]
+            if isinstance(stop := controls[worker["id"]].get("source_stop"), dict)]
+        merged["source_stops"] = source_stops
         blocked = [c for c in active_controls if (until := timestamp(c.get("blocked_until"))) and until > now()]
         access = any(c.get("block_reason") == "access_restriction" for c in active_controls)
         # Multiple independent workers throttled in one generation is evidence
         # that the aggregate load needs review; do not simply multiply IPs.
-        throttled = [s for s in actual_summaries if (s.get("pipeline_summary", {}).get("measured_request_rate") or {}).get("throttles", 0) > 0]
+        def throttled_worker(summary):
+            pipeline = summary.get("pipeline_summary") or {}
+            stop = pipeline.get("source_stop") or {}
+            metadata_throttle = (isinstance(stop, dict) and stop.get("provider") == "scryfall"
+                                 and stop.get("status_code") == 429 and stop.get("reason") == "rate_limit")
+            return (pipeline.get("measured_request_rate") or {}).get("throttles", 0) > 0 or metadata_throttle
+        throttled = [s for s in actual_summaries if throttled_worker(s)]
         systemic = access or len(throttled) >= 2
         distributed["systemic_block"] = systemic
         if systemic:
             merged["block_reason"] = "access_restriction" if access else "rate_limit"
             expiries = [timestamp(c.get("blocked_until")) for c in blocked]
             merged["blocked_until"] = (max(expiries) if expiries else now() + timedelta(hours=1)).isoformat()
+            relevant_stops = [stop for stop in source_stops if stop.get("reason") == merged["block_reason"]]
+            if relevant_stops:
+                merged["source_stop"] = deepcopy(max(relevant_stops,
+                    key=lambda stop: timestamp(stop.get("observed_at")) or datetime.min.replace(tzinfo=timezone.utc)))
         elif state.get("distributed"):
             merged.pop("blocked_until", None)
             merged.pop("block_reason", None)
+            merged.pop("source_stop", None)
         rows = manifest["inventory"]
         published = {r["commander_slug"] for r in rows if (base / f"{r['commander_slug']}.json").exists()}
         published.update(name[:-5] for _, name, _ in pending_copies if "/" not in name and name.endswith(".json"))
@@ -671,6 +693,8 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
             "resource_limit": resource_limits or None,
             "blocked": systemic, "blocked_until": merged.get("blocked_until") if systemic else None,
             "block_reason": merged.get("block_reason") if systemic else None,
+            "source_stop": deepcopy(merged.get("source_stop")) if systemic else None,
+            "source_stops": deepcopy(source_stops),
             "failures": [{"worker": s["worker_id"], "reason": s["checkpoint"].get("fallback_reason") or "Worker exited unsuccessfully"}
                 for s in summaries if s["checkpoint"].get("used_fallback") or s.get("exit_code") not in {0, None}],
             "capacity": capacity, "measured_request_rate": measured,

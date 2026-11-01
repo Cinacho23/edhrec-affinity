@@ -10,7 +10,9 @@ import httpx
 import pytest
 
 from edhrec_affinity.build_styles.collection import collect_previews, deck_dataset_sha256
-from edhrec_affinity.build_styles.sources import BudgetExpired, Cache, PreviewTransport, RequestLimiter, SourceBlocked, SourceFormatError
+from edhrec_affinity.build_styles.sources import (
+    BudgetExpired, Cache, PreviewTransport, RequestLimiter, SourceBlocked, SourceFormatError, source_stop_details,
+)
 
 
 START = datetime(2026, 10, 21, 12, tzinfo=timezone.utc)
@@ -153,6 +155,10 @@ def test_http_success_with_explicit_challenge_still_blocks_shared_collection(tmp
         with pytest.raises(SourceBlocked, match="stopped"):
             cache.get("two.json", "https://json.edhrec.com/two.json")
         assert len(calls) == 1 and cache.blocked
+        stop = limiter.stats["source_stop"]
+        assert (stop["provider"], stop["endpoint"], stop["status_code"], stop["reason"]) == (
+            "edhrec", "https://json.edhrec.com/one.json", 200, "access_restriction")
+        assert stop["retry_at"] is None
         assert not list(tmp_path.iterdir())
     finally:
         cache.close()
@@ -431,6 +437,11 @@ def test_only_http_429_lowers_the_ceiling_while_both_access_codes_stop_collectio
         assert limiter.learning_state["learned_rate"] == (1.5 if status == 429 else None)
         assert limiter.learning_state["throttles"] == (1 if status == 429 else 0)
         assert limiter.stats["block_kind"] == ("rate_limit" if status == 429 else "access_restriction")
+        assert limiter.stats["source_stop"] == {
+            "provider": "edhrec", "endpoint": "https://json.edhrec.com/one.json", "status_code": status,
+            "reason": "rate_limit" if status == 429 else "access_restriction", "observed_at": START.isoformat(),
+            "retry_after_seconds": 7200, "retry_at": (START + timedelta(hours=2)).isoformat(),
+        }
         assert limiter.stats["retry_after_seconds"] == 7200
         with pytest.raises(SourceBlocked, match="stopped"):
             cache.get("two.json", "https://json.edhrec.com/two.json")
@@ -449,6 +460,39 @@ def test_access_restriction_stays_sticky_after_rate_and_generic_stops(kinds):
         limiter.block(f"stop {index}", kind=kind)
     assert limiter.blocked
     assert limiter.stats["block_kind"] == "access_restriction"
+
+
+def test_first_specific_stop_survives_other_workers_and_upgrades_only_for_access():
+    limiter = RequestLimiter()
+    rate = source_stop_details("scryfall", "https://api.scryfall.com/cards/collection", 429, START)
+    limiter.block("Metadata rate limit", kind="rate_limit", details=rate)
+    rate["endpoint"] = "mutated caller value"
+    original = limiter.stats["source_stop"]
+    limiter.block("Another rate limit", kind="rate_limit", details=source_stop_details(
+        "edhrec", "https://json.edhrec.com/later.json", 429, START))
+    limiter.block("Generic stopped worker")
+    assert limiter.stats["source_stop"] == original
+    assert limiter.learning_state == {"learned_rate": None, "throttles": 0, "last_throttle": None}
+    access = source_stop_details("edhrec", "https://json.edhrec.com/access.json", 403, START)
+    limiter.block("Actual access restriction", kind="access_restriction", details=access)
+    copy = limiter.stats["source_stop"]
+    copy["provider"] = "mutated returned value"
+    limiter.block("Later generic stop")
+    limiter.block("Later rate", kind="rate_limit", details=original)
+    assert limiter.stats["block_kind"] == "access_restriction"
+    assert limiter.stats["source_stop"] == access
+
+
+@pytest.mark.parametrize("header,expected", [
+    ("120", 120), (format_datetime(START + timedelta(hours=2), usegmt=True), 7200),
+    (None, 60), ("bad", 60), ("nan", 60), ("inf", 60), ("-2", 60), ("0", 60),
+])
+def test_provider_stop_diagnostics_parse_retry_after_without_requesting_again(header, expected):
+    stop = source_stop_details("scryfall", "https://api.scryfall.com/cards/collection", 429, START,
+                               retry_after=header)
+    assert stop["retry_after_seconds"] == expected
+    assert stop["retry_at"] == (START + timedelta(seconds=expected)).isoformat()
+    assert stop["reason"] == "rate_limit"
 
 
 def test_in_flight_403_after_429_cannot_become_a_rate_limit_auto_resume(tmp_path):

@@ -44,6 +44,16 @@ def test_distributed_workflow_uses_real_vm_matrix_and_separate_parallel_power_jo
     assert "if: always() && needs.plan.result == 'success'" in workflow
 
 
+def test_metadata_pacing_is_divided_across_source_vms_and_power_vm():
+    workflow = WORKFLOW.read_text()
+    _, plan = step("Get the current index and partition commander ownership")
+    assert 'metadata_delay_seconds={(runners + 1) / 5}' in plan
+    assert "metadata_delay_seconds: ${{ steps.plan.outputs.metadata_delay_seconds }}" in workflow
+    for job, following in (("collect", "power"), ("power", "merge")):
+        body = workflow.split(f"  {job}:\n", 1)[1].split(f"  {following}:\n", 1)[0]
+        assert "BUILD_STYLE_METADATA_REQUEST_DELAY_SECONDS: ${{ needs.plan.outputs.metadata_delay_seconds }}" in body
+
+
 def test_each_vm_downloads_only_its_owned_shard_and_shared_metadata():
     workflow = WORKFLOW.read_text()
     collect = workflow.split("  collect:\n", 1)[1].split("  power:\n", 1)[0]

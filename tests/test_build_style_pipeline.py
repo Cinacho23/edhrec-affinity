@@ -1139,6 +1139,45 @@ def test_metadata_access_block_cannot_be_misclassified_as_an_edhrec_rate_pause(t
     assert checkpoint(args)["block_reason"] == "access_restriction"
 
 
+@pytest.mark.parametrize("status", [401, 403, 429])
+def test_metadata_stop_retains_provider_and_does_not_relearn_edhrec_rate(tmp_path, status):
+    args = options(tmp_path)
+    stop = {"provider": "scryfall", "endpoint": "https://api.scryfall.com/cards/collection",
+            "status_code": status, "reason": "rate_limit" if status == 429 else "access_restriction",
+            "observed_at": NOW.isoformat(), "retry_after_seconds": 7200 if status == 429 else None}
+    atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": {},
+                "source_rate": {"learned_rate": 1.3, "throttles": 3}})
+
+    def collect(settings, **dependencies):
+        value = evidence(settings.commander)
+        value.update(blocked=True, metadata_summary={"blocked": True, "source_stop": stop})
+        return value
+
+    result = execute(args, rows("a"), collect, saved_analyzer([]))
+    assert result["block_reason"] == stop["reason"]
+    assert result["source_stop"] == checkpoint(args)["source_stop"] == stop
+    assert result["failures"][0]["source_stop"] == stop
+    assert result["measured_request_rate"]["throttles"] == 0
+    assert checkpoint(args)["source_rate"] == {"learned_rate": 1.3, "throttles": 3}
+    if status == 429:
+        assert (datetime.fromisoformat(result["blocked_until"]) - NOW).total_seconds() == pytest.approx(7200, abs=.1)
+
+
+def test_expired_access_stop_still_requires_explicit_review_before_any_requests(tmp_path):
+    args = options(tmp_path)
+    stop = {"provider": "scryfall", "status_code": 403, "reason": "access_restriction"}
+    atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": {},
+                "block_reason": "access_restriction", "blocked_until": (NOW - timedelta(hours=1)).isoformat(),
+                "source_stop": stop})
+
+    def forbidden(*_, **__):
+        pytest.fail("An expired access restriction is still a persistent source stop")
+
+    result = execute(args, rows("a"), forbidden, forbidden)
+    assert result["blocked"] and result["block_reason"] == "access_restriction"
+    assert result["source_stop"] == stop and not result["continuation_needed"]
+
+
 @pytest.mark.parametrize("invalid", [0, -1, float("inf"), float("nan"), True, "2"])
 def test_invalid_saved_rate_cannot_silently_restore_the_configured_ceiling(tmp_path, invalid):
     args = options(tmp_path, dry_run=True)
