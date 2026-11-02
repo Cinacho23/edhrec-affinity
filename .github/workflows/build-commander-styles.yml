@@ -49,6 +49,7 @@ permissions:
   # workflow_dispatch is explicitly supported with GITHUB_TOKEN. No PAT or
   # workflow_run recursion is needed for consecutive collection batches.
   actions: write
+  checks: read
 
 concurrency:
   group: commander-build-style-samples

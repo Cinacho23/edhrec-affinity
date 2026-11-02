@@ -35,12 +35,16 @@ class GitHub:
         self.publication_failure = False
         self.cooldowns = set()
         self.cooldown_failure = False
+        self.interruption = None
 
     def active(self, excluding=None):
         return self.is_active
 
     def snapshots(self):
         return iter(self.saved)
+
+    def interruption_guard(self, checkpoint_run_id):
+        return self.interruption
 
     def source(self, run_id, *, allow_uploaded=False):
         return next((item for item in self.saved if item.run_id == run_id), None)
@@ -130,6 +134,98 @@ def test_real_client_combines_both_trusted_collector_histories_and_active_jobs()
     assert [run["id"] for run in client.runs()] == [102, 100]
     assert all(client.trusted(run) for run in client.runs())
     assert client.active() and not client.active(excluding=102)
+
+
+def interrupted_client(count=1, *, change=None):
+    client = object.__new__(coordinator.GitHub)
+    client.default_branch, client.root = "main", "repos/owner/repo"
+    client._runs = [{"id": 101 + i, "status": "completed", "conclusion": "cancelled",
+        "head_branch": "main", "event": "workflow_dispatch",
+        "display_title": "Distributed collector (16 runners)",
+        "path": f".github/workflows/{coordinator.DISTRIBUTED_COLLECTOR}"} for i in reversed(range(count))]
+    plan = {"id": 123, "name": "Restore one canonical checkpoint and partition owned work",
+            "conclusion": "cancelled", "steps": [
+                {"name": "Check active collectors and source controls", "conclusion": "success"},
+                {"name": "Get the current index and partition commander ownership", "conclusion": "cancelled"}]}
+    jobs = [plan, {"name": "Collect owned shard ${{ matrix.id }} on a separate VM", "conclusion": "skipped"},
+            {"name": "Check saved package decks while EDHREC VMs collect", "conclusion": "skipped"}]
+    annotations = [{"message": "The job has exceeded the maximum execution time of 60m0s"}]
+    if change:
+        change(client, jobs, annotations)
+    def api(path):
+        if "/jobs?" in path:
+            return {"jobs": jobs}
+        assert path.endswith("/check-runs/123/annotations?per_page=100")
+        return annotations
+    client.api = api
+    return client
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_verified_preparation_timeouts_retry_old_checkpoint_with_bound(count):
+    result = interrupted_client(count).interruption_guard(100)
+    assert result["run"] and result["preparation_timeouts"] == count
+    assert result["retry_checkpoint_run_id"] == 100
+    assert result["retry_runner_count"] == 16
+
+
+def test_three_preparation_timeouts_require_review_instead_of_endless_retries():
+    result = interrupted_client(3).interruption_guard(100)
+    assert not result["run"] and "retry bound" in result["reason"]
+
+
+@pytest.mark.parametrize("change", [
+    lambda client, jobs, annotations: annotations.clear(),
+    lambda client, jobs, annotations: jobs[0].update(conclusion="failure"),
+    lambda client, jobs, annotations: jobs[0]["steps"][0].update(conclusion="failure"),
+    lambda client, jobs, annotations: jobs[1].update(conclusion="success"),
+    lambda client, jobs, annotations: jobs[2].update(conclusion="cancelled"),
+    lambda client, jobs, annotations: jobs.clear(),
+    lambda client, jobs, annotations: client._runs[0].update(path=f".github/workflows/{coordinator.COLLECTOR}"),
+    lambda client, jobs, annotations: client._runs[0].update(display_title="Distributed collector (2 runners, pilot)"),
+    lambda client, jobs, annotations: client._runs[0].pop("display_title"),
+])
+def test_missing_controls_manual_cancellations_or_possible_source_work_do_not_auto_retry(change):
+    assert not interrupted_client(change=change).interruption_guard(100)["run"]
+
+
+def test_interruption_guard_needs_a_saved_checkpoint_and_resets_after_a_new_checkpoint():
+    client = interrupted_client()
+    assert not client.interruption_guard(None)["run"]
+    assert client.interruption_guard(102) is None
+    client._runs[0]["head_branch"] = "untrusted"
+    assert client.interruption_guard(100) is None
+
+
+def test_watchdog_recovery_cannot_override_saved_access_cooldown_or_manual_scope():
+    for summary in [paused(block_reason="access_restriction"), paused(block_reason="rate_limit"),
+                    {"automatic_continuation_allowed": False}]:
+        github = GitHub([summary])
+        github.interruption = {"run": True, "retry_checkpoint_run_id": 100, "preparation_timeouts": 1}
+        result = coordinator.coordinate(github, "watchdog", now=NOW)
+        assert not result["run"]
+        assert not any(workflow in coordinator.COLLECTORS for workflow, _ in github.dispatches)
+
+
+def test_watchdog_holds_unknown_interruption_but_restarts_verified_preparation_timeout(monkeypatch):
+    monkeypatch.setenv("BUILD_STYLE_DISTRIBUTED_RUNNERS", "16")
+    github = GitHub([{"blocked": False}])
+    github.interruption = {"run": False, "reason": "Missing source controls"}
+    assert not coordinator.coordinate(github, "watchdog", now=NOW)["run"]
+    assert github.dispatches == []
+    github.interruption = {"run": True, "retry_checkpoint_run_id": 100, "preparation_timeouts": 1}
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["dispatched"] and result["retry_checkpoint_run_id"] == 100
+    assert github.dispatches == [(coordinator.DISTRIBUTED_COLLECTOR, {"runners": "16", "pilot": "false"})]
+
+
+def test_preparation_recovery_retains_failed_pool_size_instead_of_scaling_to_repo_setting(monkeypatch):
+    monkeypatch.setenv("BUILD_STYLE_DISTRIBUTED_RUNNERS", "16")
+    github = GitHub([{"blocked": False}])
+    github.interruption = {"run": True, "retry_checkpoint_run_id": 100, "retry_runner_count": 2}
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["distributed_runners"] == 2
+    assert github.dispatches == [(coordinator.DISTRIBUTED_COLLECTOR, {"runners": "2", "pilot": "false"})]
 
 
 @pytest.mark.parametrize("count", [2, 16])

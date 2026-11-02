@@ -44,6 +44,31 @@ def test_distributed_workflow_uses_real_vm_matrix_and_separate_parallel_power_jo
     assert "if: always() && needs.plan.result == 'success'" in workflow
 
 
+def test_preparation_has_one_hour_without_changing_source_work_budgets():
+    workflow = WORKFLOW.read_text()
+    preparation = workflow.split("  plan:\n", 1)[1].split("  collect:\n", 1)[0]
+    assert "    timeout-minutes: 60" in preparation
+    source = workflow.split("  collect:\n", 1)[1].split("  power:\n", 1)[0]
+    assert "    timeout-minutes: 360" in source
+    assert "900 if pilot else 5400" in preparation
+
+
+def test_watchdog_checks_collector_completion_and_deployment_without_waiting_for_cron():
+    watchdog = (ROOT / ".github/workflows/watch-build-styles.yml").read_text()
+    assert "  workflow_run:" in watchdog and "    types: [completed]" in watchdog
+    assert 'workflows: ["Update commander build styles", "Collect commander builds on distributed runners"]' in watchdog
+    assert "head_branch == github.event.repository.default_branch" in watchdog
+    assert "head_repository.full_name == github.repository" in watchdog
+    assert "!startsWith(github.event.workflow_run.event, 'pull_request')" in watchdog
+    assert "  push:" in watchdog and "scripts/coordinate_build_styles.py" in watchdog
+    assert 'cron: "7,17,27,37,47,57 * * * *"' in watchdog
+    assert "cancel-in-progress: false" in watchdog
+    assert "run: python3 scripts/coordinate_build_styles.py watchdog" in watchdog
+    for name in ("watch-build-styles.yml", "resume-build-styles.yml", "build-commander-styles.yml",
+                 "collect-distributed-build-styles.yml"):
+        assert "  checks: read" in (ROOT / ".github/workflows" / name).read_text()
+
+
 def test_metadata_pacing_is_divided_across_source_vms_and_power_vm():
     workflow = WORKFLOW.read_text()
     _, plan = step("Get the current index and partition commander ownership")

@@ -1,6 +1,16 @@
 name: Watch commander collection
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/watch-build-styles.yml
+      - .github/workflows/collect-distributed-build-styles.yml
+      - scripts/coordinate_build_styles.py
+  workflow_run:
+    workflows: ["Update commander build styles", "Collect commander builds on distributed runners"]
+    branches: [main]
+    types: [completed]
   schedule:
     - cron: "7,17,27,37,47,57 * * * *"
   workflow_dispatch:
@@ -8,6 +18,7 @@ on:
 permissions:
   contents: read
   actions: write
+  checks: read
 
 concurrency:
   group: commander-build-style-watchdog
@@ -19,6 +30,9 @@ env:
 jobs:
   check:
     name: Recover an idle collector without restoring decks
+    # Completion checks always execute our default-branch code. Ignore PR and
+    # fork runs; their artifacts must never authorize a privileged restart.
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.head_branch == github.event.repository.default_branch && github.event.workflow_run.head_repository.full_name == github.repository && !startsWith(github.event.workflow_run.event, 'pull_request'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

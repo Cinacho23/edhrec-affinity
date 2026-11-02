@@ -20,6 +20,7 @@ on:
 permissions:
   contents: read
   actions: write
+  checks: read
 
 concurrency:
   group: commander-build-style-samples
@@ -34,7 +35,9 @@ jobs:
   plan:
     name: Restore one canonical checkpoint and partition owned work
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Restore, extract, partition and upload a growing cumulative checkpoint.
+    # This budget is independent of each source VM's collection deadline.
+    timeout-minutes: 60
     outputs:
       run: ${{ steps.ready.outputs.run }}
       matrix: ${{ steps.plan.outputs.matrix }}

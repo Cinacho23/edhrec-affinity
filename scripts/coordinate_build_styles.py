@@ -28,6 +28,7 @@ COOLDOWN = "resume-build-styles.yml"
 FRONTEND = "deploy-frontend.yml"
 ENVIRONMENT = "build-style-cooldown"
 MAX_WAIT_ATTEMPTS = 48
+MAX_PREPARATION_TIMEOUTS = 3
 ACTIVE = {"queued", "in_progress", "waiting", "pending", "requested"}
 
 
@@ -118,6 +119,52 @@ class GitHub:
                 value = self.snapshot(run)
                 if value is not None:
                     yield value
+
+    def interruption_guard(self, checkpoint_run_id):
+        """Retry only proven preparation timeouts that never started sources.
+
+        A missing summary after source work may hide a newly observed access
+        stop. Never silently fall back to older, less restrictive controls.
+        """
+        interrupted = [run for run in self.runs() if self.trusted(run)
+            and run.get("status") == "completed" and run.get("conclusion") not in {"success", "skipped", "neutral"}
+            and (checkpoint_run_id is None or run["id"] > checkpoint_run_id)]
+        if not interrupted:
+            return None
+        held = {"run": False, "interrupted_run_id": interrupted[0]["id"],
+                "reason": "Interrupted collector has no newer durable source controls; review before automatic restart"}
+        if checkpoint_run_id is None:
+            return held
+        retry_runners = None
+        for run in interrupted:
+            if not self.trusted(run, DISTRIBUTED_COLLECTOR):
+                return held
+            full_pool = re.fullmatch(r"Distributed collector \(([2-9]|1[0-6]) runners\)",
+                                     str(run.get("display_title", "")))
+            if full_pool is None:
+                return held  # A pilot or unknown scope cannot become a full retry.
+            if retry_runners is None:
+                retry_runners = int(full_pool[1])
+            jobs = self.api(f"{self.root}/actions/runs/{run['id']}/jobs?per_page=100")["jobs"]
+            plans = [job for job in jobs if job.get("name") == "Restore one canonical checkpoint and partition owned work"]
+            if len(plans) != 1 or any(job.get("conclusion") != "skipped" for job in jobs if job not in plans):
+                return held
+            plan = plans[0]
+            if plan.get("conclusion") not in {"cancelled", "timed_out"}:
+                return held
+            readiness = [step for step in plan.get("steps", []) if step.get("name") == "Check active collectors and source controls"]
+            if len(readiness) != 1 or readiness[0].get("conclusion") != "success":
+                return held
+            annotations = self.api(f"{self.root}/check-runs/{plan['id']}/annotations?per_page=100")
+            if not any(re.fullmatch(r"The job has exceeded the maximum execution time of \d+m\d+s",
+                                   annotation.get("message", "")) for annotation in annotations):
+                return held  # A manual cancellation is not permission to restart.
+        if len(interrupted) >= MAX_PREPARATION_TIMEOUTS:
+            return {**held, "preparation_timeouts": len(interrupted),
+                    "reason": "Repeated preparation timeouts reached the automatic retry bound; review the checkpoint transfer"}
+        return {"run": True, "interrupted_run_id": interrupted[0]["id"],
+                "preparation_timeouts": len(interrupted), "retry_checkpoint_run_id": checkpoint_run_id,
+                "retry_runner_count": retry_runners}
 
     def source(self, run_id, *, allow_uploaded=False):
         return self.snapshot(self.api(f"{self.root}/actions/runs/{run_id}"), allow_uploaded=allow_uploaded)
@@ -524,6 +571,11 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
     else:
         snapshots = iter(client.snapshots())
         latest = next(snapshots, None)
+    interruption = None
+    if mode in {"watchdog", "resume", "continue"} and (latest is None or latest.durable):
+        interruption = client.interruption_guard(latest.run_id if latest is not None else None)
+        if interruption and not interruption["run"]:
+            return {**interruption, **downstream}
     if mode == "preflight" and access_review_run_id:
         result = access_review_plan(latest, requested_run_id=access_review_run_id, now=now)
     elif mode == "preflight" and power_only:
@@ -532,6 +584,10 @@ def coordinate(client, mode, *, now, current_run_id=None, source_run_id=None, at
         result = recovery_plan(latest, list(snapshots), requested_run_id=recovery_run_id, now=now)
     else:
         result = decision(latest, now=now, older=snapshots, allow_bounded=mode == "preflight")
+    if interruption:
+        result.update({key: value for key, value in interruption.items() if key != "run"})
+        if runner_count is None:
+            runner_count = interruption.get("retry_runner_count")
     if mode == "resume" and result.get("retry_at"):
         if latest is not None and block_reason(latest, client.snapshots()) == "rate_limit" and attempt + 1 < MAX_WAIT_ATTEMPTS:
             client.verify_timer()
