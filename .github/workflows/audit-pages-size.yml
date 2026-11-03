@@ -2,7 +2,7 @@ name: Audit saved Pages payload size
 on:
   push:
     branches: [codex/fix-pages-payload-size]
-    paths: [.github/workflows/audit-pages-size.yml, scripts/audit_pages_artifact.py]
+    paths: [.github/workflows/audit-pages-size.yml, scripts/audit_pages_artifact.py, src/edhrec_affinity/site_payload.py]
   workflow_dispatch:
     inputs:
       artifact_id:
@@ -12,6 +12,9 @@ on:
 permissions:
   contents: read
   actions: read
+concurrency:
+  group: pages-size-audit
+  cancel-in-progress: true
 jobs:
   audit:
     runs-on: ubuntu-latest
@@ -30,4 +33,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_ID: ${{ inputs.artifact_id || '13188424628' }}
           SHARD: ${{ matrix.shard }}
+          PYTHONPATH: src
         run: python scripts/audit_pages_artifact.py --artifact-id "${ARTIFACT_ID}" --shard "${SHARD}" --shards 8

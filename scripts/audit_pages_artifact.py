@@ -13,6 +13,7 @@ import zlib
 
 import httpx
 import brotli
+from edhrec_affinity.site_payload import project_build_report
 import tarfile
 
 
@@ -48,7 +49,7 @@ def tar_chunks(reader):
             return
 
 
-def audit(chunks, *, shard=0, shards=1, quality=11):
+def audit(chunks, *, shard=0, shards=1, quality=9):
     totals, largest, samples = defaultdict(lambda: {"files": 0, "bytes": 0, "brotli_bytes": 0}), [], []
     with tarfile.open(fileobj=Reader(tar_chunks(Reader(chunks))), mode="r|") as archive:
         for member in archive:
@@ -65,6 +66,10 @@ def audit(chunks, *, shard=0, shards=1, quality=11):
             if len(largest) > 12:
                 heapq.heappop(largest)
             source = archive.extractfile(member)
+            if group == "data/latest/build-styles" and member.name.endswith(".json") and parts[-1] != "index.json":
+                projected = json.dumps(project_build_report(json.load(source)), ensure_ascii=False,
+                                       allow_nan=False, separators=(",", ":")).encode()
+                source = io.BytesIO(projected)
             compressor = brotli.Compressor(quality=quality, lgwin=24)
             compressed = 0
             capture = (group == "data/latest/build-styles" and member.name.endswith(".json")
@@ -76,6 +81,9 @@ def audit(chunks, *, shard=0, shards=1, quality=11):
                     raw.extend(chunk)
             compressed += len(compressor.finish())
             totals[group]["brotli_bytes"] += compressed if member.name.endswith(".json") else member.size
+            # The publisher retains operational indexes as plain JSON too.
+            if parts[-1] in {"index.json", "site_manifest.json"}:
+                totals[group]["brotli_bytes"] += member.size
             if raw is not None:
                 data = json.loads(raw)
                 analysis = data.get("deck_analysis", {})
@@ -91,7 +99,7 @@ def main():
     parser.add_argument("--artifact-id", required=True, type=int)
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--shards", type=int, default=1)
-    parser.add_argument("--quality", type=int, default=11, choices=range(12))
+    parser.add_argument("--quality", type=int, default=9, choices=range(12))
     args = parser.parse_args()
     repository = os.environ["GITHUB_REPOSITORY"]
     if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) or args.artifact_id <= 0
