@@ -49,7 +49,7 @@ def tar_chunks(reader):
             return
 
 
-def audit(chunks, *, shard=0, shards=1, quality=9):
+def audit(chunks, *, shard=0, shards=1, quality=10):
     totals, largest, samples = defaultdict(lambda: {"files": 0, "bytes": 0, "brotli_bytes": 0}), [], []
     with tarfile.open(fileobj=Reader(tar_chunks(Reader(chunks))), mode="r|") as archive:
         for member in archive:
@@ -99,7 +99,7 @@ def main():
     parser.add_argument("--artifact-id", required=True, type=int)
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--shards", type=int, default=1)
-    parser.add_argument("--quality", type=int, default=9, choices=range(12))
+    parser.add_argument("--quality", type=int, default=10, choices=range(12))
     args = parser.parse_args()
     repository = os.environ["GITHUB_REPOSITORY"]
     if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) or args.artifact_id <= 0

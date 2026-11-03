@@ -17,6 +17,14 @@ def _quantized(value):
     return round(value, 6)
 
 
+def _display_percentage(value):
+    # JS (value * 100).toFixed(0), including values just below a half.
+    # floor(x + .5) would itself round some near-half floats across the tie.
+    scaled = value * 100
+    whole = math.floor(scaled)
+    return whole + (scaled - whole >= 0.5)
+
+
 def _project_weights(rows, field, threshold):
     if not isinstance(rows, list):
         return
@@ -44,7 +52,7 @@ def _project_weights(rows, field, threshold):
                 continue
             if ((column, rounded) in collisions
                     or (value >= threshold) != (rounded >= threshold)
-                    or math.floor(value * 100 + 0.5) != math.floor(rounded * 100 + 0.5)):
+                    or _display_percentage(value) != _display_percentage(rounded)):
                 continue
             values[column] = rounded
 
