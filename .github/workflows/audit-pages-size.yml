@@ -1,0 +1,29 @@
+name: Audit saved Pages payload size
+on:
+  push:
+    branches: [codex/fix-pages-payload-size]
+    paths: [.github/workflows/audit-pages-size.yml, scripts/audit_pages_artifact.py]
+  workflow_dispatch:
+    inputs:
+      artifact_id:
+        description: Saved github-pages artifact to inspect without extracting it
+        type: string
+        default: '13188424628'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install httpx
+      - name: Measure saved static files and compression
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ inputs.artifact_id || '13188424628' }}
+        run: python scripts/audit_pages_artifact.py --artifact-id "${ARTIFACT_ID}"
