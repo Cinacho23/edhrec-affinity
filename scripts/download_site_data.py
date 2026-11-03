@@ -19,6 +19,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
+import brotli
+
 
 DEFAULT_BASE_URL = "https://cinacho23.github.io/edhrec-affinity/data/latest/"
 DEFAULT_OUTPUT_DIR = Path("frontend/public/data/latest")
@@ -34,16 +36,18 @@ def safe_json_filename(value: str) -> str:
     return value or "unknown"
 
 
-def fetch_json(base_url: str, relative_path: str) -> object:
-    url = urljoin(base_url, relative_path)
+def fetch_bytes(url: str) -> tuple[bytes, str]:
     request = Request(url, headers={"User-Agent": "edhrec-affinity-local-dev"})
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             with urlopen(request, timeout=60) as response:
                 raw = response.read()
-            break
+                encoding = response.headers.get("Content-Encoding", "")
+            return raw, encoding
         except HTTPError as error:
+            if error.code == 404:
+                raise
             if attempt == MAX_ATTEMPTS or error.code < 500:
                 raise RuntimeError(f"HTTP {error.code} while downloading {url}") from error
 
@@ -54,12 +58,26 @@ def fetch_json(base_url: str, relative_path: str) -> object:
 
             time.sleep(attempt * 1.5)
 
-    text = raw.decode("utf-8")
 
-    if text.lstrip().startswith("<"):
-        raise RuntimeError(f"Expected JSON at {url}, but received HTML.")
-
-    return json.loads(text)
+def fetch_json(base_url: str, relative_path: str) -> object:
+    url = urljoin(base_url, relative_path)
+    for candidate in (url, url + ".br"):
+        try:
+            raw, encoding = fetch_bytes(candidate)
+        except HTTPError as error:
+            if error.code == 404:
+                continue
+            raise
+        if re.match(rb"\s*<(?:!doctype|html\b)", raw[:100], re.I):
+            continue
+        # urllib does not automatically decode HTTP Content-Encoding.
+        if candidate.endswith(".br") or encoding == "br":
+            raw = brotli.decompress(raw)
+        text = raw.decode("utf-8")
+        if text.lstrip().startswith("<"):
+            continue
+        return json.loads(text)
+    raise RuntimeError(f"HTTP 404 or HTML while downloading JSON at {url}")
 
 
 def is_not_found_error(error: Exception) -> bool:

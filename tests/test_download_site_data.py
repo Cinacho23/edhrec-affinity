@@ -1,7 +1,9 @@
 import importlib.util
 import json
 from pathlib import Path
+from urllib.error import HTTPError
 
+import brotli
 import pytest
 
 
@@ -61,3 +63,34 @@ def test_site_download_writes_quirky_dataset_for_a_fresh_local_checkout(monkeypa
     download_module.download_site_data("https://example.test", tmp_path)
 
     assert json.loads((tmp_path / "quirky-builds.json").read_text()) == report
+
+
+def test_downloads_brotli_site_data_when_plain_resource_is_absent(monkeypatch):
+    report = {"packages": [1, 2, 3], "primer": "[[Éowyn, Shieldmaiden]]", "score": 6.71}
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        if not url.endswith(".br"):
+            raise HTTPError(url, 404, "Missing", {}, None)
+        return brotli.compress(json.dumps(report).encode()), ""
+
+    monkeypatch.setattr(download_module, "fetch_bytes", fetch)
+    assert download_module.fetch_json("https://example.test/", "report.json") == report
+    assert calls == ["https://example.test/report.json", "https://example.test/report.json.br"]
+
+
+def test_download_does_not_mask_encoded_corruption_or_service_failure(monkeypatch):
+    def corrupt(url):
+        return (b"<!doctype html><html>Shell</html>" if not url.endswith(".br") else b"corrupt"), ""
+
+    monkeypatch.setattr(download_module, "fetch_bytes", corrupt)
+    with pytest.raises(brotli.error):
+        download_module.fetch_json("https://example.test/", "report.json")
+
+    def unavailable(url):
+        raise RuntimeError("HTTP 503")
+
+    monkeypatch.setattr(download_module, "fetch_bytes", unavailable)
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        download_module.fetch_json("https://example.test/", "report.json")

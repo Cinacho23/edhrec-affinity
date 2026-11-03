@@ -224,7 +224,12 @@ jobs:
 
       - name: Build frontend
         working-directory: frontend
+        env:
+          VITE_SITE_DATA_ENCODING: br
         run: npm run build
+
+      - name: Compress and verify Pages data size
+        run: python -u scripts/pack_site_data.py --site-dir frontend/dist
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5

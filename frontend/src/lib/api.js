@@ -1,4 +1,5 @@
 import { THEME_BRACKET_MIN_Z } from "./bracketUtils.js";
+import { fetchSiteJson } from "./siteDataTransport.js";
 
 const BASE_URL = import.meta.env?.BASE_URL || "/";
 
@@ -21,35 +22,9 @@ export function safeJsonFilename(value) {
 }
 
 async function fetchJson(relativePath, { optional = false, signal, cache } = {}) {
-  const url = joinDataPath(relativePath);
-  const response = await fetch(url, signal || cache ? { ...(signal ? { signal } : {}), ...(cache ? { cache } : {}) } : undefined);
-
-  if (optional && response.status === 404) {
-    return null;
-  }
-
-  if (!response.ok) {
-    throw new Error(`Failed to load ${url}. HTTP ${response.status}`);
-  }
-
-  const text = await response.text();
-  const cleanText = text.trimStart();
-
-  if (cleanText.startsWith("<")) {
-    // Static hosts commonly serve the app shell for an absent optional file.
-    if (optional) return null;
-    throw new Error(
-      `Expected JSON at ${url}, but received HTML. Local data is probably missing. Run npm run data:download from the frontend folder.`
-    );
-  }
-
-  try {
-    return JSON.parse(text);
-  } catch (error) {
-    throw new Error(`Failed to parse JSON from ${url}: ${error.message}`, {
-      cause: error,
-    });
-  }
+  return fetchSiteJson(joinDataPath(relativePath), {
+    optional, signal, cache, preferBrotli: import.meta.env?.VITE_SITE_DATA_ENCODING === "br",
+  });
 }
 
 export function getDataUrl(relativePath) {

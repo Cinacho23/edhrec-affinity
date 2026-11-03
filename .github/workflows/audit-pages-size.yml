@@ -1,8 +1,5 @@
 name: Audit saved Pages payload size
 on:
-  push:
-    branches: [codex/fix-pages-payload-size]
-    paths: [.github/workflows/audit-pages-size.yml, scripts/audit_pages_artifact.py, src/edhrec_affinity/site_payload.py]
   workflow_dispatch:
     inputs:
       artifact_id:

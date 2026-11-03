@@ -30,6 +30,7 @@ requires-python = ">=3.12"
 #
 # These are needed for the scraper to run normally.
 dependencies = [
+    "brotli>=1.1,<2",
     "httpx",
     "pydantic",
     "pandas",

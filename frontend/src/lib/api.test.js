@@ -38,7 +38,7 @@ test("optional build reports tolerate absent files and static host HTML fallback
   try {
     globalThis.fetch = async () => ({ ok: false, status: 404 });
     assert.equal(await loadCommanderBuildStyles("ghave-guru-of-spores"), null);
-    globalThis.fetch = async () => ({ ok: true, text: async () => "  <!doctype html><html>App shell</html>" });
+    globalThis.fetch = async () => new Response("  <!doctype html><html>App shell</html>", { headers: { "content-type": "text/html" } });
     assert.equal(await loadCommanderBuildStyles("ghave-guru-of-spores"), null);
     globalThis.fetch = async () => ({ ok: false, status: 503 });
     await assert.rejects(loadCommanderBuildStyles("ghave-guru-of-spores"), /HTTP 503/);
@@ -74,7 +74,7 @@ test("build discovery index tolerates absent deployments and validates real cove
   try {
     globalThis.fetch = async () => ({ ok: false, status: 404 });
     assert.deepEqual(await loadBuildStyleIndex(), emptyCoverage);
-    globalThis.fetch = async () => ({ ok: true, text: async () => "<!doctype html><html>App shell</html>" });
+    globalThis.fetch = async () => new Response("<!doctype html><html>App shell</html>", { headers: { "content-type": "text/html" } });
     assert.deepEqual(await loadBuildStyleIndex(), emptyCoverage);
     const index = { ...emptyCoverage, total_available: 1, commanders: [{ commander_slug: "ghave-guru-of-spores", package_count: 2, unique_decks: 60 }] };
     globalThis.fetch = async (url, options) => {
