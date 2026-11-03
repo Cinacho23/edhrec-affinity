@@ -3,6 +3,7 @@
 import argparse
 from collections import defaultdict
 import heapq
+import hashlib
 import io
 import json
 import os
@@ -11,6 +12,7 @@ import struct
 import zlib
 
 import httpx
+import brotli
 import tarfile
 
 
@@ -46,11 +48,14 @@ def tar_chunks(reader):
             return
 
 
-def audit(chunks):
-    totals, largest, samples = defaultdict(lambda: {"files": 0, "bytes": 0, "gzip_bytes": 0}), [], []
+def audit(chunks, *, shard=0, shards=1, quality=11):
+    totals, largest, samples = defaultdict(lambda: {"files": 0, "bytes": 0, "brotli_bytes": 0}), [], []
     with tarfile.open(fileobj=Reader(tar_chunks(Reader(chunks))), mode="r|") as archive:
         for member in archive:
             if not member.isfile():
+                continue
+            bucket = int.from_bytes(hashlib.sha256(member.name.encode()).digest()[:4]) % shards
+            if bucket != shard:
                 continue
             parts = member.name.removeprefix("./").split("/")
             group = "/".join(parts[:3]) if parts[:2] == ["data", "latest"] else parts[0]
@@ -60,21 +65,21 @@ def audit(chunks):
             if len(largest) > 12:
                 heapq.heappop(largest)
             source = archive.extractfile(member)
-            compressor = zlib.compressobj(6, zlib.DEFLATED, 31)
+            compressor = brotli.Compressor(quality=quality, lgwin=24)
             compressed = 0
             capture = (group == "data/latest/build-styles" and member.name.endswith(".json")
                        and member.size <= 16 * 1024 * 1024 and len(samples) < 5)
             raw = bytearray() if capture else None
             while chunk := source.read(1024 * 1024):
-                compressed += len(compressor.compress(chunk))
+                compressed += len(compressor.process(chunk))
                 if raw is not None:
                     raw.extend(chunk)
-            compressed += len(compressor.flush())
-            totals[group]["gzip_bytes"] += compressed if member.name.endswith(".json") else member.size
+            compressed += len(compressor.finish())
+            totals[group]["brotli_bytes"] += compressed if member.name.endswith(".json") else member.size
             if raw is not None:
                 data = json.loads(raw)
                 analysis = data.get("deck_analysis", {})
-                samples.append({"file": member.name, "bytes": member.size, "gzip_bytes": compressed,
+                samples.append({"file": member.name, "bytes": member.size, "brotli_bytes": compressed,
                     "models": len(analysis.get("alternative_models", [])),
                     "fields": {key: len(json.dumps(value, separators=(",", ":"))) for key, value in data.items()},
                     "analysis": {key: len(json.dumps(value, separators=(",", ":"))) for key, value in analysis.items()}})
@@ -84,9 +89,13 @@ def audit(chunks):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact-id", required=True, type=int)
+    parser.add_argument("--shard", type=int, default=0)
+    parser.add_argument("--shards", type=int, default=1)
+    parser.add_argument("--quality", type=int, default=11, choices=range(12))
     args = parser.parse_args()
     repository = os.environ["GITHUB_REPOSITORY"]
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) or args.artifact_id <= 0:
+    if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) or args.artifact_id <= 0
+            or not 0 <= args.shard < args.shards <= 16):
         raise ValueError("Invalid artifact identity")
     with httpx.Client(timeout=120) as client:
         response = client.get(f"https://api.github.com/repos/{repository}/actions/artifacts/{args.artifact_id}/zip",
@@ -100,7 +109,7 @@ def main():
         # The redirected storage request carries no GitHub authentication.
         with client.stream("GET", location) as stream:
             stream.raise_for_status()
-            result = audit(stream.iter_bytes(chunk_size=1024 * 1024))
+            result = audit(stream.iter_bytes(chunk_size=1024 * 1024), shard=args.shard, shards=args.shards, quality=args.quality)
     for key, value in result.items():
         print(f"::notice title=Pages size audit {key}::{json.dumps(value, separators=(',', ':'))}")
 
