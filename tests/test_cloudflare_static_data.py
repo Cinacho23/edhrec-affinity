@@ -59,6 +59,30 @@ def test_cloudflare_free_limits_fail_before_any_upload(tmp_path):
         prepare.validate_assets(tmp_path, max_files=0)
 
 
+def test_large_plain_index_stays_on_pages_and_cloudflare_keeps_complete_encoded_index(tmp_path):
+    data, _ = exported_data(tmp_path)
+    index = {"commanders": [{"commander_slug": f"commander-{i}", "tags": ["tokens", "counters"]}
+                            for i in range(100)]}
+    # Exercise the actual per-file decision using a small test limit.
+    (data / "build-styles/index.json").write_text(json.dumps(index))
+    (data / "commanders/index.json").write_text(json.dumps(index))
+    cloud = tmp_path / "cloud"
+    prepare.prepare_data(data, cloud, build_id="123-1", max_asset_bytes=2048)
+    for name in ["build-styles/index.json", "commanders/index.json"]:
+        assert json.loads((data / name).read_text()) == index
+        assert not (cloud / "data/latest" / name).exists()
+        encoded = cloud / "data/latest" / (name + ".br")
+        assert json.loads(brotli.decompress(encoded.read_bytes())) == index
+    prepare.validate_assets(cloud, max_file_bytes=2048)
+
+    def serve(request):
+        path = cloud / request.url.path.lstrip("/")
+        return httpx.Response(200, content=path.read_bytes(), headers={"Access-Control-Allow-Origin": "*"})
+
+    with httpx.Client(transport=httpx.MockTransport(serve)) as client:
+        verify.verify_data(cloud, "https://data.example", client=client)
+
+
 def test_unsafe_staging_and_links_are_rejected_before_moving_data(tmp_path):
     data, _ = exported_data(tmp_path)
     with pytest.raises(ValueError, match="fresh, separate"):

@@ -40,6 +40,8 @@ def verify_data(root: Path, base_url: str, *, client: httpx.Client) -> None:
     assets = [path for path in root.rglob("*") if path.is_file() and path.name != "_headers"]
     paths.append(max(assets, key=lambda path: path.stat().st_size))
     for path in dict.fromkeys(paths):
+        if not path.is_file() and path.name == "index.json":
+            path = path.with_suffix(".json.br")
         if not path.is_file():
             raise ValueError(f"Missing required exported asset: {path}")
         response = client.get(f"{base_url}/{path.relative_to(root).as_posix()}", headers={"Origin": ORIGIN})

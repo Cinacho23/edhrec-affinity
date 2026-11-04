@@ -28,11 +28,12 @@ def validate_assets(root: Path, *, max_files: int = MAX_ASSETS,
     return sizes
 
 
-def prepare_data(data_dir: Path, output_dir: Path, *, build_id: str) -> dict:
+def prepare_data(data_dir: Path, output_dir: Path, *, build_id: str,
+                 max_asset_bytes: int = MAX_ASSET_BYTES) -> dict:
     data_dir, output_dir = data_dir.resolve(), output_dir.resolve()
     if not (data_dir / "site_manifest.json").is_file():
         raise ValueError("Expected an exported public data directory with site_manifest.json")
-    if not build_id or output_dir.exists() or output_dir == data_dir or output_dir.is_relative_to(data_dir) or data_dir.is_relative_to(output_dir):
+    if not build_id or max_asset_bytes <= 0 or output_dir.exists() or output_dir == data_dir or output_dir.is_relative_to(data_dir) or data_dir.is_relative_to(output_dir):
         raise ValueError("Use a fresh, separate output directory and a nonempty build ID")
     site_sizes(data_dir)  # Reject links before moving anything.
     target = output_dir / "data/latest"
@@ -49,15 +50,26 @@ def prepare_data(data_dir: Path, output_dir: Path, *, build_id: str) -> dict:
         "/*\n  Access-Control-Allow-Origin: *\n  Access-Control-Expose-Headers: Content-Encoding\n"
         "  Cache-Control: public, max-age=0, must-revalidate\n"
         "  X-Content-Type-Options: nosniff\n", encoding="utf-8")
-    sizes = validate_assets(output_dir)
     # Keep existing collector URLs and every operational index readable on Pages.
+    omitted_plain_indexes = []
     for source in target.rglob("*.json"):
         if source.name not in {"index.json", "site_manifest.json"}:
             continue
         destination = data_dir / source.relative_to(target)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
-    print(json.dumps({**metadata, "assets": sizes}, indent=2), flush=True)
+        # Pages needs plain operational indexes, while the browser and local
+        # downloader support .json.br. An optional plain duplicate must not
+        # prevent publishing an otherwise valid compressed Cloudflare dataset.
+        if source.name == "index.json" and source.stat().st_size > max_asset_bytes:
+            encoded = source.with_suffix(".json.br")
+            if not encoded.is_file():
+                raise ValueError(f"Cannot omit a plain index without its encoded copy: {source}")
+            source.unlink()
+            omitted_plain_indexes.append(source.relative_to(output_dir).as_posix())
+    sizes = validate_assets(output_dir, max_file_bytes=max_asset_bytes)
+    print(json.dumps({**metadata, "assets": sizes,
+                      "plain_indexes_kept_only_on_pages": omitted_plain_indexes}, indent=2), flush=True)
     return metadata
 
 

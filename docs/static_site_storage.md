@@ -67,6 +67,9 @@ When both secrets exist, the shared `publish-static-data` action:
    Free limits (20,000 files and 25 MiB per file). Oversized files fail with an
    instruction to split them before publishing; this change does not truncate
    packages or silently upgrade the account.
+   Plain operational indexes that exceed the per-file limit are retained on
+   GitHub Pages only; Cloudflare serves their complete `.json.br` copies. Both
+   the browser and development downloader already support that encoding.
 2. Uploads assets with Cloudflare's official Wrangler action. No request handler
    is deployed; the files use static asset serving, without per-request Worker
    execution. Content hashes let Wrangler reuse unchanged uploaded assets.
