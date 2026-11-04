@@ -65,6 +65,23 @@ def test_site_download_writes_quirky_dataset_for_a_fresh_local_checkout(monkeypa
     assert json.loads((tmp_path / "quirky-builds.json").read_text()) == report
 
 
+def test_site_download_follows_the_pages_manifest_to_its_pinned_data_host(monkeypatch, tmp_path):
+    external = "https://abcdef01-edhrec-affinity-data.example.workers.dev/data/latest"
+    files = {**remote_files({"quirky_builds_export": {"file": "quirky-builds.json"}}), "quirky-builds.json": {"commander": "test"}}
+    calls = []
+
+    def fetch(base, path):
+        calls.append((base, path))
+        if len(calls) == 1:
+            return {"data_base_url": external}
+        assert base == external + "/"
+        return files[path]
+
+    monkeypatch.setattr(download_module, "fetch_json", fetch)
+    download_module.download_site_data("https://example.test", tmp_path)
+    assert json.loads((tmp_path / "quirky-builds.json").read_text()) == {"commander": "test"}
+
+
 def test_downloads_brotli_site_data_when_plain_resource_is_absent(monkeypatch):
     report = {"packages": [1, 2, 3], "primer": "[[Éowyn, Shieldmaiden]]", "score": 6.71}
     calls = []

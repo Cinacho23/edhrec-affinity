@@ -1,0 +1,58 @@
+name: Publish large static data to Cloudflare
+description: Upload and verify a pinned data snapshot before building the Pages frontend
+inputs:
+  api-token:
+    description: Cloudflare Workers deployment token stored in repository secrets
+    required: false
+  account-id:
+    description: Cloudflare account ID stored in repository secrets
+    required: false
+outputs:
+  data-base-url:
+    description: Verified immutable data URL, or empty for same-origin publishing
+    value: ${{ steps.verify.outputs.data-base-url }}
+runs:
+  using: composite
+  steps:
+    - name: Check Cloudflare deployment credentials
+      id: config
+      shell: bash
+      env:
+        CF_API_TOKEN: ${{ inputs.api-token }}
+        CF_ACCOUNT_ID: ${{ inputs.account-id }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${CF_API_TOKEN}" && -z "${CF_ACCOUNT_ID}" ]]; then
+          echo 'enabled=false' >> "$GITHUB_OUTPUT"
+          echo 'Cloudflare is not configured; retaining same-origin Pages publication.'
+        elif [[ -z "${CF_API_TOKEN}" || -z "${CF_ACCOUNT_ID}" ]]; then
+          echo 'Set both CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID repository secrets.' >&2
+          exit 1
+        else
+          echo 'enabled=true' >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Prepare and validate Cloudflare Free assets
+      if: steps.config.outputs.enabled == 'true'
+      shell: bash
+      run: python -u scripts/prepare_cloudflare_data.py --build-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+    - name: Deploy data assets to Cloudflare
+      if: steps.config.outputs.enabled == 'true'
+      id: upload
+      uses: cloudflare/wrangler-action@v4
+      with:
+        apiToken: ${{ inputs.api-token }}
+        accountId: ${{ inputs.account-id }}
+        workingDirectory: cloudflare
+        wranglerVersion: "4.157.0"
+        command: deploy
+
+    - name: Verify the public data snapshot and CORS access
+      if: steps.config.outputs.enabled == 'true'
+      id: verify
+      shell: bash
+      env:
+        DEPLOYMENT_URL: ${{ steps.upload.outputs.deployment-url }}
+        WRANGLER_COMMAND_OUTPUT: ${{ steps.upload.outputs.command-output }}
+      run: python -u scripts/verify_cloudflare_data.py

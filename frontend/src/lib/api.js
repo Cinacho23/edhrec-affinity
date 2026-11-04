@@ -1,15 +1,27 @@
 import { THEME_BRACKET_MIN_Z } from "./bracketUtils.js";
 import { fetchSiteJson } from "./siteDataTransport.js";
+import { refreshedDataBaseUrl, siteDataUrl } from "./siteDataUrl.js";
 
 const BASE_URL = import.meta.env?.BASE_URL || "/";
+let dataBaseUrl = import.meta.env?.VITE_SITE_DATA_BASE_URL || "";
 
-function getBasePath() {
-  return BASE_URL.endsWith("/") ? BASE_URL : `${BASE_URL}/`;
+async function refreshDataLocation({ signal } = {}) {
+  if (!dataBaseUrl) return;
+  try {
+    const manifest = await fetchSiteJson(siteDataUrl("site_manifest.json", { basePath: BASE_URL }), {
+      optional: true, cache: "no-cache", signal,
+    });
+    dataBaseUrl = refreshedDataBaseUrl(dataBaseUrl, manifest?.data_base_url);
+  } catch (error) {
+    if (error.name === "AbortError") throw error;
+    // A temporary Pages failure must not discard a working Cloudflare snapshot.
+  }
 }
 
 function joinDataPath(relativePath) {
-  const cleanRelativePath = String(relativePath).replace(/^\/+/, "");
-  return `${getBasePath()}data/latest/${cleanRelativePath}`;
+  return siteDataUrl(relativePath, {
+    basePath: BASE_URL, dataBaseUrl,
+  });
 }
 
 export function safeJsonFilename(value) {
@@ -32,6 +44,7 @@ export function getDataUrl(relativePath) {
 }
 
 export async function loadSiteManifest() {
+  await refreshDataLocation();
   return fetchJson("site_manifest.json");
 }
 
@@ -73,6 +86,7 @@ export async function loadCommanderBuildStyles(commanderSlug, { signal } = {}) {
 }
 
 export async function loadBuildStyleIndex({ signal } = {}) {
+  await refreshDataLocation({ signal });
   const index = await fetchJson("build-styles/index.json", { optional: true, signal, cache: "no-cache" });
   if (index === null) {
     return { schema_version: 1, coverage: "sampled_commanders", total_available: 0, commanders: [] };

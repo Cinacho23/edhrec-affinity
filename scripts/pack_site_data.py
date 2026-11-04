@@ -80,12 +80,12 @@ def site_sizes(root: Path) -> dict:
             "groups": groups, "largest": sorted(largest, reverse=True)[:12]}
 
 
-def pack_site(root: Path, *, max_bytes: int = PAGES_BUDGET_BYTES, workers: int = 2) -> dict:
+def pack_site(root: Path, *, max_bytes: int | None = PAGES_BUDGET_BYTES, workers: int = 2) -> dict:
     root = root.resolve()
     data_dir = root / "data" / "latest"
     if not (data_dir / "site_manifest.json").is_file():
         raise ValueError("Expected a built site with data/latest/site_manifest.json")
-    if not 1 <= workers <= 4 or max_bytes <= 0:
+    if not 1 <= workers <= 4 or (max_bytes is not None and max_bytes <= 0):
         raise ValueError("Invalid compression worker count or size budget")
     # Reject links before following or modifying anything in the build.
     before = site_sizes(root)
@@ -101,7 +101,7 @@ def pack_site(root: Path, *, max_bytes: int = PAGES_BUDGET_BYTES, workers: int =
     result.update({"before_bytes": before["bytes"], "json_bytes": raw_bytes,
                    "encoded_json_bytes": encoded_bytes, "max_bytes": max_bytes})
     print(json.dumps(result, indent=2), flush=True)
-    if result["tar_budget_bytes"] > max_bytes:
+    if max_bytes is not None and result["tar_budget_bytes"] > max_bytes:
         raise ValueError(f"Pages payload exceeds the safe {max_bytes:,}-byte budget: "
                          f"{result['bytes']:,} file bytes; {result['tar_budget_bytes']:,} including archive allowance")
     return result

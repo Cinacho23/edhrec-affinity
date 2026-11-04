@@ -16,7 +16,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 import brotli
@@ -229,6 +229,13 @@ def download_site_data(base_url: str, output_dir: Path) -> None:
         base_url = f"{base_url}/"
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    manifest = fetch_json(base_url, "site_manifest.json")
+    external_base = manifest.get("data_base_url")
+    if external_base:
+        parsed = urlsplit(external_base)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise RuntimeError("Site manifest contains an invalid external data URL")
+        base_url = external_base.rstrip("/") + "/"
     paths = build_download_list(base_url, output_dir)
 
     print(f"Downloading {len(paths)} JSON files into {output_dir}...")

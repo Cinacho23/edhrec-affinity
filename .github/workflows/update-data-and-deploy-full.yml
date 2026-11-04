@@ -222,10 +222,18 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Publish large data to Cloudflare
+        id: static_data
+        uses: ./.github/actions/publish-static-data
+        with:
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       - name: Build frontend
         working-directory: frontend
         env:
           VITE_SITE_DATA_ENCODING: br
+          VITE_SITE_DATA_BASE_URL: ${{ steps.static_data.outputs.data-base-url }}
         run: npm run build
 
       - name: Compress and verify Pages data size

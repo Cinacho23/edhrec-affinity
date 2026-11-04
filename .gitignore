@@ -26,3 +26,8 @@ frontend/public/data/latest/
 
 # Local build-style experiments, reports and imported deck exports.
 data/prototypes/
+
+# Temporary public-data deployment assets and Cloudflare CLI state.
+data/cloudflare-static/
+.wrangler/
+cloudflare/node_modules/
