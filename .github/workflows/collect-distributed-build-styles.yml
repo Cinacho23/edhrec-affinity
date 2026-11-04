@@ -16,6 +16,10 @@ on:
         description: "Source-work budget per VM; 0 means 900 for pilot or 5400 for full collection"
         type: number
         default: 0
+      recover_run_id:
+        description: "Optional interrupted generation to merge from saved worker results, without source requests"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -34,6 +38,7 @@ env:
 jobs:
   plan:
     name: Restore one canonical checkpoint and partition owned work
+    if: inputs.recover_run_id == ''
     runs-on: ubuntu-latest
     # Restore, extract, partition and upload a growing cumulative checkpoint.
     # This budget is independent of each source VM's collection deadline.
@@ -52,6 +57,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/coordinate_build_styles.py preflight --summary-file data/build-style-artifact/build_style_batch.json
+      - name: Prepare disk for the cumulative checkpoint
+        if: steps.ready.outputs.run == 'true'
+        uses: ./.github/actions/prepare-data-runner
       - name: Set up Python
         if: steps.ready.outputs.run == 'true'
         uses: actions/setup-python@v6
@@ -513,15 +521,39 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  merge:
-    name: Merge owned checkpoints and publish one canonical generation
-    needs: [plan, collect, power]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.run == 'true'
+  recover:
+    name: Validate merge-only recovery of saved worker results
+    if: inputs.recover_run_id != ''
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 5
+    outputs:
+      source_run_id: ${{ steps.recovery.outputs.source_run_id }}
+      runners: ${{ steps.recovery.outputs.runners }}
+      pilot: ${{ steps.recovery.outputs.pilot }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+      - name: Verify interrupted generation and immutable recovery inputs
+        id: recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.recover_run_id }}
+        run: python3 scripts/distributed_merge_inputs.py check-recovery --source-run-id "$SOURCE_RUN_ID"
+
+  merge:
+    name: Merge owned checkpoints and publish one canonical generation
+    needs: [plan, collect, power, recover]
+    if: always() && ((needs.plan.result == 'success' && needs.plan.outputs.run == 'true') || needs.recover.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SOURCE_RUN_ID: ${{ needs.recover.outputs.source_run_id || github.run_id }}
+      PILOT: ${{ needs.recover.outputs.pilot || inputs.pilot }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Prepare disk for the cumulative checkpoint
+        uses: ./.github/actions/prepare-data-runner
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -532,31 +564,32 @@ jobs:
       - name: Download the unchanged canonical baseline
         uses: actions/download-artifact@v4
         with:
-          name: distributed-base-${{ github.run_id }}
+          name: distributed-base-${{ env.SOURCE_RUN_ID }}
           path: ${{ env.STYLES_DIR }}
-      - name: Download original owned shards for interrupted-machine fallback
-        uses: actions/download-artifact@v4
-        with:
-          pattern: distributed-input-${{ github.run_id }}-*
-          path: data/distributed-inputs
-          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
       - name: Download the pinned generation manifest
         uses: actions/download-artifact@v4
         with:
-          name: distributed-shared-${{ github.run_id }}
+          name: distributed-shared-${{ env.SOURCE_RUN_ID }}
           path: data/distributed-shared
-      - name: Download completed machine results and public-egress evidence
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: distributed-result-${{ github.run_id }}-*
-          path: data/distributed-results
+          github-token: ${{ github.token }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+      - name: Download each completed result or its required fallback once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -u scripts/distributed_merge_inputs.py restore --source-run-id "$SOURCE_RUN_ID" \
+            --manifest data/distributed-shared/manifest.json \
+            --results data/distributed-results --inputs data/distributed-inputs
       - name: Download parallel power observations if available
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: distributed-power-${{ github.run_id }}
+          name: distributed-power-${{ env.SOURCE_RUN_ID }}
           path: data/distributed-power
+          github-token: ${{ github.token }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
       - name: Merge only each machine's assigned commander state
         id: merged
         run: |
@@ -565,7 +598,7 @@ jobs:
           python scripts/distributed_build_styles.py merge \
             --base "${STYLES_DIR}" --manifest data/distributed-shared/manifest.json \
             --results data/distributed-results --inputs data/distributed-inputs \
-            --output-summary data/build-style-artifact/build_style_batch.json --generation "${GITHUB_RUN_ID}"
+            --output-summary data/build-style-artifact/build_style_batch.json --generation "${SOURCE_RUN_ID}"
       - name: Apply power results only to exact or unchanged parent lists
         if: steps.merged.outcome == 'success'
         run: |
@@ -587,7 +620,7 @@ jobs:
               --inputs data/distributed-results/power-metadata --output data/raw/build-style-card-metadata.json
           fi
       - name: Assess the two-machine pilot without automatically increasing runners
-        if: inputs.pilot == true && steps.merged.outcome == 'success'
+        if: env.PILOT == 'true' && steps.merged.outcome == 'success'
         run: |
           python scripts/check_distributed_pilot.py assess \
             --manifest data/distributed-shared/manifest.json --summaries-dir data/distributed-results \
@@ -595,7 +628,7 @@ jobs:
       - name: Include guarded power and pilot results in the publication summary
         if: steps.merged.outcome == 'success'
         env:
-          PILOT: ${{ inputs.pilot }}
+          RECOVERED_FROM: ${{ needs.recover.outputs.source_run_id }}
         run: |
           python - <<'PY'
           import json, os
@@ -603,6 +636,8 @@ jobs:
           root = Path("data/build-style-artifact")
           path = root / "build_style_batch.json"
           summary = json.loads(path.read_text())
+          if os.environ.get("RECOVERED_FROM"):
+              summary["recovered_from_run_id"] = int(os.environ["RECOVERED_FROM"])
           power = root / "power-delta-merge.json"
           if power.exists():
               merged = json.loads(power.read_text())
@@ -667,7 +702,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/coordinate_build_styles.py publish --source-run-id "${GITHUB_RUN_ID}"
       - name: Continue approved full collection from this uploaded generation
-        if: inputs.pilot != true && steps.checkpoint.outcome == 'success' && steps.summary.outcome == 'success'
+        if: env.PILOT != 'true' && steps.checkpoint.outcome == 'success' && steps.summary.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/coordinate_build_styles.py continue --source-run-id "${GITHUB_RUN_ID}" --distributed-runners "${{ needs.plan.outputs.runners }}"
+        run: python3 scripts/coordinate_build_styles.py continue --source-run-id "${GITHUB_RUN_ID}" --distributed-runners "${{ needs.recover.outputs.runners || needs.plan.outputs.runners }}"

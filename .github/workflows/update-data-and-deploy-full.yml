@@ -34,6 +34,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Prepare disk for exported data
+        uses: ./.github/actions/prepare-data-runner
+
       - name: Compute snapshot date
         shell: bash
         run: |

@@ -102,7 +102,13 @@ runs:
             rm -rf "${staging}"
             continue
           fi
-          cp -a "${staging}/." "${BUILD_STYLE_DESTINATION}/"
+          # Both directories are disposable copies of the immutable artifact.
+          # Move validated files instead of retaining a second full dataset.
+          python - "${staging}" "${BUILD_STYLE_DESTINATION}" <<'PY'
+        import shutil
+        import sys
+        shutil.copytree(sys.argv[1], sys.argv[2], dirs_exist_ok=True, copy_function=shutil.move)
+        PY
           rm -rf "${staging}"
           echo "Restored ${artifact_name} from run ${run_id}."
           echo "restored=true" >> "${GITHUB_OUTPUT}"

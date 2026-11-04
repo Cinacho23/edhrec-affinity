@@ -40,8 +40,8 @@ def test_distributed_workflow_uses_real_vm_matrix_and_separate_parallel_power_jo
     assert "needs: plan" in power and "needs: collect" not in power
     assert "inputs.pilot != true" in power
     assert "--workers 2" in power and "--max-runtime-seconds 1800" in power
-    assert "needs: [plan, collect, power]" in workflow
-    assert "if: always() && needs.plan.result == 'success'" in workflow
+    assert "needs: [plan, collect, power, recover]" in workflow
+    assert "if: always() && ((needs.plan.result == 'success'" in workflow
 
 
 def test_preparation_has_one_hour_without_changing_source_work_budgets():
@@ -100,7 +100,8 @@ def test_only_merger_uploads_a_canonical_restore_candidate():
     for worker in range(16):
         assert f"name: distributed-input-${{{{ github.run_id }}}}-{worker}" in workflow
     merger = workflow.split("  merge:\n", 1)[1]
-    assert "distributed-input-${{ github.run_id }}-*" in merger
+    assert "distributed-input-${{ github.run_id }}-*" not in merger
+    assert "distributed_merge_inputs.py restore" in merger
     assert "--inputs data/distributed-inputs" in merger
     assert "--generation" in merger
     assert merger.index("Merge only each machine's assigned commander state") < merger.index(
@@ -145,12 +146,26 @@ def test_pilot_is_two_machines_bounded_and_requires_explicit_review_for_scale_up
     assert "900 if pilot else 5400" in script
     assert "pilot and seconds > 1800" in script
     body, script = step("Assess the two-machine pilot without automatically increasing runners")
-    assert "inputs.pilot == true" in body
+    assert "env.PILOT == 'true'" in body
     assert "check_distributed_pilot.py assess" in script
     body, script = step("Continue approved full collection from this uploaded generation")
-    assert "inputs.pilot != true" in body
-    assert '--distributed-runners "${{ needs.plan.outputs.runners }}"' in script
+    assert "env.PILOT != 'true'" in body
+    assert '--distributed-runners "${{ needs.recover.outputs.runners || needs.plan.outputs.runners }}"' in script
     assert "actions/variables" not in workflow
+
+
+def test_merge_only_recovery_skips_source_jobs_and_publishes_a_new_durable_checkpoint():
+    workflow = WORKFLOW.read_text()
+    plan = workflow.split("  plan:\n", 1)[1].split("  collect:\n", 1)[0]
+    assert "if: inputs.recover_run_id == ''" in plan
+    recovery = workflow.split("  recover:\n", 1)[1].split("  merge:\n", 1)[0]
+    assert "if: inputs.recover_run_id != ''" in recovery
+    assert "check-recovery" in recovery and "--fetch" not in recovery
+    merger = workflow.split("  merge:\n", 1)[1]
+    assert "needs.recover.result == 'success'" in merger
+    assert 'generation "${SOURCE_RUN_ID}"' in merger
+    assert "name: build-styles-distributed-${{ github.run_id }}" in merger
+    assert "recovered_from_run_id" in merger
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="Requires bash")

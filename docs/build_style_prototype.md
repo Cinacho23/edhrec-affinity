@@ -524,6 +524,40 @@ For a local run after restoring the cumulative artifact and card metadata cache:
 `--commander` restricts a local experiment; the workflow's blank commander input
 continues the whole eligible catalog. No bulk API or completion date is assumed.
 
+## Distributed merge storage and recovery
+
+The merger restores one canonical baseline and one artifact per worker. It
+prefers the saved result and downloads the original input only when that worker
+has no available result. Downloading both sets previously consumed about 9 GB of
+redundant storage in the November 4 batch and exhausted the hosted runner before
+merge validation could begin.
+
+`distributed_merge_inputs.py` selects the exact generation, checks the combined
+artifact download size plus extraction allowance and a 2 GiB reserve, and
+downloads selected artifacts sequentially. The existing merger still verifies
+archive hashes, commander ownership, generation markers and source controls
+before committing canonical files. An available but corrupt result fails
+validation; it does not silently become an older fallback.
+
+Heavy planning, merging and publishing jobs reclaim unused preinstalled SDK and
+container-image space only on disposable GitHub-hosted Linux runners. The
+restore action moves validated temporary checkpoint files into the working
+directory instead of making a second full copy. Saved artifacts and collected
+decks are retained.
+
+If a distributed generation failed after workers uploaded results, dispatch
+**Collect commander builds on distributed runners** with `recover_run_id` set
+to that failed run ID. The recovery job verifies its default-branch origin,
+successful plan and unexpired artifacts, and refuses rollback over a newer
+canonical checkpoint. Planning, source collection and external validation jobs
+are skipped. The original manifest supplies runner count and pilot scope.
+
+The merger uses the original generation's baseline and worker receipts, then
+uploads a new canonical artifact and summary under the recovery run ID. The
+summary records `recovered_from_run_id`. Original rate limits, cooldowns and
+source stops remain authoritative; the normal coordinator decides whether
+automatic continuation is allowed after successful recovery.
+
 ## Local deck imports
 
 A folder of `.txt` or `.json` exports can replace or supplement previews:

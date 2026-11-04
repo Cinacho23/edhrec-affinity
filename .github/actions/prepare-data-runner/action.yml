@@ -1,0 +1,23 @@
+name: Prepare disk for large data checkpoints
+description: Free unused preinstalled SDKs on disposable GitHub-hosted Linux runners
+runs:
+  using: composite
+  steps:
+    - name: Reclaim unused hosted-runner SDK and container space
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" || "${RUNNER_OS:-}" != "Linux" ]]; then
+          echo 'Skipping cleanup outside a disposable GitHub-hosted Linux runner.'
+          exit 0
+        fi
+        echo 'Available disk before checkpoint preparation:'
+        df -h "$GITHUB_WORKSPACE"
+        # This Python/Node pipeline does not use .NET, Android, Haskell, CodeQL,
+        # or preloaded container images. No repository data or artifacts are deleted.
+        sudo rm -rf -- /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        if command -v docker >/dev/null && sudo docker info >/dev/null 2>&1; then
+          sudo docker image prune --all --force
+        fi
+        echo 'Available disk after checkpoint preparation:'
+        df -h "$GITHUB_WORKSPACE"
