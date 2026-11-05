@@ -532,15 +532,18 @@ test("exact-list local scores supply every package's power bracket when external
 test("stale, foreign-list or unsupported local calculations never acquire a current power bracket", () => {
   const checked_at = "2026-10-20T12:00:00Z";
   const now = Date.parse(checked_at);
-  const week = 7 * 24 * 3600 * 1000;
+  const month = 30 * 24 * 3600 * 1000;
   const deck_sha256 = "a".repeat(64);
   const calculated_power = { status: "calculated", source: "local_public_formula", power_formula_version: 1,
     checked_at, power_level: 6.71, score_bracket: 4, deck_sha256 };
   const deck = { status: "generated", validation: { deck_sha256, calculated_power, bracket: { recommended: 4 } } };
-  for (const time of [now - 5 * 60 * 1000 - 1, now + week, now + 2 * week]) {
+  for (const time of [now - 5 * 60 * 1000 - 1, now + month, now + 2 * month]) {
     assert.equal(getPackageBracketLabel(deck, time), "Power bracket unverified");
   }
-  assert.equal(getPackageBracketLabel(deck, now + week - 1), "Power 6.71 · Bracket 3 · local estimate");
+  for (const days of [7, 14, 29]) {
+    assert.equal(getPackageBracketLabel(deck, now + days * 24 * 3600 * 1000), "Power 6.71 · Bracket 3 · local estimate");
+  }
+  assert.equal(getPackageBracketLabel(deck, now + month - 1), "Power 6.71 · Bracket 3 · local estimate");
   for (const changed of [{ status: "unavailable" }, { source: "external" }, { power_formula_version: 2 },
     { checked_at: "unknown" }, { power_level: "6.71+" }, { deck_sha256: "b".repeat(64) }]) {
     assert.equal(getPackageBracketLabel({ ...deck, validation: { ...deck.validation,

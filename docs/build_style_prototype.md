@@ -274,7 +274,10 @@ the deck and input hashes, formula version, source-script hash and oldest
 input date. It makes no scoring-site requests. The selected Scryfall printing
 and data date can differ from the live site's lowest-price printing and cache,
 so these scores are labeled **local power estimates**, never verified external
-results. A verified external observation takes precedence. Price is an input
+results. The frontend displays an exact-list local estimate for up to 30 days
+from its oldest input date, across commander packages and Build Discovery.
+External observations and restriction evidence retain their seven-day freshness
+checks. A verified external observation takes precedence. Price is an input
 to the published power formula. Null-price printings trigger a bounded,
 paced Scryfall search for a priced physical printing of the same Oracle card;
 the original printing and dated price evidence are preserved. Missing prices

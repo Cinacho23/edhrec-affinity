@@ -95,6 +95,7 @@ export function getDeckMixtureRows(model, selectedPackage = "all", threshold = 0
 }
 
 const BUILD_EVIDENCE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const LOCAL_POWER_ESTIMATE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const BUILD_EVIDENCE_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
 
 const BUILD_SOURCE_TARGET_HOURS = 96;
@@ -225,7 +226,7 @@ export function getGeneratedDeckPowerRating(deck, now = Date.now()) {
   const scoreBracket = bracketForBuildPowerScore(calculated.power_level);
   const checkedAt = typeof calculated.checked_at === "string" ? Date.parse(calculated.checked_at) : NaN;
   if (scoreBracket === null || !Number.isFinite(now) || !Number.isFinite(checkedAt)
-      || checkedAt > now + BUILD_EVIDENCE_FUTURE_TOLERANCE_MS || now - checkedAt >= BUILD_EVIDENCE_MAX_AGE_MS) return null;
+      || checkedAt > now + BUILD_EVIDENCE_FUTURE_TOLERANCE_MS || now - checkedAt >= LOCAL_POWER_ESTIMATE_MAX_AGE_MS) return null;
   return { ...calculated, scoreBracket, kind: "local", label: "local power estimate" };
 }
 
