@@ -416,6 +416,12 @@ For an expired access restriction, an explicit **Update commander build styles**
 
 Provider-stop diagnostics retain the provider, endpoint, HTTP status and Retry-After timing through worker checkpoints and merged summaries. A confirmed Scryfall HTTP429 is a timed rate-limit pause; HTTP401/403 and challenges require review. Scryfall throttling does not lower EDHREC's learned rate. Distributed source VMs and the power VM divide a conservative five metadata requests/second average budget; this is local pacing rather than a centralized instantaneous burst limit. Multiple workers reporting confirmed metadata throttles pause the whole generation. Scryfall recommends staying below ten requests/second and reducing load after HTTP429 ([Scryfall access guidance](https://scryfall.com/docs/faqs/i-m-having-trouble-accessing-the-scryfall-api-or-i-m-blocked-17)).
 
+A worker's recorded HTTP429 pause remains an explained exit if its cooldown
+expires before the distributed merge finishes. Matching worker-state and
+pipeline stop evidence is required for this classification. The saved limiter,
+cooldown and provider diagnostics remain intact; unknown failures, access
+restrictions and correlated throttles still prevent automatic continuation.
+
 An October 22, 2026 local recovery check read the previously failing Timin preview and 126 Ghave decks with no format errors, then stopped on HTTP 429 after about 65 seconds at 1.96 successful requests per second. This confirms format recovery, but does not establish the request rate available to GitHub runners.
 
 Inspect the current catalog and request-only capacity without fetching data:

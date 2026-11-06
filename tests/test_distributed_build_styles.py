@@ -305,6 +305,64 @@ def test_correlated_throttles_stop_global_automatic_collection(tmp_path):
     assert not summary["continuation_needed"]
 
 
+@pytest.mark.parametrize("provider", ["edhrec", "scryfall"])
+def test_rate_limit_expiring_before_merge_does_not_disable_continuation(tmp_path, provider):
+    base, inputs, manifest = planned(tmp_path)
+    root, results, _ = run_worker(tmp_path, inputs, manifest, "0", blocked=True)
+    until = core.now() - timedelta(minutes=30)
+    stop = {"provider": provider, "reason": "rate_limit", "status_code": 429,
+            "observed_at": (until - timedelta(hours=1)).isoformat(),
+            "retry_at": (until - timedelta(minutes=59)).isoformat()}
+    state = core.read_json(root / core.STATE)
+    state.update(blocked_until=until.isoformat(), block_reason="rate_limit", source_stop=stop)
+    write(root / core.STATE, state)
+    pipeline = core.read_json(root.parent / "build_style_batch.json")
+    pipeline.update(blocked=True, block_reason="rate_limit", source_stop=stop)
+    write(root.parent / "build_style_batch.json", pipeline)
+    core.checkpoint(inputs / "manifest.json", "0", root, results, exit_code=1)
+    run_worker(tmp_path, inputs, manifest, "1")
+    summary = merge(tmp_path, base, inputs)
+    assert summary["automatic_continuation_allowed"] and summary["continuation_needed"]
+    assert summary["distributed"]["failed_workers"] == []
+    assert not summary["blocked"]
+    saved = core.read_json(base / core.STATE)["distributed"]["workers"]["0"]
+    assert saved["blocked_until"] == until.isoformat() and saved["source_stop"] == stop
+    assert saved["source_rate"]["learned_rate"] == 1.0
+
+
+@pytest.mark.parametrize("change", ["missing_stop", "unconfirmed_stop", "foreign_stop", "access", "unknown_exit", "invalid_retry"])
+def test_expired_pause_does_not_explain_unknown_or_restricted_worker_failure(tmp_path, change):
+    base, inputs, manifest = planned(tmp_path)
+    root, results, _ = run_worker(tmp_path, inputs, manifest, "0", blocked=True)
+    until = core.now() - timedelta(minutes=30)
+    stop = {"provider": "scryfall", "reason": "rate_limit", "status_code": 429,
+            "observed_at": (until - timedelta(hours=1)).isoformat()}
+    state = core.read_json(root / core.STATE)
+    state.update(blocked_until=until.isoformat(), block_reason="rate_limit", source_stop=stop)
+    pipeline = core.read_json(root.parent / "build_style_batch.json")
+    pipeline.update(blocked=True, block_reason="rate_limit", source_stop=deepcopy(stop))
+    if change == "missing_stop":
+        state.pop("source_stop")
+    elif change == "unconfirmed_stop":
+        pipeline["source_stop"]["status_code"] = 503
+    elif change == "foreign_stop":
+        pipeline["source_stop"]["provider"] = "other"
+    elif change == "access":
+        state["block_reason"] = "access_restriction"
+    elif change == "invalid_retry":
+        state["source_stop"]["retry_at"] = (until + timedelta(hours=1)).isoformat()
+        pipeline["source_stop"] = deepcopy(state["source_stop"])
+    write(root / core.STATE, state)
+    write(root.parent / "build_style_batch.json", pipeline)
+    core.checkpoint(inputs / "manifest.json", "0", root, results, exit_code=137 if change == "unknown_exit" else 1)
+    run_worker(tmp_path, inputs, manifest, "1")
+    summary = merge(tmp_path, base, inputs)
+    assert summary["distributed"]["failed_workers"] == ["0"]
+    assert not summary["automatic_continuation_allowed"] and not summary["continuation_needed"]
+    if change == "access":
+        assert summary["blocked"] and summary["block_reason"] == "access_restriction"
+
+
 def test_correlated_metadata429s_pause_pool_without_reducing_edhrec_rate(tmp_path):
     base, inputs, manifest = planned(tmp_path)
     for worker in manifest["workers"]:

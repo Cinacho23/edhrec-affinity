@@ -471,6 +471,29 @@ def source_window(summary):
     return None
 
 
+def expected_worker_pause(summary, checked_at):
+    """A recorded HTTP429 remains an explained exit after its cooldown expires."""
+    control = summary.get("source_control") or {}
+    until = timestamp(control.get("blocked_until"))
+    reason = control.get("block_reason")
+    if until is None or reason not in {"rate_limit", "access_restriction"}:
+        return False
+    if until > checked_at:
+        return True
+    pipeline = summary.get("pipeline_summary") or {}
+    stop = control.get("source_stop")
+    if (reason != "rate_limit" or summary.get("exit_code") != 1
+            or pipeline.get("blocked") is not True or pipeline.get("block_reason") != "rate_limit"
+            or not isinstance(stop, dict) or pipeline.get("source_stop") != stop
+            or stop.get("reason") != "rate_limit" or stop.get("status_code") != 429
+            or stop.get("provider") not in {"edhrec", "scryfall"}):
+        return False
+    observed = timestamp(stop.get("observed_at"))
+    retry = timestamp(stop.get("retry_at"))
+    return (observed is not None and observed < until
+            and (stop.get("retry_at") is None or retry is not None and observed <= retry <= until))
+
+
 def production_queue_plan(state, rows, published, scratch):
     """Reuse the production dry-run queue for freshness and policy decisions.
 
@@ -679,8 +702,7 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
             for s in actual_summaries if s.get("pipeline_summary", {}).get("resource_limit")}
         fallback = [s["worker_id"] for s in summaries if s["checkpoint"].get("used_fallback")]
         unsafe_failures = [s["worker_id"] for s in summaries if s.get("exit_code") not in {0, None}
-            and not ((until := timestamp(s.get("source_control", {}).get("blocked_until"))) and until > now()
-                     and s.get("source_control", {}).get("block_reason") in {"rate_limit", "access_restriction"})]
+            and not expected_worker_pause(s, now())]
         summary = {"schema_version": 1, "snapshot_date": now().astimezone(ZoneInfo("America/Toronto")).date().isoformat(),
             "pipeline_version": 1, "distributed": {"generation": manifest["generation"], "runners": manifest["runners"],
                 "pilot": manifest["pilot"], "systemic_block": systemic, "workers": summaries,
