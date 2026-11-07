@@ -548,6 +548,15 @@ archive hashes, commander ownership, generation markers and source controls
 before committing canonical files. An available but corrupt result fails
 validation; it does not silently become an older fallback.
 
+Each worker archive is decompressed in two forward-only passes: one validates
+every member and stages reports and controls, and one commits the validated
+files. Parsed deck caches are never staged as a second full dataset. File sizes
+collected during validation are reused for the disk-reserve check. This removes
+the repeated archive scans and gzip rewinds that exceeded the one-hour merge
+budget on November 6. Progress logs identify validated and committed workers.
+The merge job has a separate 120-minute transfer, merge and upload budget;
+collection request rates and source-work deadlines are unchanged.
+
 Heavy planning, merging and publishing jobs reclaim unused preinstalled SDK and
 container-image space only on disposable GitHub-hosted Linux runners. The
 restore action moves validated temporary checkpoint files into the working

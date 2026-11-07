@@ -503,18 +503,30 @@ def test_merge_streams_caches_without_staging_another_full_copy(tmp_path, monkey
         (root / "_collection/previews" / f"{slug}.json.gz").write_bytes(content)
         expected[slug] = content
         core.checkpoint(inputs / "manifest.json", worker["id"], root, results)
-    extractor = core.extract_archive
+    extractor = core.stage_merge_archive
     observed = []
+    archive_reads = []
+    open_archive = core.tarfile.open
+    def track_open(path, mode="r", *args, **kwargs):
+        archive_reads.append((Path(path).name, mode))
+        return open_archive(path, mode, *args, **kwargs)
     def inspect(*args, **kwargs):
-        selected = kwargs["selected"]
-        assert selected(core.STATE)
-        assert selected("a-large.json")
-        assert not selected("_collection/previews/a-large.json.gz")
+        result = extractor(*args, **kwargs)
+        destination = Path(args[1])
+        assert (destination / core.STATE).is_file()
+        assert list(destination.glob("*.json"))
+        assert not (destination / "_collection/previews").exists()
         observed.append(True)
-        return extractor(*args, **kwargs)
-    monkeypatch.setattr(core, "extract_archive", inspect)
+        return result
+    def no_random_access(_archive):
+        raise AssertionError("Merge must not scan and rewind compressed archives")
+    monkeypatch.setattr(core, "stage_merge_archive", inspect)
+    monkeypatch.setattr(core.tarfile, "open", track_open)
+    monkeypatch.setattr(core.tarfile.TarFile, "getmembers", no_random_access)
     summary = merge(tmp_path, base, inputs)
     assert len(observed) == 2
+    for worker in manifest["workers"]:
+        assert [mode for name, mode in archive_reads if name == f"shard-{worker['id']}-result.tar.gz"] == ["r|gz", "r|gz"]
     for slug, content in expected.items():
         assert (base / "_collection/previews" / f"{slug}.json.gz").read_bytes() == content
     storage = summary["distributed"]["storage"]
@@ -524,6 +536,38 @@ def test_merge_streams_caches_without_staging_another_full_copy(tmp_path, monkey
     assert state["progress"]["rate_control"]["learned_rate"] == 2 * core.SEED_REQUEST_RATE
     assert state["source_rate"]["learned_rate"] == core.SEED_REQUEST_RATE
     assert state["progress"]["distributed"]["runners"] == 2
+
+
+@pytest.mark.parametrize("kind", ["traversal", "symlink", "hardlink", "duplicate", "unowned"])
+def test_streaming_merge_rejects_unsafe_late_members_before_canonical_changes(tmp_path, kind):
+    base, inputs, manifest = planned(tmp_path)
+    for worker in manifest["workers"]:
+        _, _, _ = run_worker(tmp_path, inputs, manifest, worker["id"])
+    worker = manifest["workers"][-1]
+    result = tmp_path / "results" / f"artifact-{worker['id']}"
+    receipt_path = result / f"shard-{worker['id']}-summary.json"
+    receipt = core.read_json(receipt_path)
+    archive_path = result / receipt["checkpoint"]["archive"]
+    with tarfile.open(archive_path, "r:gz") as archive:
+        original = [(member, archive.extractfile(member).read()) for member in archive.getmembers()]
+    with tarfile.open(archive_path, "w:gz") as archive:
+        for member, content in original:
+            archive.addfile(member, io.BytesIO(content))
+        name = {"traversal": "../escape", "unowned": "unowned.json", "duplicate": original[0][0].name}.get(kind, "link")
+        item = tarfile.TarInfo(name)
+        if kind in {"symlink", "hardlink"}:
+            item.type = tarfile.SYMTYPE if kind == "symlink" else tarfile.LNKTYPE
+            item.linkname = "../escape"
+            archive.addfile(item)
+        else:
+            item.size = 2
+            archive.addfile(item, io.BytesIO(b"{}"))
+    receipt["checkpoint"]["sha256"] = core.digest(archive_path)
+    write(receipt_path, receipt)
+    before = {path.relative_to(base): path.read_bytes() for path in base.rglob("*") if path.is_file()}
+    with pytest.raises(ValueError, match="Unsafe|unowned"):
+        merge(tmp_path, base, inputs)
+    assert before == {path.relative_to(base): path.read_bytes() for path in base.rglob("*") if path.is_file()}
 
 
 def test_insufficient_stage_disk_preserves_canonical_and_original_inputs(tmp_path, monkeypatch):

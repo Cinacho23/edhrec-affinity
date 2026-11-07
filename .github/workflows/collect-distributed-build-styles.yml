@@ -545,7 +545,9 @@ jobs:
     needs: [plan, collect, power, recover]
     if: always() && ((needs.plan.result == 'success' && needs.plan.outputs.run == 'true') || needs.recover.result == 'success')
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Download, validate, commit and upload the cumulative dataset separately
+    # from the unchanged per-VM source-work deadlines.
+    timeout-minutes: 120
     env:
       SOURCE_RUN_ID: ${{ needs.recover.outputs.source_run_id || github.run_id }}
       PILOT: ${{ needs.recover.outputs.pilot || inputs.pilot }}
@@ -595,7 +597,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p data/distributed-results data/distributed-power data/raw
-          python scripts/distributed_build_styles.py merge \
+          python -u scripts/distributed_build_styles.py merge \
             --base "${STYLES_DIR}" --manifest data/distributed-shared/manifest.json \
             --results data/distributed-results --inputs data/distributed-inputs \
             --output-summary data/build-style-artifact/build_style_batch.json --generation "${SOURCE_RUN_ID}"

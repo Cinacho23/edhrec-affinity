@@ -51,6 +51,9 @@ def test_preparation_has_one_hour_without_changing_source_work_budgets():
     source = workflow.split("  collect:\n", 1)[1].split("  power:\n", 1)[0]
     assert "    timeout-minutes: 360" in source
     assert "900 if pilot else 5400" in preparation
+    merging = workflow.split("  merge:\n", 1)[1]
+    assert "    timeout-minutes: 120" in merging
+    assert "python -u scripts/distributed_build_styles.py merge" in merging
 
 
 def test_watchdog_checks_collector_completion_and_deployment_without_waiting_for_cron():

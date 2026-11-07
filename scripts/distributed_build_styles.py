@@ -20,6 +20,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+import time
 from zoneinfo import ZoneInfo
 
 from edhrec_affinity.build_styles.capacity import plan_capacity
@@ -194,10 +195,10 @@ def archive_files(destination, files, extra):
     return len(files) + len(extra)
 
 
-def archive_members(archive, owned=None, *, shared_inputs=False):
-    """Preflight every member before extraction; links and special files fail."""
-    found, total = {}, 0
-    for member in archive.getmembers():
+def iter_archive_members(archive, owned=None, *, shared_inputs=False):
+    """Validate members in archive order without seeking through compressed data."""
+    found, total = set(), 0
+    for member in archive:
         name = member.name
         path = PurePosixPath(name)
         if (member.isdir() or not member.isfile() or path.is_absolute() or ".." in path.parts
@@ -209,8 +210,36 @@ def archive_members(archive, owned=None, *, shared_inputs=False):
         total += member.size
         if total > MAX_BYTES or len(found) >= MAX_FILES:
             raise ValueError("Checkpoint archive exceeds resource bounds")
-        found[name] = member
-    return found
+        found.add(name)
+        yield name, member
+
+
+def archive_members(archive, owned=None, *, shared_inputs=False):
+    """Preflight every member before extraction; links and special files fail."""
+    return dict(iter_archive_members(archive, owned, shared_inputs=shared_inputs))
+
+
+def stage_merge_archive(path, destination, *, owned, shared_inputs=False):
+    """Validate the full archive and stage only reports and controls in one pass.
+
+    The destination is private merge scratch. Canonical files remain untouched
+    until every worker archive and report identity has passed validation.
+    """
+    destination = Path(destination)
+    sizes, staged_bytes = {}, 0
+    with tarfile.open(path, "r|gz", bufsize=1024 ** 2) as archive:
+        for name, member in iter_archive_members(archive, owned, shared_inputs=shared_inputs):
+            sizes[name] = member.size
+            if name not in {STATE, MARKER, MACHINE} and "/" in name:
+                continue
+            if shutil.disk_usage(destination.parent).free < member.size + MIN_DISK_RESERVE_BYTES:
+                raise ValueError("Insufficient free disk to stage validated distributed reports; checkpoint inputs remain durable")
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.extractfile(member) as source, target.open("wb") as output:
+                shutil.copyfileobj(source, output, length=1024 ** 2)
+            staged_bytes += member.size
+    return sizes, staged_bytes
 
 
 def extract_archive(path, destination, *, owned=None, shared_inputs=False, selected=None):
@@ -517,6 +546,7 @@ def production_queue_plan(state, rows, published, scratch):
 
 
 def merge(base, manifest_path, results, inputs, output_summary, *, generation=None):
+    started_at = time.monotonic()
     base, manifest_path, results, inputs = map(Path, (base, manifest_path, results, inputs))
     manifest = load_manifest(manifest_path)
     if generation is not None and str(generation) != manifest["generation"]:
@@ -530,7 +560,9 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
         if current != expected:
             raise ValueError("Canonical commander report changed since planning")
     state = checked_state(read_json(state_path)) if state_path.exists() else {"schema_version": 1, "commanders": {}}
+    print(f"Verified canonical baseline in {time.monotonic() - started_at:.1f}s", flush=True)
     staged, summaries, missing = [], [], []
+    archive_sizes = {}
     staged_report_bytes = 0
     # All archives, summaries and ownership are validated before the first
     # canonical file changes. A missing result uses its immutable original.
@@ -559,20 +591,16 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
                     "checkpoint": {"archive": worker["archive"], "sha256": worker["archive_sha256"],
                                    "valid": True, "used_fallback": True, "fallback_reason": "Worker returned no checkpoint"}}
             destination = Path(temporary) / worker["id"]
-            with tarfile.open(archive, "r:gz") as stream:
-                inspected = archive_members(stream, set(worker["commanders"]),
-                    shared_inputs=summary["checkpoint"].get("used_fallback") is True)
-                report_bytes = sum(member.size for name, member in inspected.items()
-                    if name in {STATE, MARKER, MACHINE} or "/" not in name)
-            if shutil.disk_usage(Path(temporary)).free < report_bytes + MIN_DISK_RESERVE_BYTES:
-                raise ValueError("Insufficient free disk to stage validated distributed reports; checkpoint inputs remain durable")
+            sizes, report_bytes = stage_merge_archive(archive, destination, owned=set(worker["commanders"]),
+                shared_inputs=summary["checkpoint"].get("used_fallback") is True)
+            archive_sizes[archive] = sizes
             staged_report_bytes += report_bytes
-            names = extract_archive(archive, destination, owned=set(worker["commanders"]),
-                                    shared_inputs=summary["checkpoint"].get("used_fallback") is True,
-                                    selected=lambda name: name in {STATE, MARKER, MACHINE} or "/" not in name)
+            names = list(sizes)
             worker_state = validate_tree(destination, manifest, worker)
             staged.append((worker, worker_state, destination, names, archive))
             summaries.append(summary)
+            print(f"Validated worker {worker['id']}: {len(names):,} files, {report_bytes:,} staged bytes; "
+                  f"{time.monotonic() - started_at:.1f}s elapsed", flush=True)
         merged = deepcopy(state)
         distributed = merged.setdefault("distributed", {})
         controls = distributed.setdefault("workers", {})
@@ -723,10 +751,7 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
             "new_previews_attempted": sum(int(s.get("pipeline_summary", {}).get("new_previews_attempted") or 0) for s in actual_summaries),
             "min_total_decks": 200, "no_fixed_completion_deadline": True,
             "model_policy": due["model_policy"], "tag_label_policy": due["tag_label_policy"]}
-        sizes, growth, delta = {}, 0, 0
-        for archive_path in {item[0] for item in pending_copies}:
-            with tarfile.open(archive_path, "r:gz") as stream:
-                sizes[archive_path] = {item.name: item.size for item in stream.getmembers()}
+        sizes, growth, delta = archive_sizes, 0, 0
         for archive_path, name, target in pending_copies:
             old = target.stat().st_size if target.exists() else 0
             change = sizes[archive_path][name] - old
@@ -753,14 +778,21 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
         for archive, name, target in pending_copies:
             by_archive.setdefault(archive, []).append((name, target))
         for archive_path, copies in by_archive.items():
-            with tarfile.open(archive_path, "r:gz") as archive:
-                members = {member.name: member for member in archive.getmembers()}
-                for name, target in copies:
+            targets = dict(copies)
+            with tarfile.open(archive_path, "r|gz", bufsize=1024 ** 2) as archive:
+                for member in archive:
+                    target = targets.pop(member.name, None)
+                    if target is None:
+                        continue
                     target.parent.mkdir(parents=True, exist_ok=True)
                     temporary_target = target.with_suffix(target.suffix + ".tmp")
-                    with archive.extractfile(members[name]) as source, temporary_target.open("wb") as output:
+                    with archive.extractfile(member) as source, temporary_target.open("wb") as output:
                         shutil.copyfileobj(source, output, length=1024 ** 2)
                     temporary_target.replace(target)
+            if targets:
+                raise ValueError("Validated worker archive lost expected checkpoint files")
+            print(f"Committed {len(copies):,} files from {archive_path.name}; "
+                  f"{time.monotonic() - started_at:.1f}s elapsed", flush=True)
         atomic_json(state_path, merged)
         atomic_json(output_summary, summary)
         return summary
