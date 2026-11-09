@@ -196,7 +196,16 @@ def _deck_roles(counts, metadata):
 
     def matches(card, qualifier):
         types = card.get("type_line", "").casefold().replace("—", " ").split()
-        if qualifier.startswith("non") and qualifier[3:] in {"land", "creature", "artifact"}:
+        if qualifier == "historic":
+            return bool(set(types) & {"artifact", "legendary", "saga"})
+        if qualifier == "permanent":
+            return bool(set(types) & {"artifact", "creature", "enchantment", "planeswalker", "battle", "land"})
+        if qualifier in {"face-down", "this", "those", "these"}:
+            return None
+        if qualifier.startswith("non") and qualifier[3:] in {
+                "land", "creature", "artifact", "enchantment", "legendary", "snow", "permanent"}:
+            if qualifier == "nonpermanent":
+                return bool(set(types) & {"instant", "sorcery"})
             return qualifier[3:] not in types
         if qualifier in {"white", "blue", "black", "red", "green", "colorless", "colored"}:
             colors = card.get("colors")

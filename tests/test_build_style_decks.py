@@ -2088,3 +2088,17 @@ def test_retained_repair_cannot_bypass_cleanup_or_transfer_its_old_external_rati
     assert result["statistics"]["support_cleanup"]["previous_score_bracket_repair"]["status"] == "retained"
     assert result["validation"]["external_rating"]["status"] == "unverified"
     assert result["validation"]["restriction_validation"]["status"] == "pending"
+
+
+@pytest.mark.parametrize("qualifier,target_type,expected", [
+    ("Historic", "Artifact", ["Ramp"]), ("Historic", "Legendary Creature — Human", ["Ramp"]),
+    ("Historic", "Enchantment — Saga", ["Ramp"]), ("Historic", "Creature — Human", ["Leftover"]),
+    ("Permanent", "Enchantment", ["Ramp"]), ("Nonlegendary", "Creature — Human", ["Ramp"]),
+    ("Rat", "Creature — Pirate", ["Leftover"]), ("Rat", "Creature — Rat", ["Ramp"]),
+])
+def test_conditional_role_qualifiers_respect_defined_groups_and_whole_subtypes(qualifier, target_type, expected):
+    from edhrec_affinity.build_styles.deckbuilding import _deck_roles
+    metadata = {"reducer": metadata_card("Reducer", types="Creature — Bird",
+                    text=f"{qualifier} spells you cast cost {{1}} less to cast."),
+                "target": metadata_card("Target", types=target_type)}
+    assert _deck_roles(Counter(reducer=1, target=1), metadata)["reducer"] == expected
