@@ -666,3 +666,24 @@ def test_continuation_alternates_source_and_official_work_and_honors_retry_time(
             "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]})
     assert result.returncode == 0, result.stderr
     assert dict(line.split("=", 1) for line in output.read_text().splitlines()) == {"needed": "true", "validate_power": expected}
+
+
+def test_targeted_rebuild_only_uses_saved_samples_and_rebuilds_every_model(tmp_path):
+    body, script = step(COLLECTOR, "Rebuild package decks from saved collections")
+    stub_timeout(tmp_path)
+    stub(tmp_path, "python", "import json, sys; print(json.dumps(sys.argv[1:]))")
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], text=True, capture_output=True,
+        env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+             "STYLES_DIR": "saved/styles", "RUNNER_TEMP": "scratch", "POWER_ONLY": "false",
+             "REBUILD_ONLY": "true", "COMMANDER_SLUGS": "yshtola-nights-blessed the-indomitable"})
+    assert result.returncode == 0, result.stderr
+    args = json.loads(result.stdout)
+    assert "--fetch-metadata" in args and "--scores-only" not in args
+    assert args[-4:] == ["--commander", "yshtola-nights-blessed", "--commander", "the-indomitable"]
+    assert "--components" not in args
+    collection, _ = step(COLLECTOR, "Continue the resumable catalog queue")
+    assert "inputs.rebuild_only != true" in collection
+    prepare, _ = step(COLLECTOR, "Prepare saved reports for a power-only pass")
+    assert "inputs.rebuild_only == true" in prepare
+    preflight, preflight_script = step(COLLECTOR, "Check active collectors and source cooldown")
+    assert '"${REBUILD_ONLY:-false}" == "true"' in preflight_script

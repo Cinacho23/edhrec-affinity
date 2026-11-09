@@ -691,3 +691,18 @@ def test_worker_resource_limit_is_retained_and_stops_automatic_retry(tmp_path):
     assert summary["resource_limit"]["0"].startswith("Insufficient")
     assert not summary["continuation_needed"] and not summary["automatic_continuation_allowed"]
     assert core.read_json(base / core.STATE)["progress"]["resource_limit"] == summary["resource_limit"]
+
+
+def test_owned_rebuild_progress_survives_checkpoint_and_canonical_merge(tmp_path):
+    base, inputs, manifest = planned(tmp_path)
+    for worker in manifest["workers"]:
+        root, destination, _ = run_worker(tmp_path, inputs, manifest, worker["id"])
+        write(root.parent / "deck-rebuild-summary.json", {"generation_version": 5, "regenerated": 2,
+            "pending": 3, "blocked": 1, "changed_deck_lists": 4})
+        receipt = core.checkpoint(inputs / "manifest.json", worker["id"], root, destination)
+        assert receipt["deck_rebuild"]["regenerated"] == 2
+    result = merge(tmp_path, base, inputs)
+    assert result["deck_rebuild"] == {"generation_version": 5, "regenerated": 4,
+        "pending": 6, "blocked": 2, "changed_deck_lists": 8}
+    assert result["publish_needed"]
+    assert core.read_json(base / core.STATE)["source_rate"]["learned_rate"] == core.SEED_REQUEST_RATE

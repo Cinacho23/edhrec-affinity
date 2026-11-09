@@ -27,7 +27,7 @@ from .sources import card_key, commander_card_alias_groups
 
 ROLES = ("Commander", "Lands", "Fast Mana", "Ramp", "Card Advantage", "Wipe",
          "Removal", "Tutor", "Recursion", "Protection", "Leftover")
-DECK_GENERATION_VERSION = 4
+DECK_GENERATION_VERSION = 5
 _BASIC_COLORS = {"plains": "W", "island": "U", "swamp": "B", "mountain": "R", "forest": "G"}
 _COLOR_NAMES = dict(zip("WUBRG", ("white", "blue", "black", "red", "green")))
 _NUMBER_WORDS = {word: number for number, word in enumerate(
@@ -172,6 +172,67 @@ def functional_tags(card):
             ("return", "cast", "play", "put that card onto", "put it onto"))):
         tags.append("Recursion")
     return tags or ["Leftover"]
+
+
+@_cached_card
+def _conditional_role_clauses(card):
+    text = _oracle(card).casefold()
+    clauses = []
+    for match in re.finditer(r"(?<![a-z])([a-z-]+(?:(?: or | and )[a-z-]+)?) spells you cast cost[^.\n]*", text):
+        if match[1] not in {"all", "your", "the"}:
+            clauses.append((match[0], match[1]))
+    for match in re.finditer(r"search your library for (?:a|an|up to \w+) ([a-z-]+(?: [a-z-]+)?) cards?\b[^.\n]*", text):
+        clauses.append((match[0], match[1]))
+    return clauses
+
+
+def _deck_roles(counts, metadata):
+    """Discount unsupported typed tutors/reducers using this exact card list.
+
+    Keep the card-only classifier/cache independent of deck context. Unknown
+    wording stays conservative; this is not a general rules engine.
+    """
+    cards = [metadata[key] for key in counts]
+
+    def matches(card, qualifier):
+        types = card.get("type_line", "").casefold().replace("—", " ").split()
+        if qualifier.startswith("non") and qualifier[3:] in {"land", "creature", "artifact"}:
+            return qualifier[3:] not in types
+        if qualifier in {"white", "blue", "black", "red", "green", "colorless", "colored"}:
+            colors = card.get("colors")
+            if colors is None:
+                return None
+            return (not colors if qualifier == "colorless" else bool(colors) if qualifier == "colored"
+                    else dict(zip(_COLOR_NAMES.values(), "WUBRG"))[qualifier] in colors)
+        if re.search(r"\b" + re.escape(qualifier) + r"\b", card.get("type_line", "").casefold()):
+            return True
+        return ("creature" in types and "changeling" in _oracle(card).casefold()
+                and not set(qualifier.split()) & {"artifact", "enchantment", "instant", "sorcery", "land",
+                                                  "planeswalker", "battle", "legendary", "basic", "snow"})
+
+    def has_target(source, qualifier):
+        parts = re.split(r"\s+(?:or|and)\s+", qualifier.strip())
+        # Recognize simple type/subtype qualifiers, not arbitrary conditions.
+        if not all(re.fullmatch(r"[a-z-]+(?: [a-z-]+)?", part) for part in parts):
+            return True
+        outcomes = [matches(other, part) for other in cards if other is not source for part in parts]
+        return any(outcome is None or outcome for outcome in outcomes)
+
+    roles = {}
+    for key in counts:
+        card = metadata[key]
+        clauses = _conditional_role_clauses(card)
+        if not clauses:
+            roles[key] = functional_tags(card)
+            continue
+        text = _oracle(card).casefold()
+        adjusted = text
+        for clause, qualifier in clauses:
+            if not has_target(card, qualifier):
+                adjusted = adjusted.replace(clause, "")
+        roles[key] = (functional_tags(card) if adjusted == text else functional_tags(
+            {**card, "oracle_text": adjusted, "card_faces": [], "_build_cache": {}}))
+    return roles
 
 
 @_cached_card
@@ -481,7 +542,9 @@ def _mana_diagnostics(counts, metadata, commander_keys, commander_color_choices=
     lands = sum(quantity for key, quantity in counts.items() if _is_land(metadata[key]))
     total_spells = sum(quantity for _, quantity in spells)
     average_cmc = sum(card.get("cmc", 0) * quantity for card, quantity in spells) / max(1, total_spells)
-    role_counts = Counter(role for card, quantity in spells for role in functional_tags(card) for _ in range(quantity))
+    effective_roles = _deck_roles(counts, metadata)
+    role_counts = Counter(role for key, quantity in counts.items() if key not in commander_keys
+                          and not _is_land(metadata[key]) for role in effective_roles[key] for _ in range(quantity))
     target = max(34, min(40, round(37 + 2 * (average_cmc - 3) - .15 * role_counts["Ramp"])))
     commander_colors, _ = _commander_colors(commander_keys, metadata, commander_color_choices)
     targets = _source_targets(counts, metadata, commander_keys, commander_color_choices)
@@ -912,6 +975,120 @@ def _prepare_package(package, model_decks, source_decks, base, profiles, metadat
             "anchor_power_targets": sources["anchor_power_targets"]}
 
 
+def _cleanup_support(counts, prepared, metadata):
+    """Replace weak, unmeasured anchor leftovers without touching package core.
+
+    One percent is a review trigger, not a ban on unmeasured cards. Require
+    twenty effective membership-weighted observations and a substantially more
+    supported sampled replacement that preserves whole-deck construction.
+    """
+    counts = counts.copy()
+    support, metrics = prepared["support"], prepared["metrics"]
+    weights = list(prepared["weights"].values())
+    effective = sum(weights) ** 2 / max(1e-12, sum(weight ** 2 for weight in weights))
+    audit = {"policy_version": 1, "weak_support_below": .01, "minimum_replacement_support": .02,
+             "effective_sample_size": effective, "swaps": [], "retained": [],
+             "status": "reviewed" if effective >= 20 else "insufficient_sample"}
+    if effective < 20:
+        return counts, audit
+    commanders = prepared["commander_keys"]
+    protected = {row.get("identity") for row in prepared["distinctive_targets"]}
+    colors = prepared["commander_color_choices"] or None
+    initial = _mana_diagnostics(counts, metadata, commanders, colors)
+    floors = {role: min(initial["role_counts"].get(role, 0), floor) for role, floor in _CORE_ROLE_FLOORS.items()}
+    known = prepared.get("known_score_restrictions") or _observed_bracket_restrictions({}, metadata)
+    def rank(key):
+        return (support.get(key, 0), metrics[key]["average_inclusion"] or 0, metrics[key]["average_lift"] or 0)
+    weak = sorted((key for key in counts if key not in commanders and counts[key] == 1
+                   and not _is_land(metadata[key]) and _copy_limit(metadata[key]) == 1
+                   and _metadata_identity(metadata[key]) not in protected and support.get(key, 0) < .01
+                   and not metrics[key]["inclusion_observed_profiles"] and not metrics[key]["lift_observed_profiles"]),
+                  key=lambda key: (rank(key), key))
+    ranked = sorted(prepared["eligible"], key=lambda key: (*(-value for value in rank(key)), key))
+    for outgoing in weak:
+        current = _mana_diagnostics(counts, metadata, commanders, colors)
+        identities = {_metadata_identity(metadata[key]) for key in counts}
+        before_restrictions = _score_restriction_counts(counts, metadata, known)
+        threshold = max(.02, 5 * support.get(outgoing, 0))
+        for incoming in ranked:
+            if support.get(incoming, 0) < threshold:
+                break
+            if incoming in counts or _metadata_identity(metadata[incoming]) in identities:
+                continue
+            candidate = counts.copy()
+            del candidate[outgoing]
+            candidate[incoming] = 1
+            if not _preserves_bracket(counts, candidate, metadata, prepared["target"]):
+                continue
+            after_restrictions = _score_restriction_counts(candidate, metadata, known)
+            if any(after > before for after, before in zip(
+                    _bracket_excess(after_restrictions, prepared["target"]),
+                    _bracket_excess(before_restrictions, prepared["target"]))):
+                continue
+            mana = _mana_diagnostics(candidate, metadata, commanders, colors)
+            if (any(mana["role_counts"].get(role, 0) < floor for role, floor in floors.items())
+                    or mana["structural_risk_score"] > current["structural_risk_score"] + 1e-9
+                    or mana["mana_base_risk"] > current["mana_base_risk"] + 1e-9
+                    or mana["average_nonland_mana_value"] > initial["average_nonland_mana_value"] + .15):
+                continue
+            if not _validate(candidate, commanders, metadata, prepared["pool"], commander_color_choices=colors)["valid"]:
+                continue
+            swap = {"out": metadata[outgoing]["name"], "in": metadata[incoming]["name"],
+                    "reason": "weak_support_cleanup", "out_member_inclusion": support.get(outgoing, 0),
+                    "in_member_inclusion": support.get(incoming, 0),
+                    "explanation": "Non-distinctive card had under 1% package support and no matched-page inclusion or lift observations. Replaced with a more supported sampled card while preserving deck roles, mana and checked restrictions."}
+            counts = candidate
+            audit["swaps"].append(swap)
+            break
+        if outgoing in counts:
+            audit["retained"].append({"name": metadata[outgoing]["name"], "reason": "no_safe_supported_replacement",
+                "explanation": "Low-support unmeasured card retained because no more supported sampled replacement preserved the deck's construction requirements."})
+    return counts, audit
+
+
+def _annotate_cleanup(deck, audit):
+    statistics = deck["statistics"]
+    audit = deepcopy(audit)
+    audit["swaps"] = [row for row in statistics["swap_details"] if row.get("reason") == "weak_support_cleanup"]
+    present = {row["name"] for row in deck["cards"]}
+    audit["retained"] = [row for row in audit["retained"] if row["name"] in present]
+    statistics["support_cleanup"] = audit
+    statistics["cleanup_swaps"] = len(audit["swaps"])
+    if audit["swaps"] or audit["retained"]:
+        deck["primer"] += "\n\nPackage support review"
+        for row in audit["swaps"]:
+            deck["primer"] += f"\nReplaced [[{row['out']}]] with [[{row['in']}]]. {row['explanation']}"
+        for row in audit["retained"]:
+            deck["primer"] += f"\n[[{row['name']}]]: {row['explanation']}"
+    return deck
+
+
+def _cleanup_existing_option(deck, package, prepared, profiles, metadata):
+    """Retained score repairs must pass the same cleanup as fresh anchors."""
+    if deck is None or deck.get("status") != "generated":
+        return deck
+    counts = Counter({card_key(row["name"]): row["quantity"] for row in deck["cards"]})
+    _, target, kind = _construction_power_rating(deck, metadata, prepared["commander_keys"])
+    context = (_score_target_context(prepared, profiles, metadata, target,
+        "verified_power_score" if kind == "verified" else "calculated_power_score") if target is not None else prepared)
+    cleaned, audit = _cleanup_support(counts, context, metadata)
+    if not audit["swaps"]:
+        return _annotate_cleanup(deck, audit)
+    anchor = next(row for row in context["anchors"] if row["id"] == deck["statistics"]["anchor_deck_id"])
+    statistics = deck["statistics"]
+    swaps = [*statistics.get("swap_details", []), *audit["swaps"]]
+    arguments = {"anchor": anchor, "core_swaps": [row for row in swaps if row.get("reason") == "distinctive_core"],
+                 "core_failures": {row.get("identity"): omitted["reason_code"]
+                    for row in context["distinctive_targets"] for omitted in deck.get("distinctive_cards", {}).get("omitted", [])
+                    if row["name"] == omitted["name"]}, "swaps": swaps,
+                 "land_changes": statistics.get("land_adjustments", []), "land_swaps": statistics.get("land_swaps", [])}
+    result = _assemble_generated_deck(package, cleaned, context, metadata, **arguments)
+    result = _repair_score_bracket(result, package, cleaned, context, profiles, metadata, **arguments)
+    if statistics.get("score_bracket_repair"):
+        audit["previous_score_bracket_repair"] = deepcopy(statistics["score_bracket_repair"])
+    return _annotate_cleanup(result, audit)
+
+
 def _generate_one(package, model_decks, source_decks, base, profiles, metadata, *, anchor_id=None, land_adjustment=0,
                   mana_base_optimization=False, _context=None):
     prepared = _context.get("prepared") if _context is not None else None
@@ -1057,6 +1234,8 @@ def _generate_one(package, model_decks, source_decks, base, profiles, metadata, 
     if mana_base_optimization:
         counts, land_swaps = _upgrade_land_base(counts, pool, metadata, commander_keys, support, protected, target, bracket_source,
                                               color_choices)
+    counts, cleanup = _cleanup_support(counts, prepared, metadata)
+    swaps.extend(cleanup["swaps"])
     validation = _validate(counts, commander_keys, metadata, pool, commander_color_choices=color_choices)
     if not validation["valid"]:
         return _unavailable("Construction did not pass the final deck checks.",
@@ -1064,9 +1243,10 @@ def _generate_one(package, model_decks, source_decks, base, profiles, metadata, 
     result = _assemble_generated_deck(package, counts, prepared, metadata, anchor=anchor,
         core_swaps=core_swaps, core_failures=core_failures, swaps=swaps,
         land_changes=land_changes, land_swaps=land_swaps)
-    return _repair_score_bracket(result, package, counts, prepared, profiles, metadata, anchor=anchor,
+    result = _repair_score_bracket(result, package, counts, prepared, profiles, metadata, anchor=anchor,
         core_swaps=core_swaps, core_failures=core_failures, swaps=swaps,
         land_changes=land_changes, land_swaps=land_swaps)
+    return _annotate_cleanup(result, cleanup)
 
 
 def _assemble_generated_deck(package, counts, prepared, metadata, *, anchor, core_swaps, core_failures,
@@ -1082,9 +1262,10 @@ def _assemble_generated_deck(package, counts, prepared, metadata, *, anchor, cor
     bracket = _bracket_validation(counts, metadata, target, bracket_source)
     distinctive = _distinctive_coverage(targets, counts, metadata, core_failures)
     rows = []
+    effective_roles = _deck_roles(counts, metadata)
     for key, quantity in counts.items():
         card = metadata[key]
-        role = "Commander" if key in commander_keys else functional_tags(card)[0]
+        role = "Commander" if key in commander_keys else effective_roles[key][0]
         rows.append({"name": card["name"], "quantity": quantity, "primary_role": role,
                      **metrics[key], "member_inclusion": support.get(key, 0)})
     rows.sort(key=lambda row: (ROLES.index(row["primary_role"]), card_key(row["name"])))
@@ -1096,7 +1277,9 @@ def _assemble_generated_deck(package, counts, prepared, metadata, *, anchor, cor
         "land_count": sum(quantity for key, quantity in counts.items() if _is_land(metadata[key])),
         "nonland_count": sum(quantity for key, quantity in counts.items() if not _is_land(metadata[key])),
         "swaps": len(swaps), "swap_details": swaps, "sampled_pool_size": len(pool),
-        "distinctive_swaps": len(core_swaps), "consensus_swaps": len(swaps) - len(core_swaps),
+        "distinctive_swaps": len(core_swaps),
+        "consensus_swaps": sum(not row.get("reason") for row in swaps),
+        "cleanup_swaps": sum(row.get("reason") == "weak_support_cleanup" for row in swaps),
         "distinctive_priority_score": _distinctive_score(targets, counts, metadata)[1],
         "land_adjustments": land_changes, "land_swaps": land_swaps, "anchor_membership": weights[anchor["id"]],
         "mana_quality": _mana_diagnostics(counts, metadata, commander_keys, color_choices),
@@ -1106,7 +1289,7 @@ def _assemble_generated_deck(package, counts, prepared, metadata, *, anchor, cor
         "profile_count": len(metric_profiles), "profile_slugs": [profile.get("tag_slug") for profile in metric_profiles],
         "profile_names": [profile.get("tag_name") or profile.get("tag_slug", "") for profile in metric_profiles],
         "target_bracket": target, "recommended_bracket": bracket["recommended"],
-        "method": "Verified 100-card anchor; distinctive package core prioritized within mana, support-role and bracket constraints; NMF-weighted role/type/curve-preserving consensus swaps",
+        "method": "Verified 100-card anchor; distinctive package core prioritized within mana, support-role and bracket constraints; NMF-weighted role/type/curve-preserving consensus swaps followed by whole-deck support cleanup",
         "metric_note": "Unweighted mean across the package's matched theme pages and target bracket page, excluding the general page; missing measurements contribute zero. Lift is the raw EDHREC ratio, not a percentage-point difference. Coverage counts show observed measurements.",
     }
     measured = [row for row in rows if row["lift_observed_profiles"] > 0 and row["primary_role"] != "Commander"]
@@ -1585,6 +1768,10 @@ def _successful_score_repair(option):
 def _score_repair_priority(option):
     if _successful_score_repair(option):
         return 0
+    prior = option.get("statistics", {}).get("support_cleanup", {}).get("previous_score_bracket_repair", {})
+    if prior.get("status") in {"repaired", "retained"} and all(
+            option.get("validation", {}).get("bracket", {}).get("rule_checks", {}).values()):
+        return 0
     repair = option.get("statistics", {}).get("score_bracket_repair", {})
     return 1 if repair.get("retention_blocked") else 2
 
@@ -1747,6 +1934,7 @@ def _generate_package_decks(analysis, decks, base, profiles, card_metadata=None,
                 context = {"source_context": source_context}
                 seed = _repair_existing_package_deck(package.get("generated_deck"), package, memberships,
                     decks, base, profiles, metadata, context)
+                seed = _cleanup_existing_option(seed, package, context.get("prepared", {}), profiles, metadata)
                 cache[identity] = _generate_one(package, memberships, decks, base, profiles, metadata, _context=context)
                 if seed is not None and _score_repair_priority(seed) < 2:
                     cache[identity] = seed

@@ -1966,3 +1966,125 @@ def test_new_metadata_cannot_use_an_expired_score_to_make_further_swaps_or_resto
     assert reviewed["statistics"]["recommended_bracket"] == 3
     assert "Restore Balance" not in reviewed["export_text"]
     assert reviewed["validation"]["external_rating"]["status"] == "unverified"
+
+
+def weak_conditional_fixture(*, observations=120):
+    data = fixture()
+    rename_fixture_card(data, "Weak Card", "The Eleventh Hour")
+    data[4]["the eleventh hour"].update(type_line="Enchantment — Saga", cmc=4,
+        oracle_text="I — Search your library for a Doctor card, reveal it, put it into your hand, then shuffle.\n"
+                    'II — Create a Food token and a Human creature token with "Doctor spells you cast cost {1} less to cast."\n'
+                    "III — Create a token that's a copy of target creature, except it's legendary.")
+    data[4]["consensus card"].update(type_line="Artifact", oracle_text="Draw a card.", cmc=3)
+    anchor = data[1][0]
+    samples = [anchor]
+    for number in range(observations):
+        deck = deepcopy(anchor)
+        deck.update(id=f"b-{number:03}", weight=.99)
+        for row in deck["cards"]:
+            if row["name"] == "The Eleventh Hour":
+                row["name"] = "Consensus Card"
+        samples.append(deck)
+    data[1][:] = samples
+    memberships = [{"id": deck["id"], "weights": [deck["weight"]]} for deck in samples]
+    data[0]["decks"] = [{"id": row["id"], "memberships": row["weights"]} for row in memberships]
+    data[0]["alternative_models"][0]["memberships"] = memberships
+    return data
+
+
+def test_cleanup_replaces_unsupported_conditional_anchor_leftover_across_type_role_and_curve():
+    data = weak_conditional_fixture()
+    result = generate(data)
+    names = {row["name"] for row in result["cards"]}
+    assert result["statistics"]["anchor_deck_id"] == "a"
+    assert "The Eleventh Hour" not in names and "Consensus Card" in names
+    assert result["card_count"] == 100 and result["validation"]["valid"]
+    assert result["statistics"]["land_count"] == 36
+    assert result["statistics"]["mana_quality"]["role_counts"].get("Tutor", 0) == 0
+    cleanup = result["statistics"]["support_cleanup"]
+    assert cleanup["effective_sample_size"] > 100
+    assert cleanup["swaps"][0]["out"] == "The Eleventh Hour"
+    assert cleanup["swaps"][0]["in"] == "Consensus Card"
+    assert result["statistics"]["cleanup_swaps"] == 1
+    assert result["statistics"]["consensus_swaps"] == 0
+    assert "[[The Eleventh Hour]]" in result["primer"]
+    assert result["validation"]["restriction_validation"]["status"] == "pending"
+    assert data[0]["alternative_models"][0]["packages"][0]["generated_deck"] == result
+    assert generate(weak_conditional_fixture()) == result
+
+
+@pytest.mark.parametrize("preserve", ["distinctive", "observed_zero", "supported", "small_sample", "essential_role"])
+def test_cleanup_is_a_review_of_weak_leftovers_not_a_ban_on_zero_measurements(preserve):
+    data = weak_conditional_fixture(observations=5 if preserve == "small_sample" else 120)
+    if preserve == "distinctive":
+        for package in [data[0]["packages"][0], data[0]["alternative_models"][0]["packages"][0]]:
+            package["top_cards"].append({"name": "The Eleventh Hour"})
+    elif preserve == "observed_zero":
+        data[3][0]["cards"]["the eleventh hour"] = {"rate": 0, "lift": 0}
+    elif preserve == "supported":
+        for sampled in data[1][1:30]:
+            next(row for row in sampled["cards"] if row["name"] == "Consensus Card")["name"] = "The Eleventh Hour"
+    elif preserve == "essential_role":
+        data[4]["core 1"].update(type_line="Creature — Time Lord Doctor")
+    result = generate(data)
+    assert "The Eleventh Hour" in {row["name"] for row in result["cards"]}
+    assert not result["statistics"]["support_cleanup"]["swaps"]
+    if preserve == "essential_role":
+        assert result["statistics"]["support_cleanup"]["retained"][0]["reason"] == "no_safe_supported_replacement"
+        assert result["statistics"]["mana_quality"]["role_counts"]["Tutor"] == 1
+
+
+def test_deck_dependent_roles_do_not_leak_through_card_cache_or_erase_independent_roles():
+    from edhrec_affinity.build_styles.deckbuilding import _deck_roles, _metadata_index
+    metadata = _metadata_index({"typed": metadata_card("Typed", types="Enchantment",
+        text="Search your library for a Doctor card. Doctor spells you cast cost {1} less to cast. Draw a card."),
+        "doctor": metadata_card("Doctor", types="Creature — Time Lord Doctor"),
+        "changer": metadata_card("Changer", types="Creature — Shapeshifter", text="Changeling"),
+        "artifact": metadata_card("Artifact", types="Artifact"),
+        "reducer": metadata_card("Reducer", types="Artifact", text="Artifact spells you cast cost {1} less to cast.")})
+    assert _deck_roles(Counter(typed=1), metadata)["typed"] == ["Card Advantage"]
+    for target in ("doctor", "changer"):
+        assert _deck_roles(Counter({"typed": 1, target: 1}), metadata)["typed"] == ["Ramp", "Card Advantage", "Tutor"]
+    assert _deck_roles(Counter(typed=1), metadata)["typed"] == ["Card Advantage"]
+    assert _deck_roles(Counter(reducer=1), metadata)["reducer"] == ["Leftover"]
+    assert _deck_roles(Counter(reducer=1, artifact=1), metadata)["reducer"] == ["Ramp"]
+    assert functional_tags(metadata["typed"]) == ["Ramp", "Card Advantage", "Tutor"]
+
+
+@pytest.mark.parametrize("excluded", ["off_color", "banned", "restriction", "pool"])
+def test_cleanup_never_uses_ineligible_or_bracket_conflicting_replacements(excluded):
+    data = weak_conditional_fixture()
+    card = data[4]["consensus card"]
+    if excluded == "off_color":
+        card["color_identity"] = ["R"]
+    elif excluded == "banned":
+        card["legalities"]["commander"] = "banned"
+    elif excluded == "restriction":
+        card["oracle_text"] += " Destroy all lands."
+    elif excluded == "pool":
+        for deck in data[1][1:]:
+            next(row for row in deck["cards"] if row["name"] == "Consensus Card")["name"] = "The Eleventh Hour"
+    result = generate(data)
+    assert "Consensus Card" not in {row["name"] for row in result["cards"]}
+    assert result["validation"]["valid"]
+
+
+def test_retained_repair_cannot_bypass_cleanup_or_transfer_its_old_external_rating(monkeypatch, tmp_path):
+    from edhrec_affinity.build_styles.external_validation import cardlist_hash
+    data = weak_conditional_fixture()
+    for package in [data[0]["packages"][0], data[0]["alternative_models"][0]["packages"][0]]:
+        package["top_cards"].append({"name": "The Eleventh Hour"})
+    old = attach_complete_restriction_record(data, monkeypatch, tmp_path, power=7, bracket=3)
+    old["generation_version"] = 4
+    old["statistics"]["score_bracket_repair"] = {"status": "retained", "score_bracket": 3,
+        "from_power_level": 7, "from_deck_sha256": cardlist_hash(old["cards"]), "swap_details": []}
+    for package in [data[0]["packages"][0], data[0]["alternative_models"][0]["packages"][0]]:
+        package["top_cards"] = [{"name": "Core 0"}]
+        package["generated_deck"] = deepcopy(old)
+    result = generate(data)
+    assert "The Eleventh Hour" not in {row["name"] for row in result["cards"]}
+    assert cardlist_hash(result["cards"]) != cardlist_hash(old["cards"])
+    assert result["generation_version"] == DECK_GENERATION_VERSION
+    assert result["statistics"]["support_cleanup"]["previous_score_bracket_repair"]["status"] == "retained"
+    assert result["validation"]["external_rating"]["status"] == "unverified"
+    assert result["validation"]["restriction_validation"]["status"] == "pending"

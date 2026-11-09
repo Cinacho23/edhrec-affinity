@@ -160,6 +160,35 @@ verified below-target result can trigger up to three more land experiments,
 capped at 40 lands and six total basic additions. Sampled duals and fetches can
 upgrade the mana base using color demand and conditional untapped heuristics.
 Price does not enter scoring.
+
+Generation version 5 also reviews non-distinctive anchor leftovers after those
+swaps. With at least 20 effective membership-weighted observations, a card is
+eligible for review when its package inclusion is below 1% and neither inclusion
+nor lift was observed on any matched theme/bracket page. Zero measurements alone
+do not exclude a card, and distinctive cards are protected. Replacements come
+only from the sampled pool, require at least 2% inclusion and five times the
+outgoing support, and are ranked by package support, then matched-page inclusion
+and lift. They may change type or curve bucket while preserving whole-deck role
+floors, mana risk, legality, and checked restrictions. Average nonland mana value
+cannot increase by more than 0.15 over the pre-cleanup deck.
+
+Role diagnostics check simple typed searches and cost reductions against the
+actual list, including commanders and changelings. A Doctor-only tutor/reducer
+does not supply those roles without a suitable Doctor; independent abilities
+still count. Unrecognized conditions remain conservative. This is a limited
+construction heuristic, not a complete rules engine. `statistics.support_cleanup`
+and the primer record replacements and weak cards retained for lack of a safe
+replacement. Every changed list gets a new local power calculation and an
+independent pending EDHPowerLevel restriction check until its own observation
+exists; a previous list's external result cannot certify it.
+
+Each non-pilot distributed VM runs a bounded, cache-only saved-deck upgrade on
+its owned reports after successful collection. It reuses collected metadata,
+preserves learned packages and source controls, and checkpoints successful
+rebuilds for normal merge/publication. Stale required metadata leaves the old
+report intact for retry. The manual **Update commander build styles** input
+`rebuild_only` instead rebuilds saved decks with bounded metadata refresh and no
+EDHREC collection or model refit; `commanders` can scope a targeted repair.
 This is constrained construction from unsupervised evidence, not a separate
 text model. Candidate selection prioritizes a successful score-based bracket
 repair when a current exact-list observation requires one, then maximizes distinctive-card coverage and

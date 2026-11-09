@@ -420,6 +420,22 @@ jobs:
               --main-tag-fraction 0.03 --min-tag-fraction 0.01 \
               --source-max-age-hours 72 --refresh-after-days 3 --freshness-target-hours 96 \
               --card-metadata-cache data/raw/build-style-card-metadata.json "${extra[@]}"
+      - name: Upgrade saved decks in this owned shard
+        if: steps.collect.outcome == 'success' && inputs.pilot != true
+        continue-on-error: true
+        timeout-minutes: 17
+        run: |
+          set -euo pipefail
+          # Reuse the rules cache warmed by collection. No extra provider
+          # requests, model fitting, or writes outside this VM's owned shard.
+          timeout --signal=INT --kill-after=30s 16m \
+            python scripts/rebuild_generated_decks.py \
+              --build-styles-dir "${STYLES_DIR}" \
+              --card-metadata-cache data/raw/build-style-card-metadata.json \
+              --validation-directory "${STYLES_DIR}/_collection/external-validations" \
+              --workers 2 --only-outdated --current-discovery-only --max-runtime-seconds 900 \
+              --summary data/build-style-artifact/deck-rebuild-summary.json \
+              --backup-dir "${RUNNER_TEMP}/owned-deck-rebuild-backups"
       - name: Capture final public egress and checkpoint owned results
         if: always() && steps.extract.outcome == 'success'
         env:

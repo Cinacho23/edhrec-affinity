@@ -31,6 +31,10 @@ on:
         description: "Calculate power for all saved package decks from the cache, then resume normal work"
         type: boolean
         default: false
+      rebuild_only:
+        description: "Rebuild saved decks from existing samples without collecting EDHREC or refitting packages"
+        type: boolean
+        default: false
       validate_power:
         description: "Check saved decks on EDHPowerLevel, repair restriction conflicts, and recheck final lists"
         type: boolean
@@ -85,6 +89,7 @@ jobs:
           ACCESS_REVIEW_RUN_ID: ${{ inputs.access_review_run_id }}
           POWER_ONLY: ${{ inputs.power_only }}
           VALIDATE_POWER: ${{ inputs.validate_power }}
+          REBUILD_ONLY: ${{ inputs.rebuild_only }}
           COMMANDER_SLUGS: ${{ inputs.commanders }}
           MAX_COMMANDERS: ${{ inputs.max_commanders || 0 }}
           SAMPLE_DECKS: ${{ inputs.sample_decks || 'all' }}
@@ -92,7 +97,7 @@ jobs:
         run: |
           args=(preflight --summary-file data/build-style-artifact/build_style_batch.json)
           if [[ -n "${ACCESS_REVIEW_RUN_ID:-}" ]]; then
-            if [[ -n "${RECOVERY_RUN_ID}" || "${POWER_ONLY}" == "true" || "${VALIDATE_POWER:-false}" == "true" || -n "${COMMANDER_SLUGS:-}" || "${MAX_COMMANDERS:-0}" != "0" || "${SAMPLE_DECKS:-all}" != "all" || "${REFRESH_REPORTS:-false}" == "true" ]]; then
+            if [[ -n "${RECOVERY_RUN_ID}" || "${POWER_ONLY}" == "true" || "${VALIDATE_POWER:-false}" == "true" || "${REBUILD_ONLY:-false}" == "true" || -n "${COMMANDER_SLUGS:-}" || "${MAX_COMMANDERS:-0}" != "0" || "${SAMPLE_DECKS:-all}" != "all" || "${REFRESH_REPORTS:-false}" == "true" ]]; then
               echo "::error::Access review requires the default collection scope without recovery or power modes."
               exit 1
             fi
@@ -101,7 +106,7 @@ jobs:
           if [[ -n "${RECOVERY_RUN_ID}" ]]; then
             args+=(--recovery-run-id "${RECOVERY_RUN_ID}")
           fi
-          if [[ "${POWER_ONLY}" == "true" || "${VALIDATE_POWER:-false}" == "true" ]]; then
+          if [[ "${POWER_ONLY}" == "true" || "${VALIDATE_POWER:-false}" == "true" || "${REBUILD_ONLY:-false}" == "true" ]]; then
             args+=(--power-only)
           elif [[ -z "${ACCESS_REVIEW_RUN_ID:-}" && -z "${RECOVERY_RUN_ID}" && -z "${COMMANDER_SLUGS:-}" && "${MAX_COMMANDERS:-0}" == "0" && "${SAMPLE_DECKS:-all}" == "all" && "${REFRESH_REPORTS:-false}" != "true" ]]; then
             args+=(--route-distributed)
@@ -126,6 +131,9 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+
+      - name: Prepare disk for the cumulative checkpoint
+        uses: ./.github/actions/prepare-data-runner
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -201,7 +209,7 @@ jobs:
           restore-keys: build-style-cards-
 
       - name: Get current commander index and weekly dataset date
-        if: inputs.power_only != true && inputs.validate_power != true
+        if: inputs.power_only != true && inputs.validate_power != true && inputs.rebuild_only != true
         shell: bash
         run: |
           set -euo pipefail
@@ -240,7 +248,7 @@ jobs:
 
       - name: Continue the resumable catalog queue
         id: collect_styles
-        if: inputs.power_only != true && inputs.validate_power != true
+        if: inputs.power_only != true && inputs.validate_power != true && inputs.rebuild_only != true
         continue-on-error: true
         timeout-minutes: 36
         shell: bash
@@ -293,7 +301,7 @@ jobs:
 
       - name: Prepare saved reports for a power-only pass
         id: prepare_power_only
-        if: inputs.power_only == true || inputs.validate_power == true
+        if: inputs.power_only == true || inputs.validate_power == true || inputs.rebuild_only == true
         env:
           GH_TOKEN: ${{ github.token }}
           RESTORED_RUN_ID: ${{ steps.restored_styles.outputs['run-id'] }}
@@ -309,6 +317,8 @@ jobs:
         timeout-minutes: 22
         env:
           POWER_ONLY: ${{ inputs.power_only }}
+          REBUILD_ONLY: ${{ inputs.rebuild_only }}
+          COMMANDER_SLUGS: ${{ inputs.commanders }}
         run: |
           set -euo pipefail
           args=(--build-styles-dir "${STYLES_DIR}"
@@ -322,6 +332,12 @@ jobs:
             args+=(--scores-only)
           else
             args+=(--fetch-metadata)
+          fi
+          if [[ "${REBUILD_ONLY:-false}" == "true" && -n "${COMMANDER_SLUGS:-}" ]]; then
+            read -r -a commander_args <<< "${COMMANDER_SLUGS}"
+            for commander_slug in "${commander_args[@]}"; do
+              args+=(--commander "${commander_slug}")
+            done
           fi
           timeout --signal=INT --kill-after=30s 21m python scripts/rebuild_generated_decks.py "${args[@]}"
 

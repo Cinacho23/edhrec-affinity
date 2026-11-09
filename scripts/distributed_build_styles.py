@@ -468,6 +468,9 @@ def checkpoint(manifest_path, worker_id, workroot, output_dir, *, exit_code=0):
             "pipeline_summary": pipeline, "machine": machine,
             "source_control": {key: deepcopy(state.get(key)) for key in
                                ("source_rate", "blocked_until", "block_reason", "source_stop", "source_stops")}}
+        rebuild_path = workroot.parent / "deck-rebuild-summary.json"
+        if rebuild_path.exists() and not fallback:
+            summary["deck_rebuild"] = read_json(rebuild_path)
         atomic_json(output_dir / f"shard-{worker['id']}-summary.json", summary)
         return summary
     finally:
@@ -731,13 +734,18 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
         fallback = [s["worker_id"] for s in summaries if s["checkpoint"].get("used_fallback")]
         unsafe_failures = [s["worker_id"] for s in summaries if s.get("exit_code") not in {0, None}
             and not expected_worker_pause(s, now())]
+        rebuilds = [s["deck_rebuild"] for s in actual_summaries if isinstance(s.get("deck_rebuild"), dict)]
+        deck_rebuild = {key: sum(int(item.get(key) or 0) for item in rebuilds)
+                        for key in ("regenerated", "pending", "blocked", "changed_deck_lists")}
+        deck_rebuild["generation_version"] = max((item.get("generation_version", 0) for item in rebuilds), default=0)
         summary = {"schema_version": 1, "snapshot_date": now().astimezone(ZoneInfo("America/Toronto")).date().isoformat(),
             "pipeline_version": 1, "distributed": {"generation": manifest["generation"], "runners": manifest["runners"],
                 "pilot": manifest["pilot"], "systemic_block": systemic, "workers": summaries,
                 "missing_workers": missing, "fallback_workers": fallback, "failed_workers": unsafe_failures},
             "scope": {"commanders": [], "max_commanders": 0, "sample_decks": None, "refresh": False},
             "automatic_continuation_allowed": not manifest["pilot"] and not fallback and not unsafe_failures and not resource_limits,
-            "continuation_needed": bool((started or changed) and pending and not systemic and not fallback and not unsafe_failures and not resource_limits and not manifest["pilot"]),
+            "continuation_needed": bool((started or changed) and (pending or deck_rebuild["pending"] and deck_rebuild["regenerated"])
+                and not systemic and not fallback and not unsafe_failures and not resource_limits and not manifest["pilot"]),
             "publish_needed": bool(changed or started), "no_progress": not (started or changed),
             "completed": sorted(completed), "changed_reports": sorted(changed), "remaining_in_batch": pending,
             "resource_limit": resource_limits or None,
@@ -749,6 +757,7 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
                 for s in summaries if s["checkpoint"].get("used_fallback") or s.get("exit_code") not in {0, None}],
             "capacity": capacity, "measured_request_rate": measured,
             "new_previews_attempted": sum(int(s.get("pipeline_summary", {}).get("new_previews_attempted") or 0) for s in actual_summaries),
+            "deck_rebuild": deck_rebuild,
             "min_total_decks": 200, "no_fixed_completion_deadline": True,
             "model_policy": due["model_policy"], "tag_label_policy": due["tag_label_policy"]}
         sizes, growth, delta = archive_sizes, 0, 0

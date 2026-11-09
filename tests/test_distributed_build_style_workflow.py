@@ -219,3 +219,16 @@ def test_legacy_debug_routes_and_watchdog_inherit_distributed_rollout_setting():
     assert "coordinate_build_styles.py continue --source-run-id" in workflow
     for name in ("build-commander-styles.yml", "watch-build-styles.yml", "resume-build-styles.yml"):
         assert "vars.BUILD_STYLE_DISTRIBUTED_RUNNERS" in (ROOT / ".github/workflows" / name).read_text()
+
+
+def test_owned_deck_upgrades_are_cache_only_bounded_and_precede_checkpoint():
+    body, script = step("Upgrade saved decks in this owned shard")
+    assert "steps.collect.outcome == 'success'" in body and "inputs.pilot != true" in body
+    assert "continue-on-error: true" in body
+    assert '--build-styles-dir "${STYLES_DIR}"' in script
+    assert all(option in script for option in ("--only-outdated", "--current-discovery-only", "--max-runtime-seconds 900"))
+    assert "--fetch-metadata" not in script and "--scores-only" not in script
+    workflow = WORKFLOW.read_text()
+    assert workflow.index("      - name: Collect and analyze this owned commander queue") < workflow.index(
+        "      - name: Upgrade saved decks in this owned shard") < workflow.index(
+        "      - name: Capture final public egress and checkpoint owned results")
