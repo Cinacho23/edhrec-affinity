@@ -1,0 +1,137 @@
+{
+  "source": "Published Ur-Dragon Auto Package 7, captured for the 95-land regression",
+  "anchor_deck_id": "-xtaPIlgRjn4CjjAGmljrQ",
+  "anchor_source_url": "https://moxfield.com/decks/rHBx6ChWsUioinc5WqyBlA",
+  "cards": [
+    {
+      "name": "The Ur-Dragon",
+      "quantity": 1,
+      "primary_role": "Commander"
+    },
+    {
+      "name": "Ancient Ziggurat",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Cascading Cataracts",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Cavern of Souls",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "City of Brass",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Command Tower",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Crucible of the Spirit Dragon",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Exotic Orchard",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Forbidden Orchard",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Gemstone Caverns",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Haven of the Spirit Dragon",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Horizon of Progress",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Island",
+      "quantity": 77,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Maelstrom of the Spirit Dragon",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Mana Confluence",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Plaza of Heroes",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Reflecting Pool",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Secluded Courtyard",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Three Tree City",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Unclaimed Territory",
+      "quantity": 1,
+      "primary_role": "Lands"
+    },
+    {
+      "name": "Mana Drain",
+      "quantity": 1,
+      "primary_role": "Ramp"
+    },
+    {
+      "name": "Zurgo and Ojutai",
+      "quantity": 1,
+      "primary_role": "Card Advantage"
+    },
+    {
+      "name": "Entomb",
+      "quantity": 1,
+      "primary_role": "Tutor"
+    },
+    {
+      "name": "Aggravated Assault",
+      "quantity": 1,
+      "primary_role": "Leftover"
+    }
+  ],
+  "other_package_land_counts": [
+    36,
+    37,
+    36,
+    36,
+    37,
+    38,
+    37
+  ],
+  "report_generated_at": "2026-10-31T21:07:26.945503+00:00"
+}

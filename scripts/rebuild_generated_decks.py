@@ -450,7 +450,11 @@ def rebuild_report(report: dict, inputs: dict, repository: MetadataRepository, *
         generated = package.get("generated_deck", {})
         if generated.get("status") == "generated":
             generated.get("validation", {}).pop("power_alignment", None)
-        if previous.get("generated_deck", {}).get("status") == "generated" and generated.get("status") != "generated":
+        quality = generated.get("anchor_quality", {})
+        quality_rejected = (generated.get("reason_code") == "anchor_quality"
+                            and quality.get("rejected", 0) > 0 and quality.get("checked", 0) > 0)
+        if (previous.get("generated_deck", {}).get("status") == "generated"
+                and generated.get("status") != "generated" and not quality_rejected):
             raise RebuildBlocked(f"Regeneration would remove an existing deck: {model}, package {package['id'] + 1}: {generated.get('reason')}")
         if generated.get("status") == "generated" and id(generated) not in seen:
             seen.add(id(generated))

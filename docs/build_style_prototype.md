@@ -161,6 +161,47 @@ capped at 40 lands and six total basic additions. Sampled duals and fetches can
 upgrade the mana base using color demand and conditional untapped heuristics.
 Price does not enter scoring.
 
+Generation version 6 screens anchors and final lists before candidate selection.
+This is a construction-quality policy, separate from Commander legality and
+external power/playability observations. Legal sampled decks still contribute
+to the learned pool and NMF memberships even when unsuitable as starting decks.
+
+An automatic example needs at least 20 noncommander spell slots and 12 estimated
+mana equivalents. Each front-face land and playable modal land back counts as
+one; early nonland mana permanents costing at most three contribute half each,
+capped at eight equivalents. Transforming land backs, rituals, reducers, and
+mana abilities only on the commander do not supply opening mana in this check.
+This intentionally declines near-all-land or near-empty-mana experiments; it
+does not assert that every legal unusual strategy can be built automatically.
+
+With fewer than five distinct eligible anchor IDs or fewer than four effective
+membership-weighted anchors, the fallback requires at least 18 mana equivalents
+and no more than 60 physical lands. Otherwise, the package's weighted 10th/90th
+land-count percentiles, expanded by 12 slots, supply the lower/upper envelope.
+The lower bound never drops below 12 mana equivalents. Obvious spell/mana
+failures are excluded before estimating that envelope. Weighted 25th/75th
+percentiles define the preferred range; more than four slots outside it is a
+secondary quality tier. The fallback preferred range is 18–50. Thus a supported
+70-land package can pass, and a zero-physical-land MDFC deck can pass, without
+making an isolated 95-land/four-spell list a valid representative example.
+
+Observed bracket restrictions remain safety constraints. Among candidates
+passing quality and those current checks, supported mana structure precedes
+historical repair status, followed by repair/core priorities and external
+playability/native diagnostics. An expired-score metadata conflict remains an
+explicit safety hold when no fresh complete repair is available. A retained
+repair must pass the same quality gate; an old rating cannot waive it. Core
+insertion, cleanup and bracket replacements also preserve usable mana slots.
+The candidate shortlist measures its membership cutoff among accepted anchors
+so an extreme high-membership outlier cannot crowd out suitable lower-weight
+anchors. `anchor_quality` and `anchor_screening` record decisions and examples.
+
+If every checked anchor fails quality, generation returns an explicit unavailable
+deck. A saved-deck rebuild can withdraw a previous unusable example for this
+specific, audited quality reason while retaining learned packages, sampled
+evidence, source dates, and backups. Missing metadata or other construction
+failures retain the existing transactional protection against losing old decks.
+
 Generation version 5 also reviews non-distinctive anchor leftovers after those
 swaps. With at least 20 effective membership-weighted observations, a card is
 eligible for review when its package inclusion is below 1% and neither inclusion

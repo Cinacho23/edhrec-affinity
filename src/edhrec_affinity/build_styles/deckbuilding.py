@@ -27,7 +27,8 @@ from .sources import card_key, commander_card_alias_groups
 
 ROLES = ("Commander", "Lands", "Fast Mana", "Ramp", "Card Advantage", "Wipe",
          "Removal", "Tutor", "Recursion", "Protection", "Leftover")
-DECK_GENERATION_VERSION = 5
+DECK_GENERATION_VERSION = 6
+ANCHOR_QUALITY_POLICY_VERSION = 1
 _BASIC_COLORS = {"plains": "W", "island": "U", "swamp": "B", "mountain": "R", "forest": "G"}
 _COLOR_NAMES = dict(zip("WUBRG", ("white", "blue", "black", "red", "green")))
 _NUMBER_WORDS = {word: number for number, word in enumerate(
@@ -484,6 +485,110 @@ def _validate(counts, commander_keys, metadata, pool, *, commander_color_choices
 
 
 @_cached_card
+def _anchor_mana_kind(card):
+    """Opening-hand mana alternatives, not every card classified as ramp."""
+    if _is_land(card):
+        return "land"
+    faces = card.get("card_faces", [])
+    if card.get("layout") == "modal_dfc" and (any(
+            "land" in face.get("type_line", "").casefold().split() for face in faces)
+            or any("land" in face.casefold().split() for face in card.get("type_line", "").split(" // ")[1:])):
+        return "modal_land"
+    types = set(card.get("type_line", "").split(" // ")[0].casefold().split())
+    if types & {"creature", "artifact", "enchantment"} and card.get("cmc", 100) <= 3:
+        front = faces[0] if faces else card
+        text = front.get("oracle_text", "").casefold()
+        if front.get("produced_mana") or re.search(r"\badd (?:\{|one mana|two mana|three mana)", text):
+            return "early_mana"
+    return None
+
+
+def _anchor_facts(counts, metadata, commanders):
+    facts = Counter()
+    for key, quantity in counts.items():
+        if key in commanders:
+            continue
+        kind = _anchor_mana_kind(metadata[key])
+        if kind:
+            facts[kind] += quantity
+        if not _is_land(metadata[key]):
+            facts["spells"] += quantity
+    return {"land_count": facts["land"], "spell_count": facts["spells"],
+            "modal_land_count": facts["modal_land"], "early_mana_sources": facts["early_mana"],
+            "mana_equivalent": facts["land"] + facts["modal_land"] + min(8, .5 * facts["early_mana"])}
+
+
+def _quality_reference(anchors, weights, facts):
+    # Exclude clearly unusable inputs before estimating a package's envelope.
+    # Keep their observations in the learned pool/support; this is generation
+    # policy, not a change to the NMF sample or membership weights.
+    unique = {deck["id"]: facts[id(deck)] for deck in anchors
+              if facts[id(deck)]["spell_count"] >= 20 and facts[id(deck)]["mana_equivalent"] >= 12}
+    scale = max((weights[key] for key in unique), default=1)
+    values = sorted((row["land_count"], str(key), weights[key] / scale) for key, row in unique.items())
+    total = math.fsum(weight for _, _, weight in values)
+    effective = total ** 2 / math.fsum(weight ** 2 for _, _, weight in values) if values else 0
+    reference = {"basis": "conservative_fallback", "observed_anchors": len(values),
+                 "effective_anchors": effective, "minimum_spell_slots": 20,
+                 "minimum_mana_equivalent": 12, "lower_mana_bound": 18, "upper_land_bound": 60,
+                 "preferred_lower": 18, "preferred_upper": 50}
+    if len(values) < 5 or effective < 4:
+        return reference
+    def quantile(fraction):
+        cumulative = 0.0
+        for value, _, weight in values:
+            cumulative += weight
+            if cumulative >= fraction * total:
+                return value
+        return values[-1][0]
+    reference.update(basis="membership_weighted_package", lower_mana_bound=max(12, quantile(.1) - 12),
+                     upper_land_bound=quantile(.9) + 12,
+                     preferred_lower=quantile(.25), preferred_upper=quantile(.75))
+    return reference
+
+
+def _anchor_quality(facts, reference):
+    checks = {"nonland_spell_slots": facts["spell_count"] >= reference["minimum_spell_slots"],
+              "mana_sources": facts["mana_equivalent"] >= reference["minimum_mana_equivalent"],
+              "package_mana_lower_bound": facts["mana_equivalent"] >= reference["lower_mana_bound"],
+              "package_land_upper_bound": facts["land_count"] <= reference["upper_land_bound"]}
+    reasons = {"nonland_spell_slots": "Too few noncommander spell slots for an automatically generated representative deck.",
+               "mana_sources": "Too few land, modal-land or early permanent mana sources.",
+               "package_mana_lower_bound": "Mana sources fall below the package's supported construction range.",
+               "package_land_upper_bound": "The land count exceeds the package's supported construction range."}
+    distance = max(0, reference["preferred_lower"] - facts["mana_equivalent"],
+                   facts["land_count"] - reference["preferred_upper"])
+    return {"policy_version": ANCHOR_QUALITY_POLICY_VERSION, "accepted": all(checks.values()),
+            "tier": 0 if distance <= 4 else 1, **facts, "checks": checks,
+            "reasons": [reasons[key] for key, passed in checks.items() if not passed],
+            "reference": reference}
+
+
+def _list_quality(counts, prepared, metadata):
+    reference = prepared.get("quality_reference")
+    if reference is None:
+        # Internal repair helpers also have small standalone callers. They use
+        # the same conservative envelope when no package reference is supplied.
+        reference = _quality_reference([], {}, {})
+    return _anchor_quality(_anchor_facts(counts, metadata, prepared["commander_keys"]), reference)
+
+
+def _quality_unavailable(quality, **extra):
+    return _unavailable("No structurally suitable sampled deck is available for this package. "
+                        "The generator will not publish a near-empty spell list or unsupported mana base.",
+                        reason_code="anchor_quality", anchor_quality=quality, **extra)
+
+
+def _quality_priority(option):
+    quality = option.get("statistics", {}).get("anchor_quality", {})
+    return quality.get("tier", 0)
+
+
+def _passes_quality(option):
+    return option.get("statistics", {}).get("anchor_quality", {}).get("accepted") is not False
+
+
+@_cached_card
 def _type_bucket(card):
     types = card.get("type_line", "").split(" // ")[0].casefold().split()
     return next((kind for kind in ("creature", "instant", "sorcery", "artifact", "enchantment", "planeswalker", "battle")
@@ -655,6 +760,12 @@ def _primer(name, commander_rows, rows, package, statistics, bracket, distinctiv
     lines += ["", "Mana and opening hands",
               f"The list has {statistics['land_count']} land cards, based on a complete observed deck. "
               "Look for an opening hand with usable mana and early plays; adjust mulligans to the table and the cards drawn."]
+    if statistics.get("anchor_quality"):
+        lines += ["", "Anchor quality",
+                  "The starting deck and final card list passed spell-slot and usable-mana checks. "
+                  "The check accounts for modal land faces and early mana permanents; unusual land counts require support from this package's sampled decks."]
+        if statistics["anchor_quality"]["tier"]:
+            lines.append("This list's mana structure is near the edge of the supported range; review its opening hands carefully.")
     explanations = {"Fast Mana": "Early mana acceleration includes", "Ramp": "Develop mana with", "Card Advantage": "Replenish cards with",
                     "Wipe": "Broad board interaction includes", "Removal": "Keep interaction available through", "Tutor": "Library-search options include",
                     "Protection": "Protect resources using", "Recursion": "Recover resources with", "Tokens": "Token-producing cards include",
@@ -702,7 +813,7 @@ _CORE_REASONS = {
     "essential_role_conflict": "No replacement retained the deck's required ramp, card advantage, and interaction support.",
     "bracket_conflict": "No replacement retained the package's checked bracket restrictions.",
     "score_bracket_conflict": "Replaced because its checked restrictions forced a higher bracket than the original list's power score supports.",
-    "mana_base_conflict": "No land replacement retained the mana base's required colored sources.",
+    "mana_base_conflict": "No replacement retained sufficient usable mana and the required colored sources.",
     "no_safe_replacement": "No replacement retained the commander, land slots, and higher-priority distinctive cards.",
     "construction_unavailable": "A verified 100-card deck could not be constructed for this package.",
 }
@@ -817,6 +928,15 @@ def _insert_distinctive(counts, targets, prepared, metadata):
                 if any(roles[role] - (role in old_roles) + (role in incoming_roles) < floor for role, floor in floors.items()):
                     role_blocked = True
                     continue
+                if _anchor_mana_kind(old) != _anchor_mana_kind(card):
+                    trial = counts.copy()
+                    trial[outgoing] -= 1
+                    if not trial[outgoing]:
+                        del trial[outgoing]
+                    trial[incoming] += 1
+                    if not _list_quality(trial, prepared, metadata)["accepted"]:
+                        mana_blocked = True
+                        continue
                 old_flags, incoming_flags = _all_bracket_flags(old), _all_bracket_flags(card)
                 next_bracket_counts = tuple(value - old + incoming for value, old, incoming in
                                             zip(current_bracket_counts, old_flags, incoming_flags))
@@ -928,6 +1048,7 @@ def _prepare_sources(source_decks, base, metadata):
     # These normalized observations are never mutated: construction copies an
     # anchor's Counter before core insertion or later candidate adjustments.
     anchor_bracket_counts = {id(deck): _bracket_counts(deck["counts"], metadata) for deck in anchors}
+    anchor_facts = {id(deck): _anchor_facts(deck["counts"], metadata, commander_keys) for deck in anchors}
     presence = {key: [] for key in pool}
     # IDs retain source-list order, including repeated IDs if a caller supplies
     # them. Package sums consequently have exactly the former addition order.
@@ -937,7 +1058,7 @@ def _prepare_sources(source_decks, base, metadata):
     return {"commander_keys": commander_keys, "pool": pool, "observed": observed, "anchors": anchors,
             "colors": colors, "eligible": eligible, "signatures": signatures, "presence": presence,
             "commander_color_choices": color_choices,
-            "anchor_bracket_counts": anchor_bracket_counts, "anchor_power_targets": {}}
+            "anchor_bracket_counts": anchor_bracket_counts, "anchor_facts": anchor_facts, "anchor_power_targets": {}}
 
 
 def _prepare_package(package, model_decks, source_decks, base, profiles, metadata, *, _source_context=None):
@@ -974,12 +1095,24 @@ def _prepare_package(package, model_decks, source_decks, base, profiles, metadat
         missing = sorted({key for deck in learned for key in deck["counts"] if not _complete_metadata(metadata.get(key))})
         return _unavailable("No sampled package deck passes the 100-card, commander, color, singleton and legality checks.",
                             missing_metadata_count=len(missing))
+    reference = _quality_reference(anchors, weights, sources["anchor_facts"])
+    qualities = {id(deck): _anchor_quality(sources["anchor_facts"][id(deck)], reference) for deck in anchors}
+    rejected = [deck for deck in anchors if not qualities[id(deck)]["accepted"]]
+    screening = {"policy_version": ANCHOR_QUALITY_POLICY_VERSION, "checked": len(anchors),
+                 "rejected": len(rejected), "reference": reference,
+                 "examples": [{"deck_id": deck["id"], "land_count": qualities[id(deck)]["land_count"],
+                               "spell_count": qualities[id(deck)]["spell_count"], "reasons": qualities[id(deck)]["reasons"]}
+                              for deck in rejected[:5]]}
+    anchors = [deck for deck in anchors if qualities[id(deck)]["accepted"]]
+    if not anchors:
+        return _quality_unavailable(screening)
     eligible = [key for key in sources["eligible"] if support.get(key, 0) > 0]
     return {"commander_keys": commander_keys, "package_id": package_id, "weights": weights,
             "pool": pool, "support": support, "target": target, "bracket_source": bracket_source,
             "suggested": suggested, "metric_profiles": metric_profiles, "metrics": metrics,
             "anchors": anchors, "colors": sources["colors"], "eligible": eligible, "signatures": sources["signatures"],
             "commander_color_choices": sources["commander_color_choices"],
+            "quality_reference": reference, "anchor_qualities": qualities, "anchor_screening": screening,
             "anchor_bracket_counts": sources["anchor_bracket_counts"],
             "anchor_power_targets": sources["anchor_power_targets"]}
 
@@ -1042,6 +1175,8 @@ def _cleanup_support(counts, prepared, metadata):
                 continue
             if not _validate(candidate, commanders, metadata, prepared["pool"], commander_color_choices=colors)["valid"]:
                 continue
+            if not _list_quality(candidate, prepared, metadata)["accepted"]:
+                continue
             swap = {"out": metadata[outgoing]["name"], "in": metadata[incoming]["name"],
                     "reason": "weak_support_cleanup", "out_member_inclusion": support.get(outgoing, 0),
                     "in_member_inclusion": support.get(incoming, 0),
@@ -1056,6 +1191,8 @@ def _cleanup_support(counts, prepared, metadata):
 
 
 def _annotate_cleanup(deck, audit):
+    if deck.get("status") != "generated":
+        return deck
     statistics = deck["statistics"]
     audit = deepcopy(audit)
     audit["swaps"] = [row for row in statistics["swap_details"] if row.get("reason") == "weak_support_cleanup"]
@@ -1080,6 +1217,14 @@ def _cleanup_existing_option(deck, package, prepared, profiles, metadata):
     _, target, kind = _construction_power_rating(deck, metadata, prepared["commander_keys"])
     context = (_score_target_context(prepared, profiles, metadata, target,
         "verified_power_score" if kind == "verified" else "calculated_power_score") if target is not None else prepared)
+    quality = _list_quality(counts, context, metadata)
+    if not quality["accepted"]:
+        return None
+    deck["statistics"]["anchor_quality"] = quality
+    deck["statistics"]["anchor_screening"] = context.get("anchor_screening", {})
+    deck["validation"]["anchor_quality"] = quality
+    deck["validation"]["checks"]["anchor_quality"] = True
+    deck["generation_version"] = DECK_GENERATION_VERSION
     cleaned, audit = _cleanup_support(counts, context, metadata)
     if not audit["swaps"]:
         return _annotate_cleanup(deck, audit)
@@ -1143,9 +1288,9 @@ def _generate_one(package, model_decks, source_decks, base, profiles, metadata, 
     if anchor_id is not None:
         anchors = [deck for deck in anchors if deck["id"] == anchor_id]
         if not anchors:
-            return _unavailable("The requested anchor does not pass the observed 100-card deck checks.",
-                                distinctive_cards=_distinctive_coverage(targets, {}, metadata, unavailable=True))
-    anchors = sorted(anchors, key=lambda deck: (bracket_penalty(deck),
+            return _quality_unavailable(prepared["anchor_screening"],
+                distinctive_cards=_distinctive_coverage(targets, {}, metadata, unavailable=True))
+    anchors = sorted(anchors, key=lambda deck: (bracket_penalty(deck), prepared["anchor_qualities"][id(deck)]["tier"],
         *(-value for value in _distinctive_score(targets, deck["counts"], metadata)), -weights[deck["id"]],
         -sum(support.get(key, 0) for key in deck["counts"] if key not in commander_keys), str(deck["id"])))
     best, best_rank = None, None
@@ -1153,13 +1298,14 @@ def _generate_one(package, model_decks, source_decks, base, profiles, metadata, 
         anchor_context = context_for_anchor(observed_anchor)
         anchor_target = anchor_context["target"]
         penalty = bracket_penalty(observed_anchor)
-        if best_rank is not None and penalty > best_rank[0]:
+        quality_tier = prepared["anchor_qualities"][id(observed_anchor)]["tier"]
+        if best_rank is not None and (penalty, quality_tier) > best_rank[:2]:
             break
         if observed_anchor["id"] not in core_anchors:
             core_anchors[observed_anchor["id"]] = _insert_distinctive(observed_anchor["counts"], targets, anchor_context, metadata)
         core_counts, core_swaps, core_failures = core_anchors[observed_anchor["id"]]
         core_score = _distinctive_score(targets, core_counts, metadata)
-        candidate_rank = (penalty, *(-value for value in core_score), -weights[observed_anchor["id"]],
+        candidate_rank = (penalty, quality_tier, *(-value for value in core_score), -weights[observed_anchor["id"]],
             -sum(support.get(key, 0) for key in core_counts if key not in commander_keys), str(observed_anchor["id"]))
         if best_rank is None or candidate_rank < best_rank:
             best, best_rank = (observed_anchor, core_counts, core_swaps, core_failures, anchor_context), candidate_rank
@@ -1268,6 +1414,12 @@ def _assemble_generated_deck(package, counts, prepared, metadata, *, anchor, cor
     targets, package_id = prepared["distinctive_targets"], prepared["package_id"]
     color_choices = prepared["commander_color_choices"] or None
     validation = _validate(counts, commander_keys, metadata, pool, commander_color_choices=color_choices)
+    quality = _list_quality(counts, prepared, metadata)
+    if not quality["accepted"]:
+        return _quality_unavailable(quality,
+            distinctive_cards=_distinctive_coverage(targets, {}, metadata, unavailable=True))
+    validation["anchor_quality"] = quality
+    validation["checks"]["anchor_quality"] = True
     bracket = _bracket_validation(counts, metadata, target, bracket_source)
     distinctive = _distinctive_coverage(targets, counts, metadata, core_failures)
     rows = []
@@ -1283,6 +1435,7 @@ def _assemble_generated_deck(package, counts, prepared, metadata, *, anchor, cor
     nonland = [row for row in rows if row["primary_role"] not in {"Commander", "Lands"}]
     statistics = {
         "anchor_deck_id": anchor["id"], "anchor_source_url": anchor.get("source_url", ""),
+        "anchor_quality": quality, "anchor_screening": prepared.get("anchor_screening", {}),
         "land_count": sum(quantity for key, quantity in counts.items() if _is_land(metadata[key])),
         "nonland_count": sum(quantity for key, quantity in counts.items() if not _is_land(metadata[key])),
         "swaps": len(swaps), "swap_details": swaps, "sampled_pool_size": len(pool),
@@ -1628,6 +1781,8 @@ def _strict_bracket_replacements(counts, prepared, metadata, target, restriction
                     identity_counts = tuple(sorted(candidate.items()))
                     if identity_counts in seen:
                         continue
+                    if not _list_quality(candidate, prepared, metadata)["accepted"]:
+                        continue
                     if outgoing_land:
                         mana = _mana_diagnostics(candidate, metadata, commanders, color_choices)
                         if any(mana["colored_land_sources"].get(color, 0) < floor for color, floor in source_floors.items()):
@@ -1672,6 +1827,8 @@ def _repair_score_bracket(option, package, counts, prepared, profiles, metadata,
     from .external_validation import attach_external_validation, cardlist_hash
     from .power_brackets import POWER_SCORE_BRACKET_POLICY_VERSION
 
+    if option.get("status") != "generated":
+        return option
     rating, score_target, rating_kind = _construction_power_rating(option, metadata, prepared["commander_keys"])
     if score_target is None:
         return option
@@ -1715,6 +1872,9 @@ def _repair_score_bracket(option, package, counts, prepared, profiles, metadata,
             result = _assemble_generated_deck(package, counts, context, metadata, anchor=anchor,
                 core_swaps=core_swaps, core_failures=failures, swaps=swaps,
                 land_changes=land_changes, land_swaps=land_swaps)
+            if result.get("status") != "generated":
+                repair["reason"] = "The bracket adjustment could not retain a structurally suitable final deck."
+                break
             _apply_score_bracket_checks(result, flags, checks, score_target)
             attach_external_validation(result)
             _mark_restriction_validation(result)
@@ -1742,6 +1902,9 @@ def _repair_score_bracket(option, package, counts, prepared, profiles, metadata,
         option = _assemble_generated_deck(package, counts, context, metadata, anchor=anchor,
             core_swaps=core_swaps, core_failures=core_failures, swaps=swaps,
             land_changes=land_changes, land_swaps=land_swaps)
+        if option.get("status") != "generated":
+            repair["reason"] = "The bracket adjustment could not retain a structurally suitable final deck."
+            break
         next_rating, next_target, next_kind = _construction_power_rating(option, metadata, prepared["commander_keys"])
         if next_target is not None:
             rating, score_target, rating_kind = next_rating, next_target, next_kind
@@ -1841,7 +2004,8 @@ def _repair_existing_package_deck(existing, package, memberships, decks, base, p
                 return None
             result[card_key(card["name"])] += quantity
         return result if _validate(result, prepared["commander_keys"], metadata, prepared["pool"],
-            commander_color_choices=prepared["commander_color_choices"] or None)["valid"] else None
+            commander_color_choices=prepared["commander_color_choices"] or None)["valid"] and _list_quality(
+                result, prepared, metadata)["accepted"] else None
 
     counts = counts_for(seed)
     if counts is None:
@@ -1944,14 +2108,15 @@ def _generate_package_decks(analysis, decks, base, profiles, card_metadata=None,
                 seed = _repair_existing_package_deck(package.get("generated_deck"), package, memberships,
                     decks, base, profiles, metadata, context)
                 seed = _cleanup_existing_option(seed, package, context.get("prepared", {}), profiles, metadata)
-                cache[identity] = _generate_one(package, memberships, decks, base, profiles, metadata, _context=context)
-                if seed is not None and _score_repair_priority(seed) < 2:
-                    cache[identity] = seed
-                if prefer_playability and cache[identity].get("status") == "generated":
+                fresh = _generate_one(package, memberships, decks, base, profiles, metadata, _context=context)
+                options = [option for option in (fresh, seed) if option is not None and option.get("status") == "generated"]
+                if prefer_playability and options:
                     candidates = generate_package_deck_candidates(analysis, decks, base, profiles, card_metadata,
                                      package_id=package.get("id", 0), components=components, max_candidates=8,
                                      _context=context, _indexed_metadata=metadata)
-                    cache[identity] = _prefer_playability([cache[identity], *candidates])
+                    options.extend(candidates)
+                cache[identity] = _prefer_playability(options,
+                    restrictions=context.get("prepared", {}).get("known_score_restrictions")) if options else fresh
             package["generated_deck"] = cache[identity]
     analysis["deck_generation"] = {"version": DECK_GENERATION_VERSION,
                                     "method": "Distinctive package core prioritized within constrained consensus of observed lists using learned NMF memberships",
@@ -1967,7 +2132,7 @@ def _all_packages(analysis):
 
 
 def _native_preference(option):
-    return (_score_repair_priority(option), *(-value for value in _core_preference(option)),
+    return (not _passes_quality(option), _quality_priority(option), _score_repair_priority(option), *(-value for value in _core_preference(option)),
             option["statistics"]["mana_quality"]["structural_risk_score"],
             -option["statistics"]["anchor_membership"], -option["statistics"]["weighted_consensus_score"])
 
@@ -1997,7 +2162,8 @@ def generate_package_decks(analysis, decks, base, profiles, card_metadata=None, 
         # Exact-list external ratings are shared across legal color choices;
         # retain the best native choice when their card-list hashes coincide.
         generated.sort(key=_native_preference)
-        package["generated_deck"] = (_prefer_playability(generated) if prefer_playability else min(generated, key=_native_preference)) if generated else options[0]
+        package["generated_deck"] = _prefer_playability(generated,
+            restrictions=_package_observed_restrictions(package, metadata)) if generated else options[0]
     analysis["deck_generation"] = {
         "version": DECK_GENERATION_VERSION,
         "method": "Distinctive package core prioritized within constrained consensus of observed lists using learned NMF memberships",
@@ -2012,16 +2178,38 @@ def _core_preference(option):
             option.get("statistics", {}).get("distinctive_priority_score", 0))
 
 
-def _prefer_playability(options):
+def _prefer_playability(options, *, restrictions=None):
     from .external_validation import attach_external_validation, cardlist_hash
 
     unique = {}
+    def duplicate_priority(option):
+        retained = option.get("statistics", {}).get("score_bracket_repair", {}).get("status") == "retained"
+        return (*_native_preference(option), not retained)
     for option in options:
-        if option.get("status") == "generated":
+        if option.get("status") == "generated" and _passes_quality(option):
             identity = cardlist_hash(option["cards"])
-            if identity not in unique or _successful_score_repair(option) and not _successful_score_repair(unique[identity]):
+            if identity not in unique or duplicate_priority(option) < duplicate_priority(unique[identity]):
                 unique[identity] = option
     options = list(unique.values())
+    if not options:
+        return _quality_unavailable({"policy_version": ANCHOR_QUALITY_POLICY_VERSION, "accepted": False})
+    holds = [option for option in options if option.get("statistics", {}).get("score_bracket_repair", {}).get("retention_blocked")]
+    if holds and not any(_successful_score_repair(option) for option in options):
+        # A current metadata conflict with expired score evidence is a safety
+        # hold, not a successful historical repair. Do not use that expiry to
+        # restore formerly removed restrictions through an unchecked anchor.
+        options = holds
+    # Current checked restrictions remain a safety requirement. Among suitable
+    # lists, prefer supported mana structure before historical repair status.
+    # If every option is blocked, retain its explicit unresolved review rather
+    # than inventing a successful bracket check.
+    compliant = [option for option in options if all(option["validation"]["bracket"]["rule_checks"].values())
+                 and option.get("statistics", {}).get("score_bracket_repair", {}).get("status") != "blocked"
+                 and _preserves_observed_candidate_restrictions(option, restrictions)]
+    if compliant:
+        options = compliant
+    quality_tier = min(_quality_priority(option) for option in options)
+    options = [option for option in options if _quality_priority(option) == quality_tier]
     # A measured bracket mismatch takes precedence over restoring an offending
     # distinctive card through an unmeasured alternate observed anchor.
     repair_priority = min(_score_repair_priority(option) for option in options)
@@ -2046,7 +2234,7 @@ def _prefer_playability(options):
         reason = ("Prioritized resolving the observed score/bracket mismatch, with explained distinctive-card exceptions. "
                   if _successful_score_repair(chosen) else "Prioritized distinctive-card coverage. ")
         reason += "No qualifying candidate has a current externally observed rating in the 72.5–77.5% target; selected native mana/role structure, not a verified playability percentage."
-    chosen["statistics"]["selection_reason"] = reason
+    chosen["statistics"]["selection_reason"] = ("Screened anchor and final-list quality; preferred package-supported mana structure before retained repair status. " + reason)
     chosen["statistics"]["selection_candidate_count"] = len(options)
     return chosen
 
@@ -2125,19 +2313,19 @@ def _generate_package_deck_candidates(analysis, decks, base, profiles, card_meta
     metadata = _indexed_metadata if _indexed_metadata is not None else _metadata_index(card_metadata,
         commander_alias_groups=commander_card_alias_groups(base.get("commander_name_groups", [])))
     context = {} if _context is None else _context
-    ranked = sorted((row for row in memberships if len(row.get("weights", [])) > package_id and row["weights"][package_id] > 0),
-                    key=lambda row: (-row["weights"][package_id], str(row["id"])))
-    if not ranked:
-        return []
-    strongest = ranked[0]["weights"][package_id]
-    anchors = [row for row in ranked if row["weights"][package_id] >= .5 * strongest][:max_candidates]
     candidates, seen = [], set()
     primary = _generate_one(package, memberships, decks, base, profiles, metadata, _context=context)
     if primary.get("status") == "generated":
         candidates.append(primary)
         seen.add(tuple((card["name"], card["quantity"]) for card in primary["cards"]))
-    for row in anchors:
-        candidate = _generate_one(package, memberships, decks, base, profiles, metadata, anchor_id=row["id"], _context=context)
+    prepared = context.get("prepared", {})
+    allowed = {row["id"] for row in prepared.get("anchors", [])}
+    ranked = sorted((row for row in prepared.get("weights", {}) if row in allowed),
+                    key=lambda identifier: (-prepared["weights"][identifier], str(identifier)))
+    strongest = prepared["weights"][ranked[0]] if ranked else 0
+    anchors = [identifier for identifier in ranked if prepared["weights"][identifier] >= .5 * strongest][:max_candidates]
+    for identifier in anchors:
+        candidate = _generate_one(package, memberships, decks, base, profiles, metadata, anchor_id=identifier, _context=context)
         if candidate["status"] != "generated":
             continue
         options = [candidate]
@@ -2145,10 +2333,10 @@ def _generate_package_deck_candidates(analysis, decks, base, profiles, card_meta
         adjustment = max(0, min(3, diagnostics["suggested_land_count"] - diagnostics["land_count"]))
         if tune_mana and adjustment:
             options.append(_generate_one(package, memberships, decks, base, profiles, metadata,
-                                         anchor_id=row["id"], land_adjustment=adjustment, _context=context))
+                                         anchor_id=identifier, land_adjustment=adjustment, _context=context))
         if mana_base_optimization:
             options.append(_generate_one(package, memberships, decks, base, profiles, metadata,
-                                         anchor_id=row["id"], land_adjustment=adjustment if tune_mana else 0,
+                                         anchor_id=identifier, land_adjustment=adjustment if tune_mana else 0,
                                          mana_base_optimization=True, _context=context))
         for option in options:
             identity = tuple((card["name"], card["quantity"]) for card in option.get("cards", []))
@@ -2157,7 +2345,7 @@ def _generate_package_deck_candidates(analysis, decks, base, profiles, card_meta
                 seen.add(identity)
     known = context.get("prepared", {}).get("known_score_restrictions")
     candidates = [option for option in candidates if _preserves_observed_candidate_restrictions(option, known)]
-    candidates.sort(key=lambda option: (_score_repair_priority(option), *(-value for value in _core_preference(option)),
+    candidates.sort(key=lambda option: (_quality_priority(option), _score_repair_priority(option), *(-value for value in _core_preference(option)),
                                        option["statistics"]["mana_quality"]["structural_risk_score"],
                                        -option["statistics"]["anchor_membership"],
                                        -option["statistics"]["weighted_consensus_score"], option["statistics"]["anchor_deck_id"]))

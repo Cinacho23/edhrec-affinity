@@ -1164,3 +1164,34 @@ def test_current_discovery_scope_excludes_archival_reports_from_pending(tmp_path
     assert result["report_count"] == result["regenerated"] == 1
     assert result["pending"] == result["blocked"] == 0
     assert rebuild.read_json(root / "archival.json")["deck_generation"]["version"] == 1
+
+
+def test_quality_rejection_withdraws_an_unusable_old_deck_without_refitting_or_losing_evidence(tmp_path):
+    report, inputs, cache = fixture(tmp_path)
+    for observed in inputs["decks"]:
+        observed["cards"] = [{"name": f"Core {i}", "quantity": 1} for i in range(4)] + [
+            {"name": "Forest", "quantity": 95}]
+    for _, package in rebuild.packages(report):
+        package["generated_deck"]["cards"] = [{"name": "Commander", "quantity": 1},
+                                               *deepcopy(inputs["decks"][0]["cards"])]
+    report["collection"]["dataset_sha256"] = inputs["dataset_sha256"] = deck_dataset_sha256(inputs["decks"])
+    learned, collection, generated_at = rebuild.learned_analysis(report["deck_analysis"]), deepcopy(report["collection"]), report["generated_at"]
+    root = tmp_path / "reports"
+    save_evidence(root, report, inputs)
+    summary = rebuild.rebuild_all(root, cache, workers=1, only_outdated=True, prefer_playability=False)
+    assert summary["regenerated"] == 1 and summary["blocked"] == 0
+    saved = rebuild.read_json(root / "commander.json")
+    assert saved["deck_generation"]["version"] == rebuild.GENERATION_VERSION
+    assert saved["collection"] == collection and saved["generated_at"] == generated_at
+    assert rebuild.learned_analysis(saved["deck_analysis"]) == learned
+    for _, package in rebuild.packages(saved):
+        result = package["generated_deck"]
+        assert result["status"] == "unavailable" and result["reason_code"] == "anchor_quality"
+        assert result["anchor_quality"]["checked"] == result["anchor_quality"]["rejected"] == 3
+        assert result["cards"] == []
+
+
+def test_current_v5_reports_are_queued_for_the_anchor_quality_upgrade(tmp_path):
+    report, inputs, cache = fixture(tmp_path)
+    report["deck_generation"]["version"] = 5
+    assert rebuild.GENERATION_VERSION == 6 and rebuild.needs_rebuild(report)

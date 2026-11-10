@@ -64,11 +64,23 @@ def rename_fixture_card(data, old_name, new_name):
         for row in sampled["cards"]:
             if row["name"] == old_name:
                 row["name"] = new_name
+
     for package in [*data[0]["packages"], *[package for model in data[0].get("alternative_models", [])
                                         for package in model.get("packages", [])]]:
         for row in package.get("top_cards", []):
             if row.get("name") == old_name:
                 row["name"] = new_name
+
+
+def add_quality_reference_samples(data, quantity=4):
+    """Give intentional land-heavy fixtures enough package evidence."""
+    for index in range(quantity):
+        deck = deepcopy(data[1][0])
+        deck["id"] = f"z-reference-{index}"
+        data[1].append(deck)
+        data[0]["decks"].append({"id": deck["id"], "memberships": [deck["weight"]]})
+        for model in data[0].get("alternative_models", []):
+            model["memberships"].append({"id": deck["id"], "weights": [deck["weight"]]})
 
 
 def test_membership_consensus_preserves_real_structure_and_only_uses_sampled_cards():
@@ -738,6 +750,7 @@ def test_distinctive_core_does_not_remove_last_required_support_roles():
             data[4][card_key(card["name"])] = card
     for deck in data[1]:
         deck["cards"] = [*deepcopy(cards), {"name": "Forest", "quantity": 73}]
+    add_quality_reference_samples(data)
     add_observed_core(data, [metadata_card("Unsupported Core")])
     result = generate(data)
     assert result["validation"]["valid"] and result["card_count"] == 100
@@ -846,6 +859,7 @@ def test_candidate_search_prefers_an_anchor_that_can_fit_more_core_over_membersh
         deck["cards"] = [*deepcopy(support), {"name": "Forest", "quantity": 73}]
     data[1][1]["cards"][-1]["quantity"] = 72
     data[1][1]["cards"].append({"name": "Core 0", "quantity": 1})
+    add_quality_reference_samples(data)
     add_observed_core(data, [metadata_card("Desired Core")])
     result = generate(data)
     assert result["statistics"]["anchor_deck_id"] == "b"
