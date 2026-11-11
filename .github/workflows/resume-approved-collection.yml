@@ -1,0 +1,50 @@
+name: Inspect and resume approved commander collection
+
+on:
+  push:
+    branches: [codex/resume-commander-collection-nov11]
+
+permissions:
+  contents: read
+  actions: write
+  checks: read
+
+jobs:
+  resume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+      - name: Inspect saved controls and resume when ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_STYLE_DISTRIBUTED_RUNNERS: '16'
+        run: |
+          python3 - <<'PY'
+          from datetime import datetime, timezone
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "scripts")
+          from coordinate_build_styles import GitHub, coordinate, dispatch_collector
+
+          if os.environ["GITHUB_RUN_ATTEMPT"] != "1":
+              raise SystemExit("One-time resume does not repeat on reruns.")
+          client = GitHub(os.environ["GITHUB_REPOSITORY"])
+          result = coordinate(client, "preflight", now=datetime.now(timezone.utc),
+                              current_run_id=int(os.environ["GITHUB_RUN_ID"]))
+          summary = result.pop("snapshot", {})
+          fields = ("blocked", "blocked_until", "block_reason", "source_stop", "resource_limit",
+                    "automatic_continuation_allowed", "continuation_needed", "no_progress", "scope",
+                    "remaining_in_batch", "capacity", "deck_rebuild", "official_validation")
+          print("::notice::Saved continuation state: " + json.dumps({key: summary[key] for key in fields if key in summary}))
+          distributed = summary.get("distributed") or {}
+          print("::notice::Distributed status: " + json.dumps({key: distributed[key] for key in
+                ("systemic_block", "missing_workers", "invalid_workers", "worker_failures", "runners") if key in distributed}))
+          if result.get("run"):
+              dispatch_collector(client, result, runners=16)
+          print("::notice::Resume decision: " + json.dumps(result))
+          PY
