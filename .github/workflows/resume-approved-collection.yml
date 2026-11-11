@@ -12,7 +12,7 @@ permissions:
 jobs:
   resume:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 125
     steps:
       - uses: actions/checkout@v6
         with:
@@ -26,7 +26,10 @@ jobs:
           from datetime import datetime, timezone
           import json
           import os
+          from pathlib import Path
           import sys
+          import tempfile
+          import time
 
           sys.path.insert(0, "scripts")
           from coordinate_build_styles import GitHub, coordinate, dispatch_collector
@@ -46,5 +49,57 @@ jobs:
                 ("systemic_block", "missing_workers", "invalid_workers", "worker_failures", "runners") if key in distributed}))
           if result.get("run"):
               dispatch_collector(client, result, runners=16)
+          elif result.get("reason") == "Source access restriction requires review":
+              source_run_id = 42771946303
+              ready = coordinate(client, "preflight", now=datetime.now(timezone.utc),
+                  current_run_id=int(os.environ["GITHUB_RUN_ID"]), access_review_run_id=source_run_id)
+              ready.pop("snapshot", None)
+              if not ready.get("run"):
+                  raise SystemExit("Access review is not ready: " + json.dumps(ready))
+              endpoint = f"{client.root}/actions/workflows/build-commander-styles.yml/runs?per_page=10"
+              existing = {run["id"] for run in client.api(endpoint)["workflow_runs"]}
+              client.dispatch("build-commander-styles.yml", {"access_review_run_id": str(source_run_id)})
+              review_id = None
+              for _ in range(20):
+                  fresh = [run for run in client.api(endpoint)["workflow_runs"] if run["id"] not in existing
+                      and run.get("head_branch") == client.default_branch and run.get("event") == "workflow_dispatch"]
+                  if len(fresh) == 1:
+                      review_id = fresh[0]["id"]
+                      break
+                  if len(fresh) > 1:
+                      raise SystemExit("Multiple new runs appeared; inspect before choosing a review.")
+                  time.sleep(3)
+              if review_id is None:
+                  raise SystemExit("Review was dispatched but its run ID is not visible yet.")
+              print(f"::notice::Access review running: https://github.com/{client.repository}/actions/runs/{review_id}", flush=True)
+              deadline = time.monotonic() + 6900
+              while time.monotonic() < deadline:
+                  run = client.api(f"{client.root}/actions/runs/{review_id}")
+                  if run["status"] == "completed":
+                      break
+                  time.sleep(30)
+              else:
+                  raise SystemExit("Review is still running; no distributed restart was attempted.")
+              if run.get("conclusion") != "success":
+                  raise SystemExit("Access review did not succeed; distributed workers remain stopped.")
+              with tempfile.TemporaryDirectory(prefix="review-proof-") as directory:
+                  client.command(["run", "download", str(review_id), "--repo", client.repository,
+                      "--name", f"build-style-summary-{review_id}", "--dir", directory])
+                  proof = json.loads((Path(directory) / "access-review.json").read_text())
+              if (proof.get("source_run_id") != str(source_run_id) or proof.get("passed") is not True
+                      or proof.get("released") is not True or len(proof.get("checks", [])) != 3
+                      or any(check.get("status_code") != 200 or check.get("valid") is not True
+                             or check.get("challenge") is not False for check in proof["checks"])):
+                  raise SystemExit("Ordinary source access was not verified; distributed workers remain stopped.")
+              client = GitHub(os.environ["GITHUB_REPOSITORY"])
+              reviewed = client.source(review_id)
+              if (reviewed is None or not reviewed.durable or reviewed.summary.get("blocked")
+                      or reviewed.summary.get("resource_limit")):
+                  raise SystemExit("Bounded collection retained a stop; distributed workers remain stopped.")
+              result = coordinate(client, "preflight", now=datetime.now(timezone.utc),
+                                  current_run_id=int(os.environ["GITHUB_RUN_ID"]))
+              result.pop("snapshot", None)
+              if result.get("run"):
+                  dispatch_collector(client, result, runners=16)
           print("::notice::Resume decision: " + json.dumps(result))
           PY
