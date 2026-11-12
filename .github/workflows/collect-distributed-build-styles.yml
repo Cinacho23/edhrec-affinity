@@ -33,7 +33,7 @@ concurrency:
 env:
   STYLES_DIR: data/build-style-artifact/build-styles
   BUILD_STYLE_DISTRIBUTED_RUNNERS: ${{ vars.BUILD_STYLE_DISTRIBUTED_RUNNERS || '0' }}
-  REQUESTS_PER_SECOND: ${{ vars.BUILD_STYLE_REQUESTS_PER_SECOND || '40' }}
+  REQUESTS_PER_SECOND: ${{ vars.BUILD_STYLE_REQUESTS_PER_SECOND || '1' }}
 
 jobs:
   plan:

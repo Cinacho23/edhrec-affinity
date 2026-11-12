@@ -1082,10 +1082,10 @@ def test_rate_limit_learning_survives_cooldown_and_the_next_collection_batch(tmp
     saved_summary = json.loads((args.output_dir.parent / "build_style_batch.json").read_text())
     assert saved_summary["blocked_until"] == expected_expiry
     learned = checkpoint(args)["source_rate"]
-    assert learned["learned_rate"] == pytest.approx(1.875)
+    assert learned["learned_rate"] == pytest.approx(.75)
     assert learned["throttles"] == 1
     assert learned["last_throttle"]["at"] == NOW.isoformat()
-    assert first["capacity"]["configured_requests_per_second"] == 40
+    assert first["capacity"]["configured_requests_per_second"] == 1
     assert first["capacity"]["effective_requests_per_second"] == learned["learned_rate"]
     assert first["publish_needed"] is True
     assert checkpoint(args)["progress"]["rate_control"]["status"] == "learned_below_observed_throttle"
@@ -1146,7 +1146,7 @@ def test_metadata_stop_retains_provider_and_does_not_relearn_edhrec_rate(tmp_pat
             "status_code": status, "reason": "rate_limit" if status == 429 else "access_restriction",
             "observed_at": NOW.isoformat(), "retry_after_seconds": 7200 if status == 429 else None}
     atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": {},
-                "source_rate": {"learned_rate": 1.3, "throttles": 3}})
+                "source_rate": {"learned_rate": .7, "throttles": 3}})
 
     def collect(settings, **dependencies):
         value = evidence(settings.commander)
@@ -1158,7 +1158,7 @@ def test_metadata_stop_retains_provider_and_does_not_relearn_edhrec_rate(tmp_pat
     assert result["source_stop"] == checkpoint(args)["source_stop"] == stop
     assert result["failures"][0]["source_stop"] == stop
     assert result["measured_request_rate"]["throttles"] == 0
-    assert checkpoint(args)["source_rate"] == {"learned_rate": 1.3, "throttles": 3}
+    assert checkpoint(args)["source_rate"] == {"learned_rate": .7, "throttles": 3}
     if status == 429:
         assert (datetime.fromisoformat(result["blocked_until"]) - NOW).total_seconds() == pytest.approx(7200, abs=.1)
 
@@ -1230,10 +1230,25 @@ def test_expired_deadline_reports_a_capacity_miss_without_inventing_a_measured_r
     result = execute(args, [{"commander_slug": "a", "total_decks": 12_000_000}],
                      lambda *_: pytest.fail("dry run collected sources"), saved_analyzer([]))
     assert result["capacity"]["status"] == "behind_target"
-    assert result["capacity"]["configured_requests_per_second"] == 40
+    assert result["capacity"]["configured_requests_per_second"] == 1
     assert result["capacity"]["observed_requests_per_second"] is None
     assert result["capacity"]["projected_finish_at"] is None
     assert result["deadline_target_met"] is False
+
+
+def test_high_legacy_rate_cannot_override_new_cap_or_release_access_hold(tmp_path):
+    args = options(tmp_path, requests_per_second=640)
+    stop = {"provider": "edhrec", "status_code": 403, "reason": "access_restriction"}
+    atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1, "commanders": {},
+        "source_rate": {"learned_rate": 40, "throttles": 4}, "block_reason": "access_restriction",
+        "blocked_until": (NOW - timedelta(hours=24)).isoformat(), "source_stop": stop})
+    def forbidden(*args, **kwargs):
+        pytest.fail("A new rate cap must never release the saved access ban")
+    result = execute(args, rows("a"), forbidden, saved_analyzer([]))
+    assert result["blocked"] and result["source_stop"] == stop
+    assert result["capacity"]["configured_requests_per_second"] == 1
+    assert result["capacity"]["effective_requests_per_second"] == 1
+    assert checkpoint(args)["source_stop"] == stop
 
 
 def test_completion_estimates_preserve_fresh_evidence_without_a_deadline(tmp_path):

@@ -25,9 +25,10 @@ from zoneinfo import ZoneInfo
 
 from edhrec_affinity.build_styles.capacity import plan_capacity
 from edhrec_affinity.build_styles.eligibility import commander_is_eligible, valid_deck_count
+from edhrec_affinity.build_styles.sources import EDHREC_MAX_REQUESTS_PER_SECOND, edhrec_request_rate
 
 SCHEMA_VERSION = 1
-SEED_REQUEST_RATE = 1.318359375
+SEED_REQUEST_RATE = EDHREC_MAX_REQUESTS_PER_SECOND
 MAX_FILES = 300000
 MAX_BYTES = 32 * 1024 ** 3
 MIN_DISK_RESERVE_BYTES = 2 * 1024 ** 3
@@ -94,7 +95,7 @@ def source_rate(value):
     rate = result.get("learned_rate") or SEED_REQUEST_RATE
     if type(rate) not in {float, int} or not math.isfinite(rate) or rate <= 0:
         raise ValueError("Invalid learned worker request rate")
-    result["learned_rate"] = rate
+    result["learned_rate"] = edhrec_request_rate(rate)
     throttles = result.get("throttles", 0)
     if type(throttles) is not int or throttles < 0:
         raise ValueError("Invalid worker throttle history")
@@ -699,7 +700,7 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
         successes = sum(int(s.get("successful_responses") or 0) for s in stats_rows)
         started = sum(int(s.get("requests_started") or 0) for s in stats_rows)
         observed = successes / elapsed if elapsed > 0 else None
-        capacity = plan_capacity(planning_rows, max_requests_per_second=40 * len(active_controls),
+        capacity = plan_capacity(planning_rows, max_requests_per_second=EDHREC_MAX_REQUESTS_PER_SECOND * len(active_controls),
             effective_requests_per_second=ceiling, observed_requests_per_second=observed,
             remaining_previews=preview_remaining,
             remaining_overhead_requests=due["capacity"]["remaining_overhead_requests"], now=now())
@@ -721,7 +722,7 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
         merged.setdefault("progress", {}).update(updated_at=now().isoformat(), capacity=capacity,
             measured_request_rate=measured, blocked=systemic, blocked_until=merged.get("blocked_until") if systemic else None,
             rate_control={"learned_rate": ceiling, "effective_requests_per_second": ceiling,
-                "configured_requests_per_second": 40 * len(active_controls), "observed_requests_per_second": observed,
+                "configured_requests_per_second": EDHREC_MAX_REQUESTS_PER_SECOND * len(active_controls), "observed_requests_per_second": observed,
                 "observed_rate_at": now().isoformat(), "status": "independent_workers",
                 "rate_scope": "aggregate_independent_workers", "throttles": measured["throttles"]},
             distributed={"runners": manifest["runners"], "active_workers": len(active_controls) - paused_workers,

@@ -101,8 +101,8 @@ def test_shared_limiter_spaces_workers_and_access_block_stops_all(tmp_path):
             first.get("blocked.json", "https://json.edhrec.com/blocked.json")
         with pytest.raises(SourceBlocked, match="stopped"):
             second.get("three.json", "https://json.edhrec.com/three.json")
-        assert starts == [0, .5, 2.5]
-        assert waits == [0, .5, 2]
+        assert starts == [0, 1, 3]
+        assert waits == [0, 1, 2]
         assert first.blocked and second.blocked
         assert limiter.stats["requests_started"] == 3
         assert limiter.stats["successful_responses"] == 2
@@ -351,18 +351,18 @@ def test_parallel_previews_keep_each_list_bound_to_its_own_provenance(tmp_path):
 
 def test_adaptive_rate_ramps_only_after_successes_and_slows_on_failure():
     ticks = [0.0]
-    limiter = RequestLimiter(max_rate=40, start_rate=2, ramp_after=2,
+    limiter = RequestLimiter(max_rate=.8, start_rate=.4, ramp_after=2,
                              monotonic=lambda: ticks[0], sleep=lambda seconds: None)
-    assert limiter.delay == .5
+    assert limiter.delay == 2.5
     limiter.record_success()
-    assert limiter.delay == .5
+    assert limiter.delay == 2.5
     limiter.record_success()
-    assert limiter.delay == .4
+    assert limiter.delay == 2
     for _ in range(100):
         limiter.record_success()
-    assert limiter.delay == pytest.approx(1 / 40)
+    assert limiter.delay == pytest.approx(1 / .8)
     limiter.record_failure(cooldown=3)
-    assert limiter.delay == pytest.approx(1 / 20)
+    assert limiter.delay == pytest.approx(1 / .4)
     assert limiter._next_request == 3
 
 
@@ -373,27 +373,27 @@ def test_learned_request_rate_rejects_invalid_persistent_values(learned_rate):
 
 
 def test_persistent_learned_ceiling_limits_startup_and_future_ramping():
-    limiter = RequestLimiter(max_rate=40, learned_rate=1.25, ramp_after=1)
-    assert limiter.delay == .8
+    limiter = RequestLimiter(max_rate=40, learned_rate=.75, ramp_after=1)
+    assert limiter.delay == pytest.approx(1 / .75)
     for _ in range(100):
         limiter.record_success()
-    assert limiter.delay == .8
-    assert limiter.stats["configured_maximum_requests_per_second"] == 40
-    assert limiter.stats["maximum_requests_per_second"] == 1.25
-    assert limiter.stats["learned_maximum_requests_per_second"] == 1.25
+    assert limiter.delay == pytest.approx(1 / .75)
+    assert limiter.stats["configured_maximum_requests_per_second"] == 1
+    assert limiter.stats["maximum_requests_per_second"] == .75
+    assert limiter.stats["learned_maximum_requests_per_second"] == .75
     # A previously higher limit cannot override a lower configured maximum.
-    lowered_configuration = RequestLimiter(max_rate=1, learned_rate=1.25)
-    assert lowered_configuration.stats["maximum_requests_per_second"] == 1
-    assert lowered_configuration.learning_state["learned_rate"] == 1
+    lowered_configuration = RequestLimiter(max_rate=.5, learned_rate=.75)
+    assert lowered_configuration.stats["maximum_requests_per_second"] == .5
+    assert lowered_configuration.learning_state["learned_rate"] == .5
 
 
 def test_throttle_learns_from_current_rate_once_per_job_and_survives_restart():
     limiter = RequestLimiter(max_rate=40, ramp_after=1, monotonic=lambda: 0)
-    limiter.record_success()  # Current rate is 2.5, below the configured ceiling.
+    limiter.record_success()  # Success cannot raise the one-request/second cap.
     limiter.record_throttle(now=START)
     assert limiter.learning_state == {
-        "learned_rate": 1.875, "throttles": 1,
-        "last_throttle": {"at": START.isoformat(), "rate_before": 2.5, "rate_after": 1.875},
+        "learned_rate": .75, "throttles": 1,
+        "last_throttle": {"at": START.isoformat(), "rate_before": 1, "rate_after": .75},
     }
     workers = [threading.Thread(target=limiter.record_throttle) for _ in range(12)]
     for worker in workers:
@@ -402,15 +402,15 @@ def test_throttle_learns_from_current_rate_once_per_job_and_survives_restart():
         worker.join(timeout=2)
         assert not worker.is_alive()
     assert limiter.learning_state["throttles"] == 1
-    assert limiter.learning_state["learned_rate"] == 1.875
+    assert limiter.learning_state["learned_rate"] == .75
     limiter.record_failure(cooldown=0)
     for _ in range(100):
         limiter.record_success()
-    assert limiter.stats["current_requests_per_second"] <= 1.875
+    assert limiter.stats["current_requests_per_second"] <= .75
     restarted = RequestLimiter(max_rate=40, learned_rate=limiter.learning_state["learned_rate"])
-    assert restarted.stats["current_requests_per_second"] == 1.875
+    assert restarted.stats["current_requests_per_second"] == .75
     restarted.record_throttle(now=START + timedelta(hours=1))
-    assert restarted.learning_state["learned_rate"] == 1.40625
+    assert restarted.learning_state["learned_rate"] == .5625
 
 
 def test_learning_can_reduce_rates_below_a_fixed_practical_floor():
@@ -418,6 +418,74 @@ def test_learning_can_reduce_rates_below_a_fixed_practical_floor():
     limiter.record_throttle(now=START)
     assert limiter.stats["maximum_requests_per_second"] == pytest.approx(.0075)
     assert limiter.stats["current_requests_per_second"] == pytest.approx(.0075)
+
+
+@pytest.mark.parametrize("requested", [None, .5, 1, 40, 640])
+@pytest.mark.parametrize("saved", [None, .25, 1.318359375, 40])
+def test_legacy_configuration_and_successes_cannot_exceed_one_request_per_second(requested, saved):
+    ticks, starts = [0.0], []
+    def sleep(seconds):
+        ticks[0] += seconds
+    limiter = RequestLimiter(delay=.001, max_rate=requested, learned_rate=saved,
+        start_rate=1000, ramp_after=1, monotonic=lambda: ticks[0], sleep=sleep)
+    for _ in range(20):
+        limiter.wait()
+        starts.append(ticks[0])
+        for _ in range(100):
+            limiter.record_success()
+    assert all(after - before >= 1 for before, after in zip(starts, starts[1:]))
+    assert limiter.stats["maximum_requests_per_second"] <= 1
+    assert limiter.stats["current_requests_per_second"] <= 1
+    if saved is not None:
+        assert limiter.stats["maximum_requests_per_second"] <= saved
+    if requested is not None:
+        assert limiter.stats["maximum_requests_per_second"] <= requested
+
+
+def test_concurrent_preview_threads_share_one_budget_instead_of_one_each():
+    ticks, starts = [0.0], []
+    def sleep(seconds):
+        ticks[0] += seconds
+        starts.append(ticks[0])  # Called under the limiter's pacing lock.
+    limiter = RequestLimiter(max_rate=40, learned_rate=40, ramp_after=1,
+        monotonic=lambda: ticks[0], sleep=sleep)
+    def collect():
+        for _ in range(10):
+            limiter.wait()
+            limiter.record_success()
+    threads = [threading.Thread(target=collect) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    assert len(starts) == limiter.stats["requests_started"] == 160
+    assert all(after - before >= 1 for before, after in zip(starts, starts[1:]))
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_redirects_cannot_bypass_the_shared_budget_or_leave_edhrec(tmp_path, external):
+    limiter, ticks, waits = fake_limiter()
+    cache = Cache(tmp_path, fetch=True, limiter=limiter)
+    calls = []
+    def handler(request):
+        calls.append((str(request.url), ticks[0]))
+        if request.url.path == "/first.json":
+            return httpx.Response(302, headers={"Location": "https://example.com/other" if external else
+                "https://json.edhrec.com/final.json"})
+        return httpx.Response(200, json={"ok": True})
+    attach_transport(cache, handler)
+    try:
+        if external:
+            with pytest.raises(ValueError, match="approved HTTPS hosts"):
+                cache.get("first.json", "https://json.edhrec.com/first.json")
+            assert len(calls) == 1
+        else:
+            assert cache.get("first.json", "https://json.edhrec.com/first.json") == {"ok": True}
+            assert [time for _, time in calls] == [0, 1]
+            assert limiter.stats["requests_started"] == 2
+    finally:
+        cache.close()
 
 
 @pytest.mark.parametrize("status", [403, 429])
@@ -434,7 +502,7 @@ def test_only_http_429_lowers_the_ceiling_while_both_access_codes_stop_collectio
     try:
         with pytest.raises(SourceBlocked, match=str(status)):
             cache.get("one.json", "https://json.edhrec.com/one.json")
-        assert limiter.learning_state["learned_rate"] == (1.5 if status == 429 else None)
+        assert limiter.learning_state["learned_rate"] == (.75 if status == 429 else None)
         assert limiter.learning_state["throttles"] == (1 if status == 429 else 0)
         assert limiter.stats["block_kind"] == ("rate_limit" if status == 429 else "access_restriction")
         assert limiter.stats["source_stop"] == {

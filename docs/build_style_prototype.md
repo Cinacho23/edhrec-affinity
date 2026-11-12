@@ -448,9 +448,19 @@ Only the coordinator updates shared queue state and publishes finished reports.
 The existing `--workers 1` option retains sequential queue behavior for local
 experiments; `--workers 2` enables opposite-end ownership.
 
-All source workers share one adaptive request budget. The configured ceiling is
-40 starts per second, initially ramping from two; it is not multiplied by either
-commander or preview worker counts, and is not treated as EDHREC's actual limit.
+All source threads within one collector VM share one request budget with a hard
+ceiling of one EDHREC request start per second. The CLI and workflow defaults are
+one; older higher repository variables, CLI values and saved learned rates are
+clamped to that ceiling. Lower configured or learned rates remain in effect.
+Successes cannot ramp above the ceiling. It is not multiplied by either
+commander or preview thread counts within the VM.
+This is a per-collector ceiling, not a cross-machine limiter or proof that
+EDHREC permits one request/second from each IP. Sixteen collector VMs could
+still generate sixteen requests/second in aggregate. The November 11 diagnostic
+received an explicit rate-ban response from the preview route directing us to
+one request/second and to contact EDHREC with collector IPs. Its scope is not
+established; the ban remains held for provider review, and IP rotation is not
+used to resume through it.
 An HTTP 429 stops the batch immediately and records an operating ceiling 25%
 below the rate at that response. Later jobs start and ramp within the learned
 ceiling. Further throttling lowers it again; concurrent responses to the same
@@ -505,7 +515,7 @@ Run the rolling full collector under the existing source-access permission:
 ```sh
 .venv/bin/python scripts/build_site_build_styles.py --pipeline --fetch \
   --workers 2 --preview-workers 16 --analysis-workers 2 \
-  --requests-per-second 40 --sample-decks all \
+  --requests-per-second 1 --sample-decks all \
   --min-total-decks 200 --source-max-age-hours 72 \
   --index-max-age-hours 24 --refresh-after-days 3 \
   --max-runtime-seconds 1800 --prune-completed-cache

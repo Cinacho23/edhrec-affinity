@@ -364,8 +364,8 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--workers", type=int, default=6, help="Concurrent commander collectors sharing one source request budget")
     cli.add_argument("--preview-workers", type=int, default=16, help="Concurrent preview downloads per commander")
     cli.add_argument("--analysis-workers", type=int, default=2, help="Independent CPU model processes")
-    cli.add_argument("--requests-per-second", type=float, default=40,
-                     help="Shared adaptive request ceiling, not a claimed sustained source capacity")
+    cli.add_argument("--requests-per-second", type=float, default=1,
+                     help="Shared EDHREC budget per collector; hard maximum 1 request/second, including saved rates")
     cli.add_argument("--source-max-age-hours", type=float, default=72)
     cli.add_argument("--index-max-age-hours", type=float, default=24)
     cli.add_argument("--target-completion-hours", type=float,

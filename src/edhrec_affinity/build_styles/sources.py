@@ -25,6 +25,16 @@ from edhrec_affinity.edhrec_payload import extract_page_deck_count
 from edhrec_affinity.tag_scraper import DEFAULT_USER_AGENT
 
 
+EDHREC_MAX_REQUESTS_PER_SECOND = 1.0
+
+
+def edhrec_request_rate(value):
+    """Cap one collector's shared budget; never infer a per-IP allowance."""
+    if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
+        raise ValueError("EDHREC request rate must be finite and positive")
+    return min(value, EDHREC_MAX_REQUESTS_PER_SECOND)
+
+
 def card_key(name: str) -> str:
     return unicodedata.normalize("NFKC", name).replace("’", "'").strip().casefold()
 
@@ -439,10 +449,10 @@ class SourceFormatError(ValueError):
 
 
 class RequestLimiter:
-    """One request-start budget shared by every collection worker.
+    """One request-start budget shared by collection threads in one process.
 
     Waiting reserves a start time, not the whole HTTP request, so slow responses
-    can overlap without multiplying the configured source request rate. An
+    can overlap without multiplying the one-request/second source ceiling. An
     access challenge stops all workers using this limiter immediately.
     """
 
@@ -464,7 +474,7 @@ class RequestLimiter:
         if deadline is not None and not math.isfinite(deadline):
             raise ValueError("Request deadline must be finite")
         self.deadline = deadline
-        self.configured_maximum_rate = max_rate if max_rate is not None else 1 / delay
+        self.configured_maximum_rate = edhrec_request_rate(max_rate if max_rate is not None else 1 / delay)
         self.learned_rate = min(learned_rate, self.configured_maximum_rate) if learned_rate is not None else None
         self.minimum_delay = 1 / (self.learned_rate or self.configured_maximum_rate)
         if not math.isfinite(self.minimum_delay):
@@ -733,6 +743,26 @@ class Cache:
             return self.preview_transport.get(self, identifier, **kwargs)
         return self.get(f"previews/{identifier}.html", f"https://edhrec.com/deckpreview/{identifier}", html=True, **kwargs)
 
+    def _get_response(self, url, *, rsc):
+        # Automatic redirects would issue unpaced extra requests. Every hop
+        # must reserve the same budget and stay within the EDHREC hosts.
+        for _ in range(21):
+            if self.blocked:
+                raise SourceBlocked("Collection stopped after an access challenge or rate limit")
+            if self.limiter is not None:
+                self.limiter.wait()
+            else:
+                time.sleep(max(0.0, self.delay - (time.monotonic() - self.last_request)))
+            self.last_request = time.monotonic()
+            response = self.client.get(url, follow_redirects=False, **({"headers": {"RSC": "1"}} if rsc else {}))
+            if not response.is_redirect or response.next_request is None:
+                return response
+            target = response.next_request.url
+            if target.scheme != "https" or target.host not in {"edhrec.com", "json.edhrec.com"}:
+                raise ValueError("EDHREC redirect left the approved HTTPS hosts")
+            url = str(target)
+        raise httpx.TooManyRedirects("EDHREC redirect limit reached")
+
     def get(self, relative: str, url: str, *, html: bool = False, rsc: bool = False,
             max_age_seconds: float | None = None, force_refresh: bool = False,
             validate=None) -> Any:
@@ -758,13 +788,8 @@ class Cache:
                 raise SourceBlocked("Collection stopped after an access challenge or rate limit")
             if httpx.URL(url).host not in {"edhrec.com", "json.edhrec.com"}:
                 raise ValueError("This collector only requests public EDHREC pages")
-            if self.limiter is not None:
-                self.limiter.wait()
-            else:
-                time.sleep(max(0.0, self.delay - (time.monotonic() - self.last_request)))
-            self.last_request = time.monotonic()
             try:
-                response = self.client.get(url, headers={"RSC": "1"}) if rsc else self.client.get(url)
+                response = self._get_response(url, rsc=rsc)
             except httpx.TransportError:
                 if self.limiter is not None:
                     self.limiter.record_failure()

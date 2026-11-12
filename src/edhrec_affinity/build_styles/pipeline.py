@@ -23,7 +23,7 @@ from .analysis import tag_label_policy
 from .eligibility import CommanderBelowMinimum, commander_is_eligible, valid_deck_count, validate_minimum
 from .sources import (
     BudgetExpired, CommanderAliasCatalog, PreviewTransport, RequestLimiter, SourceBlocked,
-    commander_names, source_time,
+    commander_names, source_time, edhrec_request_rate,
 )
 
 
@@ -176,6 +176,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     from .__main__ import collect_evidence
     from .card_metadata import MetadataRepository
 
+    request_ceiling = edhrec_request_rate(args.requests_per_second)
     now = now or (lambda: datetime.now(timezone.utc))
     current_model_policy = model_policy(args)
     started, observed_at = monotonic(), now()
@@ -268,7 +269,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                "time_budget_seconds": args.max_runtime_seconds, "max_preview_attempts": None,
                "worker_grace_seconds": getattr(args, "worker_grace_seconds", 120),
                "deferred_analyses": [], "analysis_workers_stopped": False,
-               "request_ceiling_per_second": args.requests_per_second}
+               "request_ceiling_per_second": request_ceiling}
 
     def eligible(slug):
         record = state["commanders"].get(slug, {})
@@ -391,8 +392,8 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                 if learning["last_throttle"] is not None:
                     persisted["last_throttle"] = learning["last_throttle"]
                 state["source_rate"] = persisted
-        effective_ceiling = min(args.requests_per_second, state.get("source_rate", {}).get("learned_rate")
-                                or args.requests_per_second)
+        effective_ceiling = min(request_ceiling, state.get("source_rate", {}).get("learned_rate")
+                                or request_ceiling)
         if stats is not None:
             effective_ceiling = min(effective_ceiling, stats["maximum_requests_per_second"])
         measured_rate = (stats.get("successful_responses", 0) / elapsed
@@ -416,7 +417,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         summary["block_reason"] = state.get("block_reason") if summary["blocked"] else None
         summary["source_stop"] = state.get("source_stop") if summary["blocked"] else None
         summary["capacity"] = plan_capacity(planning_rows, target_hours=args.target_completion_hours,
-            max_requests_per_second=args.requests_per_second, effective_requests_per_second=effective_ceiling,
+            max_requests_per_second=request_ceiling, effective_requests_per_second=effective_ceiling,
             observed_requests_per_second=rate, cooldown_seconds=cooldown_seconds,
             elapsed_seconds=max(0, (now() - cycle_start).total_seconds()), remaining_previews=remaining,
             remaining_overhead_requests=overhead, now=now())
@@ -439,7 +440,7 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
                 "throttles": state.get("source_rate", {}).get("throttles", 0),
                 "observed_requests_per_second": rate,
                 "observed_rate_at": state.get("source_rate", {}).get("observed_rate_at"),
-                "configured_requests_per_second": args.requests_per_second,
+                "configured_requests_per_second": request_ceiling,
                 "effective_requests_per_second": effective_ceiling,
                 "status": "learned_below_observed_throttle" if state.get("source_rate", {}).get("learned_rate") else "calibrating"}}
         if not args.dry_run:
@@ -456,8 +457,8 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
     if args.dry_run:
         return summary
     deadline = started + args.max_runtime_seconds if args.max_runtime_seconds else None
-    limiter = RequestLimiter(max_rate=args.requests_per_second, learned_rate=learned_rate,
-                             start_rate=min(2, args.requests_per_second), ramp_after=100,
+    limiter = RequestLimiter(max_rate=request_ceiling, learned_rate=learned_rate,
+                             start_rate=request_ceiling, ramp_after=100,
                              deadline=deadline, monotonic=monotonic)
     limiter_holder[0] = limiter
     transport, metadata_lock = PreviewTransport(), threading.Lock()
