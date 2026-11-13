@@ -1,0 +1,44 @@
+name: Roll out tested WebKit collection
+run-name: "Verify WebKit, review saved access, and resume collection"
+
+on:
+  push:
+    branches: [codex/run-webkit-collection]
+    paths:
+      - .github/workflows/run-browser-rollout.yml
+      - scripts/rollout_browser_collection.py
+
+permissions:
+  contents: read
+  actions: write
+  checks: read
+
+# Child workflows own the source-work mutex. Holding that mutex here would
+# deadlock the smoke test and collectors while this job waits for them.
+concurrency:
+  group: browser-collection-rollout
+  cancel-in-progress: false
+
+jobs:
+  rollout:
+    name: Require hosted proof before each collection stage
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the reviewed rollout helper
+        uses: actions/checkout@v6
+      - name: Test, review, pilot, then start the approved pool
+        run: >-
+          python3 -u scripts/rollout_browser_collection.py
+          --source-run-id 42967307416 --runners 16
+          --output data/browser-rollout
+      - name: Retain the rollout audit even if a gate stops collection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-rollout-${{ github.run_id }}
+          path: data/browser-rollout/
+          if-no-files-found: warn
+          retention-days: 7
