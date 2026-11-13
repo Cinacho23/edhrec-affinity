@@ -62,3 +62,11 @@ and parser. It spaces requests ten seconds apart and uploads the proof even
 when access fails. This workflow cannot release collection holds or dispatch
 full collection. A successful local test does not establish GitHub-hosted
 access, a sustainable rate or complete coverage of other commanders.
+
+On November 13 the separate bounded GitHub-runner rate test completed all
+five stages through one request/second: 419 distinct previews and one gallery
+returned HTTP200, with no 403, 429, or challenge. Its peak stage retrieved 240
+decks in four minutes. The user then approved one request/second per worker;
+new production batches use that default with shared pacing within each VM.
+Existing 0.1 checkpoint budgets receive a one-time audited promotion, while
+current source holds and new throttle reductions remain authoritative.

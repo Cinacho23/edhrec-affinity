@@ -73,8 +73,8 @@ GitHub-hosted Ubuntu VMs. Each VM owns its queue, parsed lists, learned request
 rate and cooldown; two local workers claim its commanders from opposite ends.
 Saved claims resume after a restart. Downloads and model processes run
 independently. Source runners use standard headless WebKit to read the embedded
-data in ordinary public gallery and preview HTML, starting at one request every
-ten seconds per VM. They do not reuse personal browser sessions or solve access
+data in ordinary public gallery and preview HTML, using one shared request per
+second per VM by default. They do not reuse personal browser sessions or solve access
 challenges. Existing access holds require an explicit successful review before
 collection can resume. The **Test EDHREC browser collection** workflow verifies
 one gallery and one 100-card preview without changing production state or

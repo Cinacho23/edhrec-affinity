@@ -1122,6 +1122,34 @@ def test_rate_limit_learning_survives_cooldown_and_the_next_collection_batch(tmp
     assert checkpoint(args)["source_rate"]["observed_rate_at"] == resumed_at.isoformat()
 
 
+def test_approved_browser_workers_resume_at_one_and_keep_new_429_reductions(tmp_path, monkeypatch):
+    from edhrec_affinity.build_styles.rate_policy import APPROVAL_ID, APPROVAL_TIME
+    monkeypatch.setenv("BUILD_STYLE_EDHREC_TRANSPORT", "webkit")
+    monkeypatch.setenv("BUILD_STYLE_EDHREC_RATE_APPROVAL", APPROVAL_ID)
+    checked = APPROVAL_TIME + timedelta(minutes=10)
+    args = options(tmp_path, requests_per_second=1)
+    original = {"schema_version": 1, "commanders": {}, "source_rate": {"learned_rate": .1, "throttles": 3}}
+    atomic_json(args.output_dir / "_collection/state.json", original)
+    def throttled(settings, **dependencies):
+        limiter = dependencies["limiter"]
+        assert limiter.stats["maximum_requests_per_second"] == 1
+        assert limiter.stats["current_requests_per_second"] == 1
+        limiter.record_throttle(now=checked)
+        limiter.block("HTTP 429", kind="rate_limit")
+        raise SourceBlocked("HTTP 429")
+    first = execute(args, rows("a"), throttled, saved_analyzer([]), checked=checked)
+    assert first["source_rate_approval"]["id"] == APPROVAL_ID
+    assert checkpoint(args)["source_rate"]["learned_rate"] == .75
+    assert checkpoint(args)["source_rate"]["throttles"] == 4
+    resumed_at = checked + timedelta(hours=2)
+    def resumed(settings, **dependencies):
+        assert dependencies["limiter"].stats["maximum_requests_per_second"] == .75
+        return evidence(settings.commander, checked=resumed_at)
+    second = execute(args, rows("a"), resumed, saved_analyzer([]), checked=resumed_at)
+    assert not second["blocked"] and "source_rate_approval" not in second
+    assert checkpoint(args)["source_rate"]["learned_rate"] == .75
+
+
 def test_metadata_access_block_cannot_be_misclassified_as_an_edhrec_rate_pause(tmp_path):
     args = options(tmp_path)
 

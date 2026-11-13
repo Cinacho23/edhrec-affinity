@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import multiprocessing
+import os
 from pathlib import Path
 import shutil
 import threading
@@ -456,6 +457,14 @@ def run_pipeline(args, rows: list[dict], *, collector=None, analyzer=None, monot
         return summary
     if args.dry_run:
         return summary
+    from .rate_policy import promote_initial_browser_rate
+    if promote_initial_browser_rate(state, request_ceiling,
+            approval=os.environ.get("BUILD_STYLE_EDHREC_RATE_APPROVAL"),
+            transport=os.environ.get("BUILD_STYLE_EDHREC_TRANSPORT"), now=now()):
+        learned_rate = state["source_rate"]["learned_rate"]
+        summary["source_rate_approval"] = state["source_rate"]["rate_approval"]
+        summary["publish_needed"] = True
+        checkpoint()
     deadline = started + args.max_runtime_seconds if args.max_runtime_seconds else None
     limiter = RequestLimiter(max_rate=request_ceiling, learned_rate=learned_rate,
                              start_rate=request_ceiling, ramp_after=100,

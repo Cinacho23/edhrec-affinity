@@ -112,12 +112,14 @@ def test_runners_install_webkit_only_for_edhrec_source_jobs():
     assert "python -m playwright install --with-deps webkit" in collect
     assert "BUILD_STYLE_EDHREC_TRANSPORT: webkit" in collect
     assert "--with-deps webkit" not in plan + following_jobs
-    assert "vars.BUILD_STYLE_BROWSER_REQUESTS_PER_SECOND || '0.1'" in distributed
+    assert "vars.BUILD_STYLE_BROWSER_REQUESTS_PER_SECOND || '1'" in distributed
+    assert "BUILD_STYLE_EDHREC_RATE_APPROVAL: webkit-1rps-2026-11-13" in distributed
     legacy = (ROOT / ".github/workflows/build-commander-styles.yml").read_text()
     install = legacy.split("      - name: Install the EDHREC document browser\n", 1)[1].split("      - name:", 1)[0]
     assert "inputs.power_only != true && inputs.validate_power != true && inputs.rebuild_only != true" in install
     assert "BUILD_STYLE_EDHREC_TRANSPORT: webkit" in legacy
-    assert "vars.BUILD_STYLE_BROWSER_REQUESTS_PER_SECOND || '0.1'" in legacy
+    assert "vars.BUILD_STYLE_BROWSER_REQUESTS_PER_SECOND || '1'" in legacy
+    assert "BUILD_STYLE_EDHREC_RATE_APPROVAL: webkit-1rps-2026-11-13" in legacy
 
 
 def test_smoke_workflow_cannot_clear_holds_or_start_production():

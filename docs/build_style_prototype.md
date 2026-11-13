@@ -450,13 +450,23 @@ experiments; `--workers 2` enables opposite-end ownership.
 
 All source threads within one collector VM share one request budget with a hard
 ceiling of one EDHREC request start per second. The CLI default is one; browser
-collection workflows initially use `BUILD_STYLE_BROWSER_REQUESTS_PER_SECOND`
-or **0.1 requests/second** (one request every ten seconds). This matches the
-spacing in the small successful Mac pilot; it is not a demonstrated sustainable
-EDHREC limit. Older higher CLI values and saved learned rates are
+collection workflows use `BUILD_STYLE_BROWSER_REQUESTS_PER_SECOND`
+or **1 request/second**. The initial 0.1 budget was raised after the
+[November 13 one-runner test](https://github.com/Cinacho23/edhrec-affinity/actions/runs/43516237383)
+retrieved 419 distinct previews across five rate stages, including 240 at one
+request/second over four minutes, without a throttle or challenge. The user
+approved applying that budget to all workers. This short test does not establish
+a permanent source quota or sustained sixteen-runner throughput. Older higher CLI values and saved learned rates are
 clamped to that ceiling. Lower configured or learned rates remain in effect.
 Successes cannot ramp above the ceiling. It is not multiplied by either
 commander or preview thread counts within the VM.
+
+`BUILD_STYLE_EDHREC_RATE_APPROVAL=webkit-1rps-2026-11-13` promotes the saved
+initial 0.1 budget to one once, with the original controls and test evidence
+retained in an audit record. Access stops, active cooldowns, malformed controls,
+and any throttle recorded since the WebKit migration prevent promotion. New
+429 reductions persist across future batches and cannot be reset by this same
+approval. Already-running jobs keep their original budget until they finish.
 This is a per-collector ceiling, not a cross-machine limiter or proof that
 EDHREC permits one request/second from each IP. Sixteen collector VMs could
 still generate sixteen requests/second in aggregate. The November 11 diagnostic
