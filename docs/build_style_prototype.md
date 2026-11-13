@@ -449,8 +449,11 @@ The existing `--workers 1` option retains sequential queue behavior for local
 experiments; `--workers 2` enables opposite-end ownership.
 
 All source threads within one collector VM share one request budget with a hard
-ceiling of one EDHREC request start per second. The CLI and workflow defaults are
-one; older higher repository variables, CLI values and saved learned rates are
+ceiling of one EDHREC request start per second. The CLI default is one; browser
+collection workflows initially use `BUILD_STYLE_BROWSER_REQUESTS_PER_SECOND`
+or **0.1 requests/second** (one request every ten seconds). This matches the
+spacing in the small successful Mac pilot; it is not a demonstrated sustainable
+EDHREC limit. Older higher CLI values and saved learned rates are
 clamped to that ceiling. Lower configured or learned rates remain in effect.
 Successes cannot ramp above the ceiling. It is not multiplied by either
 commander or preview thread counts within the VM.
@@ -459,8 +462,9 @@ EDHREC permits one request/second from each IP. Sixteen collector VMs could
 still generate sixteen requests/second in aggregate. The November 11 diagnostic
 received an explicit rate-ban response from the preview route directing us to
 one request/second and to contact EDHREC with collector IPs. Its scope is not
-established; the ban remains held for provider review, and IP rotation is not
-used to resume through it.
+established. Saved access holds require an explicit access review before
+collection resumes; changing transports does not release them. IP rotation is
+not used to resume through a denial.
 An HTTP 429 stops the batch immediately and records an operating ceiling 25%
 below the rate at that response. Later jobs start and ramp within the learned
 ceiling. Further throttling lowers it again; concurrent responses to the same
@@ -470,7 +474,48 @@ the existing minimum cooldown remain enforced across jobs. The repository owner
 confirmed permission for automated EDHREC collection on October 21, 2026. No
 alternate route is used to evade access restrictions.
 
-A shared transport discovers the site's public page format once. Legacy Next.js pages supply a build ID for compact JSON; current App Router pages supply a React stream at the same public preview URL with the `RSC: 1` rendering header. The parser reads JSON records without executing page scripts, and rediscovers the format after a deployment invalidates it. Access blocks never cause a fallback around the block. One current preview measured 301 KB as HTML and 42 KB as a React stream; this is an observation about that payload, not a promised network speedup. Unsupported data formats remain retryable and preserve prior usable cache entries; they do not permanently exclude decks or masquerade as rate limits.
+Source collection runners explicitly select standard headless Playwright
+WebKit with `BUILD_STYLE_EDHREC_TRANSPORT=webkit`. They install the `collector`
+extra and `python -m playwright install --with-deps webkit`. Each browser uses
+an isolated context without copied login sessions, identity overrides, proxies
+or challenge solving. Only ordinary EDHREC document requests are admitted;
+scripts, images, ads and other background downloads are blocked. Request starts
+share the existing per-VM limiter, and denials or challenges stop collection.
+Playwright WebKit is not the branded Safari application.
+
+The browser reads `/commanders/<slug>/decks` and `/deckpreview/<id>` HTML.
+Current galleries embed their complete deck index despite showing 50 rows at
+a time. The parser validates the commander route, unique identifiers and
+displayed population before caching the normalized index. Previews retain
+their source identifiers, commanders and card quantities. Existing parsed
+decks and cache timestamps survive the transport change. A schema change
+preserves prior usable observations instead of permanently excluding decks.
+
+The explicit **Test EDHREC browser collection** workflow runs one gallery and
+one known preview through these production paths at ten-second spacing. It
+checks all gallery identifiers against the displayed population, exact source
+preview identity, the intended commander pair and a 100-card total. Its artifact
+retains results on failure. It never restores production state, releases a hold,
+dispatches collection or automatically scales the runner pool. GitHub-hosted
+success must be checked separately from the earlier Mac success.
+
+The subsequent two-machine pilot pins its actual rate and collection budget in
+the generation manifest. Its rollout gate still requires ten minutes of real
+overlap, independent stable egress evidence, intact checkpoints, no access hold
+or new throttle, and at most 1% transient failures. Successful throughput must
+reach 80% of the pinned rate on each machine and 180% combined. The minimum
+successful count per machine is 75% of rate times budget, rounded down, with a
+floor of 10 and a ceiling of 600. The budget must permit at least ten requests.
+At 0.1 requests/second for 900 seconds, the count threshold is 67 and the rates
+are 0.08 per machine and 0.18 combined. This tests sustained progress at the
+chosen cautious pace; it does not establish a higher source limit. Pilot
+success never automatically increases runner count.
+
+The optional HTTP transport remains the default for offline tests and local
+tools unless WebKit is selected explicitly. Its shared preview transport reads
+legacy compact JSON or the React stream already exposed by the ordinary public
+preview page. Neither transport automatically switches to the other after an
+access block.
 
 Collection has no fixed completion deadline by default. Build Discovery and capacity summaries distinguish the configured ceiling, learned operating ceiling, completed HTTP requests, remaining work, fastest request-only collection time, measured projection, pending analysis and unavailable previews. The fastest estimate assumes the learned rate can be sustained and includes known cooldown time; latency, retries, model fitting and runner gaps can extend it. Until a source rate has been learned, the configured ceiling supplies only a provisional lower bound. Neither the first throttled response nor that provisional bound establishes an exact permanent source limit. A later weekly snapshot date starts a new collection cycle without resetting learned rates or source ages.
 

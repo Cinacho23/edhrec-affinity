@@ -132,6 +132,27 @@ def assess(manifest, summaries_dir, *, now=utcnow):
         if not isinstance(workers, list):
             workers = []
     generation = manifest.get("generation") if isinstance(manifest, dict) else None
+    # Older immutable manifests used the original one-request/second pilot.
+    # New plans pin their rate and work budget so a cautious browser rollout
+    # is judged against the traffic it was actually configured to send.
+    explicit_budget = isinstance(manifest, dict) and any(key in manifest for key in ("request_rate", "collect_seconds"))
+    planned_rate = number(manifest.get("request_rate", 1.0)) if isinstance(manifest, dict) else None
+    planned_seconds = number(manifest.get("collect_seconds", 900), integer=True) if isinstance(manifest, dict) else None
+    if (planned_rate is None or not 0 < planned_rate <= 1
+            or planned_seconds is None or planned_seconds <= 0):
+        failures.append("Pilot request rate and collection budget must be valid and at most one request/second.")
+        planned_rate, planned_seconds = 1.0, 900
+    if explicit_budget and ("request_rate" not in manifest or "collect_seconds" not in manifest):
+        failures.append("Pilot rate and collection budget must both be pinned in the manifest.")
+    expected_requests = planned_rate * planned_seconds
+    if expected_requests < 10:
+        failures.append("Pilot budget must permit at least ten source requests per worker.")
+    minimum_successes = max(10, min(MIN_SUCCESSFUL_REQUESTS, math.floor(0.75 * expected_requests)))
+    minimum_worker_rate = round(MIN_WORKER_RPS * planned_rate, 12)
+    minimum_aggregate_rate = round(MIN_AGGREGATE_RPS * planned_rate, 12)
+    report.update(configured_requests_per_second=planned_rate, collect_seconds=planned_seconds)
+    report["thresholds"].update(successful_requests_per_worker=minimum_successes,
+        successful_rps_per_worker=minimum_worker_rate, aggregate_successful_rps=minimum_aggregate_rate)
     report["generation"] = generation
     if not isinstance(generation, str) or not generation:
         failures.append("Manifest generation is missing.")
@@ -240,9 +261,16 @@ def assess(manifest, summaries_dir, *, now=utcnow):
         if not isinstance(stats, dict):
             unknown.append(f"{label}: actual measured source request statistics are missing.")
             continue
+        if explicit_budget:
+            actual_ceiling = number(stats.get("configured_maximum_requests_per_second"))
+            if actual_ceiling is None or actual_ceiling <= 0:
+                unknown.append(f"{label}: the actual configured source ceiling is missing.")
+            elif actual_ceiling > planned_rate + 1e-12:
+                failures.append(f"{label}: the configured source ceiling exceeded the pinned pilot rate.")
         control = summary.get("source_control") or {}
         blocked_until = timestamp(control.get("blocked_until")) if isinstance(control, dict) else None
         if (pipeline.get("blocked") or stats.get("blocked") or stats.get("block_kind")
+                or isinstance(control, dict) and control.get("block_reason") == "access_restriction"
                 or blocked_until is not None and blocked_until > timestamp(report["assessed_at"])):
             failures.append(f"{label}: source access is blocked or cooling down.")
         throttle = number(stats.get("throttles"), integer=True)
@@ -280,10 +308,10 @@ def assess(manifest, summaries_dir, *, now=utcnow):
             "source_duration_seconds": duration, "measured_elapsed_seconds": elapsed,
             "public_ipv4": captures[0].get("public_ipv4") if len(captures) == 2 else None})
         windows.append((beginning, ending))
-        if successes < MIN_SUCCESSFUL_REQUESTS:
-            failures.append(f"{label}: fewer than {MIN_SUCCESSFUL_REQUESTS} successful source requests were proven.")
-        if rate < MIN_WORKER_RPS:
-            failures.append(f"{label}: successful source throughput was below {MIN_WORKER_RPS} requests/second.")
+        if successes < minimum_successes:
+            failures.append(f"{label}: fewer than {minimum_successes} successful source requests were proven.")
+        if rate < minimum_worker_rate:
+            failures.append(f"{label}: successful source throughput was below {minimum_worker_rate:g} requests/second.")
         if fraction > MAX_FAILURE_FRACTION:
             failures.append(f"{label}: transient failures exceeded 1% of source requests.")
     if len(addresses) == 2 and len(set(addresses)) != 2:
@@ -299,8 +327,8 @@ def assess(manifest, summaries_dir, *, now=utcnow):
         report["overlap_seconds"] = max(0, (min(end for _, end in windows) - max(start for start, _ in windows)).total_seconds())
         if report["overlap_seconds"] < MIN_OVERLAP_SECONDS:
             failures.append(f"Actual source collection overlapped for less than {MIN_OVERLAP_SECONDS} seconds.")
-    if len(metrics) == 2 and report["aggregate_successful_rps"] < MIN_AGGREGATE_RPS:
-        failures.append(f"Aggregate successful throughput was below {MIN_AGGREGATE_RPS} requests/second.")
+    if len(metrics) == 2 and report["aggregate_successful_rps"] < minimum_aggregate_rate:
+        failures.append(f"Aggregate successful throughput was below {minimum_aggregate_rate:g} requests/second.")
     if len(metrics) != 2 or len(addresses) != 2 or len(jobs) != 2 or len(runners) != 2:
         unknown.append("Complete measured source, machine, job, and stable egress proof is required from both workers.")
     report["improvement_over_baseline"] = report["aggregate_successful_rps"] / BASELINE_RPS

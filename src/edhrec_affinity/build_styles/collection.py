@@ -99,7 +99,8 @@ def collect_previews(cache, slug: str, *, limit: int | None, seed: int, progress
     if should_read_index:
         try:
             kwargs = {} if index_max_age_seconds is None else {"max_age_seconds": index_max_age_seconds}
-            table = cache.get("decks.json", f"https://json.edhrec.com/pages/decks/{slug}.json", **kwargs)["table"]
+            table = (cache.get_deck_index(slug, **kwargs) if hasattr(cache, "get_deck_index") else
+                     cache.get("decks.json", f"https://json.edhrec.com/pages/decks/{slug}.json", **kwargs))["table"]
             rows = {checked_identifier(row["urlhash"], deck=True): row for row in table}
             if state is None:
                 frame = list(rows.values())

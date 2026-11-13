@@ -293,3 +293,97 @@ def test_job_identity_must_be_stable_across_collection(tmp_path):
     value["job_id"] = "another-job"
     write(path, value)
     assert assess(manifest, tmp_path)["status"] == "fail"
+
+
+def browser_evidence(tmp_path):
+    manifest = evidence(tmp_path)
+    manifest.update(request_rate=0.1, collect_seconds=900, source_transport="webkit")
+    for worker in ("0", "1"):
+        update_summary(tmp_path, lambda summary: summary["pipeline_summary"]["measured_request_rate"].update(
+            requests_started=90, successful_responses=90,
+            configured_maximum_requests_per_second=0.1), worker=worker)
+    return manifest
+
+
+def test_browser_pilot_requires_real_progress_relative_to_pinned_cautious_rate(tmp_path):
+    manifest = browser_evidence(tmp_path)
+    result = assess(manifest, tmp_path)
+    assert result["status"] == "pass" and result["allowed_scale_up"] is True
+    assert result["thresholds"]["successful_requests_per_worker"] == 67
+    assert result["thresholds"]["successful_rps_per_worker"] == pytest.approx(0.08)
+    assert result["thresholds"]["aggregate_successful_rps"] == pytest.approx(0.18)
+    assert result["proven_requests"] == 180
+    assert result["aggregate_successful_rps"] == pytest.approx(0.2)
+
+
+def test_pinned_one_rps_manifest_retains_original_pilot_thresholds(tmp_path):
+    manifest = evidence(tmp_path)
+    manifest.update(request_rate=1, collect_seconds=900)
+    for worker in ("0", "1"):
+        update_summary(tmp_path, lambda summary: summary["pipeline_summary"]["measured_request_rate"].update(
+            configured_maximum_requests_per_second=1), worker=worker)
+    result = assess(manifest, tmp_path)
+    assert result["status"] == "pass"
+    assert result["thresholds"]["successful_requests_per_worker"] == 600
+    assert result["thresholds"]["successful_rps_per_worker"] == 0.8
+    assert result["thresholds"]["aggregate_successful_rps"] == 1.8
+
+
+@pytest.mark.parametrize("stats", [
+    {"successful_responses": 66}, {"successful_responses": 70},
+    {"throttles": 1}, {"status_counts": {"403": 1}},
+    {"configured_maximum_requests_per_second": 1},
+])
+def test_cautious_rate_still_requires_successful_throughput_and_respects_safety(tmp_path, stats):
+    manifest = browser_evidence(tmp_path)
+    update_summary(tmp_path, lambda summary: summary["pipeline_summary"]["measured_request_rate"].update(stats))
+    assert assess(manifest, tmp_path)["status"] == "fail"
+
+
+def test_cautious_rate_still_requires_both_workers_combined_progress(tmp_path):
+    manifest = browser_evidence(tmp_path)
+    for worker in ("0", "1"):
+        update_summary(tmp_path, lambda summary: summary["pipeline_summary"]["measured_request_rate"].update(
+            successful_responses=76), worker=worker)
+    result = assess(manifest, tmp_path)
+    assert result["status"] == "fail"
+    assert any("Aggregate successful throughput" in reason for reason in result["reasons"])
+
+
+def test_cautious_rate_exact_throughput_boundaries_are_accepted(tmp_path):
+    manifest = browser_evidence(tmp_path)
+    update_summary(tmp_path, lambda summary: summary["pipeline_summary"]["measured_request_rate"].update(
+        successful_responses=72))
+    assert assess(manifest, tmp_path)["status"] == "pass"
+
+
+@pytest.mark.parametrize("fields", [
+    {"request_rate": 0}, {"request_rate": True}, {"request_rate": 1.01},
+    {"request_rate": float("nan")}, {"collect_seconds": 0}, {"collect_seconds": 900.5},
+    {"request_rate": 0.01, "collect_seconds": 900},
+])
+def test_invalid_or_too_short_pilot_budget_cannot_lower_rollout_gate(tmp_path, fields):
+    manifest = browser_evidence(tmp_path)
+    manifest.update(fields)
+    assert assess(manifest, tmp_path)["status"] == "fail"
+
+
+@pytest.mark.parametrize("missing", ["request_rate", "collect_seconds"])
+def test_partially_pinned_pilot_budget_fails_closed(tmp_path, missing):
+    manifest = browser_evidence(tmp_path)
+    manifest.pop(missing)
+    assert assess(manifest, tmp_path)["status"] == "fail"
+
+
+def test_missing_actual_ceiling_is_inconclusive_for_new_manifests(tmp_path):
+    manifest = browser_evidence(tmp_path)
+    update_summary(tmp_path, lambda summary: summary["pipeline_summary"]["measured_request_rate"].pop(
+        "configured_maximum_requests_per_second"))
+    assert assess(manifest, tmp_path)["status"] == "inconclusive"
+
+
+def test_expired_access_hold_still_blocks_pilot_promotion(tmp_path):
+    manifest = browser_evidence(tmp_path)
+    update_summary(tmp_path, lambda summary: summary["source_control"].update(
+        block_reason="access_restriction", blocked_until=at(-100)))
+    assert assess(manifest, tmp_path)["status"] == "fail"

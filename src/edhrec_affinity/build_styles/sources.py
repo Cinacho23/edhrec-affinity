@@ -11,6 +11,7 @@ import hashlib
 from itertools import product
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sys
@@ -698,13 +699,20 @@ def source_stop_details(provider: str, endpoint: str, status_code: int, observed
 class Cache:
     def __init__(self, root: Path, *, fetch: bool = False, delay: float = 1.0,
                  max_age_seconds: float | None = None, limiter: RequestLimiter | None = None,
-                 preview_transport=None, now=None):
+                 preview_transport=None, now=None, edhrec_transport: str | None = None):
         self.root = root
         self.fetch = fetch
         self.delay = max(1.0, delay)
         if max_age_seconds is not None and (not math.isfinite(max_age_seconds) or max_age_seconds < 0):
             raise ValueError("Cache maximum age must be finite and nonnegative")
         self.max_age_seconds, self.limiter = max_age_seconds, limiter
+        self.edhrec_transport = edhrec_transport or os.environ.get("BUILD_STYLE_EDHREC_TRANSPORT", "http")
+        if self.edhrec_transport not in {"http", "webkit"}:
+            raise ValueError("EDHREC transport must be http or webkit")
+        self._browser_transport = None
+        self._browser_lock = threading.Lock()
+        if self.edhrec_transport == "webkit" and self.limiter is None:
+            self.limiter = RequestLimiter(delay=self.delay)
         self.preview_transport = preview_transport
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.last_request = 0.0
@@ -717,7 +725,11 @@ class Cache:
         self._provenance_lock = threading.Lock()
 
     def close(self) -> None:
-        self.client.close()
+        try:
+            if self._browser_transport is not None:
+                self._browser_transport.close()
+        finally:
+            self.client.close()
 
     @property
     def blocked(self) -> bool:
@@ -739,11 +751,61 @@ class Cache:
                 self._observations[alias] = self._observations[url]
 
     def get_preview(self, identifier: str, **kwargs) -> dict:
+        checked_identifier(identifier, deck=True)
+        if self.edhrec_transport == "webkit" and (self.fetch or (self.root / f"previews/{identifier}.html").exists()):
+            original_validate = kwargs.pop("validate", None)
+            def validate(data):
+                if data.get("urlhash") != identifier:
+                    raise ValueError("Deck preview identity differs from the requested source")
+                if original_validate is not None:
+                    original_validate(data)
+            return self.get(f"previews/{identifier}.html", f"https://edhrec.com/deckpreview/{identifier}",
+                            html=True, validate=validate, **kwargs)
         if self.preview_transport is not None:
             return self.preview_transport.get(self, identifier, **kwargs)
+        if self.edhrec_transport == "webkit" and not self.fetch:
+            return PreviewTransport().get(self, identifier, **kwargs)
         return self.get(f"previews/{identifier}.html", f"https://edhrec.com/deckpreview/{identifier}", html=True, **kwargs)
 
+    def get_deck_index(self, slug: str, **kwargs) -> dict:
+        checked_identifier(slug)
+        if self.edhrec_transport != "webkit":
+            return self.get("decks.json", f"https://json.edhrec.com/pages/decks/{slug}.json", **kwargs)
+        canonical = f"https://edhrec.com/commanders/{slug}/decks"
+        path = self.root / "decks.json"
+        meta_path = path.with_suffix(".json.meta.json")
+        metadata = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        limit = kwargs.get("max_age_seconds", self.max_age_seconds)
+        fresh = limit is None or not source_is_stale(metadata.get("fetched_at"), limit, self.now())
+        if path.exists() and (not self.fetch or fresh and not kwargs.get("force_refresh")):
+            return self.get("decks.json", canonical, **kwargs)
+        from .browser_transport import extract_gallery_data
+        data = self.get("decks.html", canonical, parser=lambda text: extract_gallery_data(text, slug), **kwargs)
+        # Keep the normalized index readable by old checkpoints and offline tools.
+        # Its source age is copied from the HTML observation, never refreshed here.
+        text = json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        html_metadata_path = self.root / "decks.html.meta.json"
+        source_metadata = (json.loads(html_metadata_path.read_text()) if html_metadata_path.exists() else
+                           {"url": canonical, "fetched_at": None, "note": "Existing cache without a collection timestamp"})
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(text, encoding="utf-8")
+        temporary.replace(path)
+        temporary_meta = meta_path.with_suffix(".json.tmp")
+        temporary_meta.write_text(json.dumps({**source_metadata, "source_sha256": source_metadata.get("sha256"),
+                                             "sha256": hashlib.sha256(text.encode()).hexdigest()}, indent=2), encoding="utf-8")
+        temporary_meta.replace(meta_path)
+        return data
+
     def _get_response(self, url, *, rsc):
+        if self.edhrec_transport == "webkit":
+            from .browser_transport import BrowserHTMLTransport
+            if BrowserHTMLTransport.supports_url(url):
+                if rsc:
+                    raise ValueError("WebKit collection uses ordinary document HTML only")
+                with self._browser_lock:
+                    if self._browser_transport is None:
+                        self._browser_transport = BrowserHTMLTransport(self.limiter)
+                return self._browser_transport.get_response(url)
         # Automatic redirects would issue unpaced extra requests. Every hop
         # must reserve the same budget and stay within the EDHREC hosts.
         for _ in range(21):
@@ -765,7 +827,7 @@ class Cache:
 
     def get(self, relative: str, url: str, *, html: bool = False, rsc: bool = False,
             max_age_seconds: float | None = None, force_refresh: bool = False,
-            validate=None) -> Any:
+            validate=None, parser=None) -> Any:
         path = self.root / relative
         meta_path = path.with_suffix(path.suffix + ".meta.json")
         metadata = json.loads(meta_path.read_text()) if meta_path.exists() else {
@@ -828,7 +890,9 @@ class Cache:
             # Validate before caching, so neither a challenge nor an unsupported
             # response can replace a previously usable observation.
             try:
-                if rsc:
+                if parser is not None:
+                    parsed = parser(text)
+                elif rsc:
                     parsed = extract_preview_stream(text)
                 elif html:
                     parsed = extract_preview_data(text)
@@ -848,6 +912,8 @@ class Cache:
                 "url": url, "fetched_at": self.now().isoformat(),
                 "sha256": hashlib.sha256(text.encode()).hexdigest(),
             }
+            if response.extensions.get("edhrec_browser") == "webkit":
+                metadata["transport"] = "webkit"
             meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
             stale = False
             if self.limiter is not None:
@@ -860,6 +926,8 @@ class Cache:
         with self._provenance_lock:
             self.provenance.append(observation)
             self._observations[url] = observation
+        if parser is not None:
+            return parser(text)
         if rsc:
             return extract_preview_stream(text)
         return extract_preview_data(text) if html else json.loads(text)

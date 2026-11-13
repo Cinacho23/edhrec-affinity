@@ -42,6 +42,23 @@ The scraper should capture the cEDH-specific JSON/page and extract its deck coun
 
 ## Playwright Decision
 
-Playwright is not required for the normal scraper path.
+Playwright is not required for the aggregate commander/tag scraper. The
+individual-deck build-style collector now has a separately selected standard
+headless WebKit transport, enabled on source collection runners with
+`BUILD_STYLE_EDHREC_TRANSPORT=webkit`. It reads ordinary public gallery and
+preview HTML, using the embedded data already sent for those pages. It does not
+reuse a person's browser session or solve access challenges.
 
-It may still be used for debugging, validating network requests, or checking future EDHREC frontend changes.
+Install the `collector` optional dependency and browser on a collection machine:
+
+```bash
+python -m pip install -e ".[prototype,collector]"
+python -m playwright install --with-deps webkit
+```
+
+The explicit **Test EDHREC browser collection** workflow checks one known
+commander gallery and one known 100-card preview through the production cache
+and parser. It spaces requests ten seconds apart and uploads the proof even
+when access fails. This workflow cannot release collection holds or dispatch
+full collection. A successful local test does not establish GitHub-hosted
+access, a sustainable rate or complete coverage of other commanders.

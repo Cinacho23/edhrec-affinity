@@ -72,7 +72,13 @@ The distributed collector partitions eligible commanders across separate
 GitHub-hosted Ubuntu VMs. Each VM owns its queue, parsed lists, learned request
 rate and cooldown; two local workers claim its commanders from opposite ends.
 Saved claims resume after a restart. Downloads and model processes run
-independently, using compact public JSON or React preview data. Build Discovery
+independently. Source runners use standard headless WebKit to read the embedded
+data in ordinary public gallery and preview HTML, starting at one request every
+ten seconds per VM. They do not reuse personal browser sessions or solve access
+challenges. Existing access holds require an explicit successful review before
+collection can resume. The **Test EDHREC browser collection** workflow verifies
+one gallery and one 100-card preview without changing production state or
+starting other workflows. Build Discovery
 reports the combined operating ceiling and measured throughput, rather than
 imposing a fixed deadline. Daily
 deck-index checks add changed/new versions and remove deleted entries while
@@ -93,8 +99,12 @@ reports only when their parent hashes still match. Newer collection reports win.
 `Collect commander builds on distributed runners` starts with a bounded
 two-machine pilot. It requires distinct, stable public IPv4 addresses verified
 by two HTTPS services, at least ten minutes of overlapping actual EDHREC
-requests, at least 600 successes per VM, at least 0.8 successful requests/second
-per VM and 1.8 combined, no throttles or blocks, and valid uploaded checkpoints.
+requests, sufficient successes for the pinned rate and duration, at least 80%
+of that request rate per VM and 180% combined, no throttles or blocks, and valid
+uploaded checkpoints. At the initial 0.1 requests/second and 900-second budget,
+this means at least 67 successes per VM, 0.08 successful requests/second per VM
+and 0.18 combined. A one-request/second pilot retains the previous thresholds
+of 600 successes, 0.8 per VM and 1.8 combined.
 Missing evidence fails the rollout gate. A passing pilot measures that observed
 pair; it does not establish EDHREC's rate-limit scope for every machine.
 Only after reviewing that saved result may `BUILD_STYLE_DISTRIBUTED_RUNNERS` be

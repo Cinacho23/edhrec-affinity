@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import tempfile
@@ -21,7 +22,7 @@ import httpx
 
 from edhrec_affinity.build_styles.card_metadata import COLLECTION_URL
 from edhrec_affinity.build_styles.sources import (
-    Cache, SourceBlocked, checked_identifier, parse_preview, parse_profile,
+    Cache, RequestLimiter, SourceBlocked, checked_identifier, edhrec_request_rate, parse_preview, parse_profile,
 )
 from edhrec_affinity.tag_scraper import DEFAULT_USER_AGENT
 
@@ -189,7 +190,8 @@ class Recorder:
                                 else "rate_limit" if response.status_code == 429 else "unexpected_status")
             raise ReviewStopped("Normal service check did not return an unrestricted HTTP200 response")
         content_type = (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
-        expected_type = {"text/html", "application/xhtml+xml"} if "/deckpreview/" in url else {"application/json"}
+        expected_type = ({"text/html", "application/xhtml+xml"}
+                         if "/deckpreview/" in url or url.endswith("/decks") else {"application/json"})
         if content_type not in expected_type:
             check["outcome"] = "unexpected_content_type"
             raise ReviewStopped("Normal service check returned an unexpected response content type")
@@ -202,13 +204,32 @@ class Recorder:
         pass  # The caller owns the single shared HTTP client.
 
 
-def check_services(root, commander, rate, *, client=None, now=utcnow):
-    """Return proof from at most three serial ordinary requests."""
+def check_services(root, commander, rate, *, client=None, now=utcnow, transport="http"):
+    """Check the exact collection routes once, with no alternate-route fallback."""
+    rate = edhrec_request_rate(rate)
     checks, preview = [], known_preview(root, commander)
+    if transport not in {"http", "webkit"}:
+        raise ValueError("Unknown review transport")
+    if transport == "webkit" and preview is None:
+        return {"passed": False, "checks": [], "preview": None,
+                "reason": "WebKit review requires a known commander index"}
     owned_client = client is None
     client = client or httpx.Client(headers={"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"},
                                     timeout=30, follow_redirects=False, trust_env=False)
-    recorder = Recorder(client, checks, now=now)
+    browser = None
+    service_client = client
+    if transport == "webkit":
+        from edhrec_affinity.build_styles.browser_transport import BrowserHTMLTransport
+        browser = BrowserHTMLTransport(RequestLimiter(delay=max(1, 1 / rate)))
+        class BrowserServices:
+            def request(self, method, url, **kwargs):
+                if BrowserHTMLTransport.supports_url(url):
+                    if method != "GET":
+                        raise ValueError("Browser collection only reads documents")
+                    return browser.get_response(url)
+                return client.request(method, url, **kwargs)
+        service_client = BrowserServices()
+    recorder = Recorder(service_client, checks, now=now)
     try:
         response = recorder.request("POST", COLLECTION_URL, json={"identifiers": [{"name": "Sol Ring"}]})
         payload = response.json()
@@ -220,7 +241,7 @@ def check_services(root, commander, rate, *, client=None, now=utcnow):
             raise ValueError("Scryfall response does not match the requested known card")
         checks[-1].update(valid=True, outcome="verified")
         with tempfile.TemporaryDirectory(prefix="build-style-access-review-") as scratch:
-            cache = Cache(Path(scratch), fetch=True, delay=max(1, 1 / rate), now=now)
+            cache = Cache(Path(scratch), fetch=True, delay=max(1, 1 / rate), now=now, edhrec_transport="http")
             cache.client.close()
             cache.client = recorder
             try:
@@ -231,8 +252,19 @@ def check_services(root, commander, rate, *, client=None, now=utcnow):
                     parse_profile(data, "all", "All builds", allow_empty=True)
                 cache.get("base.json", f"https://json.edhrec.com/pages/commanders/{commander}.json", validate=validate_base)
                 checks[-1].update(valid=True, outcome="verified")
+                if transport == "webkit":
+                    from edhrec_affinity.build_styles.browser_transport import extract_gallery_data
+                    gallery_slug = preview["commander_slug"]
+                    gallery = cache.get("gallery.html", f"https://edhrec.com/commanders/{gallery_slug}/decks",
+                                        parser=lambda text: extract_gallery_data(text, gallery_slug))
+                    if not gallery["table"]:
+                        raise ValueError("Review gallery has no individual decks")
+                    preview = {**preview, "identifier": gallery["table"][0]["urlhash"]}
+                    checks[-1].update(valid=True, outcome="verified")
                 if preview is not None:
                     def validate_preview(data):
+                        if transport == "webkit" and data.get("urlhash") != preview["identifier"]:
+                            raise ValueError("Preview source identity differs from the requested deck")
                         parsed = parse_preview(data, preview["identifier"])
                         if not parsed["commanders"] or not parsed["cards"]:
                             raise ValueError("Deck preview has no commanders or mainboard cards")
@@ -246,6 +278,8 @@ def check_services(root, commander, rate, *, client=None, now=utcnow):
             checks[-1].update(outcome="invalid_schema", error=type(error).__name__)
         return {"passed": False, "checks": checks, "preview": preview, "reason": str(error)[:500]}
     finally:
+        if browser is not None:
+            browser.close()
         if owned_client:
             client.close()
     return {"passed": True, "checks": checks, "preview": preview,
@@ -255,7 +289,8 @@ def check_services(root, commander, rate, *, client=None, now=utcnow):
 def release_controls(state, proof, *, now):
     """Audit before releasing collection stops; retain every non-stop field."""
     checks = proof.get("checks", [])
-    if (proof.get("passed") is not True or not isinstance(checks, list) or len(checks) not in {2, 3}
+    webkit = proof.get("edhrec_transport", "http") == "webkit"
+    if (proof.get("passed") is not True or not isinstance(checks, list) or len(checks) not in ({4} if webkit else {2, 3})
             or any(not isinstance(check, dict) for check in checks)
             or any(check.get("valid") is not True or check.get("status_code") != 200
                    or check.get("challenge") is not False or not re.fullmatch(r"[a-f0-9]{64}", check.get("response_sha256", ""))
@@ -264,6 +299,10 @@ def release_controls(state, proof, *, now):
         raise ValueError("Fresh unrestricted normal-service proof is required before releasing collection controls")
     expected = [("scryfall", "POST", COLLECTION_URL),
                 ("edhrec", "GET", f"https://json.edhrec.com/pages/commanders/{proof['commander_slug']}.json")]
+    if webkit:
+        if proof.get("preview") is None:
+            raise ValueError("WebKit review must verify both gallery and individual deck")
+        expected.append(("edhrec", "GET", f"https://edhrec.com/commanders/{proof['preview']['commander_slug']}/decks"))
     if proof.get("preview") is not None:
         expected.append(("edhrec", "GET", f"https://edhrec.com/deckpreview/{proof['preview']['identifier']}"))
     if [(c.get("provider"), c.get("method"), c.get("url")) for c in checks] != expected:
@@ -289,14 +328,16 @@ def release_controls(state, proof, *, now):
 
 
 def review(root, source_run_id, output, *, restored_run_id, summary_file=None, expected_state_sha256=None,
-           commander=DEFAULT_COMMANDER, client=None, now=utcnow):
+           commander=DEFAULT_COMMANDER, client=None, now=utcnow, transport=None):
     root, output = Path(root), Path(output)
     state_path = root / STATE
     if root.resolve() in output.resolve().parents or output.resolve() == root.resolve():
         raise ValueError("Review proof must be outside the canonical checkpoint")
     if summary_file and output.resolve() == Path(summary_file).resolve():
         raise ValueError("Review proof cannot replace the restored source summary")
+    transport = transport or os.environ.get("BUILD_STYLE_EDHREC_TRANSPORT", "http")
     proof = {"schema_version": 1, "source_run_id": str(source_run_id), "commander_slug": checked_identifier(commander),
+             "edhrec_transport": transport,
              "started_at": now().isoformat(), "passed": False, "released": False, "checks": []}
     try:
         if state_path.is_symlink() or root.is_symlink():
@@ -311,7 +352,9 @@ def review(root, source_run_id, output, *, restored_run_id, summary_file=None, e
         rates = [control.get("source_rate", {}).get("learned_rate") for control in
                  [state, *state.get("distributed", {}).get("workers", {}).values()]]
         rate = min([1.0, *[value for value in rates if value is not None]])
-        proof.update(check_services(root, commander, rate, client=client, now=now))
+        if transport == "webkit":
+            rate = min(rate, edhrec_request_rate(float(os.environ.get("REQUESTS_PER_SECOND", "0.1"))))
+        proof.update(check_services(root, commander, rate, client=client, now=now, transport=transport))
         proof["completed_at"] = now().isoformat()
         if proof["passed"]:
             if state_path.read_bytes() != state_bytes:

@@ -33,7 +33,7 @@ concurrency:
 env:
   STYLES_DIR: data/build-style-artifact/build-styles
   BUILD_STYLE_DISTRIBUTED_RUNNERS: ${{ vars.BUILD_STYLE_DISTRIBUTED_RUNNERS || '0' }}
-  REQUESTS_PER_SECOND: ${{ vars.BUILD_STYLE_REQUESTS_PER_SECOND || '1' }}
+  REQUESTS_PER_SECOND: ${{ vars.BUILD_STYLE_BROWSER_REQUESTS_PER_SECOND || '0.1' }}
 
 jobs:
   plan:
@@ -140,6 +140,17 @@ jobs:
           args+=(--runners "${runners}")
           if [[ "${PILOT}" == "true" ]]; then args+=(--pilot); fi
           python scripts/distributed_build_styles.py "${args[@]}"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from edhrec_affinity.build_styles.sources import edhrec_request_rate
+          path = Path("data/distributed-plan/manifest.json")
+          manifest = json.loads(path.read_text())
+          config = json.loads(Path("data/distributed-plan/shared/config.json").read_text())
+          manifest.update(request_rate=edhrec_request_rate(float(os.environ["REQUESTS_PER_SECOND"])),
+                          collect_seconds=config["collect_seconds"], source_transport="webkit")
+          path.write_text(json.dumps(manifest, allow_nan=False))
+          PY
           cp data/distributed-plan/manifest.json data/distributed-plan/shared/manifest.json
           if [[ -f data/raw/build-style-card-metadata.json ]]; then
             cp data/raw/build-style-card-metadata.json data/distributed-plan/shared/card-metadata.json
@@ -335,6 +346,7 @@ jobs:
       SHARD_ID: ${{ matrix.id }}
       COLLECT_SECONDS: ${{ needs.plan.outputs.collect_seconds }}
       BUILD_STYLE_METADATA_REQUEST_DELAY_SECONDS: ${{ needs.plan.outputs.metadata_delay_seconds }}
+      BUILD_STYLE_EDHREC_TRANSPORT: webkit
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -344,7 +356,9 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install analysis dependencies
-        run: python -m pip install -e ".[prototype]"
+        run: |
+          python -m pip install -e ".[prototype,collector]"
+          python -m playwright install --with-deps webkit
       - name: Download only this VM's owned inputs
         uses: actions/download-artifact@v4
         with:

@@ -64,6 +64,65 @@ def good_response(request):
         json.dumps({"props": {"pageProps": {"data": data}}}) + '</script></html>'))
 
 
+def test_webkit_review_verifies_gallery_and_source_preview_before_releasing(tmp_path, monkeypatch):
+    root, summary, state = checkpoint(tmp_path)
+    calls = []
+    from edhrec_affinity.build_styles import browser_transport
+    class Browser:
+        supports_url = staticmethod(browser_transport.BrowserHTMLTransport.supports_url)
+        def __init__(self, limiter):
+            pass
+        def get_response(self, url):
+            calls.append(url)
+            if url.endswith("/decks"):
+                stream = '0:' + json.dumps({"route": {"section": "commanders", "tab": "decks",
+                    "cardSlug": "theoden-strength-restored"}, "decks": [
+                        {"urlhash": "current-preview", "savedate": "2026-11-01", "lands": 35, "creatures": 20}]}) + '\n'
+                html = '<p>Showing 1 to 1 of 1 decks</p><script>self.__next_f.push(' + json.dumps([1, stream]) + ')</script>'
+            else:
+                data = {"urlhash": "current-preview", "deck": {"commander": ["Theoden, Strength Restored"],
+                        "cards": {"Artifact": [["Sol Ring", 1]]}}}
+                html = '<script id="__NEXT_DATA__">' + json.dumps({"props": {"pageProps": {"data": data}}}) + '</script>'
+            return httpx.Response(200, headers={"content-type": "text/html"}, text=html, request=httpx.Request("GET", url))
+        def close(self):
+            pass
+    monkeypatch.setattr(browser_transport, "BrowserHTMLTransport", Browser)
+    def handler(request):
+        calls.append(str(request.url))
+        return good_response(request)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        proof = reviewer.review(root, RUN, tmp_path / "proof.json", restored_run_id=RUN,
+                                summary_file=summary, client=client, now=lambda: NOW, transport="webkit")
+    assert proof["released"] and proof["passed"]
+    assert proof["edhrec_transport"] == "webkit"
+    assert len(proof["checks"]) == 4
+    assert calls[-2:] == ["https://edhrec.com/commanders/theoden-strength-restored/decks",
+                          "https://edhrec.com/deckpreview/current-preview"]
+    saved = reviewer.read_json(root / reviewer.STATE)
+    assert saved["commanders"] == state["commanders"]
+    assert saved["_access_review"]["automatic_continuation_allowed"] is False
+
+
+def test_webkit_review_without_index_cannot_release(tmp_path):
+    root, summary, state = checkpoint(tmp_path, preview=False)
+    with httpx.Client(transport=httpx.MockTransport(lambda request: pytest.fail("No source request expected"))) as client:
+        proof = reviewer.review(root, RUN, tmp_path / "proof.json", restored_run_id=RUN,
+                                summary_file=summary, client=client, now=lambda: NOW, transport="webkit")
+    assert not proof["released"] and not proof["checks"]
+    assert reviewer.read_json(root / reviewer.STATE) == state
+
+
+@pytest.mark.parametrize("rate", ["-1", "0", "nan", "inf", "bad"])
+def test_invalid_browser_review_rate_never_requests_or_releases(tmp_path, monkeypatch, rate):
+    root, summary, state = checkpoint(tmp_path)
+    monkeypatch.setenv("REQUESTS_PER_SECOND", rate)
+    with httpx.Client(transport=httpx.MockTransport(lambda request: pytest.fail("No request expected"))) as client:
+        proof = reviewer.review(root, RUN, tmp_path / "proof.json", restored_run_id=RUN,
+                                summary_file=summary, client=client, now=lambda: NOW, transport="webkit")
+    assert not proof["released"] and not proof["checks"]
+    assert reviewer.read_json(root / reviewer.STATE) == state
+
+
 def execute(tmp_path, handler=good_response, *, preview=True, **kwargs):
     root, summary, state = checkpoint(tmp_path, preview=preview)
     requests = []
