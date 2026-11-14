@@ -19,13 +19,13 @@ def write(path, value):
     core.atomic_json(path, value)
 
 
-@pytest.mark.parametrize("saved", [.25, 1, 1.318359375, 40, 640])
+@pytest.mark.parametrize("saved", [.25, 1, 1.318359375, 1.5, 40, 640])
 def test_saved_worker_rate_is_capped_without_losing_stop_or_throttle_history(saved):
     original = {"learned_rate": saved, "throttles": 4,
                 "last_throttle": {"rate_before": 40, "rate_after": saved}}
     value = deepcopy(original)
     result = core.source_rate(value)
-    assert result["learned_rate"] == min(1, saved)
+    assert result["learned_rate"] == min(1.5, saved)
     assert result["throttles"] == 4 and result["last_throttle"] == original["last_throttle"]
     assert value == original
 

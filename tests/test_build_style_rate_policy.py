@@ -5,7 +5,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from edhrec_affinity.build_styles.rate_policy import (
-    APPROVAL_ID, APPROVAL_TIME, WEBKIT_START_TIME, promote_initial_browser_rate,
+    APPROVAL_ID, APPROVAL_TIME, APPROVAL_1_5_ID, APPROVAL_1_5_TIME,
+    WEBKIT_START_TIME, promote_initial_browser_rate,
 )
 
 NOW = APPROVAL_TIME + timedelta(minutes=10)
@@ -87,3 +88,67 @@ def test_only_the_legacy_initial_budget_is_promoted(saved):
     original = deepcopy(value)
     assert not promote(value)
     assert value == original
+
+
+def promote_one_point_five(value, **changes):
+    return promote_initial_browser_rate(value, changes.pop("ceiling", 1.5),
+        **({"approval": APPROVAL_1_5_ID, "transport": "webkit",
+            "now": APPROVAL_1_5_TIME + timedelta(minutes=10)} | changes))
+
+
+@pytest.mark.parametrize("prior", [.1, 1.0])
+def test_new_approval_promotes_only_unchanged_configured_budgets_and_keeps_prior_audit(prior):
+    value = state()
+    if prior == 1:
+        assert promote(value)
+    original = deepcopy(value)
+    assert promote_one_point_five(value)
+    assert value["source_rate"]["learned_rate"] == 1.5
+    audit = value["source_rate"]["rate_approval"]
+    assert audit["id"] == APPROVAL_1_5_ID
+    assert audit["previous_controls"] == original["source_rate"]
+    assert value["commanders"] == original["commanders"]
+    assert value["official_validation"] == original["official_validation"]
+    assert value["pipeline"] == original["pipeline"]
+    value["source_rate"]["learned_rate"] = 1
+    assert not promote_one_point_five(value)  # The approval cannot be reused.
+
+
+@pytest.mark.parametrize("controls", [
+    {"blocked": True}, {"block_reason": "access_restriction"},
+    {"blocked_until": (APPROVAL_1_5_TIME + timedelta(days=1)).isoformat()},
+    {"blocked_until": "bad"}, {"source_stop": {"reason": "access_restriction"}},
+])
+def test_new_approval_preserves_every_source_hold(controls):
+    value = state() | controls
+    value["source_rate"]["learned_rate"] = 1
+    original = deepcopy(value)
+    assert not promote_one_point_five(value)
+    assert value == original
+
+
+@pytest.mark.parametrize("prior", [.075, .75, 1.125, 1.5, None, True, False])
+def test_new_approval_never_overrides_a_learned_or_invalid_budget(prior):
+    value = state()
+    value["source_rate"]["learned_rate"] = prior
+    original = deepcopy(value)
+    assert not promote_one_point_five(value)
+    assert value == original
+
+
+@pytest.mark.parametrize("throttle", [{"at": WEBKIT_START_TIME.isoformat()},
+    {"at": APPROVAL_1_5_TIME.isoformat()}, {"at": "bad"}, {}, "unknown"])
+def test_new_approval_does_not_reset_an_intervening_browser_throttle(throttle):
+    value = state()
+    value["source_rate"].update(learned_rate=1, last_throttle=throttle)
+    original = deepcopy(value)
+    assert not promote_one_point_five(value)
+    assert value == original
+
+
+@pytest.mark.parametrize("changes", [{"ceiling": 1}, {"transport": "http"},
+    {"approval": APPROVAL_ID}, {"now": APPROVAL_1_5_TIME - timedelta(seconds=1)}])
+def test_new_approval_requires_the_explicit_matching_current_configuration(changes):
+    value = state()
+    value["source_rate"]["learned_rate"] = 1
+    assert not promote_one_point_five(value, **changes)

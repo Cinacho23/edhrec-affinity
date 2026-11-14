@@ -26,7 +26,7 @@ def fake_limiter():
         waits.append(seconds)
         ticks[0] += seconds
 
-    return RequestLimiter(.5, monotonic=lambda: ticks[0], sleep=sleep), ticks, waits
+    return RequestLimiter(1, monotonic=lambda: ticks[0], sleep=sleep), ticks, waits
 
 
 def attach_transport(cache, handler):
@@ -378,7 +378,7 @@ def test_persistent_learned_ceiling_limits_startup_and_future_ramping():
     for _ in range(100):
         limiter.record_success()
     assert limiter.delay == pytest.approx(1 / .75)
-    assert limiter.stats["configured_maximum_requests_per_second"] == 1
+    assert limiter.stats["configured_maximum_requests_per_second"] == 1.5
     assert limiter.stats["maximum_requests_per_second"] == .75
     assert limiter.stats["learned_maximum_requests_per_second"] == .75
     # A previously higher limit cannot override a lower configured maximum.
@@ -389,11 +389,11 @@ def test_persistent_learned_ceiling_limits_startup_and_future_ramping():
 
 def test_throttle_learns_from_current_rate_once_per_job_and_survives_restart():
     limiter = RequestLimiter(max_rate=40, ramp_after=1, monotonic=lambda: 0)
-    limiter.record_success()  # Success cannot raise the one-request/second cap.
+    limiter.record_success()  # Success cannot raise the configured production cap.
     limiter.record_throttle(now=START)
     assert limiter.learning_state == {
-        "learned_rate": .75, "throttles": 1,
-        "last_throttle": {"at": START.isoformat(), "rate_before": 1, "rate_after": .75},
+        "learned_rate": 1.125, "throttles": 1,
+        "last_throttle": {"at": START.isoformat(), "rate_before": 1.5, "rate_after": 1.125},
     }
     workers = [threading.Thread(target=limiter.record_throttle) for _ in range(12)]
     for worker in workers:
@@ -402,15 +402,15 @@ def test_throttle_learns_from_current_rate_once_per_job_and_survives_restart():
         worker.join(timeout=2)
         assert not worker.is_alive()
     assert limiter.learning_state["throttles"] == 1
-    assert limiter.learning_state["learned_rate"] == .75
+    assert limiter.learning_state["learned_rate"] == 1.125
     limiter.record_failure(cooldown=0)
     for _ in range(100):
         limiter.record_success()
-    assert limiter.stats["current_requests_per_second"] <= .75
+    assert limiter.stats["current_requests_per_second"] <= 1.125
     restarted = RequestLimiter(max_rate=40, learned_rate=limiter.learning_state["learned_rate"])
-    assert restarted.stats["current_requests_per_second"] == .75
+    assert restarted.stats["current_requests_per_second"] == 1.125
     restarted.record_throttle(now=START + timedelta(hours=1))
-    assert restarted.learning_state["learned_rate"] == .5625
+    assert restarted.learning_state["learned_rate"] == .84375
 
 
 def test_learning_can_reduce_rates_below_a_fixed_practical_floor():
@@ -420,9 +420,9 @@ def test_learning_can_reduce_rates_below_a_fixed_practical_floor():
     assert limiter.stats["current_requests_per_second"] == pytest.approx(.0075)
 
 
-@pytest.mark.parametrize("requested", [None, .5, 1, 40, 640])
+@pytest.mark.parametrize("requested", [None, .5, 1, 1.5, 40, 640])
 @pytest.mark.parametrize("saved", [None, .25, 1.318359375, 40])
-def test_legacy_configuration_and_successes_cannot_exceed_one_request_per_second(requested, saved):
+def test_legacy_configuration_and_successes_cannot_exceed_production_cap(requested, saved):
     ticks, starts = [0.0], []
     def sleep(seconds):
         ticks[0] += seconds
@@ -433,9 +433,9 @@ def test_legacy_configuration_and_successes_cannot_exceed_one_request_per_second
         starts.append(ticks[0])
         for _ in range(100):
             limiter.record_success()
-    assert all(after - before >= 1 for before, after in zip(starts, starts[1:]))
-    assert limiter.stats["maximum_requests_per_second"] <= 1
-    assert limiter.stats["current_requests_per_second"] <= 1
+    assert all(after - before >= 1 / 1.5 - 1e-12 for before, after in zip(starts, starts[1:]))
+    assert limiter.stats["maximum_requests_per_second"] <= 1.5
+    assert limiter.stats["current_requests_per_second"] <= 1.5
     if saved is not None:
         assert limiter.stats["maximum_requests_per_second"] <= saved
     if requested is not None:
@@ -460,7 +460,7 @@ def test_concurrent_preview_threads_share_one_budget_instead_of_one_each():
         thread.join(timeout=5)
         assert not thread.is_alive()
     assert len(starts) == limiter.stats["requests_started"] == 160
-    assert all(after - before >= 1 for before, after in zip(starts, starts[1:]))
+    assert all(after - before >= 1 / 1.5 - 1e-12 for before, after in zip(starts, starts[1:]))
 
 
 @pytest.mark.parametrize("external", [False, True])

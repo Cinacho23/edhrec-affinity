@@ -70,3 +70,11 @@ decks in four minutes. The user then approved one request/second per worker;
 new production batches use that default with shared pacing within each VM.
 Existing 0.1 checkpoint budgets receive a one-time audited promotion, while
 current source holds and new throttle reductions remain authoritative.
+
+On November 14 the owner approved a 1.5 requests/second production ceiling per
+worker after a separate test passed each 0.1 increment through 1.8 and stopped
+on a 302 redirect to `/rate-limit` during 1.9. That is an observed stop, not a
+proven permanent quota. The sixteen-machine pool has a combined configured
+ceiling of 24 requests/second; all threads on a VM still share its one limiter.
+A new explicit one-time policy promotes unchanged 0.1/1.0 checkpoint budgets
+while retaining their audit history, source holds, and any newer throttles.

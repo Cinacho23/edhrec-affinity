@@ -26,7 +26,7 @@ from edhrec_affinity.edhrec_payload import extract_page_deck_count
 from edhrec_affinity.tag_scraper import DEFAULT_USER_AGENT
 
 
-EDHREC_MAX_REQUESTS_PER_SECOND = 1.0
+EDHREC_MAX_REQUESTS_PER_SECOND = 1.5
 
 
 def edhrec_request_rate(value):
@@ -453,7 +453,7 @@ class RequestLimiter:
     """One request-start budget shared by collection threads in one process.
 
     Waiting reserves a start time, not the whole HTTP request, so slow responses
-    can overlap without multiplying the one-request/second source ceiling. An
+    can overlap without multiplying the shared per-collector source ceiling. An
     access challenge stops all workers using this limiter immediately.
     """
 

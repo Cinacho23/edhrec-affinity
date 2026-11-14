@@ -449,32 +449,47 @@ The existing `--workers 1` option retains sequential queue behavior for local
 experiments; `--workers 2` enables opposite-end ownership.
 
 All source threads within one collector VM share one request budget with a hard
-ceiling of one EDHREC request start per second. The CLI default is one; browser
+ceiling of 1.5 EDHREC request starts per second. The CLI default is one; browser
 collection workflows use `BUILD_STYLE_BROWSER_REQUESTS_PER_SECOND`
-or **1 request/second**. The initial 0.1 budget was raised after the
+or **1.5 requests/second**. The initial 0.1 budget was raised to one after the
 [November 13 one-runner test](https://github.com/Cinacho23/edhrec-affinity/actions/runs/43516237383)
 retrieved 419 distinct previews across five rate stages, including 240 at one
 request/second over four minutes, without a throttle or challenge. The user
-approved applying that budget to all workers. This short test does not establish
-a permanent source quota or sustained sixteen-runner throughput. Older higher CLI values and saved learned rates are
+approved applying that budget to all workers. On November 14 the owner then
+explicitly approved 1.5 after a separate bounded test passed every 0.1 increment
+through 1.8 and stopped on a `/rate-limit` redirect during 1.9. These short
+stages do not establish a permanent quota or sustainable sixteen-runner rate;
+earlier requests can contribute to a rolling allowance. See the
+[recorded test](browser_rate_test_2026-11-14.md). Older higher CLI values and saved learned rates are
 clamped to that ceiling. Lower configured or learned rates remain in effect.
 Successes cannot ramp above the ceiling. It is not multiplied by either
 commander or preview thread counts within the VM.
 
-`BUILD_STYLE_EDHREC_RATE_APPROVAL=webkit-1rps-2026-11-13` promotes the saved
-initial 0.1 budget to one once, with the original controls and test evidence
+`BUILD_STYLE_EDHREC_RATE_APPROVAL=webkit-1.5rps-2026-11-14` promotes the saved
+configured 0.1 or 1.0 budget to 1.5 once, with the original controls and test evidence
 retained in an audit record. Access stops, active cooldowns, malformed controls,
 and any throttle recorded since the WebKit migration prevent promotion. New
 429 reductions persist across future batches and cannot be reset by this same
 approval. Already-running jobs keep their original budget until they finish.
 This is a per-collector ceiling, not a cross-machine limiter or proof that
-EDHREC permits one request/second from each IP. Sixteen collector VMs could
-still generate sixteen requests/second in aggregate. The November 11 diagnostic
+EDHREC permits 1.5 requests/second from each IP. Sixteen collector VMs could
+generate 24 requests/second in aggregate. The November 11 diagnostic
 received an explicit rate-ban response from the preview route directing us to
 one request/second and to contact EDHREC with collector IPs. Its scope is not
 established. Saved access holds require an explicit access review before
 collection resumes; changing transports does not release them. IP rotation is
 not used to resume through a denial.
+
+The production pool stays at **16 source VMs**. Two queue workers inside each
+VM share its single limiter, so 32 queue workers do not multiply the 24-RPS
+combined ceiling. Separate jobs handle power validation, publication and
+coordination. GitHub Free permits 20 concurrent standard hosted jobs
+([GitHub limits](https://docs.github.com/en/actions/reference/limits)); sixteen
+source VMs leave four slots for this supporting work and occasional diagnostics.
+This is an operational choice, not the maximum available on every GitHub plan.
+More VMs would also increase aggregate source load and checkpoint transfers;
+the approved rate change does not increase their count.
+
 An HTTP 429 stops the batch immediately and records an operating ceiling 25%
 below the rate at that response. Later jobs start and ramp within the learned
 ceiling. Further throttling lowers it again; concurrent responses to the same
