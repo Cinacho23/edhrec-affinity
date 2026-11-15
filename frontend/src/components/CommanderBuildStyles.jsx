@@ -9,6 +9,7 @@ import {
   getBuildCollectionProgress,
   getBuildModel,
   getBuildModelOptions,
+  getBuildPackageDisplayOrder,
   getBuildSourceFreshness,
   getBuildThemeEvidence,
   getComparableProfilePairs,
@@ -286,6 +287,7 @@ function DeckMixtures({ model }) {
   const threshold = model.membership_threshold ?? 0.2;
   const rows = getDeckMixtureRows(model, selectedPackage, threshold);
   const visibleRows = showAll ? rows : rows.slice(0, 15);
+  const packages = getBuildPackageDisplayOrder(model.packages);
   return (
     <details className="build-evidence build-deck-mixtures">
       <summary>Inspect individual decks and their package mixtures</summary>
@@ -294,16 +296,16 @@ function DeckMixtures({ model }) {
         <span>Decks to show</span>
         <select value={selectedPackage} onChange={(event) => { setSelectedPackage(event.target.value); setShowAll(false); }}>
           <option value="all">All sampled decks</option>
-          {model.packages.map((pkg, index) => <option key={pkg.id ?? index} value={index}>Package {index + 1} members (≥ {formatBuildShare(threshold)})</option>)}
+          {packages.map(({ pkg, index }) => <option key={pkg.id ?? index} value={index}>Package {index + 1} members (≥ {formatBuildShare(threshold)})</option>)}
         </select>
       </label>
       <div className="build-table-scroll" tabIndex="0" role="region" aria-label="Individual deck package weights">
         <table>
           <caption>{formatNumber(rows.length)} sampled decks{showAll || rows.length <= 15 ? "" : "; showing the first 15"}</caption>
-          <thead><tr><th scope="col">Deck sources</th>{model.packages.map((pkg, index) => <th scope="col" key={pkg.id ?? index}>Package {index + 1}</th>)}<th scope="col">Reported tags</th></tr></thead>
+          <thead><tr><th scope="col">Deck sources</th>{packages.map(({ pkg, index }) => <th scope="col" key={pkg.id ?? index}>Package {index + 1}</th>)}<th scope="col">Reported tags</th></tr></thead>
           <tbody>{visibleRows.map((deck) => <tr key={deck.id}>
             <th scope="row"><div className="build-source-links"><SourceLink url={deck.source_url}>{deck.source_url?.includes("archidekt") ? "Archidekt" : deck.source_url?.includes("moxfield") ? "Moxfield" : "Original deck"}</SourceLink><SourceLink url={deck.preview_url}>EDHREC preview</SourceLink></div></th>
-            {model.packages.map((pkg, index) => <td key={pkg.id ?? index}><span className="build-weight"><span className="build-weight__bar" style={{ width: formatBuildShare(Math.min(1, Math.max(0, deck.memberships?.[index] || 0))) }} /> <span>{formatBuildShare(deck.memberships?.[index])}</span></span></td>)}
+            {packages.map(({ pkg, index }) => <td key={pkg.id ?? index}><span className="build-weight"><span className="build-weight__bar" style={{ width: formatBuildShare(Math.min(1, Math.max(0, deck.memberships?.[index] || 0))) }} /> <span>{formatBuildShare(deck.memberships?.[index])}</span></span></td>)}
             <td>{deck.source_tags?.length ? deck.source_tags.join(", ") : <span className="muted">None reported</span>}</td>
           </tr>)}</tbody>
         </table>
@@ -319,6 +321,7 @@ function DeckPackages({ analysis }) {
   const options = getBuildModelOptions(analysis);
   const selection = analysis.model_selection;
   const packages = model.packages || [];
+  const orderedPackages = getBuildPackageDisplayOrder(packages);
   return (
     <div className="build-view">
       <div className="build-view__header">
@@ -341,8 +344,8 @@ function DeckPackages({ analysis }) {
           <div><strong>{formatNumber(model.unique_decks)}</strong><span>unique sampled decks</span></div>
           <div><strong>{formatBuildShare(model.weighted_reconstruction_captured)}</strong><span>weighted card signal captured</span></div>
         </div>
-        <p className="build-note">Package membership can overlap, so counts need not add up to the sample size. Distinctive-card percentages describe sampled decks. Tag percentages use the commander’s total EDHREC decks; tags can overlap. Main and supporting tiers describe reported tag prevalence with minimum sample sizes. Captured card signal measures model fit, not confidence or the share of decks explained.</p>
-        <div className="build-package-grid">{packages.map((pkg, index) => <PackageCard key={pkg.id ?? index} pkg={pkg} index={index} decks={model.decks || []} />)}</div>
+        <p className="build-note">Packages are shown from most to fewest sampled deck members; their original numbers are preserved. Counts describe decks, not unique users. A deck is counted when its package weight is at least {formatBuildShare(model.membership_threshold ?? 0.2)}. Package membership can overlap, so counts need not add up to the sample size. Distinctive-card percentages describe sampled decks. Tag percentages use the commander’s total EDHREC decks; tags can overlap. Main and supporting tiers describe reported tag prevalence with minimum sample sizes. Captured card signal measures model fit, not confidence or the share of decks explained.</p>
+        <div className="build-package-grid">{orderedPackages.map(({ pkg, index }) => <PackageCard key={pkg.id ?? index} pkg={pkg} index={index} decks={model.decks || []} />)}</div>
         <DeckMixtures key={selectedCount} model={model} />
       </> : <p className="muted">{analysis.reason || analysis.interpretation || "There are not enough usable decklists to discover card packages yet. Tag-profile comparisons are available in the other view."}</p>}
       {selection?.candidates?.length ? <details className="build-evidence"><summary>How the package count was chosen</summary><p className="muted">The model balances reconstruction on held-out decks, simplicity, support, and stability. This is an exploratory estimate of useful packages.</p>{selection.validation_note ? <p className="muted">{selection.validation_note}</p> : null}<div className="build-table-scroll" tabIndex="0" role="region" aria-label="Package count comparison"><table><thead><tr><th scope="col">Packages</th><th scope="col">Held-out error ↓</th><th scope="col">Result</th></tr></thead><tbody>{selection.candidates.map((candidate) => <tr key={candidate.components}><th scope="row">{candidate.components}</th><td>{formatDecimal(candidate.validation_error, 3)}</td><td>{candidate.selected ? "Suggested" : candidate.eligible ? "Supported alternative" : candidate.reason || "Insufficient support"}</td></tr>)}</tbody></table></div></details> : null}

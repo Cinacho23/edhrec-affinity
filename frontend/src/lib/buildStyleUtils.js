@@ -43,6 +43,16 @@ export function getBuildModelOptions(analysis) {
     .map((model) => model.components))].sort((left, right) => left - right);
 }
 
+export function getBuildPackageDisplayOrder(packages) {
+  if (!Array.isArray(packages)) return [];
+  const count = (pkg) => Number.isSafeInteger(pkg?.member_count) && pkg.member_count >= 0
+    ? pkg.member_count : -1;
+  // Keep the source index: deck membership columns and saved package names use
+  // that index even when the website displays packages in a different order.
+  return packages.map((pkg, index) => ({ pkg, index }))
+    .sort((left, right) => count(right.pkg) - count(left.pkg) || left.index - right.index);
+}
+
 export function getSupportedThemes(pkg) {
   const seen = new Set();
   return (pkg.tag_suggestions || []).filter((theme) => {

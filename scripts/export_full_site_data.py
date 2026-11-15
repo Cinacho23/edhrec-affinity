@@ -1408,7 +1408,7 @@ def current_build_discovery_slugs(directory: Path, reports: dict[str, dict[str, 
 
 
 def summarize_build_style_packages(analysis: dict[str, Any]) -> list[dict[str, Any]]:
-    """Expose the selected model's package labels and bracket evidence only.
+    """Expose the selected model's package counts, labels and bracket evidence.
 
     Discovery must not fetch every full report just to display these details.
     Keep the rating timestamps so the frontend can age external verification in
@@ -1427,6 +1427,8 @@ def summarize_build_style_packages(analysis: dict[str, Any]) -> list[dict[str, A
         ]}
         if isinstance(package.get("name"), str):
             summary["name"] = package["name"]
+        if type(package.get("member_count")) is int and package["member_count"] >= 0:
+            summary["member_count"] = package["member_count"]
         deck = package.get("generated_deck")
         if isinstance(deck, dict) and isinstance(deck.get("status"), str):
             generated = {"status": deck["status"]}

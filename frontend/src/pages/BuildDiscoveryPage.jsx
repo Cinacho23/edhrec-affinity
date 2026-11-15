@@ -5,7 +5,7 @@ import BuildDiscoveryCards from "../components/BuildDiscoveryCards";
 import CommanderName from "../components/CommanderName";
 import { loadCommanderIndex } from "../lib/api";
 import { getCommanderCards } from "../lib/commanderPreview";
-import { getBuildCollectionProgress, getBuildSourceFreshness, getBuildThemeEvidence, getCurrentBuildDiscoveryCommanders, getPackageBracketLabel, getSupportedThemes } from "../lib/buildStyleUtils";
+import { getBuildCollectionProgress, getBuildPackageDisplayOrder, getBuildSourceFreshness, getBuildThemeEvidence, getCurrentBuildDiscoveryCommanders, getPackageBracketLabel, getSupportedThemes } from "../lib/buildStyleUtils";
 import { formatCollectionDuration, getBuildCollectorExecutionStatus, getBuildCollectorStatus } from "../lib/buildCollectionStatus";
 import { watchBuildDiscovery } from "../lib/buildDiscoveryRefresh";
 import {
@@ -67,11 +67,13 @@ function PackageSummaries({ commander, selectedTag }) {
       <span>{formatNumber(commander.packages.length)} {commander.packages.length === 1 ? "package" : "packages"} · tags &amp; brackets</span>
       <span className="build-discovery-card__package-toggle" aria-hidden="true" />
     </summary>
-    <ul>{commander.packages.map((pkg, index) => {
+    <p className="muted build-discovery-card__package-note">Most sampled deck members first; original package numbers preserved.</p>
+    <ul>{getBuildPackageDisplayOrder(commander.packages).map(({ pkg, index }) => {
       const tags = getSupportedThemes(pkg);
       const bracket = getPackageBracketLabel(pkg.generated_deck);
       return <li key={pkg.id ?? index}>
         <div className="build-discovery-card__package-heading"><strong>Package {index + 1}</strong><span className={bracket ? "build-discovery-card__bracket" : "muted"}>{bracket || "Bracket unavailable"}</span></div>
+        {Number.isSafeInteger(pkg.member_count) && pkg.member_count >= 0 ? <p className="muted build-discovery-card__package-note">{formatNumber(pkg.member_count)} sampled decks</p> : null}
         <div className="build-discovery-card__tags">{tags.length ? tags.map((tag) => {
           const matched = selectedTag && matchesBuildDiscoveryPackageTag(tag, selectedTag);
           const evidence = getBuildThemeEvidence(tag);

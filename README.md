@@ -68,6 +68,10 @@ export, discovery cards and individual commander package views. Older evidence
 remains stored. A visible browser tab refreshes published results and checks the
 collector’s GitHub execution status every two minutes.
 
+Commander packages and their Discovery summaries display the largest sampled
+deck membership first. Original package numbers stay attached to their generated
+decks and mixture weights; ordering does not change the fitted models or collection.
+
 The distributed collector partitions eligible commanders across separate
 GitHub-hosted Ubuntu VMs. Each VM owns its queue, parsed lists, learned request
 rate and cooldown; two local workers claim its commanders from opposite ends.

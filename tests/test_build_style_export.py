@@ -240,7 +240,7 @@ def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_
     calculated = {"status": "calculated", "checked_at": "2026-10-24T10:00:00Z", "power_level": 6.72,
                   "score_bracket": 3, "deck_sha256": "current-list", "source": "local_public_formula",
                   "power_formula_version": 1, "card_details": ["large internal calculation detail"]}
-    packages[0].update(name="Package 1", tag_suggestions=[
+    packages[0].update(name="Package 1", member_count=9, tag_suggestions=[
         {"tag_slug": "tokens", "tag_name": "Tokens", "similarity": 0.8, "compared_cards": 81,
          "support_tier": "main", "deck_count": 15, "commander_deck_count": 300, "deck_fraction": 0.05},
         {"tag_slug": "counters", "tag_name": "Counters", "similarity": 0.6,
@@ -251,7 +251,7 @@ def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_
         "validation": {"valid": True, "bracket": {"recommended": 3, "rule_checks": {"expensive": True}},
                        "external_rating": rating},
         "statistics": {"recommended_bracket": 3, "swap_details": [{"in": "Large card detail"}]}})
-    packages[1].update(generated_deck={"status": "generated", "validation": {
+    packages[1].update(member_count=45, generated_deck={"status": "generated", "validation": {
         "deck_sha256": "current-list", "calculated_power": calculated},
                                       "statistics": {"recommended_bracket": 2}})
     packages[2].update(tag_suggestions=[], generated_deck={"status": "unavailable", "reason": "Metadata missing"})
@@ -265,7 +265,7 @@ def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_
                                      tmp_path / "processed", tmp_path / "site", seed_dir=tmp_path / "none")
     index = json.loads((tmp_path / "site/build-styles/index.json").read_text())
     assert index["commanders"][0]["packages"] == [
-        {"id": 0, "name": "Package 1", "tag_suggestions": [
+        {"id": 0, "name": "Package 1", "member_count": 9, "tag_suggestions": [
             {"tag_slug": "tokens", "tag_name": "Tokens", "similarity": 0.8,
              "support_tier": "main", "deck_count": 15, "commander_deck_count": 300, "deck_fraction": 0.05},
             {"tag_slug": "counters", "tag_name": "Counters", "similarity": 0.6,
@@ -274,7 +274,7 @@ def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_
          "generated_deck": {"status": "generated", "validation": {
              "bracket": {"recommended": 3}, "external_rating": rating},
              "statistics": {"recommended_bracket": 3}}},
-        {"id": 1, "tag_suggestions": [], "generated_deck": {
+        {"id": 1, "member_count": 45, "tag_suggestions": [], "generated_deck": {
             "status": "generated", "validation": {"deck_sha256": "current-list", "calculated_power": {
                 key: value for key, value in calculated.items() if key != "card_details"}},
             "statistics": {"recommended_bracket": 2}}},
@@ -285,6 +285,17 @@ def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_
     assert "Do not embed full decks" not in json.dumps(index)
     assert "Alternative tag" not in json.dumps(index)
     assert "large internal calculation detail" not in json.dumps(index)
+    # Display sorting must not change the source model or its membership columns.
+    assert json.loads((tmp_path / "processed/build-styles/commander-a.json").read_text()) == source
+    published = json.loads((tmp_path / "site/build-styles/commander-a.json").read_text())
+    assert [(p["id"], p.get("member_count")) for p in published["deck_analysis"]["packages"]] == [
+        (p["id"], p.get("member_count")) for p in packages]
+
+
+@pytest.mark.parametrize("count", [None, True, -1, 3.5, "10"])
+def test_discovery_package_summary_does_not_invent_missing_or_invalid_member_counts(count):
+    assert "member_count" not in exporter.summarize_build_style_packages({
+        "status": "fitted", "packages": [{"id": 0, "member_count": count}]})[0]
 
 
 @pytest.mark.parametrize("cards", [

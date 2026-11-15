@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  bracketForBuildPowerScore, formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildCollectionProgress, getBuildModel, getBuildModelOptions, getBuildSourceFreshness, getBuildThemeEvidence, getComparableProfilePairs,
+  bracketForBuildPowerScore, formatBuildLift, formatBuildPoints, formatBuildShare, generatedDeckFilename, getBuildCollectionProgress, getBuildModel, getBuildModelOptions, getBuildPackageDisplayOrder, getBuildSourceFreshness, getBuildThemeEvidence, getComparableProfilePairs,
   getCurrentBuildDiscoveryCommanders, getDeckMixtureRows, getExternalDeckRating, getExternalDeckRestrictionCheck, getGeneratedDeckBracketRepair, getGeneratedDeckColorChoices, getGeneratedDeckDistinctiveCards, getGeneratedDeckExport, getGeneratedDeckGroups, getGeneratedDeckPowerAlignment, getGeneratedDeckPowerRating, getPackageBracketLabel, getSupportedThemes, hasBuildStylePopulation, isBuildMetadataFresh, safeExternalUrl, splitPrimerCardReferences,
 } from "./buildStyleUtils.js";
 
@@ -115,6 +115,42 @@ test("models keep any number of packages and match alternative weights by deck I
 test("selector lists only available positive integer package counts in numeric order", () => {
   assert.deepEqual(getBuildModelOptions({ alternative_models: [1, 7, 3, 1, 0, 2.5].map((components) => ({ components, packages: [] })) }), [1, 3, 7]);
   assert.deepEqual(getBuildModelOptions(undefined), []);
+});
+
+test("package display sorts deck counts without mutating identities or guessing missing counts", () => {
+  const packages = Object.freeze([
+    { id: 0, member_count: 281 }, { id: 1, member_count: 1125 },
+    { id: 2, member_count: 1125 }, { id: 3 }, { id: 4, member_count: 0 },
+    { id: 5, member_count: null }, { id: 6, member_count: "2000" },
+    { id: 7, member_count: -1 }, { id: 8, member_count: NaN }, { id: 9, member_count: Infinity },
+  ].map(Object.freeze));
+  const entries = getBuildPackageDisplayOrder(packages);
+  assert.deepEqual(entries.map(({ index }) => index), [1, 2, 0, 4, 3, 5, 6, 7, 8, 9]);
+  for (const { pkg, index } of entries) assert.equal(pkg, packages[index]);
+  assert.deepEqual(packages.map((pkg) => pkg.id), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  for (const value of [null, undefined, {}, []]) assert.deepEqual(getBuildPackageDisplayOrder(value), []);
+});
+
+test("sorted Auto and alternative packages retain the correct membership columns and generated decks", () => {
+  const model = {
+    packages: [{ id: 0, member_count: 2, generated_deck: { name: "Package 1 deck" } },
+      { id: 1, member_count: 7, generated_deck: { name: "Package 2 deck" } }],
+    decks: [{ id: "a", memberships: [.8, .2] }, { id: "b", memberships: [.1, .9] }],
+    alternative_models: [{ components: 3, packages: [
+      { id: 0, member_count: 1 }, { id: 1, member_count: 3 }, { id: 2, member_count: 2 },
+    ], memberships: [{ id: "a", weights: [.7, .1, .2] }, { id: "b", weights: [.1, .6, .3] }] }],
+  };
+  const before = structuredClone(model);
+  const auto = getBuildPackageDisplayOrder(model.packages);
+  assert.equal(auto[0].pkg.generated_deck.name, "Package 2 deck");
+  assert.deepEqual(getDeckMixtureRows(model, String(auto[0].index), .25).map((deck) => deck.id), ["b"]);
+  assert.deepEqual(auto.map(({ index }) => model.decks[0].memberships[index]), [.2, .8]);
+  const alternative = getBuildModel(model, "3");
+  const ordered = getBuildPackageDisplayOrder(alternative.packages);
+  assert.deepEqual(ordered.map(({ index }) => index), [1, 2, 0]);
+  assert.deepEqual(ordered.map(({ index }) => alternative.decks[1].memberships[index]), [.6, .3, .1]);
+  assert.deepEqual(getDeckMixtureRows(alternative, String(ordered[0].index), .25).map((deck) => deck.id), ["b"]);
+  assert.deepEqual(model, before);
 });
 
 test("all supported suggested themes survive, including single themes and more than three", () => {
