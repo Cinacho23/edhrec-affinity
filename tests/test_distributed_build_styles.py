@@ -269,6 +269,51 @@ def test_merge_preserves_unowned_data_proofs_and_independent_rates(tmp_path):
     assert summary["continuation_needed"] and not summary["blocked"]
 
 
+def test_job_only_redirect_caps_are_reported_without_persisting_lower_budgets(tmp_path):
+    base, inputs, manifest = planned(tmp_path)
+    for worker in manifest["workers"]:
+        root, results, _ = run_worker(tmp_path, inputs, manifest, worker["id"])
+        path = root.parent / "build_style_batch.json"
+        pipeline = core.read_json(path)
+        pipeline["measured_request_rate"]["maximum_requests_per_second"] = 1
+        pipeline["measured_request_rate"]["job_rate_limit"] = 1
+        pipeline["measured_request_rate"]["redirect_rate_events"] = [{"will_retry": True}]
+        write(path, pipeline)
+        core.checkpoint(inputs / "manifest.json", worker["id"], root, results)
+    summary = merge(tmp_path, base, inputs)
+    state = core.read_json(base / core.STATE)
+    assert not summary["blocked"] and summary["continuation_needed"]
+    assert summary["capacity"]["effective_requests_per_second"] == 2
+    assert summary["capacity"]["configured_requests_per_second"] == 3
+    assert state["progress"]["rate_control"]["learned_rate"] == 3
+    assert state["progress"]["rate_control"]["effective_requests_per_second"] == 2
+    assert all(control["source_rate"]["learned_rate"] == 1.5 for control in state["distributed"]["workers"].values())
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_confirmed_repeated_rate_redirects_are_timed_pauses_without_losing_progress(tmp_path, expired):
+    base, inputs, manifest = planned(tmp_path)
+    for worker in manifest["workers"]:
+        root, results, _ = run_worker(tmp_path, inputs, manifest, worker["id"], blocked=True)
+        until = core.now() + timedelta(hours=-1 if expired else 1)
+        stop = {"provider": "edhrec", "status_code": 302, "reason": "rate_limit",
+                "rate_limit_redirect": True, "redirect_target": "https://edhrec.com/rate-limit",
+                "observed_at": (until - timedelta(hours=1)).isoformat()}
+        state = core.read_json(root / core.STATE)
+        state.update(blocked_until=until.isoformat(), block_reason="rate_limit", source_stop=stop)
+        write(root / core.STATE, state)
+        path = root.parent / "build_style_batch.json"
+        pipeline = core.read_json(path)
+        pipeline.update(blocked=True, block_reason="rate_limit", source_stop=stop)
+        write(path, pipeline)
+        core.checkpoint(inputs / "manifest.json", worker["id"], root, results, exit_code=1)
+    summary = merge(tmp_path, base, inputs)
+    assert summary["blocked"] and summary["block_reason"] == "rate_limit"
+    assert summary["automatic_continuation_allowed"]
+    assert summary["distributed"]["failed_workers"] == []
+    assert summary["source_stop"]["rate_limit_redirect"] is True
+
+
 def test_missing_result_uses_original_input_without_losing_other_progress(tmp_path):
     base, inputs, manifest = planned(tmp_path)
     run_worker(tmp_path, inputs, manifest, "0")

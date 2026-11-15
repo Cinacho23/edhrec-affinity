@@ -79,6 +79,44 @@ def test_watchdog_and_preflight_skip_active_collectors_before_reading_checkpoint
     assert github.dispatches == []
 
 
+def redirect_pause(**changes):
+    stop = {"provider": "edhrec", "status_code": 302, "reason": "rate_limit",
+            "rate_limit_redirect": True, "redirect_target": "https://edhrec.com/rate-limit"}
+    return paused(throttles=0, block_reason="rate_limit", source_stop=stop, **changes)
+
+
+def test_confirmed_rate_redirect_can_queue_a_timer_and_resume_after_cooldown():
+    summary = redirect_pause()
+    assert coordinator.actual_rate_limit(summary)
+    assert coordinator.classify_outcome(summary) == "rate_limit_paused"
+    client = GitHub([summary])
+    result = coordinator.queue_cooldown(client, client.saved[0], now=NOW)
+    assert result["cooldown_dispatched"] and client.timer_checks == 1
+    assert client.dispatches == [(coordinator.COOLDOWN, {"source_run_id": "100", "attempt": "0"})]
+    assert coordinator.decision(client.saved[0], now=NOW + timedelta(hours=2))["run"]
+
+
+@pytest.mark.parametrize("changes", [
+    {"rate_limit_redirect": False}, {"rate_limit_redirect": None},
+    {"redirect_target": "https://evil.example/rate-limit"},
+    {"redirect_target": "https://edhrec.com/login"}, {"provider": "scryfall"},
+    {"status_code": 403},
+])
+def test_unverified_redirect_does_not_authorize_automatic_rate_limit_recovery(changes):
+    summary = redirect_pause()
+    summary["source_stop"].update(changes)
+    summary["block_reason"] = "access_restriction"
+    assert not coordinator.actual_rate_limit(summary)
+    assert not coordinator.decision(coordinator.Snapshot(100, summary), now=NOW + timedelta(days=1))["run"]
+
+
+def test_old_302_hold_without_destination_is_not_silently_reinterpreted():
+    summary = paused(throttles=0, block_reason="access_restriction",
+        source_stop={"provider": "edhrec", "status_code": 302, "reason": "access_restriction"})
+    assert not coordinator.actual_rate_limit(summary)
+    assert not coordinator.decision(coordinator.Snapshot(100, summary), now=NOW + timedelta(days=1))["run"]
+
+
 def test_explicit_access_review_only_prepares_latest_expired_durable_checkpoint():
     github = GitHub([paused(expiry=NOW - timedelta(hours=1), throttles=0, block_reason="access_restriction")])
     result = coordinator.coordinate(github, "preflight", now=NOW, access_review_run_id=100)

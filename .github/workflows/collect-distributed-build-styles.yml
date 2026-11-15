@@ -739,3 +739,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/coordinate_build_styles.py continue --source-run-id "${GITHUB_RUN_ID}" --distributed-runners "${{ needs.recover.outputs.runners || needs.plan.outputs.runners }}"
+      - name: Queue a confirmed rate-limit cooldown when collection paused
+        if: env.PILOT != 'true' && steps.checkpoint.outcome == 'success' && steps.summary.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/coordinate_build_styles.py queue-cooldown --source-run-id "${GITHUB_RUN_ID}"

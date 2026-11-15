@@ -1064,6 +1064,38 @@ def test_shared_access_block_stops_new_collection_and_automatic_continuation(tmp
     assert second["blocked"] is True
 
 
+def test_redirect_fallback_is_job_only_and_next_batch_keeps_configured_rate(tmp_path):
+    args = options(tmp_path, requests_per_second=1.5, max_runtime_seconds=600)
+    atomic_json(args.output_dir / "_collection/state.json", {"schema_version": 1,
+        "commanders": {}, "source_rate": {"learned_rate": 1.5, "throttles": 0}})
+
+    def fallback(settings, **dependencies):
+        limiter = dependencies["limiter"]
+        assert limiter.stats["maximum_requests_per_second"] == 1.5
+        assert limiter.record_redirect({"provider": "edhrec", "status_code": 302,
+            "reason": "rate_limit", "rate_limit_redirect": True,
+            "redirect_target": "https://edhrec.com/rate-limit"},
+            request_started=limiter.monotonic(), recover=True)
+        assert limiter.stats["maximum_requests_per_second"] == 1
+        return evidence(settings.commander)
+
+    first = execute(args, rows("a"), fallback, saved_analyzer([]))
+    assert first["completed"] == ["a"]
+    assert first["measured_request_rate"]["maximum_requests_per_second"] == 1
+    assert checkpoint(args)["source_rate"]["learned_rate"] == 1.5
+    assert checkpoint(args)["source_rate"]["throttles"] == 0
+
+    def resumed(settings, **dependencies):
+        limiter = dependencies["limiter"]
+        assert limiter.stats["maximum_requests_per_second"] == 1.5
+        assert limiter.stats["redirect_rate_events"] == []
+        return evidence(settings.commander)
+
+    second = execute(args, rows("a", "b"), resumed, saved_analyzer([]))
+    assert second["completed"] == ["b"]
+    assert not second["blocked"]
+
+
 def test_rate_limit_learning_survives_cooldown_and_the_next_collection_batch(tmp_path):
     args = options(tmp_path)
 

@@ -8,7 +8,9 @@ import httpx
 import pytest
 
 from edhrec_affinity.build_styles.browser_transport import BrowserHTMLTransport, extract_gallery_data
-from edhrec_affinity.build_styles.sources import BudgetExpired, RequestLimiter, SourceBlocked, SourceFormatError
+from edhrec_affinity.build_styles.sources import (
+    BudgetExpired, Cache, ReducedRateRetry, RequestLimiter, SourceBlocked, SourceFormatError,
+)
 
 
 PREVIEW = "https://edhrec.com/deckpreview/Abc_123-X"
@@ -285,8 +287,149 @@ def test_unexpected_redirect_terminates_transport_without_next_request(payload):
             transport.get_response(GALLERY)
         assert len(runtime.goto_calls) == 1
         assert transport.stats["redirects"]
+        assert transport.limiter.stats["source_stop"]["redirect_target"] == transport.stats["redirects"][0]["to"]
     finally:
         transport.close()
+
+
+def deck_body():
+    return ('<script id="__NEXT_DATA__">' + json.dumps({"props": {"pageProps": {"data": {
+        "urlhash": "Abc_123-X", "deck": {"commander": ["Example"], "cards": {"Land": [["Island", 99]]}}
+    }}}}) + '</script>').encode()
+
+
+def browser_cache(tmp_path, responses, *, deadline=None):
+    clock = Clock()
+    budget = limiter(clock, max_rate=1.5, start_rate=1.5, learned_rate=1.5, deadline=deadline)
+    runtime = FakeRuntime(responses)
+    transport = BrowserHTMLTransport(budget, playwright_factory=runtime.factory)
+    value = Cache(tmp_path, edhrec_transport="webkit", limiter=budget, fetch=True)
+    value._browser_transport = transport
+    value.client.close()
+    value.client = httpx.Client(transport=httpx.MockTransport(lambda request: pytest.fail("Unexpected HTTP fallback")))
+    return clock, budget, runtime, transport, value
+
+
+@pytest.mark.parametrize("target", ["/rate-limit", "https://edhrec.com/rate-limit/", "/rate-limit?source=preview"])
+def test_rate_redirect_retries_original_once_and_caps_whole_job_without_changing_next_job(tmp_path, target):
+    clock, budget, runtime, transport, value = browser_cache(tmp_path, [
+        {"status": 302, "headers": {"location": target, "retry-after": "75"},
+         "redirect": "https://edhrec.com/rate-limit"},
+        {"body": deck_body()}, {"body": deck_body()},
+    ])
+    try:
+        assert value.get_preview("Abc_123-X")["urlhash"] == "Abc_123-X"
+        assert clock.value == 175
+        assert not budget.blocked
+        assert budget.stats["current_requests_per_second"] == 1
+        assert budget.stats["maximum_requests_per_second"] == 1
+        assert budget.stats["configured_maximum_requests_per_second"] == 1.5
+        assert budget.learning_state == {"learned_rate": 1.5, "throttles": 0, "last_throttle": None}
+        for _ in range(300):
+            budget.record_success()
+        value.get_preview("Abc_123-X", force_refresh=True)
+        assert clock.value == 176
+        assert [url for url, _ in runtime.goto_calls] == [PREVIEW] * 3
+        assert transport.stats["document_requests"] == 3
+        assert len(budget.stats["redirect_rate_events"]) == 1  # Duplicate browser events are one incident.
+        assert budget.stats["redirect_rate_events"][0]["redirect_target"] == "https://edhrec.com/rate-limit"
+        assert "rate-limit" not in (tmp_path / "previews/Abc_123-X.html").read_text()
+        assert RequestLimiter(max_rate=1.5, learned_rate=budget.learning_state["learned_rate"]).stats[
+            "current_requests_per_second"] == 1.5
+    finally:
+        value.close()
+
+
+def test_second_rate_redirect_at_reduced_rate_stops_without_a_third_request(tmp_path):
+    response = {"status": 302, "headers": {"location": "/rate-limit"}}
+    clock, budget, runtime, _, value = browser_cache(tmp_path, [response, response, {"body": deck_body()}])
+    try:
+        with pytest.raises(SourceBlocked, match="rate-limit"):
+            value.get_preview("Abc_123-X")
+        assert len(runtime.goto_calls) == 2 and clock.value == 160
+        assert budget.blocked and budget.stats["block_kind"] == "rate_limit"
+        assert budget.stats["source_stop"]["rate_limit_redirect"] is True
+        assert budget.learning_state["learned_rate"] == 1.5
+        assert not (tmp_path / "previews/Abc_123-X.html").exists()
+        with pytest.raises(SourceBlocked):
+            value.get_preview("Abc_123-X")
+        assert len(runtime.goto_calls) == 2
+    finally:
+        value.close()
+
+
+@pytest.mark.parametrize("target", ["https://evil.example/rate-limit", "//edhrec.com.evil.example/rate-limit",
+    "http://edhrec.com/rate-limit", "https://user:secret@edhrec.com/rate-limit", "/login", ""])
+def test_unrecognized_302_is_recorded_but_never_followed_or_retried(tmp_path, target):
+    _, budget, runtime, _, value = browser_cache(tmp_path, [{"status": 302, "headers": {"location": target}}])
+    try:
+        with pytest.raises(SourceFormatError, match="redirect"):
+            value.get_preview("Abc_123-X")
+        assert budget.blocked and budget.stats["block_kind"] == "access_restriction"
+        assert len(runtime.goto_calls) == 1 and budget.stats["maximum_requests_per_second"] == 1
+        assert budget.stats["source_stop"]["redirect_target"]
+    finally:
+        value.close()
+
+
+def test_retry_after_beyond_job_budget_becomes_a_saved_pause_without_navigation_retry(tmp_path):
+    _, budget, runtime, _, value = browser_cache(tmp_path, [
+        {"status": 302, "headers": {"location": "/rate-limit", "retry-after": "7200"}},
+    ], deadline=200)
+    try:
+        with pytest.raises(SourceBlocked, match="rate-limit"):
+            value.get_preview("Abc_123-X")
+        assert len(runtime.goto_calls) == 1 and budget.blocked
+        assert budget.stats["retry_after_seconds"] == 7200
+        assert budget.stats["source_stop"]["retry_after_seconds"] == 7200
+    finally:
+        value.close()
+
+
+def test_inflight_responses_share_one_fallback_but_later_redirects_cannot_reopen_it():
+    clock = Clock()
+    budget = limiter(clock, max_rate=1.5, start_rate=1.5, learned_rate=1.5)
+    details = {"status_code": 302, "redirect_target": "https://edhrec.com/rate-limit"}
+    assert budget.record_redirect(details, request_started=99, recover=True)
+    assert budget.record_redirect(details, request_started=100, recover=True)
+    # A navigation caught by a new pause is cancelled without spending a slot.
+    with pytest.raises(ReducedRateRetry):
+        budget.wait_document()
+    assert budget.stats["requests_started"] == 0
+    budget.wait_for_redirect_pause()
+    assert clock.value == 160 and budget.stats["requests_started"] == 0
+    budget.wait_document()
+    assert not budget.record_redirect(details, request_started=160, recover=True)
+    assert budget.stats["maximum_requests_per_second"] == 1
+
+
+def test_fallback_interrupts_an_already_waiting_browser_without_blocking_response_callback():
+    clock = Clock()
+    waiting, release = threading.Event(), threading.Event()
+    first = [True]
+    def sleep(seconds):
+        if seconds and first[0]:
+            first[0] = False
+            waiting.set()
+            assert release.wait(2)
+        clock.sleep(seconds)
+    budget = RequestLimiter(max_rate=1.5, start_rate=1.5, monotonic=clock.monotonic, sleep=sleep)
+    budget.wait_document()
+    errors = []
+    def navigate():
+        try:
+            budget.wait_document()
+        except Exception as error:
+            errors.append(error)
+    worker = threading.Thread(target=navigate)
+    worker.start()
+    assert waiting.wait(2)
+    assert budget.record_redirect({"status_code": 302}, request_started=100, recover=True)
+    release.set()
+    worker.join(2)
+    assert not worker.is_alive() and len(errors) == 1 and isinstance(errors[0], ReducedRateRetry)
+    assert budget.stats["requests_started"] == 1
+    assert budget.stats["maximum_requests_per_second"] == 1
 
 
 def test_browser_decoded_body_is_not_decompressed_twice_by_httpx():

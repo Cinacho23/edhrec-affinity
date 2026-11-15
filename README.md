@@ -74,7 +74,12 @@ rate and cooldown; two local workers claim its commanders from opposite ends.
 Saved claims resume after a restart. Downloads and model processes run
 independently. Source runners use standard headless WebKit to read the embedded
 data in ordinary public gallery and preview HTML, using a shared ceiling of 1.5
-requests per second per VM by default. They do not reuse personal browser sessions or solve access
+requests per second per VM by default. A confirmed HTTP302 redirect to EDHREC's
+`/rate-limit` route waits at least 60 seconds (or a longer `Retry-After`), then
+retries the original URL once with a shared 1-request/second ceiling for the rest
+of that VM's job. Repeated throttling pauses collection; unrelated redirects
+remain access stops. The temporary cap resets on the next job, while learned
+HTTP429 reductions persist. They do not reuse personal browser sessions or solve access
 challenges. Existing access holds require an explicit successful review before
 collection can resume. The **Test EDHREC browser collection** workflow verifies
 one gallery and one 100-card preview without changing production state or

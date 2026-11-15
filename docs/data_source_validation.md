@@ -78,3 +78,13 @@ proven permanent quota. The sixteen-machine pool has a combined configured
 ceiling of 24 requests/second; all threads on a VM still share its one limiter.
 A new explicit one-time policy promotes unchanged 0.1/1.0 checkpoint budgets
 while retaining their audit history, source holds, and any newer throttles.
+
+On November 15 the owner requested a job-only fallback: retain the 1.5 default,
+but reduce the affected VM's shared ceiling to one request/second on HTTP302.
+Only a recorded HTTPS `edhrec.com/rate-limit` destination permits one retry of
+the original URL, after at least 60 seconds and any longer `Retry-After`.
+Further rate-limit redirects pause that VM; unknown destinations and access
+challenges still require review. Destinations are now saved in stop receipts.
+The fallback does not alter persistent learned rates, so a new job starts at
+1.5 unless an existing lower rate applies. Older 302 stops without a recorded
+destination are not reclassified or released automatically.

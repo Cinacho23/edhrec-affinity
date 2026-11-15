@@ -18,8 +18,13 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
+# The watchdog does not install collector dependencies. This receipt predicate
+# and both package initializers use only the standard library.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from edhrec_affinity.build_styles.rate_events import confirmed_rate_stop
 
 COLLECTOR = "build-commander-styles.yml"
 DISTRIBUTED_COLLECTOR = "collect-distributed-build-styles.yml"
@@ -205,11 +210,9 @@ class GitHub:
 def actual_rate_limit(summary):
     stats = summary.get("measured_request_rate") or {}
     stop = summary.get("source_stop") or {}
-    metadata_throttle = (isinstance(stop, dict) and stop.get("provider") == "scryfall"
-                         and stop.get("status_code") == 429 and stop.get("reason") == "rate_limit")
     return (summary.get("blocked") is True and not summary.get("preflight_skipped")
             and summary.get("block_reason") != "access_restriction"
-            and (metadata_throttle or type(stats.get("throttles")) is int and stats["throttles"] > 0))
+            and (confirmed_rate_stop(stop) or type(stats.get("throttles")) is int and stats["throttles"] > 0))
 
 
 def automatic_continuation_allowed(summary):

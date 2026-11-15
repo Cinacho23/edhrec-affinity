@@ -115,6 +115,16 @@ def test_only_merger_uploads_a_canonical_restore_candidate():
     assert paths and all(Path(path).parent.as_posix() == "data/build-style-artifact" for path in paths)
 
 
+def test_rate_cooldown_is_scheduled_only_after_durable_source_controls_are_uploaded():
+    workflow = WORKFLOW.read_text()
+    queue, _ = step("Queue a confirmed rate-limit cooldown when collection paused")
+    assert "steps.checkpoint.outcome == 'success' && steps.summary.outcome == 'success'" in queue
+    assert "env.PILOT != 'true'" in queue
+    assert "coordinate_build_styles.py queue-cooldown" in queue
+    assert workflow.index("Upload the canonical summary and pilot evidence") < workflow.index(
+        "Queue a confirmed rate-limit cooldown when collection paused")
+
+
 def test_machine_evidence_and_checkpoint_upload_survive_collection_failure():
     body, _ = step("Collect and analyze this owned commander queue")
     assert "continue-on-error: true" in body

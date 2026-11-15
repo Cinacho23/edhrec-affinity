@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 from edhrec_affinity.build_styles.capacity import plan_capacity
 from edhrec_affinity.build_styles.eligibility import commander_is_eligible, valid_deck_count
 from edhrec_affinity.build_styles.sources import EDHREC_MAX_REQUESTS_PER_SECOND, edhrec_request_rate
+from edhrec_affinity.build_styles.rate_events import confirmed_rate_stop
 
 SCHEMA_VERSION = 1
 SEED_REQUEST_RATE = EDHREC_MAX_REQUESTS_PER_SECOND
@@ -505,7 +506,7 @@ def source_window(summary):
 
 
 def expected_worker_pause(summary, checked_at):
-    """A recorded HTTP429 remains an explained exit after its cooldown expires."""
+    """A confirmed rate pause remains explained after its cooldown expires."""
     control = summary.get("source_control") or {}
     until = timestamp(control.get("blocked_until"))
     reason = control.get("block_reason")
@@ -518,8 +519,7 @@ def expected_worker_pause(summary, checked_at):
     if (reason != "rate_limit" or summary.get("exit_code") != 1
             or pipeline.get("blocked") is not True or pipeline.get("block_reason") != "rate_limit"
             or not isinstance(stop, dict) or pipeline.get("source_stop") != stop
-            or stop.get("reason") != "rate_limit" or stop.get("status_code") != 429
-            or stop.get("provider") not in {"edhrec", "scryfall"}):
+            or not confirmed_rate_stop(stop)):
         return False
     observed = timestamp(stop.get("observed_at"))
     retry = timestamp(stop.get("retry_at"))
@@ -669,9 +669,8 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
         def throttled_worker(summary):
             pipeline = summary.get("pipeline_summary") or {}
             stop = pipeline.get("source_stop") or {}
-            metadata_throttle = (isinstance(stop, dict) and stop.get("provider") == "scryfall"
-                                 and stop.get("status_code") == 429 and stop.get("reason") == "rate_limit")
-            return (pipeline.get("measured_request_rate") or {}).get("throttles", 0) > 0 or metadata_throttle
+            return ((pipeline.get("measured_request_rate") or {}).get("throttles", 0) > 0
+                    or confirmed_rate_stop(stop))
         throttled = [s for s in actual_summaries if throttled_worker(s)]
         systemic = access or len(throttled) >= 2
         distributed["systemic_block"] = systemic
@@ -695,7 +694,16 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
         planning_rows = [r for r in rows if not (merged["commanders"].get(r["commander_slug"], {}).get("status") == "ineligible"
                                                 and r["commander_slug"] not in selected)]
         preview_remaining = due["capacity"]["remaining_previews"]
-        ceiling = sum(source_rate(c.get("source_rate"))["learned_rate"] for c in active_controls)
+        persistent_rates = [source_rate(c.get("source_rate"))["learned_rate"] for c in active_controls]
+        observed_limits = {s["worker_id"]: (s.get("pipeline_summary", {}).get("measured_request_rate") or {}).get(
+            "maximum_requests_per_second") for s in actual_summaries}
+        operating_rates = []
+        for worker, persistent_rate in zip(manifest["workers"], persistent_rates):
+            observed_limit = observed_limits.get(worker["id"])
+            operating_rates.append(min(persistent_rate, observed_limit)
+                if type(observed_limit) in {int, float} and math.isfinite(observed_limit) and observed_limit > 0
+                else persistent_rate)
+        ceiling = sum(operating_rates)
         elapsed = ((max(w[1] for w in source_windows) - min(w[0] for w in source_windows)).total_seconds() if source_windows else 0)
         successes = sum(int(s.get("successful_responses") or 0) for s in stats_rows)
         started = sum(int(s.get("requests_started") or 0) for s in stats_rows)
@@ -713,7 +721,7 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
             "elapsed_seconds": elapsed, "blocked": systemic, "block_kind": merged.get("block_reason") if systemic else None}
         paused_workers = len(active_controls) if systemic else len(blocked)
         capacity["available_requests_per_second"] = (0 if systemic else
-            sum(source_rate(c.get("source_rate"))["learned_rate"] for c in active_controls if c not in blocked))
+            sum(rate for rate, control in zip(operating_rates, active_controls) if control not in blocked))
         if paused_workers:
             capacity.update(estimated_minimum_seconds=None, earliest_possible_finish_at=None,
                 measured_projection_seconds=None, projected_finish_at=None, projection_requests_per_second=None,
@@ -721,7 +729,7 @@ def merge(base, manifest_path, results, inputs, output_summary, *, generation=No
                 estimate_note="Independent worker cooldowns are pending. A catalog-wide ETA is unavailable until the paused work can resume.")
         merged.setdefault("progress", {}).update(updated_at=now().isoformat(), capacity=capacity,
             measured_request_rate=measured, blocked=systemic, blocked_until=merged.get("blocked_until") if systemic else None,
-            rate_control={"learned_rate": ceiling, "effective_requests_per_second": ceiling,
+            rate_control={"learned_rate": sum(persistent_rates), "effective_requests_per_second": ceiling,
                 "configured_requests_per_second": EDHREC_MAX_REQUESTS_PER_SECOND * len(active_controls), "observed_requests_per_second": observed,
                 "observed_rate_at": now().isoformat(), "status": "independent_workers",
                 "rate_scope": "aggregate_independent_workers", "throttles": measured["throttles"]},

@@ -13,13 +13,12 @@ from html.parser import HTMLParser
 import json
 import re
 import threading
-import time
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
 from .sources import (
-    BudgetExpired, RequestLimiter, SourceBlocked, SourceFormatError,
+    BudgetExpired, ReducedRateRetry, RequestLimiter, SourceBlocked, SourceFormatError,
     _NextDataParser, checked_identifier, source_stop_details,
 )
 
@@ -67,6 +66,8 @@ class BrowserHTMLTransport:
         self._navigation_error = None
         self._stopped_error = None
         self._admitted_document = False
+        self._active_started = None
+        self._redirect_handled = False
         self._requests = []
         self._redirects = []
         self._aborted_resources = 0
@@ -104,6 +105,9 @@ class BrowserHTMLTransport:
             if self._stopped_error is not None:
                 raise self._stopped_error
             self.limiter.check_budget()
+            wait_pause = getattr(self.limiter, "wait_for_redirect_pause", None)
+            if callable(wait_pause):
+                wait_pause()
             return self._executor.submit(self._get_on_worker, url).result()
 
     def _start(self):
@@ -140,31 +144,55 @@ class BrowserHTMLTransport:
             route.abort()
             return
         try:
-            self.limiter.wait()
-        except (BudgetExpired, SourceBlocked) as error:
+            getattr(self.limiter, "wait_document", self.limiter.wait)()
+        except (BudgetExpired, ReducedRateRetry, SourceBlocked) as error:
             self._navigation_error = error
             route.abort()
             return
         self._admitted_document = True
+        self._active_started = self.limiter.monotonic()
         with self._stats_lock:
             self._requests.append({"url": request.url,
                                    "at": datetime.now(timezone.utc).isoformat(),
-                                   "monotonic": time.monotonic()})
+                                   "monotonic": self._active_started})
         route.continue_()
 
     def _observe_request(self, request):
         if request.is_navigation_request() and request.redirected_from is not None:
             self._stop_redirect(request.url, request.redirected_from.url)
 
-    def _stop_redirect(self, target, origin):
+    def _stop_redirect(self, target, origin, *, status=302, headers=None):
+        headers = headers or {}
+        destination = urljoin(origin, target)
         with self._stats_lock:
-            self._redirects.append({"from": origin, "to": target,
+            self._redirects.append({"from": origin, "to": destination, "status_code": status,
                                     "at": datetime.now(timezone.utc).isoformat()})
-        self._navigation_error = SourceFormatError(
-            "Unexpected EDHREC browser redirect; collection stopped without retry"
-        )
-        self._stopped_error = self._navigation_error
-        self._block(origin, 302, {}, challenge=True)
+        if self._redirect_handled:
+            return  # Response and request events can describe the same redirect.
+        self._redirect_handled = True
+        parsed = urlsplit(destination)
+        rate_limit = (status == 302 and parsed.scheme == "https" and parsed.netloc == "edhrec.com"
+                      and parsed.path.rstrip("/") == "/rate-limit")
+        details = source_stop_details("edhrec", origin, status, datetime.now(timezone.utc),
+            retry_after=headers.get("retry-after"), reason="rate_limit" if rate_limit else "access_restriction")
+        details["redirect_target"] = destination
+        if rate_limit:
+            details.update(rate_limit_redirect=True, redirect_target="https://edhrec.com/rate-limit")
+        record_redirect = getattr(self.limiter, "record_redirect", None)
+        retry = (record_redirect(details, request_started=self._active_started, recover=rate_limit)
+                 if status == 302 and callable(record_redirect) else False)
+        if retry:
+            self._navigation_error = ReducedRateRetry(details)
+        elif rate_limit:
+            self.limiter.block("Rate-limit redirect could not recover within this job", kind="rate_limit", details=details)
+            self._navigation_error = SourceBlocked("EDHREC rate-limit redirect; job paused")
+            self._stopped_error = self._navigation_error
+        else:
+            self._navigation_error = SourceFormatError(
+                "Unexpected EDHREC browser redirect; collection stopped without retry"
+            )
+            self._stopped_error = self._navigation_error
+            self.limiter.block("Unexpected EDHREC browser redirect", kind="access_restriction", details=details)
         # Closing the page is the public API's immediate cancellation mechanism.
         # A browser-generated redirect may already have begun when its event is
         # delivered, so the evidence explicitly retains that limitation.
@@ -175,7 +203,8 @@ class BrowserHTMLTransport:
         if not response.request.is_navigation_request():
             return
         if 300 <= response.status < 400 and response.status != 304:
-            self._stop_redirect(response.headers.get("location", ""), response.url)
+            self._stop_redirect(response.headers.get("location", ""), response.url,
+                                status=response.status, headers=response.headers)
         elif response.status in {401, 403, 429}:
             self._block(response.url, response.status, response.headers)
 
@@ -195,6 +224,8 @@ class BrowserHTMLTransport:
             self._active_url = url
             self._navigation_error = None
             self._admitted_document = False
+            self._active_started = None
+            self._redirect_handled = False
             page = self._context.new_page()
             self._active_page = page
             response = page.goto(url, wait_until="commit", timeout=self.timeout_seconds * 1000)

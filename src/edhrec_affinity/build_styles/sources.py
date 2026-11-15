@@ -449,6 +449,14 @@ class SourceFormatError(ValueError):
     """A source response could not be read; preserve the item for a later retry."""
 
 
+class ReducedRateRetry(SourceFormatError):
+    """One original-URL retry is allowed after a confirmed rate-limit redirect."""
+
+    def __init__(self, details):
+        super().__init__("EDHREC rate-limit redirect; shared job rate reduced before one retry")
+        self.details = deepcopy(details)
+
+
 class RequestLimiter:
     """One request-start budget shared by collection threads in one process.
 
@@ -502,6 +510,10 @@ class RequestLimiter:
         self._retry_after_until = 0.0
         self._throttles = 0
         self._last_throttle: dict | None = None
+        self._job_minimum_delay = 0.0
+        self._job_redirect_at: float | None = None
+        self._redirect_pause_until = 0.0
+        self._redirect_events: list[dict] = []
 
     @property
     def blocked(self) -> bool:
@@ -520,21 +532,26 @@ class RequestLimiter:
         with self._lock:
             with self._block_lock:
                 stop, block_kind = deepcopy(self._source_stop), self._block_kind
+                job_delay, redirect_until = self._job_minimum_delay, self._redirect_pause_until
+                redirect_events = deepcopy(self._redirect_events)
             elapsed = max(0.0, self.monotonic() - self._started_at) if self._started_at is not None else 0.0
             return {
                 "requests_started": self._requests_started, "successful_responses": self._successful_responses,
-                "failures": self._failures + int(self.blocked), "cooldowns": self._deferrals,
-                "maximum_requests_per_second": 1 / self.minimum_delay,
+                "failures": self._failures + int(self.blocked),
+                "cooldowns": self._deferrals + sum(event["will_retry"] for event in redirect_events),
+                "maximum_requests_per_second": 1 / max(self.minimum_delay, job_delay),
                 "configured_maximum_requests_per_second": self.configured_maximum_rate,
                 "learned_maximum_requests_per_second": self.learned_rate,
-                "current_requests_per_second": 1 / self.delay,
+                "current_requests_per_second": 1 / max(self.delay, job_delay),
                 "observed_requests_per_second": max(0, self._requests_started - 1) / elapsed if elapsed else 0.0,
-                "retry_after_seconds": max(0.0, self._retry_after_until - self.monotonic()),
+                "retry_after_seconds": max(0.0, max(self._retry_after_until, redirect_until) - self.monotonic()),
                 "elapsed_seconds": elapsed, "blocked": self.blocked,
                 "started_at": self._source_started_at, "completed_at": self._source_completed_at,
                 "block_kind": block_kind, "source_stop": stop,
                 "throttles": self._throttles,
                 "last_throttle": dict(self._last_throttle) if self._last_throttle else None,
+                "job_rate_limit": 1 / job_delay if job_delay else None,
+                "redirect_rate_events": redirect_events,
             }
 
     @property
@@ -544,28 +561,87 @@ class RequestLimiter:
             return {"learned_rate": self.learned_rate, "throttles": self._throttles,
                     "last_throttle": dict(self._last_throttle) if self._last_throttle else None}
 
-    def wait(self) -> None:
+    def wait(self, *, _interrupt_redirect_pause=False) -> None:
         # Holding the lock while waiting prevents newly arriving workers from
         # overtaking the current waiter or booking requests past a cooldown.
         with self._lock:
-            if self.blocked:
-                raise SourceBlocked("Collection stopped: " + self._blocked_reason)
-            self.check_budget()
-            delay = max(0.0, self._next_request - self.monotonic())
-            if self.deadline is not None:
-                delay = min(delay, max(0, self.deadline - self.monotonic()))
-            self.sleep(delay)
-            if self.blocked:
-                raise SourceBlocked("Collection stopped: " + self._blocked_reason)
-            self.check_budget()
-            current = self.monotonic()
-            if self._started_at is None:
-                self._started_at = current
-                self._source_started_at = datetime.now(timezone.utc).isoformat()
-            self._requests_started += 1
-            self._next_request = current + self.delay
+            while True:
+                if self.blocked:
+                    raise SourceBlocked("Collection stopped: " + self._blocked_reason)
+                self.check_budget()
+                with self._block_lock:
+                    if _interrupt_redirect_pause and self._redirect_pause_until > self.monotonic():
+                        raise ReducedRateRetry(self._redirect_events[0])
+                    due = max(self._next_request, self._redirect_pause_until)
+                delay = max(0.0, due - self.monotonic())
+                if self.deadline is not None:
+                    delay = min(delay, max(0, self.deadline - self.monotonic()))
+                self.sleep(delay)
+                if self.blocked:
+                    raise SourceBlocked("Collection stopped: " + self._blocked_reason)
+                self.check_budget()
+                with self._block_lock:
+                    current = self.monotonic()
+                    # A response callback may announce a new cooldown while a
+                    # different browser is asleep at the ordinary pacing gate.
+                    if current < self._redirect_pause_until:
+                        if _interrupt_redirect_pause:
+                            raise ReducedRateRetry(self._redirect_events[0])
+                        continue
+                    if self._started_at is None:
+                        self._started_at = current
+                        self._source_started_at = datetime.now(timezone.utc).isoformat()
+                    self._requests_started += 1
+                    self._next_request = current + max(self.delay, self._job_minimum_delay)
+                    return
 
     acquire = wait
+
+    def wait_document(self) -> None:
+        """Abort an unadmitted navigation instead of sleeping through its timeout."""
+        self.wait(_interrupt_redirect_pause=True)
+
+    def wait_for_redirect_pause(self) -> None:
+        """Wait before opening a browser page, without spending a request slot."""
+        with self._lock:
+            while True:
+                if self.blocked:
+                    raise SourceBlocked("Collection stopped: " + self._blocked_reason)
+                self.check_budget()
+                with self._block_lock:
+                    delay = max(0.0, self._redirect_pause_until - self.monotonic())
+                if not delay:
+                    return
+                if self.deadline is not None:
+                    delay = min(delay, max(0, self.deadline - self.monotonic()))
+                self.sleep(delay)
+
+    def record_redirect(self, details: dict, *, request_started: float | None, recover: bool) -> bool:
+        """Cap this job at 1 RPS; permit only the first in-flight incident to recover.
+
+        The callback must not wait for the pacing lock: another thread can be
+        sleeping there. Its next admission sees both this cap and the pause.
+        This does not change the persistent learned_rate or release any hold.
+        """
+        with self._block_lock:
+            before = 1 / max(self.delay, self._job_minimum_delay)
+            same_incident = (self._job_redirect_at is None or request_started is not None
+                             and request_started <= self._job_redirect_at)
+            retry = recover and same_incident and not self.blocked
+            self._job_minimum_delay = max(self._job_minimum_delay, 1.0)
+            if self._job_redirect_at is None:
+                self._job_redirect_at = self.monotonic()
+            pause = max(60.0, details.get("retry_after_seconds") or 0.0) if retry else 0.0
+            if retry:
+                self._redirect_pause_until = max(self._redirect_pause_until, self.monotonic() + pause)
+                if self.deadline is not None and self._redirect_pause_until >= self.deadline:
+                    # Preserve a server wait beyond this job as a real saved
+                    # rate pause, rather than losing it at a budget boundary.
+                    retry = False
+            self._redirect_events.append({**deepcopy(details), "rate_before": before,
+                "rate_after": 1 / max(self.delay, self._job_minimum_delay),
+                "will_retry": retry, "cooldown_seconds": pause})
+            return retry
 
     def defer(self, seconds: float) -> None:
         """Apply a shared server cooldown without automatically retrying."""
@@ -627,7 +703,7 @@ class RequestLimiter:
             self._source_completed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
             if self._throttles:
                 return
-            rate_before = 1 / self.delay
+            rate_before = 1 / max(self.delay, self._job_minimum_delay)
             # The floating-point guard only prevents underflow; there is no
             # practical fixed floor that could exceed a lower source limit.
             learned_rate = max(rate_before * .75, min(rate_before, sys.float_info.min))
@@ -851,7 +927,17 @@ class Cache:
             if httpx.URL(url).host not in {"edhrec.com", "json.edhrec.com"}:
                 raise ValueError("This collector only requests public EDHREC pages")
             try:
-                response = self._get_response(url, rsc=rsc)
+                for attempt in range(2):
+                    try:
+                        response = self._get_response(url, rsc=rsc)
+                        break
+                    except ReducedRateRetry as error:
+                        if attempt:
+                            self._block("Rate-limit redirect recurred at the reduced rate",
+                                        kind="rate_limit", details=error.details)
+                            raise SourceBlocked("Repeated EDHREC rate-limit redirect; job paused") from error
+                        # Retry exactly this URL through the same browser and
+                        # shared pacing gate. Never follow the redirect target.
             except httpx.TransportError:
                 if self.limiter is not None:
                     self.limiter.record_failure()
