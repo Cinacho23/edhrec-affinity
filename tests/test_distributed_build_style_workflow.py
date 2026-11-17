@@ -44,10 +44,10 @@ def test_distributed_workflow_uses_real_vm_matrix_and_separate_parallel_power_jo
     assert "if: always() && ((needs.plan.result == 'success'" in workflow
 
 
-def test_preparation_has_one_hour_without_changing_source_work_budgets():
+def test_preparation_has_three_hours_without_changing_source_work_budgets():
     workflow = WORKFLOW.read_text()
     preparation = workflow.split("  plan:\n", 1)[1].split("  collect:\n", 1)[0]
-    assert "    timeout-minutes: 60" in preparation
+    assert "    timeout-minutes: 180" in preparation
     source = workflow.split("  collect:\n", 1)[1].split("  power:\n", 1)[0]
     assert "    timeout-minutes: 360" in source
     assert "900 if pilot else 5400" in preparation

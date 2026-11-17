@@ -161,8 +161,11 @@ class GitHub:
             if len(readiness) != 1 or readiness[0].get("conclusion") != "success":
                 return held
             annotations = self.api(f"{self.root}/check-runs/{plan['id']}/annotations?per_page=100")
-            if not any(re.fullmatch(r"The job has exceeded the maximum execution time of \d+m\d+s",
-                                   annotation.get("message", "")) for annotation in annotations):
+            # GitHub formats hour-long budgets as 1h0m0s, while older receipts
+            # use 60m0s. Both require the exact provider timeout message.
+            if not any(isinstance(annotation.get("message"), str) and re.fullmatch(
+                    r"The job has exceeded the maximum execution time of (?:\d+h)?\d+m\d+s",
+                    annotation["message"]) for annotation in annotations):
                 return held  # A manual cancellation is not permission to restart.
         if len(interrupted) >= MAX_PREPARATION_TIMEOUTS:
             return {**held, "preparation_timeouts": len(interrupted),

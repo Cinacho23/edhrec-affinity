@@ -41,9 +41,10 @@ jobs:
     name: Restore one canonical checkpoint and partition owned work
     if: inputs.recover_run_id == ''
     runs-on: ubuntu-latest
-    # Restore, extract, partition and upload a growing cumulative checkpoint.
-    # This budget is independent of each source VM's collection deadline.
-    timeout-minutes: 60
+    # Restore, extract, partition and upload the growing cumulative checkpoint.
+    # A 45-minute restore left too little of the old hour for baseline/shard
+    # uploads. This ceiling is independent of each source VM's work deadline.
+    timeout-minutes: 180
     outputs:
       run: ${{ steps.ready.outputs.run }}
       matrix: ${{ steps.plan.outputs.matrix }}

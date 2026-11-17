@@ -200,16 +200,34 @@ def interrupted_client(count=1, *, change=None):
 
 
 @pytest.mark.parametrize("count", [1, 2])
-def test_verified_preparation_timeouts_retry_old_checkpoint_with_bound(count):
-    result = interrupted_client(count).interruption_guard(100)
+@pytest.mark.parametrize("duration", ["30m0s", "60m0s", "120m0s", "1h0m0s", "1h30m0s", "3h0m0s"])
+def test_verified_preparation_timeouts_retry_old_checkpoint_with_bound(count, duration):
+    def receipt(client, jobs, annotations):
+        annotations[0]["message"] = f"The job has exceeded the maximum execution time of {duration}"
+    result = interrupted_client(count, change=receipt).interruption_guard(100)
     assert result["run"] and result["preparation_timeouts"] == count
     assert result["retry_checkpoint_run_id"] == 100
     assert result["retry_runner_count"] == 16
 
 
-def test_three_preparation_timeouts_require_review_instead_of_endless_retries():
-    result = interrupted_client(3).interruption_guard(100)
+@pytest.mark.parametrize("duration", ["60m0s", "1h0m0s", "3h0m0s"])
+def test_three_preparation_timeouts_require_review_instead_of_endless_retries(duration):
+    def receipt(client, jobs, annotations):
+        annotations[0]["message"] = f"The job has exceeded the maximum execution time of {duration}"
+    result = interrupted_client(3, change=receipt).interruption_guard(100)
     assert not result["run"] and "retry bound" in result["reason"]
+
+
+@pytest.mark.parametrize("message", [None, 60, "The operation was canceled.",
+    "The job has exceeded the maximum execution time of 1h",
+    "The job has exceeded the maximum execution time of 1h0s",
+    "The job has exceeded the maximum execution time of -1h0m0s",
+    "The job has exceeded the maximum execution time of 1h0m0s; manually canceled",
+    "Unverified: The job has exceeded the maximum execution time of 1h0m0s"])
+def test_only_exact_provider_timeout_annotations_authorize_recovery(message):
+    def receipt(client, jobs, annotations):
+        annotations[0]["message"] = message
+    assert not interrupted_client(change=receipt).interruption_guard(100)["run"]
 
 
 @pytest.mark.parametrize("change", [
@@ -225,6 +243,14 @@ def test_three_preparation_timeouts_require_review_instead_of_endless_retries():
 ])
 def test_missing_controls_manual_cancellations_or_possible_source_work_do_not_auto_retry(change):
     assert not interrupted_client(change=change).interruption_guard(100)["run"]
+
+
+@pytest.mark.parametrize("source_conclusion", ["success", "failure", "cancelled", "in_progress"])
+def test_hour_formatted_preparation_timeout_cannot_release_possible_source_work(source_conclusion):
+    def receipt(client, jobs, annotations):
+        annotations[0]["message"] = "The job has exceeded the maximum execution time of 1h0m0s"
+        jobs[1]["conclusion"] = source_conclusion
+    assert not interrupted_client(change=receipt).interruption_guard(100)["run"]
 
 
 def test_interruption_guard_needs_a_saved_checkpoint_and_resets_after_a_new_checkpoint():
@@ -254,6 +280,22 @@ def test_watchdog_holds_unknown_interruption_but_restarts_verified_preparation_t
     github.interruption = {"run": True, "retry_checkpoint_run_id": 100, "preparation_timeouts": 1}
     result = coordinator.coordinate(github, "watchdog", now=NOW)
     assert result["dispatched"] and result["retry_checkpoint_run_id"] == 100
+    assert github.dispatches == [(coordinator.DISTRIBUTED_COLLECTOR, {"runners": "16", "pilot": "false"})]
+
+
+def test_watchdog_recovers_hour_timeout_during_baseline_upload_from_saved_checkpoint(monkeypatch):
+    monkeypatch.setenv("BUILD_STYLE_DISTRIBUTED_RUNNERS", "16")
+    def receipt(client, jobs, annotations):
+        annotations[0]["message"] = "The job has exceeded the maximum execution time of 1h0m0s"
+        jobs[0]["steps"][1]["conclusion"] = "success"
+        jobs[0]["steps"].append({"name": "Upload immutable canonical baseline", "conclusion": "cancelled"})
+    github = GitHub([{"blocked": False, "continuation_needed": True,
+                      "source_rate": {"learned_rate": 1.5}}])
+    github.interruption = interrupted_client(change=receipt).interruption_guard(100)
+    result = coordinator.coordinate(github, "watchdog", now=NOW)
+    assert result["dispatched"] and result["retry_checkpoint_run_id"] == 100
+    assert result["preparation_timeouts"] == 1
+    assert github.saved[0].summary["source_rate"]["learned_rate"] == 1.5
     assert github.dispatches == [(coordinator.DISTRIBUTED_COLLECTOR, {"runners": "16", "pilot": "false"})]
 
 
