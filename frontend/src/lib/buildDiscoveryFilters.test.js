@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   BUILD_DISCOVERY_SORT_OPTIONS, DEFAULT_BUILD_DISCOVERY_FILTERS,
   buildDiscoverySearchParams, filterBuildDiscoveryCommanders, getBuildDiscoveryFilterErrors,
-  getBuildDiscoveryPackageTags, matchesBuildDiscoveryPackageTag, readBuildDiscoveryFilters,
+  getBuildDiscoveryPackageTags, getBuildDiscoverySignalCaptured, matchesBuildDiscoveryPackageTag, readBuildDiscoveryFilters,
 } from "./buildDiscoveryFilters.js";
 
 const NOW = Date.parse("2026-10-24T12:00:00Z");
@@ -236,6 +236,77 @@ test("zero is an exact filterable count; missing and invalid report values do no
   }
 });
 
+test("card signal percentage bounds are inclusive and use unrounded Auto fractions", () => {
+  const reports = [
+    report("below", { weighted_reconstruction_captured: .249999 }),
+    report("lower", { weighted_reconstruction_captured: .25 }),
+    report("middle", { weighted_reconstruction_captured: .425 }),
+    report("upper", { weighted_reconstruction_captured: .75 }),
+    report("above", { weighted_reconstruction_captured: .750001 }),
+  ];
+  assert.deepEqual(slugs(reports, { minSignalCaptured: "25", maxSignalCaptured: "75" }), ["lower", "middle", "upper"]);
+  assert.deepEqual(slugs(reports, { minSignalCaptured: "42.5", maxSignalCaptured: "42.5" }), ["middle"]);
+  assert.deepEqual(slugs(reports, { minSignalCaptured: 75 }), ["above", "upper"]);
+  assert.deepEqual(slugs(reports, { maxSignalCaptured: "25" }), ["below", "lower"]);
+  assert.deepEqual(slugs([report("exact", { weighted_reconstruction_captured: .29 })], {
+    minSignalCaptured: "29", maxSignalCaptured: "29",
+  }), ["exact"]);
+});
+
+test("missing or invalid card signal never becomes a measured zero", () => {
+  const reports = [report("zero", { weighted_reconstruction_captured: 0 }),
+    report("full", { weighted_reconstruction_captured: 1 }),
+    report("insufficient", { status: "insufficient_data", weighted_reconstruction_captured: .5 }),
+    ...[undefined, null, "0", "0.5", NaN, -0.1, 1.01, Infinity, false, true]
+      .map((value, index) => report(`invalid-${index}`, { weighted_reconstruction_captured: value }))];
+  assert.equal(slugs(reports).length, reports.length);
+  assert.deepEqual(slugs(reports, { minSignalCaptured: "0", maxSignalCaptured: "0" }), ["zero"]);
+  assert.deepEqual(slugs(reports, { minSignalCaptured: "100", maxSignalCaptured: "100" }), ["full"]);
+  assert.deepEqual(slugs(reports, { minSignalCaptured: "0", maxSignalCaptured: "100" }), ["full", "zero"]);
+  assert.equal(getBuildDiscoverySignalCaptured(null), null);
+});
+
+test("card signal filtering combines with package tags, search, counts and source checks", () => {
+  const main = [{ tag_suggestions: [{ tag_slug: "tokens", tag_name: "Tokens", support_tier: "main" }] }];
+  const reports = [
+    report("match", { commander_name: "Match", weighted_reconstruction_captured: .425, packages: main }),
+    report("low-fit", { commander_name: "Match low fit", weighted_reconstruction_captured: .2, packages: main }),
+    report("no-tag", { commander_name: "Match no tag", weighted_reconstruction_captured: .5 }),
+    report("low-count", { commander_name: "Match low count", unique_decks: 199, weighted_reconstruction_captured: .5, packages: main }),
+  ];
+  const before = structuredClone(reports);
+  assert.deepEqual(slugs(reports, { query: "match", packageTag: "tokens", minAnalyzed: "200",
+    minSignalCaptured: "40", maxSignalCaptured: "60", coverage: "complete", freshness: "fresh" }), ["match"]);
+  assert.deepEqual(reports, before);
+});
+
+test("card signal sort uses real fractional values with unknown measurements last in both directions", () => {
+  const reports = [report("unknown"), report("zero", { weighted_reconstruction_captured: 0 }),
+    report("b", { weighted_reconstruction_captured: .4 }), report("a", { weighted_reconstruction_captured: .4 }),
+    report("high", { weighted_reconstruction_captured: 1 }), report("invalid", { weighted_reconstruction_captured: 20 })];
+  assert.deepEqual(slugs(reports, { sortBy: "weighted_reconstruction_captured", direction: "asc" }),
+    ["zero", "a", "b", "high", "invalid", "unknown"]);
+  assert.deepEqual(slugs(reports, { sortBy: "weighted_reconstruction_captured", direction: "desc" }),
+    ["high", "a", "b", "zero", "invalid", "unknown"]);
+});
+
+test("card signal range validates decimal percentages and inverted ranges", () => {
+  for (const input of ["-1", "100.1", "1e2", "+2", "abc", "NaN", "Infinity", NaN, Infinity, {}, true]) {
+    for (const key of ["minSignalCaptured", "maxSignalCaptured"]) {
+      const errors = getBuildDiscoveryFilterErrors({ [key]: input });
+      assert.equal(errors.length, 1, `${key}: ${String(input)}`);
+      assert.match(errors[0], /percentage from 0 to 100/);
+      assert.deepEqual(slugs([report("a")], { [key]: input }), []);
+    }
+  }
+  for (const input of [" 0 ", ".5", "12.345", "100.0", 0, 100]) {
+    assert.deepEqual(getBuildDiscoveryFilterErrors({ minSignalCaptured: input, maxSignalCaptured: input }), []);
+  }
+  assert.deepEqual(getBuildDiscoveryFilterErrors({ minSignalCaptured: " ", maxSignalCaptured: null }), []);
+  assert.deepEqual(getBuildDiscoveryFilterErrors({ minSignalCaptured: "60.1", maxSignalCaptured: "60" }),
+    ["Weighted card signal captured minimum cannot exceed its maximum."]);
+});
+
 test("validates whole number inputs, safe integer limits, and every inverted range", () => {
   for (const input of ["-1", "1.5", "1e3", "+2", "abc", "9007199254740992", NaN, Infinity, {}, true]) {
     assert.equal(getBuildDiscoveryFilterErrors({ minPackages: input }).length, 1, String(input));
@@ -335,7 +406,7 @@ test("filtering and sorting preserve source records, collections, array order, a
 
 test("exports all supported sort choices and handles absent inputs", () => {
   assert.deepEqual(BUILD_DISCOVERY_SORT_OPTIONS.map((option) => option.value), [
-    "package_count", "unique_decks", "total_edhrec_decks", "profile_count", "coverage", "generated_at", "commander_name",
+    "package_count", "unique_decks", "total_edhrec_decks", "profile_count", "weighted_reconstruction_captured", "coverage", "generated_at", "commander_name",
   ]);
   assert.ok(BUILD_DISCOVERY_SORT_OPTIONS.every((option) => option.label));
   assert.deepEqual(filterBuildDiscoveryCommanders(undefined), []);
@@ -347,6 +418,7 @@ test("URL filters round trip count ranges, accented search, statuses and sorting
     ...DEFAULT_BUILD_DISCOVERY_FILTERS,
     query: "Dánitha & counters", packageTag: "+1/+1 Counters", minPackages: "2", maxPackages: "8", minAnalyzed: "200", maxAnalyzed: "3000",
     minTotalDecks: "250", maxTotalDecks: "10000", minProfiles: "0", maxProfiles: "12",
+    minSignalCaptured: "12.5", maxSignalCaptured: "75.25",
     status: "fitted", coverage: "complete", freshness: "needs_refresh", sortBy: "package_count", direction: "asc",
   };
   const params = buildDiscoverySearchParams({ ...filters, unrecognized: "ignored" });
@@ -354,6 +426,18 @@ test("URL filters round trip count ranges, accented search, statuses and sorting
   assert.deepEqual(readBuildDiscoveryFilters(new URLSearchParams(params.toString())), filters);
   assert.equal(buildDiscoverySearchParams(DEFAULT_BUILD_DISCOVERY_FILTERS).toString(), "");
   assert.deepEqual(readBuildDiscoveryFilters(), DEFAULT_BUILD_DISCOVERY_FILTERS);
+});
+
+test("card signal URL bounds and ordering round trip, retain visible errors and reset", () => {
+  const settings = readBuildDiscoveryFilters("minSignalCaptured=25.5&maxSignalCaptured=80&sortBy=weighted_reconstruction_captured&direction=asc");
+  assert.equal(settings.minSignalCaptured, "25.5");
+  assert.equal(settings.maxSignalCaptured, "80");
+  assert.equal(settings.sortBy, "weighted_reconstruction_captured");
+  assert.deepEqual(readBuildDiscoveryFilters(buildDiscoverySearchParams(settings)), settings);
+  assert.equal(buildDiscoverySearchParams(DEFAULT_BUILD_DISCOVERY_FILTERS).toString(), "");
+  const invalid = readBuildDiscoveryFilters("minSignalCaptured=abc&maxSignalCaptured=101");
+  assert.equal(getBuildDiscoveryFilterErrors(invalid).length, 2);
+  assert.equal(buildDiscoverySearchParams(invalid).toString(), "minSignalCaptured=abc&maxSignalCaptured=101");
 });
 
 test("unknown package tag links retain the chosen value and reset with the default filters", () => {

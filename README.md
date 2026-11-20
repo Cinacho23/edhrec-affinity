@@ -71,6 +71,9 @@ collector’s GitHub execution status every two minutes.
 Commander packages and their Discovery summaries display the largest sampled
 deck membership first. Original package numbers stay attached to their generated
 decks and mixture weights; ordering does not change the fitted models or collection.
+Discovery can filter weighted card signal captured by a minimum/maximum percentage
+from 0 to 100, or sort by it. This uses the unrounded Auto-model fit; reports
+without a measurement are excluded only when a percentage bound is set.
 
 The distributed collector partitions eligible commanders across separate
 GitHub-hosted Ubuntu VMs. Each VM owns its queue, parsed lists, learned request

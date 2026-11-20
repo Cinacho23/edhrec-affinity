@@ -5,7 +5,7 @@ import BuildDiscoveryCards from "../components/BuildDiscoveryCards";
 import CommanderName from "../components/CommanderName";
 import { loadCommanderIndex } from "../lib/api";
 import { getCommanderCards } from "../lib/commanderPreview";
-import { getBuildCollectionProgress, getBuildPackageDisplayOrder, getBuildSourceFreshness, getBuildThemeEvidence, getCurrentBuildDiscoveryCommanders, getPackageBracketLabel, getSupportedThemes } from "../lib/buildStyleUtils";
+import { formatBuildShare, getBuildCollectionProgress, getBuildPackageDisplayOrder, getBuildSourceFreshness, getBuildThemeEvidence, getCurrentBuildDiscoveryCommanders, getPackageBracketLabel, getSupportedThemes } from "../lib/buildStyleUtils";
 import { formatCollectionDuration, getBuildCollectorExecutionStatus, getBuildCollectorStatus } from "../lib/buildCollectionStatus";
 import { watchBuildDiscovery } from "../lib/buildDiscoveryRefresh";
 import {
@@ -15,6 +15,7 @@ import {
   filterBuildDiscoveryCommanders,
   getBuildDiscoveryFilterErrors,
   getBuildDiscoveryPackageTags,
+  getBuildDiscoverySignalCaptured,
   matchesBuildDiscoveryPackageTag,
   readBuildDiscoveryFilters,
 } from "../lib/buildDiscoveryFilters";
@@ -35,25 +36,30 @@ function collectorDate(value) {
     : "Date unavailable";
 }
 
-const COUNT_FILTERS = [
+const RANGE_FILTERS = [
   { title: "Auto-selected packages", minKey: "minPackages", maxKey: "maxPackages" },
   { title: "Analyzed unique decks", minKey: "minAnalyzed", maxKey: "maxAnalyzed" },
   { title: "Total EDHREC decks", minKey: "minTotalDecks", maxKey: "maxTotalDecks" },
   { title: "Tag profiles", minKey: "minProfiles", maxKey: "maxProfiles" },
+  { title: "Weighted card signal captured (%)", minKey: "minSignalCaptured", maxKey: "maxSignalCaptured",
+    max: 100, step: "any", inputMode: "decimal",
+    description: "Uses the unrounded Auto-model fit, from 0–100%. Reports without this measurement are excluded when a bound is set." },
 ];
 const PAGE_SIZE = 50;
 
-function CountRange({ title, minKey, maxKey, filters, onChange }) {
+function NumberRange({ title, minKey, maxKey, filters, onChange, max, step = "1", inputMode = "numeric", description }) {
+  const noteId = description ? `build-discovery-${minKey}-note` : undefined;
   return <fieldset className="build-discovery-range">
     <legend>{title}</legend>
     <div>
       <label htmlFor={`build-discovery-${minKey}`}>Minimum
-        <input id={`build-discovery-${minKey}`} aria-label={`Minimum ${title.toLowerCase()}`} type="number" min="0" step="1" inputMode="numeric" placeholder="Any" value={filters[minKey]} onChange={(event) => onChange(minKey, event.target.value)} />
+        <input id={`build-discovery-${minKey}`} aria-label={`Minimum ${title.toLowerCase()}`} aria-describedby={noteId} type="number" min="0" max={max} step={step} inputMode={inputMode} placeholder="Any" value={filters[minKey]} onChange={(event) => onChange(minKey, event.target.value)} />
       </label>
       <label htmlFor={`build-discovery-${maxKey}`}>Maximum
-        <input id={`build-discovery-${maxKey}`} aria-label={`Maximum ${title.toLowerCase()}`} type="number" min="0" step="1" inputMode="numeric" placeholder="Any" value={filters[maxKey]} onChange={(event) => onChange(maxKey, event.target.value)} />
+        <input id={`build-discovery-${maxKey}`} aria-label={`Maximum ${title.toLowerCase()}`} aria-describedby={noteId} type="number" min="0" max={max} step={step} inputMode={inputMode} placeholder="Any" value={filters[maxKey]} onChange={(event) => onChange(maxKey, event.target.value)} />
       </label>
     </div>
+    {description ? <p id={noteId} className="muted">{description}</p> : null}
   </fieldset>;
 }
 
@@ -210,7 +216,7 @@ export default function BuildDiscoveryPage() {
     {state.loading ? <p className="muted" role="status">Loading available build reports…</p> : state.error ? <div className="panel"><p className="error-message">Could not load build discovery: {state.error}</p></div> : state.commanders.length ? <>
       <section className="filter-panel build-discovery-filters" aria-labelledby="build-discovery-filter-heading">
         <div className="filter-panel-header">
-          <div><h2 id="build-discovery-filter-heading">Find build reports</h2><p className="muted">Combine filters across all current reports. Leave a bound blank for any value; use the same minimum and maximum for an exact count.</p></div>
+          <div><h2 id="build-discovery-filter-heading">Find build reports</h2><p className="muted">Combine filters across all current reports. Leave a bound blank for any value; use the same minimum and maximum for an exact value.</p></div>
           <button type="button" onClick={resetFilters} disabled={!hasChanges}>Reset filters</button>
         </div>
         <div className="filter-grid build-discovery-filters__search">
@@ -240,7 +246,7 @@ export default function BuildDiscoveryPage() {
           <p id="build-discovery-package-tag-note" className="muted">Show commanders with this main tag on at least one auto-selected package. Supporting tags do not qualify. Expand package details to see tags and brackets.</p>
         </div>
         <div className="build-discovery-filters__ranges">
-          {COUNT_FILTERS.map((range) => <CountRange key={range.minKey} {...range} filters={filters} onChange={updateFilter} />)}
+          {RANGE_FILTERS.map((range) => <NumberRange key={range.minKey} {...range} filters={filters} onChange={updateFilter} />)}
         </div>
         <div className="filter-grid">
           <label htmlFor="build-discovery-status">Analysis result
@@ -274,6 +280,7 @@ export default function BuildDiscoveryPage() {
         const freshness = getBuildSourceFreshness(commander.collection);
         const progress = getBuildCollectionProgress(commander.collection);
         const cardDetails = { ...cardCatalog.get(commander.commander_slug), ...commander };
+        const signalCaptured = getBuildDiscoverySignalCaptured(commander);
         return <article className="panel build-discovery-card" key={commander.commander_slug}>
         <h2><CommanderName commander={cardDetails} className="build-discovery-card__name" /></h2>
         <BuildDiscoveryCards commander={cardDetails} />
@@ -282,6 +289,7 @@ export default function BuildDiscoveryPage() {
           <div><strong>{formatNumber(commander.profile_count)}</strong><span>tag profiles</span></div>
           <div><strong>{formatNumber(commander.unique_decks)}</strong><span>analyzed decks</span></div>
         </div>
+        <p className="build-discovery-card__signal">Weighted card signal captured: <strong>{signalCaptured === null ? "unavailable" : formatBuildShare(signalCaptured, 1)}</strong></p>
         <PackageSummaries commander={commander} selectedTag={filters.packageTag} />
         {commander.status !== "fitted" ? <p className="muted">{commander.profile_count > 0
           ? "Tag profile comparisons available; deck evidence is insufficient to fit packages."

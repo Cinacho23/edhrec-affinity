@@ -1547,6 +1547,10 @@ def export_build_style_files(
             "unique_decks": analysis["unique_decks"], "status": analysis["status"],
             **catalog_cards.get(slug, {}),
         }
+        signal = analysis.get("weighted_reconstruction_captured")
+        if (analysis["status"] == "fitted" and type(signal) in {int, float}
+                and math.isfinite(signal) and 0 <= signal <= 1):
+            entry["weighted_reconstruction_captured"] = signal
         collection = report.get("collection", {})
         if isinstance(collection, dict):
             # Keep source observations distinct from generated_at. The catalog

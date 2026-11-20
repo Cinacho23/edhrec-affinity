@@ -232,6 +232,30 @@ def test_empty_insufficient_report_is_counted_without_inventing_packages(tmp_pat
     assert not (site / "build-styles/pending.json").exists()
 
 
+@pytest.mark.parametrize("signal", [0, .425123456789, 1])
+def test_discovery_index_exports_unrounded_primary_signal_without_using_alternative_models(tmp_path, signal):
+    source = report()
+    source["deck_analysis"].update(weighted_reconstruction_captured=signal,
+        alternative_models=[{"components": 8, "weighted_reconstruction_captured": .99}])
+    write_json(tmp_path / "processed/build-styles/commander-a.json", source)
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"], "total_decks": 200}),
+                                     tmp_path / "processed", tmp_path / "site", seed_dir=tmp_path / "none")
+    index = json.loads((tmp_path / "site/build-styles/index.json").read_text())
+    assert index["commanders"][0]["weighted_reconstruction_captured"] == signal
+    assert json.loads((tmp_path / "processed/build-styles/commander-a.json").read_text()) == source
+
+
+@pytest.mark.parametrize("signal,packages", [(None, 3), ("0.5", 3), (True, 3), (-.1, 3), (1.1, 3), (.5, 0)])
+def test_discovery_index_leaves_unmeasured_invalid_or_insufficient_signal_unknown(tmp_path, signal, packages):
+    source = report(packages=packages)
+    source["deck_analysis"]["weighted_reconstruction_captured"] = signal
+    write_json(tmp_path / "processed/build-styles/commander-a.json", source)
+    exporter.export_build_style_files(pd.DataFrame({"commander_slug": ["commander-a"], "total_decks": 200}),
+                                     tmp_path / "processed", tmp_path / "site", seed_dir=tmp_path / "none")
+    index = json.loads((tmp_path / "site/build-styles/index.json").read_text())
+    assert "weighted_reconstruction_captured" not in index["commanders"][0]
+
+
 def test_discovery_index_summarizes_selected_packages_without_deck_payloads(tmp_path):
     source = report(packages=4)
     packages = source["deck_analysis"]["packages"]

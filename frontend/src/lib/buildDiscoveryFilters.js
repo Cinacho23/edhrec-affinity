@@ -7,6 +7,7 @@ export const DEFAULT_BUILD_DISCOVERY_FILTERS = Object.freeze({
   minAnalyzed: "", maxAnalyzed: "",
   minTotalDecks: "", maxTotalDecks: "",
   minProfiles: "", maxProfiles: "",
+  minSignalCaptured: "", maxSignalCaptured: "",
   status: "all", coverage: "all", freshness: "all",
   sortBy: "unique_decks", direction: "desc",
 });
@@ -16,6 +17,7 @@ export const BUILD_DISCOVERY_SORT_OPTIONS = [
   { value: "unique_decks", label: "Analyzed decks" },
   { value: "total_edhrec_decks", label: "Total EDHREC decks" },
   { value: "profile_count", label: "Tag profiles" },
+  { value: "weighted_reconstruction_captured", label: "Weighted card signal captured" },
   { value: "coverage", label: "Index coverage" },
   { value: "generated_at", label: "Analysis date" },
   { value: "commander_name", label: "Commander name" },
@@ -29,7 +31,7 @@ const ENUM_VALUES = {
   direction: ["asc", "desc"],
 };
 
-/** Keep invalid count text visible so shared links can explain validation errors. */
+/** Keep invalid range text visible so shared links can explain validation errors. */
 export function readBuildDiscoveryFilters(searchParams) {
   const params = searchParams instanceof URLSearchParams ? searchParams : new URLSearchParams(searchParams);
   return Object.fromEntries(Object.entries(DEFAULT_BUILD_DISCOVERY_FILTERS).map(([key, fallback]) => {
@@ -66,6 +68,20 @@ function countInput(value) {
     ? count(Number(value.trim())) ?? NaN : NaN;
 }
 
+function percentageInput(value) {
+  if (value === undefined || value === null || (typeof value === "string" && !value.trim())) return null;
+  const numeric = typeof value === "number" ? value
+    : typeof value === "string" && /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(value.trim()) ? Number(value.trim()) : NaN;
+  return Number.isFinite(numeric) && numeric >= 0 && numeric <= 100 ? numeric : NaN;
+}
+
+/** The selected primary (Auto) model's unrounded reconstruction fraction. */
+export function getBuildDiscoverySignalCaptured(commander) {
+  const value = commander?.weighted_reconstruction_captured;
+  return commander?.status === "fitted" && typeof value === "number" && Number.isFinite(value)
+    && value >= 0 && value <= 1 ? value : null;
+}
+
 export function getBuildDiscoveryFilterErrors(filters = {}) {
   const errors = [];
   for (const range of COUNT_RANGES) {
@@ -76,6 +92,13 @@ export function getBuildDiscoveryFilterErrors(filters = {}) {
     if (min !== null && max !== null && Number.isFinite(min) && Number.isFinite(max) && min > max) {
       errors.push(`${range.label} minimum cannot exceed its maximum.`);
     }
+  }
+  const minimumSignal = percentageInput(filters?.minSignalCaptured);
+  const maximumSignal = percentageInput(filters?.maxSignalCaptured);
+  if (Number.isNaN(minimumSignal)) errors.push("Weighted card signal captured minimum must be a percentage from 0 to 100.");
+  if (Number.isNaN(maximumSignal)) errors.push("Weighted card signal captured maximum must be a percentage from 0 to 100.");
+  if (Number.isFinite(minimumSignal) && Number.isFinite(maximumSignal) && minimumSignal > maximumSignal) {
+    errors.push("Weighted card signal captured minimum cannot exceed its maximum.");
   }
   return errors;
 }
@@ -182,13 +205,16 @@ export function filterBuildDiscoveryCommanders(commanders, filters = {}, now = D
   const sortBy = BUILD_DISCOVERY_SORT_OPTIONS.some((option) => option.value === settings.sortBy)
     ? settings.sortBy : DEFAULT_BUILD_DISCOVERY_FILTERS.sortBy;
   const direction = settings.direction === "asc" ? "asc" : "desc";
+  const minimumSignal = percentageInput(settings.minSignalCaptured);
+  const maximumSignal = percentageInput(settings.maxSignalCaptured);
 
   const reports = (Array.isArray(commanders) ? commanders : []).filter((commander) => commander && typeof commander === "object")
     .map((commander) => ({
       commander,
+      signalCaptured: getBuildDiscoverySignalCaptured(commander),
       progress: getBuildCollectionProgress(commander.collection, now),
       freshness: getBuildSourceFreshness(commander.collection, now).status,
-    })).filter(({ commander, progress, freshness }) => {
+    })).filter(({ commander, progress, freshness, signalCaptured }) => {
       const search = searchable(`${commander.commander_name || ""} ${commander.commander_slug || ""}`);
       if (!words.every((word) => search.includes(word))) return false;
       if (tagKey(settings.packageTag) && !mainPackageTags(commander).some((tag) => matchesBuildDiscoveryPackageTag(tag, settings.packageTag))) return false;
@@ -197,6 +223,11 @@ export function filterBuildDiscoveryCommanders(commanders, filters = {}, now = D
         if (value === null || (range.minimum !== null && value < range.minimum)
             || (range.maximum !== null && value > range.maximum)) return false;
       }
+      // Compare unrounded fractions to percentage bounds; an unknown fit must
+      // never become a measured zero. No bound leaves unknown reports visible.
+      if ((minimumSignal !== null || maximumSignal !== null) && (signalCaptured === null
+          || minimumSignal !== null && signalCaptured < minimumSignal / 100
+          || maximumSignal !== null && signalCaptured > maximumSignal / 100)) return false;
       if (["fitted", "insufficient_data"].includes(settings.status) && commander.status !== settings.status) return false;
       if (settings.coverage === "complete" && !progress.complete) return false;
       if (settings.coverage === "partial" && (!progress.known || progress.complete)) return false;
@@ -213,7 +244,8 @@ export function filterBuildDiscoveryCommanders(commanders, filters = {}, now = D
         * (direction === "asc" ? 1 : -1) || compareNames(left.commander, right.commander);
     }
     const value = (report) => sortBy === "coverage" ? coverageRatio(report.progress)
-      : sortBy === "generated_at" ? analysisDate(report.commander.generated_at) : count(report.commander[sortBy]);
+      : sortBy === "generated_at" ? analysisDate(report.commander.generated_at)
+        : sortBy === "weighted_reconstruction_captured" ? report.signalCaptured : count(report.commander[sortBy]);
     return knownNumberOrder(value(left), value(right), direction)
       || (sortBy === "package_count"
         ? knownNumberOrder(count(left.commander.unique_decks), count(right.commander.unique_decks), "desc") : 0)

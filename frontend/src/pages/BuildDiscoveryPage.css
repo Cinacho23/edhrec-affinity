@@ -21,6 +21,7 @@
 .build-discovery-range > div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .6rem; }
 .build-discovery-range label { display: grid; gap: .35rem; color: var(--muted); font-size: .75rem; }
 .build-discovery-range input { width: 100%; min-width: 0; margin: 0; }
+.build-discovery-range > p { margin: .6rem 0 0; font-size: .75rem; line-height: 1.5; }
 .build-discovery-filters__note { margin: 1rem 0 0; font-size: .78rem; line-height: 1.55; }
 .build-discovery-filters .error-message p { margin: .6rem 0 0; font-size: .85rem; }
 .build-discovery-results { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .75rem; margin: 1rem 0; }
@@ -37,6 +38,8 @@
 .build-discovery-card__stats > div { display: grid; gap: .35rem; }
 .build-discovery-card__stats strong { color: var(--accent); font-size: 1.45rem; }
 .build-discovery-card__stats span { color: var(--muted); font-size: .75rem; }
+.build-discovery-card__signal { margin: -.5rem 0 1rem; color: var(--muted); font-size: .8rem; line-height: 1.5; }
+.build-discovery-card__signal strong { color: var(--muted-strong); }
 .build-discovery-card__packages { margin-bottom: 1.2rem; }
 .build-discovery-card__packages > summary { display: flex; align-items: center; justify-content: space-between; gap: .8rem; padding: .55rem 0; color: var(--accent); cursor: pointer; list-style: none; font-size: .8rem; line-height: 1.5; }
 .build-discovery-card__packages > summary::-webkit-details-marker { display: none; }
