@@ -4,43 +4,77 @@
   padding-inline: 0;
 }
 
-.synergy-commander-picker {
-  display: grid;
-  gap: 0.65rem;
+.synergy-commander-catalog__header {
+  padding: clamp(1.15rem, 3.5vw, 2.6rem);
+  background: radial-gradient(ellipse at top right, rgb(125 211 252 / 0.17), transparent 70%), var(--panel);
 }
 
-.synergy-commander-picker form {
+.synergy-commander-catalog__header h1 {
+  font-size: clamp(2.25rem, 5.2vw, 4.6rem);
+  line-height: 1;
+}
+
+.synergy-commander-catalog__header p {
+  margin: 0.8rem 0 1.35rem;
+}
+
+.synergy-commander-catalog__header label {
   display: grid;
   gap: 0.45rem;
-  max-width: 34rem;
+  max-width: 30rem;
+  font-weight: 700;
 }
 
-.synergy-commander-picker input {
+.synergy-commander-catalog__header input {
   width: 100%;
   min-width: 0;
+  font-weight: 400;
 }
 
-.synergy-commander-picker p {
+.synergy-commander-catalog > p {
   margin: 0;
 }
 
-.synergy-commander-picker__results {
+.synergy-commander-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr));
-  gap: 0.35rem 0.85rem;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 9rem), 1fr));
+  gap: clamp(0.65rem, 1.7vw, 1rem);
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.synergy-commander-picker__results a {
-  display: block;
-  padding: 0.4rem 0;
+.synergy-commander-grid__tile {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: 0.65rem;
+  height: 100%;
+  padding: clamp(0.45rem, 1vw, 0.7rem);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  font-size: 0.92rem;
+  font-weight: 700;
+  line-height: 1.35;
   overflow-wrap: anywhere;
 }
 
-.synergy-commander-picker__results a[aria-current="true"] {
-  color: var(--accent);
+.synergy-commander-grid__tile:is(:hover, :focus-visible) {
+  border-color: var(--accent);
+  background: var(--panel-strong);
+}
+
+.synergy-commander-grid__art {
+  display: grid;
+  align-items: center;
+  aspect-ratio: 488 / 680;
+  min-width: 0;
+  border-radius: var(--radius-xs);
+  background: var(--bg-soft);
+}
+
+.synergy-commander-catalog__more {
+  justify-self: center;
 }
 
 .synergy-deck-hero {

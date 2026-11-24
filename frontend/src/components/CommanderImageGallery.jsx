@@ -4,7 +4,8 @@ import "./CommanderImageGallery.css";
 
 export default function CommanderImageGallery({ commander, variant = "card", linked = false, linkTo }) {
   const cards = getCommanderCards(commander);
-  const faces = cards.flatMap((card) => card.faces.map((face, index) => ({
+  const tile = variant === "tile";
+  const faces = cards.flatMap((card) => (tile ? card.faces.slice(0, 1) : card.faces).map((face, index) => ({
     ...face,
     scryfall_uri: card.scryfall_uri,
     label: card.faces.length > 1
@@ -35,7 +36,7 @@ export default function CommanderImageGallery({ commander, variant = "card", lin
         );
         return (
           <figure className="commander-gallery__face" key={`${face.image_url}-${index}`}>
-            {linked && linkTo ? (
+            {tile ? image : linked && linkTo ? (
               <Link to={linkTo}>{image}</Link>
             ) : face.scryfall_uri ? (
               <a href={face.scryfall_uri} target="_blank" rel="noreferrer" aria-label={`Open ${face.label} on Scryfall`}>{image}</a>

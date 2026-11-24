@@ -29,6 +29,7 @@ const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" 
 const finishLabels = { nonfoil: "Nonfoil", foil: "Foil", etched: "Etched foil" };
 const prototypeCommander = "the-tenth-doctor-rose-tyler";
 const prototypeTitle = "The Tenth Doctor + Rose Tyler";
+const catalogPageSize = 24;
 const commanderColorChoices = { W: "White", U: "Blue", B: "Black", R: "Red", G: "Green" };
 const choosesCommanderColor = new Set(["clara oswald", "faceless one", "the prismatic piper"]);
 const cardTypes = [
@@ -107,41 +108,44 @@ function searchKey(value) {
   return value.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
 }
 
-function CommanderPicker({ entries, selected, searchParams, state, onSelect }) {
-  const [query, setQuery] = useState("");
-  const search = searchKey(query.trim());
+function CommanderCatalog({ entries, index, catalog, setCatalog, searchParams, heading }) {
+  const search = searchKey(catalog.query.trim());
   const terms = search.split(/\s+/);
-  const matches = search ? entries.filter((entry) => terms.every((term) => entry.search.includes(term))) : [];
-  const visible = matches.slice(0, 12);
+  const matches = search ? entries.filter((entry) => terms.every((term) => entry.search.includes(term))) : entries;
+  const visible = matches.slice(0, catalog.limit);
 
-  function selectFirst(event) {
-    event.preventDefault();
-    if (!visible.length) return;
-    onSelect(visible[0].slug);
-    setQuery("");
-  }
-
-  return <section className="panel synergy-commander-picker" aria-label="Choose a commander">
-    <form onSubmit={selectFirst}>
-      <label htmlFor="synergy-commander-search">Find a commander</label>
-      <input id="synergy-commander-search" type="search" value={query} onChange={(event) => setQuery(event.target.value)}
-        placeholder="Commander or partner name" disabled={state.loading || !!state.error} />
-    </form>
-    {state.loading ? <p className="muted" role="status">Loading commanders…</p> : null}
-    {state.error ? <p className="error-message" role="status">Could not load the commander catalog.</p> : null}
-    {search && !state.loading && !state.error ? <>
-      <p className="muted" role="status">{matches.length ? (
-        matches.length > visible.length ? `Showing ${visible.length} of ${formatNumber(matches.length)} matches.` : `${formatNumber(matches.length)} ${matches.length === 1 ? "commander matches" : "commanders match"}.`
-      ) : "No commanders match your search."}</p>
-      {visible.length ? <ul className="synergy-commander-picker__results">
-        {visible.map(({ slug, name }) => {
-          const next = commanderSelection(searchParams, slug);
-          return <li key={slug}><Link to={{ search: `?${next}` }} onClick={() => setQuery("")}
-            aria-current={selected === slug ? "true" : undefined}>{name}</Link></li>;
-        })}
+  return <div className="page synergy-deck-page synergy-commander-catalog">
+    <header className="panel synergy-commander-catalog__header">
+      <h1 ref={heading} tabIndex={-1}>Synergy Deck</h1>
+      <p className="muted">Choose a commander or pair to build a deck around their card mechanics.</p>
+      <label>
+        Find a commander
+        <input type="search" value={catalog.query}
+          onChange={(event) => setCatalog({ query: event.target.value, limit: catalogPageSize })}
+          placeholder="Commander or partner name" disabled={!!index.error} />
+      </label>
+    </header>
+    {index.loading ? <p className="muted" role="status">Loading commanders…</p> : null}
+    {index.error ? <p className="error-message" role="status">Could not load the commander catalog.</p> : null}
+    {!index.loading && !index.error ? <>
+      <p className="muted" role="status">{matches.length
+        ? `Showing ${formatNumber(visible.length)} of ${formatNumber(matches.length)} commander configurations.`
+        : "No commanders match your search."}</p>
+      {visible.length ? <ul className="synergy-commander-grid" aria-label="Commander catalog">
+        {visible.map(({ slug, name, row }) => <li key={slug}>
+          <Link to={{ search: `?${commanderSelection(searchParams, slug)}` }} aria-label={name}
+            className="synergy-commander-grid__tile">
+            <div className="synergy-commander-grid__art"><CommanderImageGallery commander={row} variant="tile" /></div>
+            <span>{name}</span>
+          </Link>
+        </li>)}
       </ul> : null}
+      {visible.length < matches.length ? <button className="synergy-commander-catalog__more" type="button"
+        onClick={() => setCatalog((current) => ({ ...current, limit: current.limit + catalogPageSize }))}>
+        Load more commanders
+      </button> : null}
     </> : null}
-  </section>;
+  </div>;
 }
 
 function useGeneratedBundle(entry, chosenColor) {
@@ -363,14 +367,14 @@ function DeckExport({ deck, allCards, tier, commanderTitle }) {
   </>;
 }
 
-function DeckHero({ deck, commanderTitle, summary, allCards, tier, priceDetails, budgetPicker, colorPicker, unavailableReason }) {
+function DeckHero({ deck, commanderTitle, summary, allCards, tier, priceDetails, budgetPicker, colorPicker, unavailableReason, heading }) {
   const landCount = quantity(allCards.filter((card) => cardGroup(card) === "Lands"));
   const art = deck?.commanders.filter((card) => card.image_url) || [];
 
   return <header className="panel synergy-deck-hero">
     <div>
       <p className="eyebrow">Oracle mechanics</p>
-      <h1>{commanderTitle}</h1>
+      <h1 ref={heading} tabIndex={-1}>{commanderTitle}</h1>
       {summary ? <p className="synergy-deck-hero__summary">{summary}</p> : null}
       {colorPicker}
       {budgetPicker}
@@ -393,9 +397,10 @@ function DeckHero({ deck, commanderTitle, summary, allCards, tier, priceDetails,
 export default function SynergyDeckPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [index, setIndex] = useState({ entries: [], loading: true, error: null });
-  const commander = searchParams.get("commander") || prototypeCommander;
-  const requested = searchParams.get("budget");
-  const selected = budgetOptions.find(({ id }) => id === requested) || budgetOptions.at(-1);
+  const [catalog, setCatalog] = useState({ query: "", limit: catalogPageSize });
+  const commander = searchParams.get("commander");
+  const heading = useRef(null);
+  const previousCommander = useRef(commander);
 
   useEffect(() => {
     let active = true;
@@ -407,18 +412,38 @@ export default function SynergyDeckPage() {
     return () => { active = false; };
   }, []);
 
+  useEffect(() => {
+    window.scrollTo(0, 0);
+    if (previousCommander.current !== commander) {
+      heading.current?.focus({ preventScroll: true });
+      previousCommander.current = commander;
+    }
+  }, [commander]);
+
   const commanderEntries = useMemo(() => index.entries.flatMap((row) => {
     const slug = row.commander_slug;
     const name = commanderName(row);
+    const indexName = row.commander_name?.replace(/\s*\(Commander\)$/i, "") || "";
     const cardNames = row.commander_cards?.map((card) => card.name).filter(Boolean);
     const names = cardNames?.length ? cardNames : row.scryfall_card_names?.length ? row.scryfall_card_names : [name];
     return slug && name ? [{
-      slug, name, names, search: searchKey(`${name} ${slug}`), decks: Number(row.total_decks) || 0,
+      slug, name, names, row, search: searchKey(`${name} ${indexName} ${slug}`), decks: Number(row.total_decks) || 0,
       colors: Array.isArray(row.color_identity) ? row.color_identity : [],
       choosesColor: names.some((card) => choosesCommanderColor.has(searchKey(card))),
     }] : [];
   }).sort((a, b) => b.decks - a.decks || a.name.localeCompare(b.name)), [index.entries]);
+
+  if (!commander) return <CommanderCatalog entries={commanderEntries} index={index} catalog={catalog}
+    setCatalog={setCatalog} searchParams={searchParams} heading={heading} />;
+
   const selectedCommander = commanderEntries.find((entry) => entry.slug === commander);
+  return <CommanderDeck commander={commander} selectedCommander={selectedCommander} index={index}
+    searchParams={searchParams} setSearchParams={setSearchParams} heading={heading} />;
+}
+
+function CommanderDeck({ commander, selectedCommander, index, searchParams, setSearchParams, heading }) {
+  const requested = searchParams.get("budget");
+  const selected = budgetOptions.find(({ id }) => id === requested) || budgetOptions.at(-1);
   const isPrototype = commander === prototypeCommander;
   const colorParam = searchParams.get("color");
   const chosenColor = selectedCommander?.choosesColor && Object.hasOwn(commanderColorChoices, colorParam) ? colorParam : null;
@@ -463,12 +488,15 @@ export default function SynergyDeckPage() {
     </select>
   </label> : null;
 
+  const catalogParams = new URLSearchParams(searchParams);
+  catalogParams.delete("commander");
+  catalogParams.delete("color");
+
   return <article className="page synergy-deck-page">
-    <CommanderPicker entries={commanderEntries} selected={commander} searchParams={searchParams} state={index}
-      onSelect={(slug) => setSearchParams((current) => commanderSelection(current, slug))} />
+    <div><Link className="detail-back-link" to={{ search: catalogParams.toString() }}>← Back to commander grid</Link></div>
     <DeckHero deck={deck} commanderTitle={commanderTitle} summary={synergy.summary} allCards={[...commanders, ...mainDeck]} tier={tier}
       priceDetails={tier ? <PriceProvenance tier={tier} pricing={activeBudgets.pricing} /> : null} budgetPicker={budgetPicker}
-      colorPicker={colorPicker} unavailableReason={unavailableReason} />
+      colorPicker={colorPicker} unavailableReason={unavailableReason} heading={heading} />
     {deck ? <>
       <div className="synergy-deck-overview">
         {synergy.highlights?.length ? <section className="panel synergy-deck-plan" aria-labelledby="synergy-plan-heading">
