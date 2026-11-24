@@ -196,6 +196,8 @@ export default function CommanderDetailPage() {
             <span className="pill">{formatNumber(tagRows.length)} tags</span>
           </div>
 
+          <p><Link to={{ pathname: "/synergy-deck", search: `?${new URLSearchParams({ commander: commanderSlug })}` }}>Build a Synergy Deck →</Link></p>
+
           {strongestTag ? (
             <p>
               Strongest tag by z-score: <strong>{strongestTag.tag_name}</strong>{" "}

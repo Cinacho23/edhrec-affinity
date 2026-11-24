@@ -26,6 +26,7 @@ export default function Layout() {
             </NavLink>
             <NavLink to="/commanders">Commanders</NavLink>
             <NavLink to="/build-discovery">Build Discovery</NavLink>
+            <NavLink to="/synergy-deck">Synergy Deck</NavLink>
             <NavLink to="/leaderboard">Leaderboard</NavLink>
             <NavLink to="/tags">Tag Explorer</NavLink>
             <NavLink to="/sets">Sets</NavLink>

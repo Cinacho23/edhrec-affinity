@@ -15,6 +15,7 @@ This project is not trying to reproduce EDHREC. Its purpose is to add an origina
 - Commander search
 - Cumulative tag filters across commander list pages: every selected tag must have z > 1, with matching commanders sorted by their summed z-scores
 - Commander detail pages with a minimum of 5 tagged decks per displayed tag
+- Synergy Deck generation for the Commander-legal configurations in the commander index, with four budgets and exact Card Kingdom printings
 - Build discovery with a resumable collection queue for every indexed commander: automatic 1–N card packages when supported, overlapping theme suggestions, tag-profile evidence and source decklists
 - Global commander-tag leaderboard
 - Tag explorer
@@ -143,3 +144,90 @@ Each collection worker retains its commander, using saved progress and remaining
 work to finish reports promptly. Completed checkpoints explicitly trigger website
 publication, including collections started by GitHub Actions itself.
 Access restrictions remain distinct from rate-limit pauses.
+
+## Synergy Decks
+
+The separate **Synergy Deck** page (`/#/synergy-deck`) searches the site's commander index and generates a deck for the selected legal configuration. The page also opens from commander detail pages. Partners, Backgrounds, and commanders with a chosen color use their eligible command zone and color identity.
+Generation runs in a browser worker using versioned Scryfall, Card Kingdom, and neural model assets. A capped tier requires stocked quotes for the whole deck at or below its ceiling. A commander whose price alone consumes the cap can still have higher-tier lists.
+
+The original verified The Tenth Doctor and Rose Tyler deck remains the starting example. Browser-generated card lists use native mana and role checks, including a local land-and-ramp estimate to guide playability, and link to the exact list in EDHPowerLevel for an external check. The page displays a verified rating when its recorded observation matches that exact list.
+The offline ranker learns to recover masked cards using commander and partial-deck features. Construction scores
+legal spells from the Scryfall catalog and gives separate credit for effects that start suspend, advance its
+countdown, or reward casting from exile. The search keeps the best-scoring candidate it finds under its mana and role targets.
+
+For generated decks, aim for **72.5–77.5% EDHPowerLevel playability**, inclusive. Tune the land count,
+colored mana sources, and ramp alongside the deck's mana values and colored costs. Check playability
+on the exact generated list. The comparison experiments held the mana base at 37 lands to isolate
+changes to spell selection. The uncapped mana-base builder favors early colored sources and untapped typed duals
+for fetchlands.
+
+To regenerate, download the `jsonl_download_uri` from the [Scryfall Oracle Cards bulk endpoint](https://api.scryfall.com/bulk-data/oracle-cards)
+and use a restored Build Discovery preview checkpoint. Pass the bulk export's `updated_at` value to identify the catalog snapshot.
+
+```bash
+python -m edhrec_affinity.synergy_prototype generate \
+  --oracle-jsonl /path/to/oracle-cards.jsonl.gz \
+  --catalog-updated-at 2026-11-21T22:01:57.459Z \
+  --previews data/processed/build-styles-current/_collection/previews \
+  --alias-cache data/raw/distinctive-core-card-metadata.json
+python -m edhrec_affinity.synergy_prototype check
+```
+
+Generation uses the `prototype` Python extra. The check uses the `validation` extra and Playwright Chromium.
+It attaches the external result to the exact card list and commander roles. The offline benchmark holds out
+card identities and deck records and measures recovery of known inclusions among sampled legal candidates.
+
+The budget selector offers **$** (up to $100 USD), **$$** (up to $500), **$$$** (up to $1,000), and
+**$$$$** (uncapped). Capped lists use Card Kingdom prices for all 100 cards, including both commanders and
+every copy of each basic land. The shopping list picks the cheapest in-stock English printings eligible for paper play,
+including foil copies where they cost less. It can split quantities across printings and conditions. The reported total is
+the dated singles subtotal before tax and shipping. Each exact list has its own playability result.
+
+To rebuild the tiers, save the [Card Kingdom singles feed](https://api.cardkingdom.com/api/v2/pricelist) as JSON,
+and obtain Scryfall's Default Cards and Oracle Cards gzipped JSONL exports.
+
+```bash
+python -m edhrec_affinity.synergy_prototype.prices \
+  --price-feed /path/to/card-kingdom.json \
+  --printing-jsonl /path/to/default-cards.jsonl.gz \
+  --oracle-jsonl /path/to/oracle-cards.jsonl.gz \
+  --output /path/to/deck-prices.json
+python -m edhrec_affinity.synergy_prototype.budgets generate \
+  --prices /path/to/deck-prices.json \
+  --oracle-jsonl /path/to/oracle-cards.jsonl.gz \
+  --catalog-updated-at 2026-11-21T22:01:57.459Z \
+  --previews data/processed/build-styles-current/_collection/previews \
+  --alias-cache data/raw/distinctive-core-card-metadata.json \
+  --exports-directory data/prototypes/synergy-deck/budgets
+python -m edhrec_affinity.synergy_prototype.budgets check
+```
+
+Run `python -m edhrec_affinity.synergy_prototype.budgets reprice --prices /path/to/deck-prices.json`
+to update shopping choices for the existing deck lists.
+
+To refresh the public worker's card and price snapshot while reusing the trained model, run
+
+```bash
+python -m edhrec_affinity.synergy_decks.assets \
+  --oracle-jsonl /path/to/oracle-cards.jsonl.gz \
+  --catalog-updated-at YYYY-MM-DDTHH:MM:SSZ \
+  --prices /path/to/deck-prices.json \
+  --printings-jsonl /path/to/default-cards.jsonl.gz \
+  --reuse-model-from frontend/public/synergy-assets
+```
+
+The standard GitHub Pages build publishes these versioned assets. Newly added cards get Oracle-text scores until the model is retrained. Use `--previews` in place of `--reuse-model-from` to train from saved deck previews.
+
+The [experiment report](frontend/src/generated/synergy-deck-experiments.json) preserves the original comparison
+and all exact-list EDHPowerLevel assessments. The offline experiment command uses the archived baseline and compares
+changes to the Oracle scoring, the ramp penalty, the model's representation of the partial deck, and all three together.
+
+```bash
+python -m edhrec_affinity.synergy_prototype.experiments generate \
+  --oracle-jsonl /path/to/oracle-cards.jsonl.gz \
+  --catalog-updated-at 2026-11-21T22:01:57.459Z \
+  --previews data/processed/build-styles-current/_collection/previews \
+  --alias-cache data/raw/distinctive-core-card-metadata.json \
+  --exports-directory data/prototypes/synergy-deck/experiments
+python -m edhrec_affinity.synergy_prototype.experiments check
+```

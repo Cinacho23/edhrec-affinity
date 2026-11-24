@@ -1,3 +1,4 @@
+import { lazy, Suspense } from "react";
 import { Routes, Route } from "react-router-dom";
 
 import Layout from "./components/Layout";
@@ -16,6 +17,8 @@ import QuirkyBuildsPage from "./pages/QuirkyBuildsPage";
 import MethodologyPage from "./pages/MethodologyPage";
 import NotFoundPage from "./pages/NotFoundPage";
 
+const SynergyDeckPage = lazy(() => import("./pages/SynergyDeckPage"));
+
 export default function App() {
   return (
     <Routes>
@@ -24,6 +27,7 @@ export default function App() {
         <Route path="/commanders" element={<CommanderSearchPage />} />
         <Route path="/commanders/:commanderSlug" element={<CommanderDetailPage />} />
         <Route path="/build-discovery" element={<BuildDiscoveryPage />} />
+        <Route path="/synergy-deck" element={<Suspense fallback={<p className="page" role="status">Loading generated deck…</p>}><SynergyDeckPage /></Suspense>} />
         <Route path="/leaderboard" element={<GlobalLeaderboardPage />} />
         <Route path="/tags" element={<TagExplorerPage />} />
         <Route path="/sets" element={<SetExplorerPage />} />
