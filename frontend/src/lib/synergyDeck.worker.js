@@ -1,4 +1,4 @@
-import { buildCommanderBudgets, commanderCards, commanderColors, maskForColors } from "./synergyDeckBuilder.js";
+import { buildCommanderDeck, commanderCards, commanderColors, maskForColors } from "./synergyDeckBuilder.js";
 import { decodeCardFeatures } from "./synergyDeckRanker.js";
 
 async function readJson(url, compressed = false) {
@@ -47,7 +47,7 @@ self.addEventListener("message", async ({ data }) => {
     }
     const allColors = commanderColors(commanders, chosenColor);
     if (allColors & ~mask) catalog = await readCatalog(baseUrl, manifest, allColors, model, cache);
-    self.postMessage({ id, bundle: await buildCommanderBudgets(catalog, commanders, chosenColor, model, manifest) });
+    self.postMessage({ id, report: await buildCommanderDeck(catalog, commanders, chosenColor, model, manifest) });
   } catch (error) {
     self.postMessage({ id, error: error instanceof Error ? error.message : "Could not generate a deck for this commander." });
   }

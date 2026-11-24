@@ -22,15 +22,12 @@ def test_browser_assets_use_color_shards_and_little_endian_model_features(tmp_pa
                              features=np.asarray([[.25, -.5], [1, 2]], dtype=np.float32),
                              model=SimpleNamespace(coefs_=[np.arange(10, dtype=np.float32).reshape((10, 1))],
                                                    intercepts_=[np.asarray([.5])]))
-    quotes = {"source": "Card Kingdom", "source_url": "https://www.cardkingdom.com/",
-              "checked_at": "2026-11-23T22:51:00Z", "cards": {"plains": {"offers": [
-                  {"price_cents": 20, "stock": 3}, {"price_cents": 40, "stock": 99},
-              ]}}}
     output = tmp_path / "public"
     manifest = export_browser_assets(output, catalog, {"white wizard": "saruman", "plains": "saruman"}, ranker,
-                                     quotes, snapshot_at="2026-11-21T22:01:57Z")
+                                     snapshot_at="2026-11-21T22:01:57Z")
 
     assert manifest == json.loads((output / "manifest.json").read_text())
+    assert "pricing" not in manifest
     assert [shard["color_mask"] for shard in manifest["shards"]] == [0, 2]
     model = json.loads((output / manifest["model_path"]).read_text())
     assert model["shapes"] == [[10, 1]] and model["weights"] == [list(range(10))]
@@ -38,14 +35,14 @@ def test_browser_assets_use_color_shards_and_little_endian_model_features(tmp_pa
     payloads = [json.loads(gzip.decompress((output / shard["path"]).read_bytes())) for shard in manifest["shards"]]
     basic, commander = [payload["cards"][0] for payload in payloads]
     assert basic["produced_mask"] == 1 and basic["copies"] == 100
-    assert [offer["price_cents"] for offer in basic["offers"]] == [20, 40]
+    assert all("offers" not in card for card in (basic, commander))
     assert commander["aliases"] == ["white wizard"] and commander["can_command"] is True
     for payload, expected in zip(payloads, ([1, 2], [.25, -.5]), strict=True):
         features = np.frombuffer(base64.b64decode(payload["features"]), dtype="<i2") / FEATURE_SCALE
         np.testing.assert_array_equal(features, expected)
 
     catalog["new card"] = {**catalog["saruman"], "name": "New Card", "oracle_id": "new"}
-    refreshed = refresh_browser_assets(output, output, catalog, {}, quotes, snapshot_at="2026-11-23T22:01:57Z")
+    refreshed = refresh_browser_assets(output, output, catalog, {}, snapshot_at="2026-11-23T22:01:57Z")
     assert refreshed["model_catalog_updated_at"] == manifest["oracle_updated_at"]
     assert refreshed["oracle_only_cards"] == 1
     shard = json.loads(gzip.decompress((output / refreshed["shards"][1]["path"]).read_bytes()))

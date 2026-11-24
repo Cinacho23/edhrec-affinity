@@ -3,6 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 
 import BracketBadge from "../components/BracketBadge";
 import CommanderImageGallery from "../components/CommanderImageGallery";
+import original from "../generated/synergy-deck.json";
 import { loadCommanderIndex } from "../lib/api";
 import {
   generatedDeckFilename,
@@ -13,20 +14,6 @@ import {
 import { formatDecimal, formatNumber } from "../lib/formatters";
 import "./SynergyDeckPage.css";
 
-const artifacts = import.meta.glob([
-  "../generated/synergy-deck.json",
-  "../generated/synergy-deck-budgets.json",
-], { eager: true, import: "default" });
-const original = artifacts["../generated/synergy-deck.json"];
-const budgets = artifacts["../generated/synergy-deck-budgets.json"];
-const budgetOptions = [
-  { id: "100", label: "$", cap_usd: 100 },
-  { id: "500", label: "$$", cap_usd: 500 },
-  { id: "1000", label: "$$$", cap_usd: 1000 },
-  { id: "uncapped", label: "$$$$", cap_usd: null },
-];
-const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
-const finishLabels = { nonfoil: "Nonfoil", foil: "Foil", etched: "Etched foil" };
 const prototypeCommander = "the-tenth-doctor-rose-tyler";
 const prototypeTitle = "The Tenth Doctor + Rose Tyler";
 const catalogPageSize = 24;
@@ -58,37 +45,6 @@ function cardGroup(card) {
 
 function quantity(cards) {
   return cards.reduce((count, card) => count + card.quantity, 0);
-}
-
-function hasPrice(value) {
-  return Number.isFinite(value) && value >= 0;
-}
-
-function printingLabel(option) {
-  const code = option.set_code?.toUpperCase();
-  const edition = option.printing && code ? `${option.printing} (${code})` : option.printing || code;
-  const collectorNumber = option.collector_number != null && option.collector_number !== ""
-    ? `#${option.collector_number}` : null;
-  const version = [edition, collectorNumber].filter(Boolean).join(" ");
-  return [version, finishLabels[option.finish] || option.finish, option.condition].filter(Boolean).join(" · ");
-}
-
-function getShoppingList(cards, commanderTitle, tierName, totalUsd) {
-  if (!hasPrice(totalUsd)) return null;
-  const lines = [];
-  for (const card of cards) {
-    const options = card.purchase_options || [];
-    if (quantity(options) !== card.quantity) return null;
-    for (const option of options) {
-      const url = safeExternalUrl(option.source_url);
-      if (!url || !hasPrice(option.price_usd)) return null;
-      lines.push(`${option.quantity} × ${card.name} — ${printingLabel(option)} — ${usd.format(option.price_usd)} each\n${url}`);
-    }
-  }
-  return [
-    `${commanderTitle} · ${tierName}\nCard Kingdom shopping list\nEstimated singles total ${usd.format(totalUsd)}`,
-    ...lines,
-  ].join("\n\n") + "\n";
 }
 
 function commanderName(row) {
@@ -148,7 +104,7 @@ function CommanderCatalog({ entries, index, catalog, setCatalog, searchParams, h
   </div>;
 }
 
-function useGeneratedBundle(entry, chosenColor) {
+function useGeneratedReport(entry, chosenColor) {
   const runtime = useRef(null);
   const requestId = useRef(0);
   const [result, setResult] = useState(null);
@@ -165,7 +121,7 @@ function useGeneratedBundle(entry, chosenColor) {
     const worker = runtime.current ||= new Worker(new URL("../lib/synergyDeck.worker.js", import.meta.url), { type: "module" });
     const receive = ({ data }) => {
       if (data?.id !== id) return;
-      if (data.bundle?.tiers?.length) setResult({ selection, bundle: data.bundle });
+      if (data.report?.deck?.commanders?.length && data.report.deck.cards?.length) setResult({ selection, report: data.report });
       else setResult({ selection, error: data.error || "The generated deck report was empty." });
     };
     function fail() {
@@ -193,37 +149,6 @@ function useGeneratedBundle(entry, chosenColor) {
   return result?.selection === selection ? result : { loading: true };
 }
 
-function BudgetPicker({ selected, searchParams }) {
-  return <nav className="synergy-deck-budgets" aria-label="Deck budget">
-    {budgetOptions.map(({ id, label, cap_usd }) => {
-      const next = new URLSearchParams(searchParams);
-      next.set("budget", id);
-      return <Link key={id} to={{ search: `?${next}` }} aria-current={selected === id ? "true" : undefined}>
-        <strong>{label}</strong>
-        <span>{cap_usd == null ? "Uncapped" : `Up to $${formatNumber(cap_usd)} USD`}</span>
-      </Link>;
-    })}
-  </nav>;
-}
-
-function PriceProvenance({ tier, pricing }) {
-  const sourceUrl = safeExternalUrl(pricing?.source_url);
-  const source = pricing?.source;
-  const date = reportDate(pricing?.checked_at);
-  const missing = tier.unpriced_cards?.length || 0;
-  const note = tier.price_notes || pricing?.description || pricing?.methodology;
-
-  return <div className="synergy-deck-price">
-    {!hasPrice(tier.total_usd) && missing > 0 ? <details>
-      <summary>Full estimate unavailable. {formatNumber(missing)} {missing === 1 ? "card is" : "cards are"} unpriced.</summary>
-      <p>{tier.unpriced_cards.join(", ")}</p>
-    </details> : null}
-    {!hasPrice(tier.total_usd) && missing === 0 ? <p>Price estimate unavailable.</p> : null}
-    {source ? <p>USD prices from {sourceUrl ? <a href={sourceUrl} target="_blank" rel="noreferrer">{source}</a> : source}{date ? ` on ${date}` : ""}.</p> : null}
-    {note ? <p>{note}</p> : null}
-  </div>;
-}
-
 function ExternalBracket({ rating, deckHash, externalUrl }) {
   const recorded = deckHash ? getExternalDeckRating(rating, undefined, deckHash) : null;
   const stale = recorded?.status === "stale";
@@ -246,21 +171,6 @@ function ExternalBracket({ rating, deckHash, externalUrl }) {
       : "This exact list is ready to check on EDHPowerLevel."}</p>}
     <a className="synergy-deck-link" href={link} target="_blank" rel="noreferrer">{recorded ? "Open on EDHPowerLevel" : "Check on EDHPowerLevel"} ↗</a>
   </section>;
-}
-
-function CardPrintings({ card }) {
-  const options = card.purchase_options || [];
-  if (!options.length) return null;
-  return <span className="synergy-deck-list__printings">{options.map((option) => {
-    const url = safeExternalUrl(option.source_url);
-    const label = printingLabel(option);
-    const key = [option.scryfall_id, option.finish, option.condition, option.source_url].join("|");
-    return <span className="synergy-deck-list__printing" key={key}>
-      {card.quantity > 1 ? `${option.quantity} × ` : null}
-      {url ? <a href={url} target="_blank" rel="noreferrer" aria-label={`Card Kingdom, ${card.name}, ${label}`}>{label}</a> : label}
-      {options.length > 1 && hasPrice(option.price_usd) ? ` · ${usd.format(option.price_usd)} ea.` : null}
-    </span>;
-  })}</span>;
 }
 
 function DeckList({ commanders, mainDeck }) {
@@ -289,19 +199,11 @@ function DeckList({ commanders, mainDeck }) {
           <ul>{cards.toSorted((a, b) => a.name.localeCompare(b.name)).map((card) => {
             const link = safeExternalUrl(card.scryfall_uri);
             const reason = typeof card.synergy_signal === "string" ? card.synergy_signal : card.reason;
-            const unitPrice = hasPrice(card.price_usd);
-            const price = unitPrice ? card.price_usd : card.price_total_usd;
             return <li key={card.name}>
               <span className="synergy-deck-list__quantity">{card.quantity}</span>
               <span>{link ? <a href={link} target="_blank" rel="noreferrer">{card.name}</a> : card.name}
-                <CardPrintings card={card} />
                 {reason ? <small>{reason}</small> : null}</span>
-              {card.mana_cost || hasPrice(price) ? <span className="synergy-deck-list__cost">
-                {card.mana_cost || null}
-                {hasPrice(price) ? <span className="synergy-deck-list__price" title={unitPrice ? "USD per copy" : "USD for all copies"}>
-                  {usd.format(price)}{card.quantity > 1 ? (unitPrice ? " ea." : " total") : ""}
-                </span> : null}
-              </span> : null}
+              {card.mana_cost ? <span className="synergy-deck-list__mana-cost">{card.mana_cost}</span> : null}
             </li>;
           })}</ul>
         </section>;
@@ -339,14 +241,11 @@ function ModelSummary({ synergy, deck, generated }) {
   </details>;
 }
 
-function DeckExport({ deck, allCards, tier, commanderTitle }) {
+function DeckExport({ deck, commanderTitle }) {
   const [copyStatus, setCopyStatus] = useState("");
-  const exportText = deck.export_text || getGeneratedDeckExport({ commanders: deck.commanders, cards: allCards });
+  const exportText = deck.export_text || getGeneratedDeckExport(deck);
   const downloadUrl = `data:text/plain;charset=utf-8,${encodeURIComponent(exportText)}`;
-  const tierName = tier?.cap_usd == null ? "Uncapped" : `${tier.cap_usd} USD`;
-  const filename = generatedDeckFilename(tier ? `${commanderTitle} ${tierName}` : commanderTitle);
-  const shoppingList = getShoppingList(allCards, commanderTitle, tierName, tier?.total_usd);
-  const shoppingUrl = shoppingList ? `data:text/plain;charset=utf-8,${encodeURIComponent(shoppingList)}` : null;
+  const filename = generatedDeckFilename(commanderTitle);
 
   async function copyDeck() {
     try {
@@ -361,14 +260,13 @@ function DeckExport({ deck, allCards, tier, commanderTitle }) {
     <div className="synergy-deck-hero__actions">
       <button type="button" onClick={copyDeck}>Copy for Moxfield</button>
       <a href={downloadUrl} download={filename}>Download .txt</a>
-      {shoppingUrl ? <a href={shoppingUrl} download={generatedDeckFilename(`${commanderTitle} ${tierName} shopping list`)}>Download shopping list</a> : null}
     </div>
     {copyStatus ? <p role="status" className="synergy-deck-hero__copy">{copyStatus}</p> : null}
   </>;
 }
 
-function DeckHero({ deck, commanderTitle, summary, allCards, tier, priceDetails, budgetPicker, colorPicker, unavailableReason, heading }) {
-  const landCount = quantity(allCards.filter((card) => cardGroup(card) === "Lands"));
+function DeckHero({ deck, commanderTitle, summary, colorPicker, unavailableReason, heading }) {
+  const landCount = quantity(deck?.cards.filter((card) => cardGroup(card) === "Lands") || []);
   const art = deck?.commanders.filter((card) => card.image_url) || [];
 
   return <header className="panel synergy-deck-hero">
@@ -377,17 +275,14 @@ function DeckHero({ deck, commanderTitle, summary, allCards, tier, priceDetails,
       <h1 ref={heading} tabIndex={-1}>{commanderTitle}</h1>
       {summary ? <p className="synergy-deck-hero__summary">{summary}</p> : null}
       {colorPicker}
-      {budgetPicker}
       {deck ? <>
         <ul className="synergy-deck-hero__stats">
-          {hasPrice(tier?.total_usd) ? <li aria-live="polite"><strong>{usd.format(tier.total_usd)}</strong> estimated total</li> : null}
-          <li><strong>{quantity(allCards)}</strong> cards</li>
+          <li><strong>{quantity(deck.cards)}</strong> cards</li>
           <li><strong>{landCount}</strong> lands</li>
           {Number.isFinite(deck.mana_diagnostics?.average_nonland_mana_value)
             ? <li><strong>{formatDecimal(deck.mana_diagnostics.average_nonland_mana_value, 1)}</strong> average spell mana value</li> : null}
         </ul>
-        {priceDetails}
-        <DeckExport key={`${commanderTitle}|${tier?.id}`} deck={deck} allCards={allCards} tier={tier} commanderTitle={commanderTitle} />
+        <DeckExport key={deck.deck_sha256 ?? deck.cardlist_sha256 ?? commanderTitle} deck={deck} commanderTitle={commanderTitle} />
       </> : <p role="status" className="muted">{unavailableReason || "The generated deck is unavailable."}</p>}
     </div>
     {art.length ? <CommanderImageGallery commander={{ commander_cards: art }} variant="detail" /> : null}
@@ -401,6 +296,13 @@ export default function SynergyDeckPage() {
   const commander = searchParams.get("commander");
   const heading = useRef(null);
   const previousCommander = useRef(commander);
+
+  useEffect(() => {
+    if (!searchParams.has("budget")) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete("budget");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   useEffect(() => {
     let active = true;
@@ -443,19 +345,12 @@ export default function SynergyDeckPage() {
 }
 
 function CommanderDeck({ commander, selectedCommander, index, searchParams, setSearchParams, heading }) {
-  const requested = searchParams.get("budget");
-  const selected = budgetOptions.find(({ id }) => id === requested) || budgetOptions.at(-1);
   const isPrototype = commander === prototypeCommander;
   const colorParam = searchParams.get("color");
   const chosenColor = selectedCommander?.choosesColor && Object.hasOwn(commanderColorChoices, colorParam) ? colorParam : null;
-  const generatedBundle = useGeneratedBundle(isPrototype ? null : selectedCommander, chosenColor);
-  const activeBudgets = isPrototype ? budgets : generatedBundle.bundle;
-  const hasBudgets = activeBudgets?.tiers?.length > 0;
-  const tier = hasBudgets ? { ...activeBudgets.tiers.find(({ id }) => id === selected.id), ...selected } : null;
-  const report = tier?.report ?? (isPrototype && (!tier || selected.id === "uncapped") ? original : null);
-  const budgetPicker = hasBudgets || selectedCommander && !isPrototype
-    ? <BudgetPicker selected={selected.id} searchParams={searchParams} /> : null;
-  const deck = report?.deck?.commanders?.length && report.deck.cards?.length ? report.deck : null;
+  const generatedReport = useGeneratedReport(isPrototype ? null : selectedCommander, chosenColor);
+  const report = isPrototype ? original : generatedReport.report;
+  const deck = report?.deck;
 
   const synergy = report?.synergy || {};
   const commanderCards = deck?.commanders || [];
@@ -467,14 +362,14 @@ function CommanderDeck({ commander, selectedCommander, index, searchParams, setS
   const commanderTitle = deck ? commanderCards.map((card) => card.name).join(" + ")
     : selectedCommander?.name || (isPrototype ? prototypeTitle : "Synergy Deck");
   const generated = reportDate(report?.generated_at);
-  let unavailableReason = tier?.unavailable_reason;
+  let unavailableReason;
   if (!isPrototype) {
     if (index.loading) unavailableReason = "Loading commander details…";
     else if (index.error) unavailableReason = "The deck builder needs the commander catalog. Try refreshing the page.";
     else if (!selectedCommander) unavailableReason = "Commander not found. Choose a commander from the catalog.";
     else if (selectedCommander.choosesColor && !chosenColor) unavailableReason = "Choose a commander color to build a deck.";
-    else if (generatedBundle.loading) unavailableReason = "Building legal deck lists for each budget…";
-    else if (generatedBundle.error) unavailableReason = generatedBundle.error;
+    else if (generatedReport.loading) unavailableReason = "Building a legal deck list…";
+    else if (generatedReport.error) unavailableReason = generatedReport.error;
   }
   const colorPicker = selectedCommander?.choosesColor ? <label className="synergy-deck-color">
     Commander color
@@ -495,8 +390,7 @@ function CommanderDeck({ commander, selectedCommander, index, searchParams, setS
 
   return <article className="page synergy-deck-page">
     <div><Link className="detail-back-link" to={{ search: catalogParams.toString() }}>← Back to commander grid</Link></div>
-    <DeckHero deck={deck} commanderTitle={commanderTitle} summary={synergy.summary} allCards={[...commanders, ...mainDeck]} tier={tier}
-      priceDetails={tier ? <PriceProvenance tier={tier} pricing={activeBudgets.pricing} /> : null} budgetPicker={budgetPicker}
+    <DeckHero deck={deck} commanderTitle={commanderTitle} summary={synergy.summary}
       colorPicker={colorPicker} unavailableReason={unavailableReason} heading={heading} />
     {deck ? <>
       <div className="synergy-deck-overview">

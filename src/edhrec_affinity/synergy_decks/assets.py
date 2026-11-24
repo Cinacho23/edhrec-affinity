@@ -1,4 +1,4 @@
-"""Export a trained card ranker, Oracle catalog, and price quotes for Pages."""
+"""Export a trained card ranker and Oracle catalog for Pages."""
 
 import argparse
 from base64 import b64decode, b64encode
@@ -17,7 +17,6 @@ from ..build_styles.deckbuilding import (
 )
 from ..build_styles.sources import card_key
 from ..synergy_prototype.__main__ import commander_keys
-from ..synergy_prototype.budgets import load_snapshot
 from ..synergy_prototype.catalog import load_catalog
 from ..synergy_prototype.construction import _land_colors, _land_quality
 from ..synergy_prototype.prices import _legal_paper_printing
@@ -73,27 +72,7 @@ def _aliases_by_card(catalog, aliases, printings_path=None):
     return result
 
 
-def _purchase_offers(quote, limit):
-    if not quote:
-        return []
-    selected = []
-    remaining = limit
-    # The pricing snapshot already sorts by unit price and deterministic tie breaks.
-    for offer in quote.get("offers", [quote]):
-        price, stock = offer.get("price_cents"), offer.get("stock")
-        if type(price) is not int or price <= 0 or type(stock) is not int or stock <= 0:
-            continue
-        selected.append({key: offer[key] for key in (
-            "price_cents", "stock", "printing", "set_code", "collector_number", "finish",
-            "condition", "source_url", "scryfall_id",
-        ) if key in offer})
-        remaining -= stock
-        if remaining <= 0:
-            break
-    return selected
-
-
-def _browser_card(key, card, aliases, quotes, index, has_features):
+def _browser_card(key, card, aliases, index, has_features):
     mask = color_mask(card["color_identity"])
     land = _is_land(card)
     copies = _copy_limit(card)
@@ -102,7 +81,7 @@ def _browser_card(key, card, aliases, quotes, index, has_features):
     row.update(oracle_id=card["oracle_id"], color_mask=mask, produced_mask=color_mask(produces),
                produces_colorless="C" in produces, land=land, basic=_is_basic(card),
                copies=copies, can_command=_commander_eligible(card), chooses_color=_chooses_commander_color(card),
-               roles=functional_tags(card), offers=_purchase_offers(quotes.get(key), copies))
+               roles=functional_tags(card))
     if index is not None:
         row["index"] = index
     if not has_features:
@@ -130,7 +109,7 @@ def _browser_model(ranker):
             "biases": [layer.tolist() for layer in model.intercepts_]}
 
 
-def export_browser_assets(output, catalog, aliases, ranker, snapshot, *, snapshot_at, printings_path=None):
+def export_browser_assets(output, catalog, aliases, ranker, *, snapshot_at, printings_path=None):
     """Slice the catalog by color identity and keep all output files below asset limits."""
     if set(catalog) != set(ranker.index):
         raise ValueError("Browser export requires a model trained against the exact Oracle catalog")
@@ -140,7 +119,7 @@ def export_browser_assets(output, catalog, aliases, ranker, snapshot, *, snapsho
     packed = quantized.astype("<i2")
     vectors = {key: packed[index] for key, index in ranker.index.items()}
     return _write_browser_assets(output, catalog, aliases, _browser_model(ranker), vectors, ranker.index,
-                                 snapshot, snapshot_at=snapshot_at, model_catalog_at=snapshot_at,
+                                 snapshot_at=snapshot_at, model_catalog_at=snapshot_at,
                                  printings_path=printings_path)
 
 
@@ -150,8 +129,8 @@ def _source_path(directory, name):
     return directory / name
 
 
-def refresh_browser_assets(output, source, catalog, aliases, snapshot, *, snapshot_at, printings_path=None):
-    """Refresh legal cards and retail quotes while retaining existing learned feature rows."""
+def refresh_browser_assets(output, source, catalog, aliases, *, snapshot_at, printings_path=None):
+    """Refresh legal cards while retaining existing learned feature rows."""
     previous = json.loads((source / "manifest.json").read_bytes())
     if previous.get("schema_version") != 1:
         raise ValueError("Cannot reuse an unsupported browser asset version")
@@ -187,23 +166,20 @@ def refresh_browser_assets(output, source, catalog, aliases, snapshot, *, snapsh
         if result and result[0] in (None, card["oracle_id"]):
             _, indices[key], vectors[key] = result
     unambiguous = {alias: next(iter(keys)) for alias, keys in aliases_by_name.items() if len(keys) == 1}
-    return _write_browser_assets(output, catalog, unambiguous, model, vectors, indices, snapshot,
+    return _write_browser_assets(output, catalog, unambiguous, model, vectors, indices,
                                  snapshot_at=snapshot_at, printings_path=printings_path,
                                  model_catalog_at=previous.get("model_catalog_updated_at", previous["oracle_updated_at"]))
 
 
-def _write_browser_assets(output, catalog, aliases, model, vectors, indices, snapshot, *, snapshot_at,
+def _write_browser_assets(output, catalog, aliases, model, vectors, indices, *, snapshot_at,
                           model_catalog_at, printings_path=None):
     aliases_by_card = _aliases_by_card(catalog, aliases, printings_path)
-    quotes = snapshot["cards"]
     manifest = {"schema_version": 1, "oracle_updated_at": snapshot_at, "model_path": "model.json",
                 "model_catalog_updated_at": model_catalog_at, "oracle_only_cards": len(catalog) - len(vectors),
-                "pricing": {key: snapshot[key] for key in ("source", "source_url", "checked_at")}, "shards": []}
-    if snapshot.get("methodology"):
-        manifest["pricing"]["description"] = snapshot["methodology"]
+                "shards": []}
     by_color = defaultdict(list)
     for key in sorted(catalog):
-        row = _browser_card(key, catalog[key], aliases_by_card, quotes, indices.get(key), key in vectors)
+        row = _browser_card(key, catalog[key], aliases_by_card, indices.get(key), key in vectors)
         by_color[row["color_mask"]].append(row)
 
     output.mkdir(parents=True, exist_ok=True)
@@ -235,10 +211,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--oracle-jsonl", type=Path, required=True)
     parser.add_argument("--catalog-updated-at", required=True)
-    parser.add_argument("--prices", type=Path, required=True)
     training = parser.add_mutually_exclusive_group(required=True)
     training.add_argument("--previews", type=Path, help="Train a new ranker from collector previews")
-    training.add_argument("--reuse-model-from", type=Path, help="Reprice and refresh Oracle data using existing site assets")
+    training.add_argument("--reuse-model-from", type=Path, help="Refresh Oracle data using existing site assets")
     parser.add_argument("--printings-jsonl", type=Path)
     parser.add_argument("--alias-cache", type=Path)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -248,16 +223,15 @@ def main():
     if args.previews is not None and args.epochs < 1:
         parser.error("--epochs must be positive")
     catalog, aliases = load_catalog(args.oracle_jsonl, args.catalog_updated_at, args.alias_cache)
-    snapshot = load_snapshot(args.prices)
     options = {"snapshot_at": args.catalog_updated_at, "printings_path": args.printings_jsonl}
     if args.reuse_model_from is not None:
-        manifest = refresh_browser_assets(args.output, args.reuse_model_from, catalog, aliases, snapshot, **options)
+        manifest = refresh_browser_assets(args.output, args.reuse_model_from, catalog, aliases, **options)
     else:
         ranker = DeckRanker(catalog, aliases, seed=args.seed)
         train, _, sample = ranker.load_decks(args.previews, tuple(key for key in commander_keys() if key in catalog))
         print(f"Training on {len(train):,} rows from {sample['parsed_decks']:,} parsed decks", flush=True)
         ranker.fit(train, epochs=args.epochs)
-        manifest = export_browser_assets(args.output, catalog, aliases, ranker, snapshot, **options)
+        manifest = export_browser_assets(args.output, catalog, aliases, ranker, **options)
     print(f"Wrote {len(manifest['shards'])} shards to {args.output} at revision {manifest['revision']}")
 
 
