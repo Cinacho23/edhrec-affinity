@@ -132,11 +132,11 @@ function CommanderCatalog({ entries, index, catalog, setCatalog, searchParams, h
         ? `Showing ${formatNumber(visible.length)} of ${formatNumber(matches.length)} commander configurations.`
         : "No commanders match your search."}</p>
       {visible.length ? <ul className="synergy-commander-grid" aria-label="Commander catalog">
-        {visible.map(({ slug, name, row }) => <li key={slug}>
-          <Link to={{ search: `?${commanderSelection(searchParams, slug)}` }} aria-label={name}
+        {visible.map(({ slug, catalogName, row }) => <li key={slug}>
+          <Link to={{ search: `?${commanderSelection(searchParams, slug)}` }} aria-label={catalogName}
             className="synergy-commander-grid__tile">
             <div className="synergy-commander-grid__art"><CommanderImageGallery commander={row} variant="tile" /></div>
-            <span>{name}</span>
+            <span>{catalogName}</span>
           </Link>
         </li>)}
       </ul> : null}
@@ -426,8 +426,9 @@ export default function SynergyDeckPage() {
     const indexName = row.commander_name?.replace(/\s*\(Commander\)$/i, "") || "";
     const cardNames = row.commander_cards?.map((card) => card.name).filter(Boolean);
     const names = cardNames?.length ? cardNames : row.scryfall_card_names?.length ? row.scryfall_card_names : [name];
+    const catalogName = (cardNames?.length > 1 ? indexName.replace(" // ", " + ") : indexName) || name;
     return slug && name ? [{
-      slug, name, names, row, search: searchKey(`${name} ${indexName} ${slug}`), decks: Number(row.total_decks) || 0,
+      slug, name, names, row, catalogName, search: searchKey(`${name} ${indexName} ${catalogName} ${slug}`), decks: Number(row.total_decks) || 0,
       colors: Array.isArray(row.color_identity) ? row.color_identity : [],
       choosesColor: names.some((card) => choosesCommanderColor.has(searchKey(card))),
     }] : [];
