@@ -9,6 +9,7 @@ on:
         required: true
 
 permissions:
+  actions: read
   contents: read
   pages: write
   id-token: write
@@ -18,12 +19,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  build:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -68,6 +66,13 @@ jobs:
           DATA_VERSION: ${{ inputs.data_version }}
         run: python scripts/reuse_live_pages_data.py --version "$DATA_VERSION" --destination frontend/dist/data/latest --check-only
 
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - name: Deploy GitHub Pages site
         id: deployment
         uses: actions/deploy-pages@v4
