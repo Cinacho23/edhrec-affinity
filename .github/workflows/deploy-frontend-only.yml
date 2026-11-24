@@ -1,0 +1,73 @@
+name: Deploy frontend with the live data snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      data_version:
+        description: Eight-character Cloudflare version prefix from the current live Pages data manifest
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify and preserve the live Pages data indexes
+        id: snapshot
+        env:
+          DATA_VERSION: ${{ inputs.data_version }}
+        run: |
+          python -m pip install 'brotli>=1.1,<2'
+          python scripts/reuse_live_pages_data.py --version "$DATA_VERSION" --destination frontend/public/data/latest
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the frontend against the verified snapshot
+        working-directory: frontend
+        env:
+          VITE_SITE_DATA_ENCODING: br
+          VITE_SITE_DATA_BASE_URL: ${{ steps.snapshot.outputs.data-base-url }}
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: frontend/dist
+
+      - name: Confirm Pages still points at the same snapshot
+        env:
+          DATA_VERSION: ${{ inputs.data_version }}
+        run: python scripts/reuse_live_pages_data.py --version "$DATA_VERSION" --destination frontend/dist/data/latest --check-only
+
+      - name: Deploy GitHub Pages site
+        id: deployment
+        uses: actions/deploy-pages@v4

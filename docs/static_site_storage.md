@@ -97,6 +97,12 @@ After adding the secrets and merging the configuration, run **Deploy frontend
 to GitHub Pages** to publish the latest saved data. The weekly full-data workflow
 uses the same action. There is no need to restart collection.
 
+Use **Deploy frontend with the live data snapshot** for a frontend-only release.
+Supply the eight-character version prefix from `data_base_url` in the live Pages
+manifest. The workflow verifies the pinned Worker's manifest and operational
+indexes, preserves the existing Pages copies, and checks the manifest again
+just before publishing the frontend.
+
 Cloudflare references: [GitHub Actions authentication](https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/),
 [static asset limits](https://developers.cloudflare.com/workers/platform/limits/#static-assets),
 [static asset pricing](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/),
