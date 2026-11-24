@@ -1,12 +1,15 @@
 import hashlib
+import importlib.util
 import json
+from pathlib import Path
 
 import brotli
 import pytest
 
-from scripts import reuse_live_pages_data as snapshot
-
-
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "reuse_live_pages_data.py"
+spec = importlib.util.spec_from_file_location("reuse_live_pages_data", SCRIPT)
+snapshot = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(snapshot)
 VERSION = "1234abcd"
 VERSION_ROOT = f"https://{VERSION}-{snapshot.WORKER_HOST}"
 DATA_BASE = f"{VERSION_ROOT}/data/latest"
