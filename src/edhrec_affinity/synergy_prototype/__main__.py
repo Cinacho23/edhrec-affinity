@@ -116,6 +116,8 @@ def main():
     generate.add_argument("--oracle-jsonl", type=Path, required=True)
     generate.add_argument("--catalog-updated-at", required=True)
     generate.add_argument("--previews", type=Path, required=True)
+    generate.add_argument("--target-previews", type=Path,
+                          help="Train on every usable distinct list from a completed target-pair checkpoint")
     generate.add_argument("--alias-cache", type=Path)
     generate.add_argument("--output", type=Path, default=DEFAULT_REPORT)
     generate.add_argument("--epochs", type=int, default=2)
@@ -141,7 +143,7 @@ def main():
 
     catalog, aliases = load_catalog(args.oracle_jsonl, args.catalog_updated_at, args.alias_cache)
     ranker = DeckRanker(catalog, aliases, seed=args.seed)
-    train, test, sample = ranker.load_decks(args.previews, commander_keys())
+    train, test, sample = ranker.load_decks(args.previews, commander_keys(), target_previews=args.target_previews)
     sample.update(training_decks=len(train), heldout_decks=len(test), target_pair_decks=sample.get("target_pair_decks", 0))
     print(f"Training on {len(train):,} decks and {len(catalog):,} cards.", flush=True)
     ranker.fit(train, epochs=args.epochs)

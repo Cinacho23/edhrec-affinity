@@ -188,6 +188,8 @@ python -m edhrec_affinity.synergy_prototype generate \
 python -m edhrec_affinity.synergy_prototype check
 ```
 
+Pass `--target-previews /path/to/completed-pair-checkpoint.json.gz` to `generate` to train on every usable distinct deck from that pair’s collected index. The report records the indexed count, unavailable previews, duplicates, and training count. Decks from other commander configurations supply the held-out evaluation.
+
 Generation uses the `prototype` Python extra. The check uses the `validation` extra and Playwright Chromium.
 It attaches the external result to the exact card list and commander roles. The offline benchmark holds out
 card identities and deck records and measures recovery of known inclusions among sampled legal candidates.

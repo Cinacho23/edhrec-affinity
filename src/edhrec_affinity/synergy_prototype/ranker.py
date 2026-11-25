@@ -60,6 +60,25 @@ def _stats(card):
     ]
 
 
+def _read_checkpoint(path):
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _full_target_checkpoint(path):
+    checkpoint = _read_checkpoint(path)
+    frame, results = checkpoint.get("frame"), checkpoint.get("results")
+    if not isinstance(frame, list) or not isinstance(results, dict):
+        raise ValueError("Full target training requires an indexed preview checkpoint")
+    ids = {row["urlhash"] for row in frame}
+    if not ids or len(ids) != len(frame) or ids != set(results) or any(
+        not isinstance(record, dict) or not (isinstance(record.get("deck"), dict) or record.get("error"))
+        for record in results.values()
+    ):
+        raise ValueError("The target preview checkpoint has an incomplete deck index")
+    return checkpoint
+
+
 @dataclass(frozen=True, slots=True)
 class DeckExample:
     commanders: tuple[int, ...]
@@ -92,7 +111,8 @@ class DeckRanker:
         self.model = MLPClassifier(hidden_layer_sizes=(96, 48, 24), batch_size=256,
                                    learning_rate_init=0.0015, alpha=0.001, random_state=seed)
 
-    def load_decks(self, directory, commander_keys):
+    def load_decks(self, directory, commander_keys, *, target_previews=None):
+        """Load training data and reserve independent cards and decks for evaluation."""
         target_ids = tuple(sorted(self.index[key] for key in commander_keys))
         training, testing = [], []
         seen = set()
@@ -104,9 +124,37 @@ class DeckRanker:
                 name_cache[name] = self.alias_indices.get(card_key(name))
             return name_cache[name]
 
-        for path in sorted(directory.glob("*.json.gz")):
-            with gzip.open(path, "rt", encoding="utf-8") as handle:
-                checkpoint = json.load(handle)
+        paths = sorted(directory.glob("*.json.gz"))
+        index_source_at = None
+        holdout = self.holdout
+        if target_previews is not None:
+            target_previews = target_previews.resolve()
+            target_checkpoint = _full_target_checkpoint(target_previews)
+            paths = [target_previews, *(path for path in paths if path.resolve() != target_previews)]
+            index_source_at = target_checkpoint.get("index_source_at")
+            stats["target_indexed_decks"] = len(target_checkpoint["frame"])
+            stats["target_unavailable_previews"] = sum(
+                not record.get("deck") for record in target_checkpoint["results"].values()
+            )
+            colors = int(np.bitwise_or.reduce(self.masks[list(target_ids)]))
+            target_zone = set(target_ids)
+            exposed = target_zone.copy()
+            for record in target_checkpoint["results"].values():
+                deck = record.get("deck")
+                if not deck or len(deck["commanders"]) != len(target_ids) or set(map(resolve, deck["commanders"])) != target_zone:
+                    continue
+                for row in deck["cards"]:
+                    index = resolve(row["name"])
+                    if index is not None and self.spells[index] and not self.masks[index] & ~colors:
+                        exposed.add(index)
+            # Full target decks can expose any of their spells. Keep the card
+            # test set independent by reserving other card identities.
+            holdout = self.holdout.copy()
+            holdout[list(exposed)] = False
+
+        for path in paths:
+            is_target_checkpoint = path == target_previews
+            checkpoint = target_checkpoint if is_target_checkpoint else _read_checkpoint(path)
             stats["checkpoint_files"] += 1
             for result in checkpoint["results"].values():
                 deck = result.get("deck")
@@ -117,10 +165,14 @@ class DeckRanker:
                 if not command or None in command or len(set(command)) != len(command):
                     continue
                 commanders = tuple(sorted(command))
-                if commanders == target_ids:
+                is_target = commanders == target_ids
+                # The supplied checkpoint defines the exact target population.
+                if target_previews is not None and is_target_checkpoint != is_target:
+                    continue
+                if is_target:
                     stats["target_pair_decks"] += 1
                 # Exclude interactions in which a held-out card appeared in the command zone too.
-                if any(self.holdout[index] for index in commanders):
+                if any(holdout[index] for index in commanders):
                     continue
                 colors = int(np.bitwise_or.reduce(self.masks[list(commanders)]))
                 counts = Counter()
@@ -131,24 +183,35 @@ class DeckRanker:
                 if not 90 <= sum(counts.values()) + len(commanders) <= 100:
                     continue
                 order = sorted(counts)
-                active = tuple(index for index in order if self.spells[index] and not self.holdout[index])
-                if len(active) < 25:
+                active = tuple(index for index in order if self.spells[index] and not holdout[index])
+                minimum_spells = 1 if is_target_checkpoint else 25
+                if len(active) < minimum_spells:
                     continue
                 fingerprint = np.asarray((*commanders, -1, *((index << 8) | counts[index] for index in order)),
                                          dtype="<i4")
                 key = blake2b(fingerprint.tobytes(), digest_size=12).digest()
                 if key in seen:
                     stats["duplicates"] += 1
+                    if is_target_checkpoint:
+                        stats["target_duplicate_decks"] += 1
                     continue
                 seen.add(key)
-                if key[0] < 32 or commanders == target_ids:
-                    held_out = tuple(index for index in order if self.holdout[index])
+                if is_target_checkpoint:
+                    training.append(DeckExample(commanders, active, (), colors))
+                    stats["target_pair_training_decks"] += 1
+                elif key[0] < 32 or is_target:
+                    held_out = tuple(index for index in order if holdout[index])
                     if held_out:
                         testing.append(DeckExample(commanders, active, held_out, colors))
                 else:
                     training.append(DeckExample(commanders, active, (), colors))
         if not training or not testing:
             raise ValueError("The saved checkpoint needs both training data and held-out card examples")
+        if target_previews is not None and not stats["target_pair_training_decks"]:
+            raise ValueError("The target preview checkpoint contains no usable decks for the exact command zone")
+        if index_source_at:
+            stats["target_index_source_at"] = index_source_at
+        self.holdout = holdout
         return training, testing, dict(stats)
 
     def _input(self, candidates, commanders, context):

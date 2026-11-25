@@ -2,6 +2,7 @@ import gzip
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from edhrec_affinity.build_styles.external_validation import cardlist_hash
@@ -9,6 +10,59 @@ from edhrec_affinity.synergy_prototype import __main__ as prototype
 from edhrec_affinity.synergy_prototype.catalog import load_catalog
 from edhrec_affinity.synergy_prototype.construction import ORACLE_POLICY
 from edhrec_affinity.synergy_prototype.experiments import DEFAULT_BASELINE, DEFAULT_EXPERIMENTS
+from edhrec_affinity.synergy_prototype.ranker import DeckRanker
+
+
+def test_completed_target_checkpoint_trains_on_every_distinct_target_list(tmp_path):
+    pair = ("doctor", "rose")
+    common = [f"spell-{i}" for i in range(25)]
+    alternatives = [f"choice-{i}" for i in range(50)]
+    keys = [*pair, "another-commander", "basic-land", *common, *alternatives, "target-spell", "test-spell"]
+    ranker = DeckRanker.__new__(DeckRanker)
+    ranker.index = ranker.alias_indices = {name: index for index, name in enumerate(keys)}
+    ranker.masks = np.zeros(len(keys), dtype=np.int32)
+    ranker.spells = np.array([name != "basic-land" for name in keys])
+    ranker.holdout = np.array([name in {"target-spell", "test-spell"} for name in keys])
+
+    def deck(commanders, cards):
+        return {"deck": {"commanders": commanders, "cards": [
+            *({"name": card, "quantity": 1} for card in cards),
+            {"name": "basic-land", "quantity": 100 - len(commanders) - len(cards)},
+        ]}}
+
+    def checkpoint(path, **value):
+        with gzip.open(path, "wt", encoding="utf-8") as handle:
+            json.dump(value, handle)
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    checkpoint(corpus / "others.json.gz", results={
+        name: deck(["another-commander"], [*common, name, "test-spell"]) for name in alternatives
+    })
+    first = deck(list(pair), [*common, "target-spell"])
+    target = tmp_path / "target.json.gz"
+    results = {
+        "direct": first,
+        "reverse": deck(list(reversed(pair)), [*common, "target-spell", alternatives[0]]),
+        "duplicate": first,
+        "land-heavy": deck(list(pair), ["target-spell", alternatives[1]]),
+        "unavailable": {"error": "source preview returned HTTP 404"},
+    }
+    frame = [{"urlhash": name} for name in results]
+    checkpoint(target, frame=frame, results=results)
+
+    train, test, stats = ranker.load_decks(corpus, pair, target_previews=target)
+    command = tuple(ranker.index[name] for name in pair)
+    paired = [row for row in train if row.commanders == command]
+    assert len(paired) == stats["target_pair_training_decks"] == 3
+    assert stats["target_duplicate_decks"] == stats["target_unavailable_previews"] == 1
+    assert stats["target_indexed_decks"] == 5
+    assert all(ranker.index["target-spell"] in row.spells for row in paired)
+    assert all(row.commanders != command and row.held_out == (ranker.index["test-spell"],) for row in test)
+
+    checkpoint(target, frame=[*frame, {"urlhash": "pending"}], results=results)
+    with pytest.raises(ValueError, match="incomplete deck index"):
+        ranker.load_decks(corpus, pair, target_previews=target)
 
 
 def test_catalog_uses_oracle_legality_across_printings(tmp_path):

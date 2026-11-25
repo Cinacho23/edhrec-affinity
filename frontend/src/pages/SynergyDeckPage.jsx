@@ -216,6 +216,7 @@ function ModelSummary({ synergy, deck, generated }) {
   const construction = deck.construction || {};
   const metrics = [
     ["Training decks", synergy.training_decks],
+    ["Training decks for this pair", synergy.target_pair_training_decks],
     ["Catalog cards", synergy.catalog_cards],
     ["Legal spell candidates", construction.candidate_spell_count],
     ["Candidate lists evaluated", synergy.evaluated_decks ?? construction.search_starts],
