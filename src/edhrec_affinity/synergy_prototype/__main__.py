@@ -1,9 +1,11 @@
 """Generate and externally check the static Tenth Doctor + Rose Tyler prototype."""
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import pickle
 
 from edhrec_affinity.build_styles.external_validation import cardlist_hash
 from edhrec_affinity.build_styles.official_checker import check_deck, deck_url
@@ -19,6 +21,11 @@ ORACLE_MODEL_DESCRIPTION = (
     "A three-layer neural ranker predicts card fit from the commanders and partial deck. "
     "Oracle-text rules give separate credit for repeatable suspend, countdown acceleration, "
     "and effects that reward casting from exile."
+)
+REFINED_MODEL_DESCRIPTION = (
+    "The neural ranker scores legal cards using the commanders and partial deck. The optimizer checks "
+    "when each effect works, scores the suspend engine across the full list, and sizes the land allocation "
+    "from the Card Kingdom price of the nonlands."
 )
 
 
@@ -109,6 +116,51 @@ def verify_report(report, *, validation_directory, timeout_seconds=120, checker=
     return result
 
 
+def refine_reports(args):
+    from edhrec_affinity.build_styles.official_checker import OfficialDeckChecker
+    from .budgets import load_snapshot, playability_status
+    from .refinement import build_candidates, price_deck, selection_score
+
+    baseline = json.loads(args.training_report.read_text(encoding="utf-8"))["synergy"]
+    snapshot_at, seed, epochs = (baseline[key] for key in ("catalog_updated_at", "seed", "epochs"))
+    catalog, _ = load_catalog(args.oracle_jsonl, snapshot_at)
+    with args.trained_ranker.open("rb") as handle:
+        ranker, evaluation, sample = pickle.load(handle)
+    if list(catalog) != ranker.keys:
+        raise ValueError("The Oracle catalog must match the saved ranker's feature index")
+    snapshot = load_snapshot(args.prices)
+    prices = {key: quote["price_cents"] for key, quote in snapshot["cards"].items()}
+    args.output_directory.mkdir(parents=True, exist_ok=True)
+    reports = {}
+    for deck in build_candidates(catalog, ranker.for_commanders(commander_keys()), prices):
+        digest = deck["cardlist_sha256"]
+        if digest in reports:
+            continue
+        report = report_for_deck(deck, catalog, evaluation, sample, snapshot_at=snapshot_at, seed=seed, epochs=epochs)
+        report["synergy"]["model"] = REFINED_MODEL_DESCRIPTION
+        report["pricing"], shopping = price_deck(deck, snapshot)
+        atomic_json(args.output_directory / f"{digest}-shopping.json", shopping)
+        reports[digest] = report
+    eligible = []
+    with (OfficialDeckChecker() if args.check else nullcontext()) as checker:
+        for digest, report in reports.items():
+            report["synergy"]["evaluated_decks"] = len(reports)
+            if args.check:
+                verify_report(report, validation_directory=args.output_directory / "edhpowerlevel", checker=checker,
+                              timeout_seconds=args.timeout_seconds)
+            atomic_json(args.output_directory / f"{digest}.json", report)
+            if playability_status(report["external_rating"]) == "within" and report["pricing"]["total_cents"] is not None:
+                eligible.append(report)
+    if eligible:
+        selected = max(eligible, key=selection_score)
+        atomic_json(args.output_directory / "selected.json", selected)
+        (args.output_directory / "selected.txt").write_text(selected["deck"]["export_text"], encoding="utf-8")
+        print(f"Selected {selected['deck']['deck_sha256']} from {len(eligible)} verified lists.")
+    else:
+        print(f"Wrote {len(reports)} candidates. No complete price and in-range external rating were verified.")
+    return int(args.check and not eligible)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -122,11 +174,22 @@ def main():
     generate.add_argument("--output", type=Path, default=DEFAULT_REPORT)
     generate.add_argument("--epochs", type=int, default=2)
     generate.add_argument("--seed", type=int, default=42)
+    generate.add_argument("--save-ranker", type=Path, help="Write a trusted local cache for optimizer comparisons")
+    refine = commands.add_parser("refine", help="Regenerate Doctor + Rose with a saved ranker and a proportional mana budget")
+    refine.add_argument("--trained-ranker", type=Path, required=True, help="Trusted local cache from --save-ranker")
+    refine.add_argument("--training-report", type=Path, default=DEFAULT_REPORT)
+    refine.add_argument("--oracle-jsonl", type=Path, required=True)
+    refine.add_argument("--prices", type=Path, required=True)
+    refine.add_argument("--output-directory", type=Path, required=True)
+    refine.add_argument("--check", action="store_true", help="Verify the exact lists and choose the best in-range candidate")
+    refine.add_argument("--timeout-seconds", type=float, default=60)
     verify = commands.add_parser("check", help="Check the exact generated deck with EDHPowerLevel")
     verify.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     verify.add_argument("--validation-directory", type=Path, default=Path("data/prototypes/synergy-deck-validation"))
     verify.add_argument("--timeout-seconds", type=float, default=120)
     args = parser.parse_args()
+    if args.command == "refine":
+        return refine_reports(args)
     if args.command == "check":
         report = json.loads(args.report.read_text(encoding="utf-8"))
         result = verify_report(report, validation_directory=args.validation_directory, timeout_seconds=args.timeout_seconds)
@@ -148,6 +211,9 @@ def main():
     print(f"Training on {len(train):,} decks and {len(catalog):,} cards.", flush=True)
     ranker.fit(train, epochs=args.epochs)
     evaluation = ranker.evaluate(test)
+    if args.save_ranker:
+        with args.save_ranker.open("wb") as handle:
+            pickle.dump((ranker, evaluation, sample), handle, protocol=pickle.HIGHEST_PROTOCOL)
     report = generate_report(catalog, ranker, evaluation, sample, snapshot_at=args.catalog_updated_at,
                              seed=args.seed, epochs=args.epochs)
     atomic_json(args.output, report)

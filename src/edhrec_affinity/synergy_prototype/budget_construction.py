@@ -32,7 +32,7 @@ def _price_of(counts, prices):
     return sum(prices[key] * quantity for key, quantity in counts.items())
 
 
-def _budget_lands(metadata, colors, prices, budget, count):
+def _budget_lands(metadata, colors, prices, budget, count, *, price_pressure=.75):
     pool = {key: card for key, card in metadata.items() if _is_land(card)}
     basics = [key for key, color in _BASIC_COLORS.items() if color in colors]
     missing = [key for key in basics if key not in pool]
@@ -50,7 +50,9 @@ def _budget_lands(metadata, colors, prices, budget, count):
     if spent + (count - sum(lands.values())) * replacement_cost > budget:
         raise ConstructionSearchError(f"The land allocation of {budget} cents cannot cover the basic mana base")
     slot_budget = max(100, budget / count)
-    cost_penalties = {key: .75 * math.log1p(max(0, prices[key] - replacement_cost) / slot_budget) for key in pool}
+    cost_penalties = {
+        key: price_pressure * math.log1p(max(0, prices[key] - replacement_cost) / slot_budget) for key in pool
+    }
 
     def sources_now():
         return {**direct, **{key: _land_sources(key, lands, metadata, colors) for key in fetches}}

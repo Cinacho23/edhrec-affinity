@@ -100,6 +100,24 @@ def _priced_card(offers, *, basic):
     return {**(estimate or selected[-1]), "offers": selected}
 
 
+def cheapest_copies(quote, quantity):
+    """Fill one card line at minimum cost across stocked printings and conditions."""
+    if quote is None:
+        return []
+    remaining = quantity
+    chosen = []
+    for offer in sorted(quote.get("offers", (quote,)), key=lambda item: item["price_cents"]):
+        stock = offer.get("stock", remaining)
+        if type(stock) is not int or stock <= 0:
+            continue
+        take = min(remaining, stock)
+        chosen.append({**offer, "quantity": take})
+        remaining -= take
+        if not remaining:
+            return chosen
+    return []
+
+
 def build_price_snapshot(catalog, feed, printings_path, *, checked_at):
     """Return the cheapest eligible Card Kingdom stock for each priced Oracle identity."""
     by_card = {}

@@ -193,7 +193,8 @@ def _land_quality(card: dict) -> float:
     if (re.search(r"enters? (?:the battlefield )?tapped(?! unless)", text)
             and "pay 2 life" not in text):
         quality = min(quality, .2)
-    if "you control two or more other lands" in text or "hand contains" in text:
+    if ("you control two or more other lands" in text or "hand contains" in text
+            or re.search(r"enters?[^.\n]*tapped unless you reveal", text)):
         quality *= .45
     if "two or more opponents" in text:
         quality = 1.0
@@ -332,7 +333,8 @@ def _within_limits(spell: Spell, coverage: Counter, limits, removed: frozenset[s
     return all(coverage[role] - (role in removed) < limit for role, limit in limits.items() if role in spell.roles)
 
 
-def _pick_spells(spells: dict[str, Spell], rank, start: int, policy: ConstructionPolicy) -> list[str]:
+def _pick_spells(spells: dict[str, Spell], rank, start: int, policy: ConstructionPolicy,
+                 *, spell_slots: int = SPELL_SLOTS) -> list[str]:
     selected = []
     used = set()
     coverage = Counter()
@@ -341,7 +343,7 @@ def _pick_spells(spells: dict[str, Spell], rank, start: int, policy: Constructio
     order = (*[role for role in first_roles if role in policy.goals],
              *(role for role in policy.goals if role not in first_roles))
     expensive = 0
-    for slot in range(SPELL_SLOTS):
+    for slot in range(spell_slots):
         if slot % 7 == 0:
             scores = _relative_scores(rank, selected, spells)
         role = next((role for role in order if coverage[role] < policy.goals[role]), None)

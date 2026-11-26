@@ -14,6 +14,7 @@ from edhrec_affinity.build_styles.sources import card_key
 
 from .__main__ import DEFAULT_REPORT, commander_keys, report_for_deck, verify_report
 from .catalog import load_catalog
+from .prices import cheapest_copies
 
 
 DEFAULT_BUDGET_REPORT = DEFAULT_REPORT.with_name("synergy-deck-budgets.json")
@@ -54,22 +55,7 @@ def load_snapshot(path):
 
 
 def _cheapest_copies(quote, quantity):
-    """Fill one card line at minimum cost across stocked printings and conditions."""
-    if quote is None:
-        return []
-    offers = quote.get("offers", [quote])
-    remaining = quantity
-    chosen = []
-    for offer in sorted(offers, key=lambda item: item["price_cents"]):
-        stock = offer.get("stock", remaining)
-        if type(stock) is not int or stock <= 0:
-            continue
-        take = min(remaining, stock)
-        chosen.append({**offer, "quantity": take, "price_usd": offer["price_cents"] / 100})
-        remaining -= take
-        if not remaining:
-            return chosen
-    return []
+    return [{**offer, "price_usd": offer["price_cents"] / 100} for offer in cheapest_copies(quote, quantity)]
 
 
 def _line_total_cents(options):

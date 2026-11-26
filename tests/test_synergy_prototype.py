@@ -8,9 +8,10 @@ import pytest
 from edhrec_affinity.build_styles.external_validation import cardlist_hash
 from edhrec_affinity.synergy_prototype import __main__ as prototype
 from edhrec_affinity.synergy_prototype.catalog import load_catalog
-from edhrec_affinity.synergy_prototype.construction import ORACLE_POLICY
 from edhrec_affinity.synergy_prototype.experiments import DEFAULT_BASELINE, DEFAULT_EXPERIMENTS
 from edhrec_affinity.synergy_prototype.ranker import DeckRanker
+from edhrec_affinity.synergy_prototype.refinement import ORIGINAL_DUALS, SCORE_EXPLANATION
+from edhrec_affinity.build_styles.sources import card_key
 
 
 def test_completed_target_checkpoint_trains_on_every_distinct_target_list(tmp_path):
@@ -106,14 +107,20 @@ def test_published_deck_has_exact_list_and_commander_roles():
     assert {card["name"] for card in deck["commanders"]} <= {card["name"] for card in deck["cards"]}
     assert deck["validation"]["valid"] and all(checks.values())
     construction = deck["construction"]
-    assert construction["score_explanation"] == ORACLE_POLICY.score_explanation
-    assert report["synergy"]["model"] == prototype.ORACLE_MODEL_DESCRIPTION
+    assert construction["score_explanation"] == SCORE_EXPLANATION
+    assert report["synergy"]["model"] == prototype.REFINED_MODEL_DESCRIPTION
     roles = construction["spell_role_counts"]
     assert all(roles[role] >= minimum for role, minimum in construction["spell_role_targets"].items())
     assert all(roles[role] <= maximum for role, maximum in construction["spell_role_limits"].items())
-    assert report["external_rating"]["deck_sha256"] == deck["deck_sha256"]
-    if report["external_rating"]["status"] == "verified":
-        assert report["external_rating"]["restriction_check"]["commander_names"] == list(prototype.COMMANDER_NAMES)
+    rating = report["external_rating"]
+    assert rating["deck_sha256"] == deck["deck_sha256"]
+    assert rating["status"] == "verified" and 72.5 <= rating["playability_pct"] <= 77.5
+    assert rating["restriction_check"]["commander_names"] == list(prototype.COMMANDER_NAMES)
+    assert not (ORIGINAL_DUALS & {card_key(card["name"]) for card in deck["cards"]})
+    pricing = report["pricing"]
+    assert not pricing["unpriced"]
+    assert pricing["lands_cents"] + pricing["nonlands_cents"] == pricing["total_cents"]
+    assert pricing["lands_cents"] <= construction["land_allocation"]["estimated_cents"]
 
 
 def test_experiments_have_distinct_legal_decks_and_exact_assessments():
