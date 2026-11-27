@@ -63,3 +63,23 @@ The fixed-spell 39-land comparison also tested Cavern of Souls with `build_mana_
 The final deck contains **29 printed Dinosaurs**, including Pantlaza, eight cards classified as early land ramp, and five blink effects. The land-only pass kept its spell list intact. A simplified simulation used 12,000 openings per finalist and modeled land entry conditions, casting colors and early ramp. The bracket estimate for the published list is 2. Its exact hash starts with `25195223ee30`. [Published Pantlaza deck](https://cinacho23.github.io/edhrec-affinity/#/synergy-deck?commander=pantlaza-sun-favored)
 
 Run `python -m edhrec_affinity.synergy_prototype.pantlaza_benchmark --oracle-jsonl "$oracle_snapshot" --catalog-updated-at "$oracle_date" REPORTS...` to compare openings on the same simulator.
+
+## Y’shtola adaptation
+
+Y’shtola needs a noncreature spell with mana value 3 or more on the stack. The optimizer scores the mode actually cast and gives credit to cost reductions and effects that reopen mana for a second cast. Lower-mana interaction and ramp still have jobs in the deck. The end-step draw needs one player to have lost at least four life by the time the step begins. Score life payments, extra damage to that same player, and abilities that turn Y’shtola’s life gain into more life lost. Treat effects that start at the end step, such as Wound Reflection, as finishers. [FINAL FANTASY release notes](https://magic.wizards.com/en/news/feature/final-fantasy-release-notes)
+
+Use the same commands as the Pantlaza run with `python -m edhrec_affinity.synergy_prototype.commander_pipeline --commander yshtola-nights-blessed` in place of the Pantlaza module. Pass the Y’shtola checkpoints to `train`, then check both arms with `generate --check`. Use `python -m edhrec_affinity.synergy_prototype.opening_benchmark` with the same Oracle arguments to compare early access to all three colors and four mana. The published list lives in `frontend/src/generated/synergy-deck-yshtola.json`.
+
+### Y’shtola run record
+
+The November 27 deck gallery indexed 60,703 preview IDs. This run fetched 670 fresh lists and merged 293 additional historical lists, for 963 distinct Y’shtola lists in the 174,630-deck training set. The 173,667-deck control omitted those 963 lists. On the shared held-out queries, top-ten inclusion recall was 46.5% with the Y’shtola lists and 46.0% in the control.
+
+The first pass scored a one-for-one mana filter as ramp. It also credited Shrine and Blood-token payoffs without enough support for them. The revised search checks net mana, separates direct interaction from abilities that place counters, and rewards qualifying instants that can be played without an opposing spell to target. The final version includes Dismember and Snuff Out for life payments, Vito and Sanguine Bond to add life loss, and Queza and Frantic Search for the draw engine.
+
+| Checked finalist | Lands | Land subtotal | Nonland subtotal | EDHPowerLevel playability | Simulated Y’shtola by turn four |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Published deck | 39 | $112.94 | $109.58 | 75.9% | 81.4% |
+| Fixed-spell mana comparison | 39 | $105.94 | $109.58 | 75.9% | 81.2% |
+| Model without Y’shtola lists, same lands as the published deck | 39 | $112.94 | $114.43 | 77.4% | 83.1% |
+
+The selection favors the 22 proactive qualifying off-turn casts in the published deck over the control’s 13. The published mana base had slightly better unrestricted blue and white coverage than the fixed-spell comparison and cost within $3.36 of the nonlands. The benchmark used 12,000 simulated openings per list with land drops and early ramp. The exact published list checked at estimated Bracket 2. Its hash starts with `65da04cf1d1b`. [Published Y’shtola deck](https://cinacho23.github.io/edhrec-affinity/#/synergy-deck?commander=yshtola-nights-blessed)

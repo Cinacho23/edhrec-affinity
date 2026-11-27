@@ -18,6 +18,8 @@ from .refinement import _evaluate, _refine, land_allocation
 COMMANDER = "Pantlaza, Sun-Favored"
 COMMANDER_KEY = card_key(COMMANDER)
 COMMANDER_SLUG = "pantlaza-sun-favored"
+COHORT = "pantlaza"
+SUMMARY = "Ramp into Pantlaza, discover from Dinosaur entries, and keep the engine going on other players’ turns."
 SCORE_EXPLANATION = (
     "The search scores Dinosaur entries, useful discover hits, and ways to keep the engine active across turns."
 )
@@ -91,6 +93,8 @@ _PRIORITY_ROLES = (
 _ENGINE_ROLES = ("Dinosaur token", "Dinosaur payoff", "High-toughness Dinosaur", "Repeatable entry", "Dinosaur recursion",
                  "Creature deployment", "Creature protection", "Dinosaur entry effect", "Discover payoff")
 _ENTRY_ROLES = ("Blink", "Opponents' turns", "Repeatable entry", "Creature deployment")
+PROFILES = ((37, 11, .21), (38, 10, .14), (38, 11, .23), (39, 11, .15),
+            (40, 10, .15), (40, 11, .20), (41, 10, .16))
 
 
 def classify_spell(card, price_cents=0):
@@ -236,8 +240,7 @@ def build_candidates(catalog, rank, prices, *, profiles=None):
     if COMMANDER_KEY not in metadata:
         raise ConstructionSearchError("Pantlaza has no matching legal stocked printing")
     if profiles is None:
-        profiles = ((37, 11, .21), (38, 10, .14), (38, 11, .23), (39, 11, .15),
-                    (40, 10, .15), (40, 11, .20), (41, 10, .16))
+        profiles = PROFILES
     heavy = {key: max(0, metadata[key]["cmc"] - 4) for key in spells}
     for land_count, ramp_goal, curve_penalty in profiles:
         goals = {"Early ramp": ramp_goal, "Early land ramp": 3, "Early universal ramp": 7,
@@ -292,15 +295,15 @@ def game_plan(deck):
     names = {card["name"] for card in deck["cards"]}
     stages = [
         ("Cast Pantlaza early",
-         "Set up green mana and early ramp, then cast Pantlaza to discover 4 from its own entry.",
+         "Open on green mana for land ramp. Casting Pantlaza triggers discover 4 from its own entry, so it starts the engine even on an empty board.",
          ("Nature's Lore", "Three Visits", "Farseek", "Otepec Huntmaster", "Drover of the Mighty")),
-        ("Discover off Dinosaur entries",
-         "Use tough Dinosaurs and cards that put them directly onto the battlefield. An unused discover can happen on any player's turn.",
-         ("Regisaur Alpha", "Ghalta, Stampede Tyrant", "Etali, Primal Conqueror // Etali, Primal Sickness",
-          "Vaultborn Tyrant", "Monster Manual // Zoological Study", "Sneak Attack")),
-        ("Use blink and play across turns",
-         "Blinking Pantlaza returns it as a new object that can discover again. Reuse another Dinosaur's entry when Pantlaza still has its trigger available.",
-         ("Ephemerate", "Cloudshift", "Eerie Interlude", "Teleportation Circle", "Phelia, Exuberant Shepherd")),
+        ("Choose which Dinosaur to discover from",
+         "Discover uses the entering Dinosaur's toughness. You can decline a small discover if a bigger Dinosaur is about to enter. Token makers and creatures with their own entry effects help build a board.",
+         ("Regisaur Alpha", "Trumpeting Carnosaur", "Palani's Hatcher", "Gishath, Sun's Avatar",
+          "Ghalta, Stampede Tyrant", "Vaultborn Tyrant")),
+        ("Keep the engine running across turns",
+         "Save an instant blink to protect Pantlaza or return it as a fresh creature with its own discover. Putting another Dinosaur into play on a different player's turn can also use that turn's discover.",
+         ("Ephemerate", "Elvish Piper", "Vivien's Arkbow", "Cloudshift", "Teleportation Circle")),
     ]
     result = []
     for title, description, examples in stages:

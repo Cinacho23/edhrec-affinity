@@ -5,6 +5,7 @@ import BracketBadge from "../components/BracketBadge";
 import CommanderImageGallery from "../components/CommanderImageGallery";
 import doctorAndRose from "../generated/synergy-deck.json";
 import pantlaza from "../generated/synergy-deck-pantlaza.json";
+import yshtola from "../generated/synergy-deck-yshtola.json";
 import { loadCommanderIndex } from "../lib/api";
 import {
   generatedDeckFilename,
@@ -18,6 +19,7 @@ import "./SynergyDeckPage.css";
 const optimizedReports = new Map([
   ["the-tenth-doctor-rose-tyler", doctorAndRose],
   ["pantlaza-sun-favored", pantlaza],
+  ["yshtola-nights-blessed", yshtola],
 ]);
 const catalogPageSize = 24;
 const commanderColorChoices = { W: "White", U: "Blue", B: "Black", R: "Red", G: "Green" };
