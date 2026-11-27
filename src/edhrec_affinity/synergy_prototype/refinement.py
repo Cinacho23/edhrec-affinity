@@ -132,12 +132,12 @@ def _strategy_bonus(coverage):
             + .55 * math.log1p(attack) + .55 * math.log1p(coverage["Evasion support"]) + recursion)
 
 
-def _evaluate(selected, spells, rank, policy):
+def _evaluate(selected, spells, rank, policy, *, strategy_bonus=_strategy_bonus):
     fit, scores, coverage = _score_list(selected, spells, rank, policy)
-    return fit + _strategy_bonus(coverage) / len(selected), selected, scores, coverage
+    return fit + strategy_bonus(coverage) / len(selected), selected, scores, coverage
 
 
-def _refine(current, spells, rank, policy):
+def _refine(current, spells, rank, policy, *, strategy_bonus=_strategy_bonus, extra_roles=None):
     """Search coordinated one- and two-card swaps and rescore complete lists."""
     fit, selected, scores, coverage = current
     present = set(selected)
@@ -146,12 +146,14 @@ def _refine(current, spells, rank, policy):
               for key, value in predictions.items() if key not in present}
     best_incoming = sorted(values, key=lambda key: (values[key], key), reverse=True)
     pool = set(best_incoming[:24])
-    tracked_roles = (*policy.goals, "Repeatable suspend", "Recurring suspend", "Suspend acceleration",
-                     "Commander exile payoff", "Evasion support")
+    if extra_roles is None:
+        extra_roles = ("Repeatable suspend", "Recurring suspend", "Suspend acceleration",
+                       "Commander exile payoff", "Evasion support")
+    tracked_roles = (*policy.goals, *extra_roles)
     for role in tracked_roles:
         pool.update([key for key in best_incoming if role in spells[key].roles][:3])
     edits = []
-    old_bonus = _strategy_bonus(coverage)
+    old_bonus = strategy_bonus(coverage)
     for index, outgoing in enumerate(selected):
         removed = spells[outgoing].roles
         for incoming in sorted(pool):
@@ -159,7 +161,7 @@ def _refine(current, spells, rank, policy):
             next_roles = coverage.copy()
             next_roles.subtract(removed)
             next_roles.update(added)
-            delta = values[incoming] - scores[outgoing] + _strategy_bonus(next_roles) - old_bonus
+            delta = values[incoming] - scores[outgoing] + strategy_bonus(next_roles) - old_bonus
             edits.append((delta, index, incoming, next_roles))
     edits.sort(key=lambda row: row[:3], reverse=True)
 
@@ -176,14 +178,14 @@ def _refine(current, spells, rank, policy):
         next_roles.subtract(spells[selected[other_index]].roles)
         next_roles.update(spells[other].roles)
         if admissible(next_roles):
-            linked_bonus = _strategy_bonus(next_roles) + old_bonus - _strategy_bonus(roles) - _strategy_bonus(other_roles)
+            linked_bonus = strategy_bonus(next_roles) + old_bonus - strategy_bonus(roles) - strategy_bonus(other_roles)
             pairs.append((gain + other_gain + linked_bonus, ((index, incoming), (other_index, other))))
     best = current
     for _, changes in [*singles, *sorted(pairs, reverse=True)[:4]]:
         candidate = list(selected)
         for index, incoming in changes:
             candidate[index] = incoming
-        result = _evaluate(candidate, spells, rank, policy)
+        result = _evaluate(candidate, spells, rank, policy, strategy_bonus=strategy_bonus)
         if result[0] > best[0] + 1e-6:
             best = result
     return best

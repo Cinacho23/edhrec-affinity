@@ -3,7 +3,8 @@ import { Link, useSearchParams } from "react-router-dom";
 
 import BracketBadge from "../components/BracketBadge";
 import CommanderImageGallery from "../components/CommanderImageGallery";
-import original from "../generated/synergy-deck.json";
+import doctorAndRose from "../generated/synergy-deck.json";
+import pantlaza from "../generated/synergy-deck-pantlaza.json";
 import { loadCommanderIndex } from "../lib/api";
 import {
   generatedDeckFilename,
@@ -14,8 +15,10 @@ import {
 import { formatDecimal, formatNumber } from "../lib/formatters";
 import "./SynergyDeckPage.css";
 
-const prototypeCommander = "the-tenth-doctor-rose-tyler";
-const prototypeTitle = "The Tenth Doctor + Rose Tyler";
+const optimizedReports = new Map([
+  ["the-tenth-doctor-rose-tyler", doctorAndRose],
+  ["pantlaza-sun-favored", pantlaza],
+]);
 const catalogPageSize = 24;
 const commanderColorChoices = { W: "White", U: "Blue", B: "Black", R: "Red", G: "Green" };
 const choosesCommanderColor = new Set(["clara oswald", "faceless one", "the prismatic piper"]);
@@ -217,6 +220,10 @@ function ModelSummary({ synergy, deck, generated }) {
   const metrics = [
     ["Training decks", synergy.training_decks],
     ["Training decks for this pair", synergy.target_pair_training_decks],
+    ["Training decks for this commander", synergy.target_commander_training_decks],
+    ["Fresh deck previews collected", synergy.current_previews_loaded],
+    ["Public decks indexed", synergy.public_index_decks],
+    ["Model parameters", synergy.parameters],
     ["Catalog cards", synergy.catalog_cards],
     ["Legal spell candidates", construction.candidate_spell_count],
     ["Candidate lists evaluated", synergy.evaluated_decks ?? construction.search_starts],
@@ -346,11 +353,11 @@ export default function SynergyDeckPage() {
 }
 
 function CommanderDeck({ commander, selectedCommander, index, searchParams, setSearchParams, heading }) {
-  const isPrototype = commander === prototypeCommander;
+  const optimizedReport = optimizedReports.get(commander);
   const colorParam = searchParams.get("color");
   const chosenColor = selectedCommander?.choosesColor && Object.hasOwn(commanderColorChoices, colorParam) ? colorParam : null;
-  const generatedReport = useGeneratedReport(isPrototype ? null : selectedCommander, chosenColor);
-  const report = isPrototype ? original : generatedReport.report;
+  const generatedReport = useGeneratedReport(optimizedReport ? null : selectedCommander, chosenColor);
+  const report = optimizedReport ?? generatedReport.report;
   const deck = report?.deck;
 
   const synergy = report?.synergy || {};
@@ -361,10 +368,10 @@ function CommanderDeck({ commander, selectedCommander, index, searchParams, setS
   const commanders = commanderCards.map((card) => ({ ...card, ...commanderRows.get(card.name) }));
   const mainDeck = list.filter((card) => !commanderNames.has(card.name));
   const commanderTitle = deck ? commanderCards.map((card) => card.name).join(" + ")
-    : selectedCommander?.name || (isPrototype ? prototypeTitle : "Synergy Deck");
+    : selectedCommander?.name || "Synergy Deck";
   const generated = reportDate(report?.generated_at);
   let unavailableReason;
-  if (!isPrototype) {
+  if (!optimizedReport) {
     if (index.loading) unavailableReason = "Loading commander details…";
     else if (index.error) unavailableReason = "The deck builder needs the commander catalog. Try refreshing the page.";
     else if (!selectedCommander) unavailableReason = "Commander not found. Choose a commander from the catalog.";

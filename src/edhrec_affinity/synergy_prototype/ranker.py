@@ -232,6 +232,15 @@ class DeckRanker:
             if candidate not in excluded:
                 return candidate
 
+    def _comparable_negative(self, deck, positive, pool, excluded):
+        return self._take_negative(pool, excluded)
+
+    def _training_input(self, candidates, decks, commanders, context):
+        return self._input(candidates, commanders, context)
+
+    def _fit_training_batch(self, features, labels):
+        self.model.partial_fit(features, labels, classes=np.asarray([0, 1]))
+
     def fit(self, decks, *, epochs):
         popularity = np.zeros(len(self.keys), dtype=np.int32)
         for deck in decks:
@@ -261,16 +270,17 @@ class DeckRanker:
                     common = self._take_negative(popular[deck.colors], excluded)
                     excluded.add(common)
                     cost_pool = same_cost[deck.colors, self.cost_buckets[positive]]
-                    similar = self._take_negative(cost_pool if len(cost_pool) > len(excluded) else legal[deck.colors],
-                                                  excluded)
+                    similar = self._comparable_negative(
+                        deck, positive, cost_pool if len(cost_pool) > len(excluded) else legal[deck.colors], excluded,
+                    )
                     candidate_ids[index] = [positive, uniform, common, similar]
                     commander_matrix[index, 0] = commander_features[deck.commanders]
                     # Randomly vary the information available at inference time.
                     context_size = int(self.rng.integers(0, len(order)))
                     context_matrix[index, 0] = self._mean(order[1:1 + context_size])
-                features = self._input(candidate_ids, commander_matrix, context_matrix)
+                features = self._training_input(candidate_ids, block, commander_matrix, context_matrix)
                 labels = np.tile([1, 0, 0, 0], len(block))
-                self.model.partial_fit(features.reshape(len(labels), -1), labels, classes=np.asarray([0, 1]))
+                self._fit_training_batch(features.reshape(len(labels), -1), labels)
             print(f"Finished training epoch {epoch + 1}/{epochs}", flush=True)
 
     def predict(self, candidates, command, context):

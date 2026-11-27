@@ -334,12 +334,14 @@ def _within_limits(spell: Spell, coverage: Counter, limits, removed: frozenset[s
 
 
 def _pick_spells(spells: dict[str, Spell], rank, start: int, policy: ConstructionPolicy,
-                 *, spell_slots: int = SPELL_SLOTS) -> list[str]:
+                 *, spell_slots: int = SPELL_SLOTS, priority_roles=None) -> list[str]:
     selected = []
     used = set()
     coverage = Counter()
     pools = {role: [key for key, spell in spells.items() if role in spell.roles] for role in policy.goals}
-    first_roles = ((), ("Suspend", "Time travel", "Exile payoffs"), ("Early attackers", "Rose support"))[start % 3]
+    if priority_roles is None:
+        priority_roles = ((), ("Suspend", "Time travel", "Exile payoffs"), ("Early attackers", "Rose support"))
+    first_roles = priority_roles[start % len(priority_roles)]
     order = (*[role for role in first_roles if role in policy.goals],
              *(role for role in policy.goals if role not in first_roles))
     expensive = 0
@@ -469,8 +471,9 @@ def _deck_result(metadata, commanders, lands, early_colors, spells, selected, sc
                      "synergy_score": round(scores[key], 4) if key in scores else None, "synergy_signal": evidence})
     tagged = "\n".join(f"{row['quantity']} {row['name']}" + (" *CMDR*" if row["primary_role"] == "Commander" else "")
                        for row in rows) + "\n"
-    result = {"status": "generated", "name": " + ".join(COMMANDER_NAMES), "card_count": sum(counts.values()),
-              "commanders": rows[:2], "cards": rows, "deck_text": tagged, "export_text": tagged,
+    result = {"status": "generated", "name": " + ".join(metadata[key]["name"] for key in commanders),
+              "card_count": sum(counts.values()), "commanders": rows[:len(commanders)], "cards": rows,
+              "deck_text": tagged, "export_text": tagged,
               "synergy_score": round(fit, 4), "cardlist_sha256": cardlist_hash(rows), "validation": validation,
               "mana_diagnostics": mana, "construction": {"candidate_spell_count": len(spells),
                   "spell_role_counts": {role: coverage[role] for role in (*policy.goals, *policy.limits, "Time counters", "Library setup", "Attack setup")},
