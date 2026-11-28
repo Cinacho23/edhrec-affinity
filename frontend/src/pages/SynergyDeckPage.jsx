@@ -5,6 +5,7 @@ import BracketBadge from "../components/BracketBadge";
 import CommanderImageGallery from "../components/CommanderImageGallery";
 import doctorAndRose from "../generated/synergy-deck.json";
 import pantlaza from "../generated/synergy-deck-pantlaza.json";
+import rogSilas from "../generated/synergy-deck-rog-silas.json";
 import yshtola from "../generated/synergy-deck-yshtola.json";
 import { loadCommanderIndex } from "../lib/api";
 import {
@@ -19,6 +20,7 @@ import "./SynergyDeckPage.css";
 const optimizedReports = new Map([
   ["the-tenth-doctor-rose-tyler", doctorAndRose],
   ["pantlaza-sun-favored", pantlaza],
+  ["rograkh-son-of-rohgahh-silas-renn-seeker-adept", rogSilas],
   ["yshtola-nights-blessed", yshtola],
 ]);
 const catalogPageSize = 24;

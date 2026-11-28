@@ -13,14 +13,14 @@ from ..build_styles.collection import deck_dataset_sha256
 from ..build_styles.official_checker import OfficialDeckChecker
 from ..build_styles.pipeline import atomic_json
 from ..synergy_decks.typed_ranker import TypedDeckRanker
-from . import pantlaza, yshtola
+from . import pantlaza, rog_silas, yshtola
 from .__main__ import report_for_deck, verify_report
 from .budgets import load_snapshot, playability_status
 from .catalog import load_catalog
 from .refinement import price_deck
 
 
-_COMMANDERS = {policy.COMMANDER_SLUG: policy for policy in (pantlaza, yshtola)}
+_COMMANDERS = {policy.COMMANDER_SLUG: policy for policy in (pantlaza, yshtola, rog_silas)}
 
 
 def _read_checkpoint(path, commander_slug):
@@ -68,14 +68,15 @@ def train(args, commander):
     coverage = freeze_target(args.current_previews, args.historical_previews, frozen, commander_slug=commander.COMMANDER_SLUG)
     catalog, aliases = load_catalog(args.oracle_jsonl, args.catalog_updated_at, args.alias_cache)
     included = TypedDeckRanker(catalog, aliases, seed=args.seed)
-    training, test, counts = included.load_decks(args.previews, (commander.COMMANDER_KEY,), target_previews=frozen)
-    exact = (included.index[commander.COMMANDER_KEY],)
+    training, test, counts = included.load_decks(args.previews, commander.COMMANDER_KEYS, target_previews=frozen)
+    exact = tuple(sorted(included.index[key] for key in commander.COMMANDER_KEYS))
     other_decks = [deck for deck in training if deck.commanders != exact]
     target_count = len(training) - len(other_decks)
     assert target_count == counts["target_pair_training_decks"]
     print(f"Frozen {target_count} distinct lists for {commander.COMMANDER}. Current index has {coverage['public_index_decks']} entries.",
           flush=True)
     results = {}
+    training_count_field = "target_pair_training_decks" if len(exact) > 1 else "target_commander_training_decks"
     for arm, examples in (("with", training), ("without", other_decks)):
         label = f"{arm}-{commander.COHORT}"
         ranker = included if arm == "with" else TypedDeckRanker(catalog, aliases, seed=args.seed)
@@ -90,7 +91,7 @@ def train(args, commander):
         params = sum(tensor.size for tensor in (*ranker.model.coefs_, *ranker.model.intercepts_))
         sample = {
             **coverage, "training_decks": len(examples), "heldout_decks": len(test),
-            "target_commander_training_decks": target_count if arm == "with" else 0,
+            training_count_field: target_count if arm == "with" else 0,
             "target_commander_eligible_decks": target_count,
             "target_duplicate_decks": counts.get("target_duplicate_decks", 0),
             "target_unavailable_previews": counts.get("target_unavailable_previews", 0),
@@ -154,7 +155,7 @@ def generate(args, commander):
             if ranker.keys != list(catalog):
                 raise ValueError("The Oracle catalog does not match the model's stored features")
             reports = {}
-            for deck in commander.build_candidates(catalog, ranker.for_commanders((commander.COMMANDER_KEY,)),
+            for deck in commander.build_candidates(catalog, ranker.for_commanders(commander.COMMANDER_KEYS),
                                                    prices, profiles=profiles):
                 digest = deck["cardlist_sha256"]
                 if digest in reports:

@@ -23,7 +23,7 @@ class LandOption:
     utility: float
 
 
-def land_option(card, colors, creature_type):
+def land_option(card, colors, creature_type, *, artifact_support=False):
     text = re.sub(r"\([^)]*\)", "", _oracle(card).casefold())
     direct = _land_colors(card, colors)
     quality = _land_quality(card)
@@ -73,15 +73,18 @@ def land_option(card, colors, creature_type):
         quality *= .65
     if "first, second, or third turn" in text:
         quality = .80
+    if artifact_support and "Artifact" in card["type_line"].split(" — ", 1)[0].split():
+        utility += 1.25 * quality
     return LandOption(frozenset(direct), quality, frozenset(types), fetch, restricted, utility)
 
 
-def build_mana_base(metadata, prices, colors, creature_type, *, budget, count, price_pressure, required=()):
+def build_mana_base(metadata, prices, colors, creature_type, *, budget, count, price_pressure, required=(),
+                    artifact_support=False):
     """Select a mana base and report general and tribal-only casting sources."""
     basics = [key for key, color in _BASIC_COLORS.items() if color in colors]
     if not all(key in metadata for key in basics):
         raise ConstructionSearchError("The price snapshot is missing one or more basic land types")
-    options = {key: land_option(card, colors, creature_type)
+    options = {key: land_option(card, colors, creature_type, artifact_support=artifact_support)
                for key, card in metadata.items() if _is_land(card) and prices[key] <= budget}
     options = {key: option for key, option in options.items() if option.colors or option.fetch}
     minimum_price = min(prices[key] for key in basics)

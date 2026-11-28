@@ -83,3 +83,23 @@ The first pass scored a one-for-one mana filter as ramp. It also credited Shrine
 | Model without Y’shtola lists, same lands as the published deck | 39 | $112.94 | $114.43 | 77.4% | 83.1% |
 
 The selection favors the 22 proactive qualifying off-turn casts in the published deck over the control’s 13. The published mana base had slightly better unrestricted blue and white coverage than the fixed-spell comparison and cost within $3.36 of the nonlands. The benchmark used 12,000 simulated openings per list with land drops and early ramp. The exact published list checked at estimated Bracket 2. Its hash starts with `65da04cf1d1b`. [Published Y’shtola deck](https://cinacho23.github.io/edhrec-affinity/#/synergy-deck?commander=yshtola-nights-blessed)
+
+## Silas Renn and Rograkh adaptation
+
+Rograkh can tap to power another permanent’s ability or be sacrificed to a creature outlet. His first cast costs zero, he has red color for Mox Amber, and his zero power limits outlets that scale with power. Silas needs to deal combat damage to a player. He can then cast the targeted artifact card from your graveyard that turn, paying its costs and following normal timing. Count low-cost castable artifacts, ways to get them into the graveyard, ways for Silas to connect, and payoffs for replaying or accumulating artifacts. [Commander Legends release notes](https://magic.wizards.com/en/news/feature/commander-legends-release-notes-2020-11-06)
+
+Use `python -m edhrec_affinity.synergy_prototype.commander_pipeline --commander rograkh-son-of-rohgahh-silas-renn-seeker-adept` with the collector checkpoint for this exact pair. The control omits their lists and retains decks with either commander in a different pairing. Generate from both rankers with `generate --check`. The opening benchmark draws from 98 cards and measures when the deck can pay for Silas with its opening lands and early ramp. The mana allocator uses the completed nonland subtotal and excludes the three original Grixis duals. The published report lives in `frontend/src/generated/synergy-deck-rog-silas.json`.
+
+### Silas Renn and Rograkh run record
+
+The November 28 gallery indexed 9,305 public decks. All 670 previews in the collected sample produced distinct, eligible deck lists. The matched models trained on 173,554 decks with the pair’s lists and 172,884 decks in the control. Both had 51,841 parameters. Top-ten recall on the shared held-out inclusion queries was 42.7% with the pair’s lists and 44.2% in the control. [EDHREC deck gallery](https://edhrec.com/commanders/rograkh-son-of-rohgahh-silas-renn-seeker-adept/decks)
+
+The first pass checked at 83.5%–90.2% playability and selected many artifacts that did the same job. The revised search limits redundant consumables and rewards effects that trigger on other artifacts, repeatable damage, and finishes that scale with the board. It checks what each sacrifice outlet can get from a zero-power, zero-mana-value creature. The mana allocator also gives utility to artifact lands that contribute to those payoffs.
+
+| Checked finalist | Lands | Land subtotal | Nonland subtotal | EDHPowerLevel playability | Simulated Silas by turn three |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Published deck | 35 | $107.64 | $103.60 | 77.2% | 78.3% |
+| Same spells with Haunted Ridge replacing Mount Doom | 35 | $101.44 | $103.60 | 77.2% | 78.2% |
+| Model without the pair’s lists | 35 | $70.32 | $71.32 | 76.5% | 77.6% |
+
+The published list has 11 consumable replay targets to the control’s eight and adds Aether Spellbomb, Mnemonic Sphere, and Deadly Rollick. Its lands include Great Furnace, Seat of the Synod, and Vault of Whispers, with Mount Doom providing untapped black or red mana. The land-only alternative costs $6.20 less and had essentially the same opening results across 12,000 simulated draws per deck. All three finalists checked at estimated Bracket 2. The published list’s hash starts with `ec46788a0a9e`. [Published Silas Renn and Rograkh deck](https://cinacho23.github.io/edhrec-affinity/#/synergy-deck?commander=rograkh-son-of-rohgahh-silas-renn-seeker-adept)

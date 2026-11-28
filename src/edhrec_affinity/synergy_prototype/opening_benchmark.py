@@ -1,4 +1,4 @@
-"""Compare opening mana for a single commander using the exact deck list."""
+"""Compare opening mana for casting a commander using the exact deck list."""
 
 import argparse
 from collections import Counter
@@ -11,7 +11,7 @@ import re
 
 from ..build_styles.deckbuilding import _is_land, _land_information, _oracle
 from ..build_styles.sources import card_key
-from . import pantlaza, yshtola
+from . import pantlaza, rog_silas, yshtola
 from .catalog import card_faces, load_catalog
 from .mana_plan import land_option
 
@@ -67,7 +67,7 @@ def _land(card, text, colors, creature_type):
                 option.fetch, "onto the battlefield tapped" in text, card.get("layout") == "modal_dfc")
 
 
-def _ramp(card, text, roles, identity):
+def _ramp(card, text, roles, identity, *, free_commander_colors=frozenset()):
     if "Early ramp" not in roles:
         return None
     front = card_faces(card)[0]
@@ -84,7 +84,9 @@ def _ramp(card, text, roles, identity):
         return Ramp(int(card["cmc"]), pips, frozenset(), False, 0, int(reduction[1]), False, frozenset())
     if permanent and re.search(r"\{t\}[^:\n]*: add ", text):
         colors = frozenset(card.get("produced_mana", ())) & identity
-        if "add one mana of any color" in text:
+        if "legendary creatures and planeswalkers you control" in text:
+            colors = free_commander_colors
+        elif "add one mana of any color" in text:
             colors = frozenset(identity)
         restricted = "spend this mana only" in text
         return Ramp(int(card["cmc"]), pips, colors, restricted, 2 if "add {c}{c}" in text else 1,
@@ -184,38 +186,42 @@ def _draw_game(cards, rng, pips, commander_value):
 
 
 
-def opening_turns(report, catalog, classify, *, creature_type=None, trials=6000, seed=197):
+def opening_turns(report, catalog, classify, *, creature_type=None, target_commander=None, trials=6000, seed=197):
     """Model land drops, casting colors, and one early ramp play per turn."""
     deck = report["deck"]
-    if len(deck["commanders"]) != 1:
-        raise ValueError("The opening benchmark expects a single commander")
-    name = deck["commanders"][0]["name"]
-    commander = catalog[card_key(name)]
-    identity = set(commander["color_identity"])
+    command_cards = {card_key(row["name"]): catalog[card_key(row["name"])] for row in deck["commanders"]}
+    if not target_commander and len(command_cards) != 1:
+        raise ValueError("The opening benchmark needs one commander to measure")
+    commander = command_cards[card_key(target_commander)] if target_commander else next(iter(command_cards.values()))
+    identity = {color for card in command_cards.values() for color in card["color_identity"]}
+    free_colors = frozenset(color for card in command_cards.values() if card["mana_cost"] == "{0}"
+                            for color in card.get("colors", ()))
     pips = tuple(frozenset(pip.split("/")) & identity for pip in re.findall(r"\{([^}]+)\}", commander["mana_cost"])
                  if any(color in pip for color in identity))
     cards = []
     for row in deck["cards"]:
-        if row["name"] == name:
+        if card_key(row["name"]) in command_cards:
             continue
         card = catalog[card_key(row["name"])]
         text = re.sub(r"\([^)]*\)", "", _oracle(card).casefold())
         if _is_land(card):
             entry = (_land(card, text, identity, creature_type), None)
         else:
-            entry = (None, _ramp(card, text, classify(card).roles, identity))
+            entry = (None, _ramp(card, text, classify(card).roles, identity, free_commander_colors=free_colors))
         cards.extend([entry] * row["quantity"])
-    if len(cards) != 99:
-        raise ValueError("The benchmark expects 99 cards outside the command zone")
+    if len(cards) != 100 - len(command_cards):
+        raise ValueError("The benchmark expects a complete deck outside the command zone")
     randomizer = random.Random(seed)
     return Counter(_draw_game(cards, randomizer, pips, int(commander["cmc"])) for _ in range(trials))
 
 
 def benchmark(report, catalog, *, trials=6000, seed=197):
-    key = card_key(report["deck"]["commanders"][0]["name"])
-    policy = {pantlaza.COMMANDER_KEY: pantlaza, yshtola.COMMANDER_KEY: yshtola}[key]
+    keys = frozenset(card_key(row["name"]) for row in report["deck"]["commanders"])
+    policy = {frozenset(mod.COMMANDER_KEYS): mod for mod in (pantlaza, yshtola, rog_silas)}[keys]
     tribe = "Dinosaur" if policy is pantlaza else None
-    turns = opening_turns(report, catalog, policy.classify_spell, creature_type=tribe, trials=trials, seed=seed)
+    target = rog_silas.SILAS if policy is rog_silas else None
+    turns = opening_turns(report, catalog, policy.classify_spell, creature_type=tribe, target_commander=target,
+                          trials=trials, seed=seed)
     return {"trials": trials, **{f"commander_by_turn_{turn}": round(
         sum(turns[played] for played in range(1, turn + 1)) / trials * 100, 1) for turn in (3, 4, 5)}}
 

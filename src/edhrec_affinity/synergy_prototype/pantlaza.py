@@ -17,6 +17,7 @@ from .refinement import _evaluate, _refine, land_allocation
 
 COMMANDER = "Pantlaza, Sun-Favored"
 COMMANDER_KEY = card_key(COMMANDER)
+COMMANDER_KEYS = (COMMANDER_KEY,)
 COMMANDER_SLUG = "pantlaza-sun-favored"
 COHORT = "pantlaza"
 SUMMARY = "Ramp into Pantlaza, discover from Dinosaur entries, and keep the engine going on other players’ turns."

@@ -14,6 +14,7 @@ from .refinement import _evaluate, _refine, land_allocation
 
 COMMANDER = "Y'shtola, Night's Blessed"
 COMMANDER_KEY = card_key(COMMANDER)
+COMMANDER_KEYS = (COMMANDER_KEY,)
 COMMANDER_SLUG = "yshtola-nights-blessed"
 COHORT = "yshtola"
 SUMMARY = (
